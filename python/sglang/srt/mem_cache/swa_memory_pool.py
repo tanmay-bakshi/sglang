@@ -19,6 +19,9 @@ GB = 1024 * 1024 * 1024
 class SWAKVPool(BaseSWAKVPool):
     """KV cache with separate pools for full and SWA attention layers."""
 
+    _full_attention_layer_ids: tuple[int, ...]
+    _swa_attention_layer_ids: tuple[int, ...]
+
     def __init__(
         self,
         size: int,
@@ -39,8 +42,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.device = device
-        self.swa_layer_nums = len(swa_attention_layer_ids)
-        self.full_layer_nums = len(full_attention_layer_ids)
+        self._swa_attention_layer_ids = tuple(swa_attention_layer_ids)
+        self._full_attention_layer_ids = tuple(full_attention_layer_ids)
+        self.swa_layer_nums = len(self._swa_attention_layer_ids)
+        self.full_layer_nums = len(self._full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
@@ -74,9 +79,11 @@ class SWAKVPool(BaseSWAKVPool):
         )
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
-        for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
+        for full_attn_layer_id, global_layer_id in enumerate(
+            self._full_attention_layer_ids
+        ):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
-        for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
+        for swa_layer_id, global_layer_id in enumerate(self._swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
@@ -133,6 +140,25 @@ class SWAKVPool(BaseSWAKVPool):
             full_kv_data_lens,
             full_kv_item_lens,
         )
+
+    def get_kv_layer_ids(self) -> list[int]:
+        """Return global full-attention layer IDs in K-then-V order.
+
+        :returns: Layer identifiers matching ``get_contiguous_buf_infos``.
+        """
+
+        return [
+            *self._full_attention_layer_ids,
+            *self._full_attention_layer_ids,
+        ]
+
+    def get_state_layer_ids(self) -> list[int]:
+        """Return global SWA layer IDs in K-then-V order.
+
+        :returns: Layer identifiers matching ``get_state_buf_infos``.
+        """
+
+        return [*self._swa_attention_layer_ids, *self._swa_attention_layer_ids]
 
     def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
