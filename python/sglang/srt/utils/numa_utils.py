@@ -1,3 +1,4 @@
+import atexit
 import ctypes
 import glob
 import logging
@@ -8,7 +9,6 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -57,34 +57,32 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     )
                     yield
                     return
-                with _create_numactl_executable(
+                executable, debug_str = _create_numactl_executable(
                     numactl_args=numactl_args
-                ) as executable_info:
-                    executable, debug_str = executable_info
-                    debug_str += (
-                        f", logical_gpu_id={gpu_id}, "
-                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                        "CUDA_VISIBLE_DEVICES="
-                        f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-                    )
-                    with _mp_set_executable(
-                        executable=executable,
-                        debug_str=debug_str,
-                    ):
-                        yield
-                        return
+                )
+                debug_str += (
+                    f", logical_gpu_id={gpu_id}, "
+                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                    "CUDA_VISIBLE_DEVICES="
+                    f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                )
+                with _mp_set_executable(
+                    executable=executable,
+                    debug_str=debug_str,
+                ):
+                    yield
+                    return
     yield
 
 
-@contextmanager
 def _create_numactl_executable(
     numactl_args: str,
-) -> Iterator[tuple[str, str]]:
-    """Create a private NUMA launcher for one multiprocessing spawn context.
+) -> tuple[str, str]:
+    """Create a private NUMA launcher for the parent process lifetime.
 
     :param numactl_args: Validated arguments inserted before the Python
         executable.
-    :yields: Executable path and debug description.
+    :returns: Executable path and debug description.
     """
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
@@ -97,13 +95,12 @@ exec numactl {numactl_args} {quoted_executable} "$@"'''
         dir=tempfile.gettempdir(),
     )
     path = Path(temporary_path)
-    try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
-            stream.write(script)
-        path.chmod(0o700)
-        yield str(path), f"{script=}"
-    finally:
-        path.unlink(missing_ok=True)
+    with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+        stream.write(script)
+    path.chmod(0o700)
+    # Process.start returns before a spawn child necessarily opens this path.
+    atexit.register(path.unlink, missing_ok=True)
+    return str(path), f"{script=}"
 
 
 @contextmanager
