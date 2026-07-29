@@ -309,7 +309,14 @@ class PackedLease:
 
 
 class PackedLeaseAllocator(Protocol):
-    """Allocator contract required by the decode protocol."""
+    """Allocator contract required by the decode protocol.
+
+    Every callback runs while the protocol serializes chunk transitions. An
+    implementation must complete without waiting for device or network work,
+    must not call back into :class:`PackedDecodeProtocol`, and must be
+    transactional: if it raises, lease ownership must remain unchanged so the
+    same operation can be retried safely.
+    """
 
     def allocate(self, length_bytes: int) -> PackedLease:
         """Allocate one contiguous registered staging lease.
@@ -430,9 +437,6 @@ class _PackedChunk:
     )
     quiesced_writers: set[StagingWriterId] = dataclasses.field(default_factory=set)
     lease: PackedLease | None = None
-    ready_messages: dict[StagingWriterId, PackedReady] = dataclasses.field(
-        default_factory=dict
-    )
     ready_issued: bool = False
     quarantined: bool = False
     scatter_started: bool = False
@@ -462,6 +466,7 @@ class PackedDecodeProtocol:
     """Thread-safe decode-side consensus and lease-safety state machine."""
 
     _allocator: PackedLeaseAllocator
+    _allocator_callback_active: bool
     _chunks: dict[PackedChunkKey, _PackedChunk]
     _lock: threading.RLock
 
@@ -472,6 +477,7 @@ class PackedDecodeProtocol:
         """
 
         self._allocator = allocator
+        self._allocator_callback_active = False
         self._chunks = {}
         self._lock = threading.RLock()
 
@@ -508,6 +514,7 @@ class PackedDecodeProtocol:
             writer_layout.writer_id for writer_layout in layout.writers
         )
         with self._lock:
+            self._require_no_allocator_callback_locked()
             if key in self._chunks:
                 raise ValueError(f"packed chunk is already registered: {key}")
             self._chunks[key] = _PackedChunk(
@@ -532,7 +539,7 @@ class PackedDecodeProtocol:
 
         :param message: Untrusted PREPARE payload.
         :param authenticated_writer_id: Writer bound to the transport peer.
-        :returns: READY messages produced or replayed by this PREPARE.
+        :returns: READY messages produced by final unique-writer consensus.
         :raises PackedProtocolError: If the payload conflicts with local truth.
         """
 
@@ -553,10 +560,7 @@ class PackedDecodeProtocol:
                         chunk,
                         f"conflicting duplicate PREPARE from {authenticated_writer_id}",
                     )
-                ready = chunk.ready_messages.get(authenticated_writer_id)
-                if ready is None:
-                    return ()
-                return (ready,)
+                return ()
 
             chunk.prepares[authenticated_writer_id] = message
             if set(chunk.prepares) != set(chunk.expected_writers):
@@ -785,6 +789,29 @@ class PackedDecodeProtocol:
                 failure_reason=chunk.failure_reason,
             )
 
+    def retire_chunk(self, key: PackedChunkKey) -> None:
+        """Forget terminal metadata and immutable destination-page snapshots.
+
+        Retirement is forbidden while a writer DMA or scatter may still own the
+        lease. Adapters must drive quarantine to a terminal state before
+        retiring a failed room.
+
+        :param key: Request and chunk identity.
+        :raises PackedProtocolError: If asynchronous ownership is not terminal.
+        """
+
+        with self._lock:
+            chunk = self._require_chunk_locked(key)
+            if chunk.state not in (
+                PackedProtocolState.RELEASED,
+                PackedProtocolState.FAILED_RELEASED,
+            ):
+                raise PackedProtocolError(
+                    key,
+                    f"chunk cannot retire in state {chunk.state.value}",
+                )
+            del self._chunks[key]
+
     def _require_chunk_locked(self, key: PackedChunkKey) -> _PackedChunk:
         """Return one registered chunk while the protocol lock is held.
 
@@ -793,6 +820,7 @@ class PackedDecodeProtocol:
         :raises PackedProtocolError: If the chunk was never registered.
         """
 
+        self._require_no_allocator_callback_locked()
         try:
             return self._chunks[key]
         except KeyError as error:
@@ -890,7 +918,7 @@ class PackedDecodeProtocol:
         if chunk.lease is not None or chunk.ready_issued:
             raise PackedProtocolError(chunk.key, "packed lease was already allocated")
         try:
-            lease = self._allocator.allocate(chunk.layout.total_bytes)
+            lease = self._allocate_lease_locked(chunk.layout.total_bytes)
         except Exception as error:
             logger.error(
                 "Packed staging lease allocation failed:\n%s",
@@ -899,14 +927,17 @@ class PackedDecodeProtocol:
             chunk.failure_reason = f"lease allocation failed: {error}"
             chunk.state = PackedProtocolState.FAILED_RELEASED
             raise PackedProtocolError(chunk.key, chunk.failure_reason) from error
+        chunk.lease = lease
         if lease.length_bytes < chunk.layout.total_bytes:
             chunk.failure_reason = (
                 "allocator returned undersized lease: "
                 f"{lease.length_bytes} < {chunk.layout.total_bytes}"
             )
-            chunk.state = PackedProtocolState.FAILED_RELEASED
+            chunk.state = PackedProtocolState.FAILED_QUARANTINED
+            chunk.quarantined = True
+            chunk.quiesced_writers.update(chunk.expected_writers)
             try:
-                self._allocator.release(lease)
+                self._release_failed_if_safe_locked(chunk)
             except Exception as error:
                 logger.error(
                     "Undersized packed staging lease release failed:\n%s",
@@ -918,7 +949,6 @@ class PackedDecodeProtocol:
                 ) from error
             raise PackedProtocolError(chunk.key, chunk.failure_reason)
 
-        chunk.lease = lease
         ready_messages: dict[StagingWriterId, PackedReady] = {}
         for writer_id in chunk.expected_writers:
             projection = _writer_layout(chunk.layout, writer_id)
@@ -931,7 +961,6 @@ class PackedDecodeProtocol:
                 projection_offset=projection.lease_offset,
                 projection_length=projection.length_bytes,
             )
-        chunk.ready_messages = ready_messages
         chunk.ready_issued = True
         chunk.state = PackedProtocolState.READY
         return tuple(ready_messages[writer_id] for writer_id in chunk.expected_writers)
@@ -956,16 +985,13 @@ class PackedDecodeProtocol:
 
         if chunk.failure_reason is None:
             chunk.failure_reason = reason
-        if not chunk.ready_issued:
-            chunk.state = PackedProtocolState.FAILED_RELEASED
-            return
         lease = chunk.lease
         if lease is None:
             chunk.state = PackedProtocolState.FAILED_RELEASED
             return
         chunk.state = PackedProtocolState.FAILED_QUARANTINED
         if not chunk.quarantined:
-            self._allocator.quarantine(lease, chunk.failure_reason)
+            self._quarantine_lease_locked(lease, chunk.failure_reason)
             chunk.quarantined = True
         self._release_failed_if_safe_locked(chunk)
 
@@ -995,4 +1021,51 @@ class PackedDecodeProtocol:
         lease = chunk.lease
         if lease is None:
             raise PackedProtocolError(chunk.key, "chunk has no lease to release")
-        self._allocator.release(lease)
+        self._release_allocator_lease_locked(lease)
+
+    def _require_no_allocator_callback_locked(self) -> None:
+        """Reject allocator reentry before it can mutate protocol state.
+
+        :raises RuntimeError: If an allocator callback reenters the protocol.
+        """
+
+        if self._allocator_callback_active:
+            raise RuntimeError("packed lease allocator must not reenter the protocol")
+
+    def _allocate_lease_locked(self, length_bytes: int) -> PackedLease:
+        """Invoke the non-reentrant allocator allocation callback.
+
+        :param length_bytes: Minimum contiguous lease capacity.
+        :returns: Allocated lease.
+        """
+
+        self._allocator_callback_active = True
+        try:
+            return self._allocator.allocate(length_bytes)
+        finally:
+            self._allocator_callback_active = False
+
+    def _quarantine_lease_locked(self, lease: PackedLease, reason: str) -> None:
+        """Invoke the non-reentrant allocator quarantine callback.
+
+        :param lease: Failed lease that may retain asynchronous owners.
+        :param reason: First failure reason.
+        """
+
+        self._allocator_callback_active = True
+        try:
+            self._allocator.quarantine(lease, reason)
+        finally:
+            self._allocator_callback_active = False
+
+    def _release_allocator_lease_locked(self, lease: PackedLease) -> None:
+        """Invoke the non-reentrant allocator release callback.
+
+        :param lease: Terminally quiescent lease.
+        """
+
+        self._allocator_callback_active = True
+        try:
+            self._allocator.release(lease)
+        finally:
+            self._allocator_callback_active = False
