@@ -27,6 +27,9 @@ class DecodePrefixMatch:
     l3_storage_hit_length: int
     last_device_node: Any
     last_host_node: Any = None
+    swa_host_hit_length: int = 0
+    mamba_host_hit_length: int = 0
+    page_size: int = 1
     prefetch_registered: bool = False
 
     @property
@@ -38,13 +41,38 @@ class DecodePrefixMatch:
         return self.l1_prefix_len + self.l2_host_hit_length + self.l3_storage_hit_length
 
     @property
-    def needs_local_restore(self) -> bool:
-        return self.decode_prefix_len > self.l1_prefix_len
+    def full_restore_token_count(self) -> int:
+        """Return the page-rounded full-attention restore size.
+
+        :returns: Number of full-attention device slots reserved for load-back.
+        """
+
+        token_count = self.decode_prefix_len - self.l1_prefix_len
+        return ((token_count + self.page_size - 1) // self.page_size) * self.page_size
 
     @property
-    def restore_token_count(self) -> int:
-        """Number of tokens that need L2/L3 load_back to device."""
-        return self.decode_prefix_len - self.l1_prefix_len
+    def swa_restore_token_count(self) -> int:
+        """Return the page-rounded sliding-window restore size.
+
+        :returns: Number of SWA device slots reserved for load-back.
+        """
+
+        return (
+            (self.swa_host_hit_length + self.page_size - 1) // self.page_size
+        ) * self.page_size
+
+    @property
+    def needs_local_restore(self) -> bool:
+        """Return whether any rank-local cache component needs load-back.
+
+        :returns: Whether full-attention, SWA, or Mamba state is host-resident.
+        """
+
+        return (
+            self.full_restore_token_count > 0
+            or self.swa_restore_token_count > 0
+            or self.mamba_host_hit_length > 0
+        )
 
 
 class HiCacheRestoreResult(Enum):
@@ -93,6 +121,9 @@ class DecodeHiCachePreallocMixin:
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
+            swa_host_hit_length=result.swa_host_hit_length,
+            mamba_host_hit_length=result.mamba_host_hit_length,
+            page_size=self.token_to_kv_pool_allocator.page_size,
             last_host_node=(
                 result.last_host_node if l3_storage_hit_length > 0 else None
             ),
@@ -138,16 +169,30 @@ class DecodeHiCachePreallocMixin:
             prefix_match.l3_storage_hit_length = 0
             prefix_match.prefetch_registered = False
 
-    def _hicache_pending_restore_tokens(self) -> int:
-        """Total device tokens reserved for pending HiCache L2/L3 load_back."""
+    def _hicache_pending_restore_budgets(self) -> tuple[int, int]:
+        """Return device reservations for pending full-attention and SWA restores.
+
+        :returns: Page-rounded full-attention and SWA device-slot reservations.
+        """
+
         if not self.scheduler.enable_decode_hicache:
-            return 0
-        return sum(
-            dr.prefix_match.restore_token_count
+            return (0, 0)
+
+        pending_matches = [
+            dr.prefix_match
             for dr in self.transfer_queue.queue
             if dr.prefix_match is not None
             and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
             and dr.hicache_restored_node is None
+        ]
+        return (
+            sum(
+                prefix_match.full_restore_token_count
+                for prefix_match in pending_matches
+            ),
+            sum(
+                prefix_match.swa_restore_token_count for prefix_match in pending_matches
+            ),
         )
 
 
@@ -233,10 +278,8 @@ class DecodeHiCacheTransferMixin:
         dr.hicache_restored_node = restored_node
         self.tree_cache.inc_lock_ref(restored_node)
 
-        if len(new_indices) == 0:
-            # Whole prefix already on device; no DMA needed.
-            dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return False
+        # A unified SWA-only restore has no new full-attention indices. The
+        # controller's merged load queue determines whether a DMA was issued.
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:

@@ -899,8 +899,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
-        reserved_restore_tokens = self._hicache_pending_restore_tokens()
-        full_allocatable_tokens -= reserved_restore_tokens
+        (
+            reserved_full_restore_tokens,
+            reserved_swa_restore_tokens,
+        ) = self._hicache_pending_restore_budgets()
+        if uses_swa_tail_prealloc:
+            reserved_restore_tokens = reserved_full_restore_tokens
+            full_allocatable_tokens -= reserved_full_restore_tokens
+            swa_allocatable_tokens -= reserved_swa_restore_tokens
+        else:
+            reserved_restore_tokens = max(
+                reserved_full_restore_tokens, reserved_swa_restore_tokens
+            )
+            full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
@@ -1073,7 +1084,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
-                reserved_restore_tokens += prefix_match.restore_token_count
+                reserved_full_restore_tokens += prefix_match.full_restore_token_count
+                reserved_swa_restore_tokens += prefix_match.swa_restore_token_count
+                reserved_restore_tokens = (
+                    reserved_full_restore_tokens
+                    if uses_swa_tail_prealloc
+                    else max(
+                        reserved_full_restore_tokens,
+                        reserved_swa_restore_tokens,
+                    )
+                )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,

@@ -47,7 +47,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._hicache_pending_restore_budgets = MagicMock(return_value=(0, 0))
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -93,7 +93,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._hicache_pending_restore_budgets = MagicMock(return_value=(0, 0))
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []

@@ -1785,6 +1785,28 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
             finish_count -= 1
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return whether a unified component load-back event is complete.
+
+        :param consumer_index: Layer-done counter slot returned by
+            :meth:`ready_to_load_host_cache`.
+        :returns: Whether all rank-local component copies have completed.
+        """
+
+        if consumer_index < 0:
+            return True
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache load-back has no cache controller")
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
     # ---- HiCache: Scheduler Entry Points ----
 
     def init_load_back(
