@@ -93,6 +93,52 @@ class RecordingAllocator:
         self.releases.append(lease.lease_id)
 
 
+class FaultInjectingAllocator(RecordingAllocator):
+    """Transactional allocator that can fail before changing ownership."""
+
+    quarantine_failures: int
+    release_failures: int
+    reenter_on_quarantine: bool
+    protocol: PackedDecodeProtocol | None
+
+    def __init__(self) -> None:
+        """Initialize disabled fault injection."""
+
+        super().__init__()
+        self.quarantine_failures = 0
+        self.release_failures = 0
+        self.reenter_on_quarantine = False
+        self.protocol = None
+
+    def quarantine(self, lease: PackedLease, reason: str) -> None:
+        """Fail transactionally or record quarantine.
+
+        :param lease: Failed lease.
+        :param reason: First failure reason.
+        """
+
+        if self.reenter_on_quarantine:
+            protocol = self.protocol
+            if protocol is None:
+                raise RuntimeError("fault allocator has no protocol")
+            protocol.snapshot(KEY)
+        if self.quarantine_failures > 0:
+            self.quarantine_failures -= 1
+            raise RuntimeError("injected quarantine failure")
+        super().quarantine(lease, reason)
+
+    def release(self, lease: PackedLease) -> None:
+        """Fail transactionally or record release.
+
+        :param lease: Lease safe for reuse.
+        """
+
+        if self.release_failures > 0:
+            self.release_failures -= 1
+            raise RuntimeError("injected release failure")
+        super().release(lease)
+
+
 def writer(rank: int) -> StagingWriterId:
     """Build one authenticated TP writer identity.
 
@@ -205,6 +251,8 @@ def buffer(
 
 def protocol_fixture(
     component_ids: tuple[StagingComponentId, ...] = (MAIN_KV,),
+    *,
+    allocator: RecordingAllocator | None = None,
 ) -> tuple[
     PackedDecodeProtocol,
     RecordingAllocator,
@@ -213,6 +261,7 @@ def protocol_fixture(
     """Register one CPU-only protocol chunk.
 
     :param component_ids: Active component shape.
+    :param allocator: Allocator override used for lifecycle fault injection.
     :returns: Protocol, recording allocator, and canonical spec.
     """
 
@@ -223,10 +272,10 @@ def protocol_fixture(
             for component_geometry in spec.destination_components
         )
     )
-    allocator = RecordingAllocator()
-    protocol = PackedDecodeProtocol(allocator)
+    selected_allocator = RecordingAllocator() if allocator is None else allocator
+    protocol = PackedDecodeProtocol(selected_allocator)
     protocol.register_chunk(KEY, spec, registry)
-    return protocol, allocator, spec
+    return protocol, selected_allocator, spec
 
 
 def prepare(
@@ -336,16 +385,37 @@ def test_complete_prepare_consensus_allocates_once_and_projects_ready() -> None:
 
     assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
     ready_messages = protocol.handle_prepare(second_prepare, WRITERS[1])
-    replay = protocol.handle_prepare(first_prepare, WRITERS[0])
+    duplicate_result = protocol.handle_prepare(first_prepare, WRITERS[0])
 
     assert len(allocator.allocations) == 1
     assert tuple(message.writer_id for message in ready_messages) == WRITERS
-    assert len(replay) == 1
-    assert replay[0] == ready_messages[0]
+    assert duplicate_result == ()
     assert len(allocator.allocations) == 1
     assert ready_messages[0].projection_offset == 0
     assert ready_messages[1].projection_offset >= ready_messages[0].projection_length
     assert all(message.projection_length > 0 for message in ready_messages)
+
+
+def test_duplicate_prepare_never_reexposes_a_ready_lease() -> None:
+    """READY is emitted once even after COMMIT consensus and begun scatter."""
+
+    protocol, allocator, spec = protocol_fixture()
+    first_prepare = prepare(WRITERS[0], spec)
+    digest, lease_id = reach_ready(protocol, spec)
+
+    assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
+    protocol.handle_commit(
+        commit(WRITERS[0], digest, lease_id),
+        WRITERS[0],
+    )
+    assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
+    protocol.handle_commit(
+        commit(WRITERS[1], digest, lease_id),
+        WRITERS[1],
+    )
+    protocol.begin_scatter(KEY)
+    assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
+    assert len(allocator.allocations) == 1
 
 
 def test_prepare_claim_cannot_spoof_authenticated_writer() -> None:
@@ -575,6 +645,114 @@ def test_failed_begun_scatter_requires_explicit_scatter_quiescence() -> None:
     snapshot = protocol.snapshot(KEY)
     assert snapshot.state is PackedProtocolState.FAILED_RELEASED
     assert snapshot.scatter_terminal
+
+
+def test_retirement_requires_terminal_async_ownership() -> None:
+    """Terminal retirement drops specs and page snapshots, never live leases."""
+
+    protocol, _, spec = protocol_fixture()
+    reach_ready(protocol, spec)
+
+    with pytest.raises(PackedProtocolError, match="cannot retire"):
+        protocol.retire_chunk(KEY)
+
+    protocol.fail_chunk(KEY, "room cleanup")
+    with pytest.raises(PackedProtocolError, match="cannot retire"):
+        protocol.retire_chunk(KEY)
+    for writer_id in WRITERS:
+        protocol.quiesce_writer(KEY, writer_id)
+
+    protocol.retire_chunk(KEY)
+
+    with pytest.raises(PackedProtocolError, match="not registered"):
+        protocol.snapshot(KEY)
+
+
+def test_quarantine_callback_failure_is_transactionally_retryable() -> None:
+    """A failed quarantine callback leaves the lease owned and retryable."""
+
+    allocator = FaultInjectingAllocator()
+    protocol, _, spec = protocol_fixture(allocator=allocator)
+    _, lease_id = reach_ready(protocol, spec)
+    allocator.quarantine_failures = 1
+
+    with pytest.raises(RuntimeError, match="injected quarantine failure"):
+        protocol.fail_chunk(KEY, "transport failed")
+
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.quarantines == []
+    assert allocator.releases == []
+
+    protocol.fail_chunk(KEY, "retry quarantine")
+    assert allocator.quarantines == [(lease_id, "transport failed")]
+    for writer_id in WRITERS:
+        protocol.quiesce_writer(KEY, writer_id)
+    assert allocator.releases == [lease_id]
+
+
+def test_release_callback_failure_is_transactionally_retryable() -> None:
+    """A failed release callback cannot mark or double-release the lease."""
+
+    allocator = FaultInjectingAllocator()
+    protocol, _, spec = protocol_fixture(allocator=allocator)
+    _, lease_id = reach_scatter_ready(protocol, spec)
+    protocol.begin_scatter(KEY)
+    allocator.release_failures = 1
+
+    with pytest.raises(RuntimeError, match="injected release failure"):
+        protocol.complete_scatter(KEY)
+
+    snapshot = protocol.snapshot(KEY)
+    assert snapshot.state is PackedProtocolState.SCATTERING
+    assert snapshot.scatter_terminal
+    assert allocator.releases == []
+
+    protocol.complete_scatter(KEY)
+    assert allocator.releases == [lease_id]
+    assert protocol.snapshot(KEY).state is PackedProtocolState.RELEASED
+
+
+def test_allocator_reentry_is_rejected_before_protocol_mutation() -> None:
+    """Allocator callbacks cannot recursively observe or mutate chunk state."""
+
+    allocator = FaultInjectingAllocator()
+    protocol, _, spec = protocol_fixture(allocator=allocator)
+    _, lease_id = reach_ready(protocol, spec)
+    allocator.protocol = protocol
+    allocator.reenter_on_quarantine = True
+
+    with pytest.raises(RuntimeError, match="must not reenter"):
+        protocol.fail_chunk(KEY, "transport failed")
+
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.quarantines == []
+    allocator.reenter_on_quarantine = False
+    protocol.fail_chunk(KEY, "retry quarantine")
+    for writer_id in WRITERS:
+        protocol.quiesce_writer(KEY, writer_id)
+    assert allocator.releases == [lease_id]
+
+
+def test_undersized_lease_release_failure_retains_protocol_ownership() -> None:
+    """Malformed allocation cleanup remains retryable if release first fails."""
+
+    allocator = FaultInjectingAllocator()
+    allocator.length_adjustment = -1
+    allocator.release_failures = 1
+    protocol, _, spec = protocol_fixture(allocator=allocator)
+    protocol.handle_prepare(prepare(WRITERS[0], spec), WRITERS[0])
+
+    with pytest.raises(PackedProtocolError, match="release failed"):
+        protocol.handle_prepare(prepare(WRITERS[1], spec), WRITERS[1])
+
+    snapshot = protocol.snapshot(KEY)
+    assert snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert not snapshot.ready_issued
+    assert allocator.releases == []
+
+    protocol.fail_chunk(KEY, "retry malformed lease cleanup")
+    assert allocator.releases == [snapshot.lease_id]
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
 
 
 @pytest.mark.parametrize(
