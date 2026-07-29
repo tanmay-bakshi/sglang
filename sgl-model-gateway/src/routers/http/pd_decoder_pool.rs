@@ -304,6 +304,12 @@ enum CohortPhase {
     Quiescing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestChainPhase {
+    Open,
+    Terminal,
+}
+
 /// One-owner logical request chain spanning zero or more retry cohorts.
 #[derive(Debug)]
 pub struct LogicalRequestOwner {
@@ -428,6 +434,8 @@ pub enum DecoderPoolError {
         request_id: String,
         assignment_id: Uuid,
     },
+    #[error("logical request {0} is terminal")]
+    RequestChainTerminal(String),
     #[error("no ready decoder replica is registered")]
     NoReadyDecoder,
     #[error("every ready decoder is at its configured admission limit")]
@@ -504,6 +512,7 @@ impl ReplicaState {
 #[derive(Debug)]
 struct RequestChainRecord {
     request_id: Arc<str>,
+    phase: RequestChainPhase,
     owner_alive: bool,
     active_assignment: Option<Uuid>,
     failed_decoders: HashSet<DecoderId>,
@@ -696,6 +705,7 @@ impl DecoderPool {
             chain_id,
             RequestChainRecord {
                 request_id: Arc::clone(&request_id),
+                phase: RequestChainPhase::Open,
                 owner_alive: true,
                 active_assignment: None,
                 failed_decoders: HashSet::new(),
@@ -812,6 +822,11 @@ impl DecoderPool {
                     request_id: chain.request_id.to_string(),
                     assignment_id,
                 });
+            }
+            if chain.phase == RequestChainPhase::Terminal {
+                return Err(DecoderPoolError::RequestChainTerminal(
+                    chain.request_id.to_string(),
+                ));
             }
             chain.failed_decoders.clone()
         };
@@ -1064,17 +1079,16 @@ impl DecoderPool {
                 .expect("request owner disappeared while cohort was active");
             assert_eq!(chain.active_assignment, Some(cohort.assignment_id));
             chain.active_assignment = None;
-            if chain.owner_alive {
-                match disposition {
-                    RetryDisposition::Terminal => chain.failed_decoders.clear(),
-                    RetryDisposition::Retryable => {
-                        chain.failed_decoders.insert(record.decoder_id);
-                    }
+            match disposition {
+                RetryDisposition::Terminal => {
+                    chain.phase = RequestChainPhase::Terminal;
+                    chain.failed_decoders.clear();
                 }
-                false
-            } else {
-                true
+                RetryDisposition::Retryable => {
+                    chain.failed_decoders.insert(record.decoder_id);
+                }
             }
+            !chain.owner_alive
         };
         if remove_request {
             remove_request_chain(&mut state, record.chain_id);
@@ -1387,6 +1401,22 @@ mod tests {
         assert_eq!(second.decoder_id(), &failed_decoder);
         pool.finish_before_dispatch(second, RetryDisposition::Terminal)
             .unwrap();
+    }
+
+    #[test]
+    fn terminal_release_closes_the_logical_request_chain() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let mut owner = pool.begin_request("request").unwrap();
+        let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
+        pool.finish_before_dispatch(cohort, RetryDisposition::Terminal)
+            .unwrap();
+
+        assert_eq!(
+            pool.reserve(&owner, scalar_demand()).unwrap_err(),
+            DecoderPoolError::RequestChainTerminal("request".to_string())
+        );
+        pool.finalize_request(&mut owner).unwrap();
     }
 
     #[test]
