@@ -1,10 +1,14 @@
 import ctypes
 import os
+import stat
+import tempfile
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _create_numactl_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -21,6 +25,61 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
+
+
+class TestNumactlExecutable(unittest.TestCase):
+    """Tests private launcher placement, permissions, and lifetime."""
+
+    def test_uses_configured_temp_directory_and_removes_launcher(self) -> None:
+        """The wrapper exists only inside its configured spawn context."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch(
+                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                return_value=temporary_directory,
+            ):
+                with _create_numactl_executable(
+                    "--cpunodebind=1 --membind=1"
+                ) as executable_info:
+                    executable, debug_description = executable_info
+                    executable_path = Path(executable)
+
+                    self.assertEqual(
+                        executable_path.parent,
+                        Path(temporary_directory),
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(executable_path.stat().st_mode),
+                        0o700,
+                    )
+                    self.assertIn(
+                        "exec numactl --cpunodebind=1 --membind=1",
+                        executable_path.read_text(encoding="utf-8"),
+                    )
+                    self.assertIn("script=", debug_description)
+
+                self.assertFalse(executable_path.exists())
+
+    def test_removes_launcher_when_spawn_context_raises(self) -> None:
+        """A failed child launch cannot leak its temporary executable."""
+
+        executable_path: Path | None = None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch(
+                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                return_value=temporary_directory,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "spawn failed"):
+                    with _create_numactl_executable(
+                        "--cpunodebind=1"
+                    ) as executable_info:
+                        executable_path = Path(executable_info[0])
+                        raise RuntimeError("spawn failed")
+
+                self.assertIsNotNone(executable_path)
+                if executable_path is None:
+                    self.fail("launcher path was not captured")
+                self.assertFalse(executable_path.exists())
 
 
 class TestIsNumaAvailable(unittest.TestCase):
