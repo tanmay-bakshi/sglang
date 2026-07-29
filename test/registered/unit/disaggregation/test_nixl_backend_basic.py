@@ -304,20 +304,28 @@ class TestNixlTransferStatus(CustomTestCase):
         status.received_kvs_per_pp[1].update({0, 1})
         self.assertTrue(status.is_done())
 
-    def test_state_required_completion_waits_for_all_pp_ranks(self):
+    def test_state_completion_waits_for_every_writer_component_pair(self):
         status = TransferStatus()
         status.received_aux = True
         status.num_pp_ranks_expected = 2
+        status.expected_kvs_per_pp[2] = 0
+        status.expected_kvs_per_pp[5] = 0
+        status.expected_state_indices.update({0, 3})
+
+        self.assertFalse(status.is_done())
+
+        status.received_state_components.update({(2, 0), (2, 3), (5, 0)})
+        self.assertFalse(status.is_done())
+
+        status.received_state_components.add((5, 3))
+        self.assertTrue(status.is_done())
+
+    def test_empty_state_components_do_not_delay_completion(self):
+        status = TransferStatus()
+        status.received_aux = True
+        status.num_pp_ranks_expected = 1
         status.expected_kvs_per_pp[0] = 0
-        status.expected_kvs_per_pp[1] = 0
-        status.expects_state = True
 
-        self.assertFalse(status.is_done())
-
-        status.received_state_per_pp.add(0)
-        self.assertFalse(status.is_done())
-
-        status.received_state_per_pp.add(1)
         self.assertTrue(status.is_done())
 
 
@@ -463,7 +471,10 @@ class TestNixlTransferWorker(CustomTestCase):
             mgr.update_status(room, KVPoll.Failed)
             return "DONE"
 
-        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        mgr.agent = SimpleNamespace(
+            check_xfer_state=check_xfer_state,
+            send_notif=MagicMock(),
+        )
         return mgr
 
     def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
@@ -512,6 +523,31 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_worker_error_notifies_decode_peer_and_marks_sender_failed(self):
+        room = 23
+        mgr = self._make_manager(room)
+        mgr.send_kvcache = MagicMock(side_effect=RuntimeError("invalid geometry"))
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertEqual(str(mgr.exceptions[room]), "invalid geometry")
+        mgr.agent.send_notif.assert_called_once_with("agent", b"23_failure_0")
+
+    def test_notification_error_does_not_mask_original_transfer_failure(self):
+        room = 24
+        mgr = self._make_manager(room)
+        mgr.send_kvcache = MagicMock(side_effect=RuntimeError("invalid geometry"))
+        mgr.agent.send_notif.side_effect = ValueError("notification failed")
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertEqual(str(mgr.exceptions[room]), "invalid geometry")
+        self.assertEqual(mgr.failure_records[room], "invalid geometry")
+
 
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
@@ -519,6 +555,9 @@ class TestNixlNotifications(CustomTestCase):
         mgr.agent = NotificationFakeAgent(messages)
         mgr.transfer_statuses = defaultdict(TransferStatus)
         mgr.required_prefill_response_num_table = required or {}
+        mgr.request_status = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
         mgr.enable_staging = False
         mgr._staging_handler = None
         mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(list))
@@ -556,12 +595,27 @@ class TestNixlNotifications(CustomTestCase):
         self.assertEqual(status.expected_kvs_per_pp[3], 0)
         self.assertEqual(status.num_pp_ranks_expected, 4)
 
-    def test_state_notification_marks_pp_rank(self):
-        mgr = self._make_manager(["7_state_2"])
+    def test_state_notification_records_writer_and_component(self):
+        mgr = self._make_manager(["7_state_2_3"])
 
         mgr.update_transfer_status()
 
-        self.assertEqual(mgr.transfer_statuses[7].received_state_per_pp, {2})
+        self.assertEqual(
+            mgr.transfer_statuses[7].received_state_components,
+            {(2, 3)},
+        )
+
+    def test_failure_notification_marks_known_room_failed(self):
+        mgr = self._make_manager(["9_failure_3"])
+        mgr.request_status[9] = KVPoll.Transferring
+
+        mgr.update_transfer_status()
+
+        self.assertEqual(mgr.request_status[9], KVPoll.Failed)
+        self.assertEqual(
+            mgr.failure_records[9],
+            "Prefill source rank 3 reported transfer failure",
+        )
 
     def test_aux_nokv_allows_full_hit_completion(self):
         mgr = self._make_manager(["8_aux_nokv_0"], required={8: 1})
@@ -591,6 +645,23 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.abort_notified = False
         return receiver, mgr
 
+    def test_send_metadata_records_only_nonempty_state_components(self):
+        receiver, mgr = self._make_receiver()
+        receiver.bootstrap_infos = []
+        mgr.enable_staging = False
+        mgr.transfer_statuses = defaultdict(TransferStatus)
+
+        receiver.send_metadata(
+            np.array([], dtype=np.int32),
+            state_indices=[[4], [], None],
+        )
+
+        self.assertEqual(
+            mgr.transfer_statuses[11].expected_state_indices,
+            {0},
+        )
+        self.assertTrue(receiver.started_transfer)
+
     def test_returns_existing_conclude_state_without_polling_manager(self):
         receiver, mgr = self._make_receiver()
         receiver.conclude_state = KVPoll.Success
@@ -610,6 +681,17 @@ class TestNixlReceiverPoll(CustomTestCase):
 
             self.assertEqual(receiver.poll(), terminal_status)
             self.assertEqual(receiver.conclude_state, terminal_status)
+
+    def test_failure_drained_from_notifications_is_immediately_terminal(self):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.check_status.side_effect = [KVPoll.WaitingForInput, KVPoll.Failed]
+
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        mgr.update_transfer_status.assert_called_once_with()
+        mgr.check_transfer_done.assert_not_called()
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
     def test_waiting_timeout_records_failure(self, mock_time):
@@ -658,6 +740,22 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+    def test_clear_releases_failed_room_bookkeeping(self):
+        receiver, mgr = self._make_receiver(status=KVPoll.Failed)
+        mgr.request_status = {11: KVPoll.Failed}
+        mgr.required_prefill_response_num_table = {11: 1}
+        mgr.prefill_response_tracker = defaultdict(set)
+        mgr.prefill_response_tracker[11].add(0)
+        mgr.transfer_statuses = {11: TransferStatus()}
+
+        receiver.clear()
+
+        self.assertNotIn(11, mgr.request_status)
+        self.assertNotIn(11, mgr.required_prefill_response_num_table)
+        self.assertNotIn(11, mgr.prefill_response_tracker)
+        self.assertNotIn(11, mgr.transfer_statuses)
+        self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
 
 
 class TestNixlNodeFailure(CustomTestCase):
