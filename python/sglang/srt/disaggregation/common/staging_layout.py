@@ -125,6 +125,10 @@ class StagingChunkLayout:
     :ivar chunk_id: Request-local monotonically increasing chunk identifier.
     :ivar is_last: Whether this is the request's final transfer chunk.
     :ivar component_spans: Component-local page spans.
+    :ivar source_components: Immutable source geometry for every active
+        component.
+    :ivar destination_components: Immutable destination geometry for every
+        active component.
     :ivar writers: Canonically ordered writer projections.
     :ivar total_bytes: Complete decode lease size.
     :ivar digest: SHA-256 digest of the immutable plan.
@@ -133,6 +137,8 @@ class StagingChunkLayout:
     chunk_id: int
     is_last: bool
     component_spans: tuple[StagingComponentSpan, ...]
+    source_components: tuple[StagingComponentGeometry, ...]
+    destination_components: tuple[StagingComponentGeometry, ...]
     writers: tuple[StagingWriterLayout, ...]
     total_bytes: int
     digest: bytes
@@ -198,7 +204,9 @@ def _validate_component_id(component_id: StagingComponentId) -> None:
         raise ValueError("state component must declare state_type")
 
 
-def _validate_geometry(geometry: StagingComponentGeometry, label: str) -> None:
+def validate_staging_component_geometry(
+    geometry: StagingComponentGeometry, label: str
+) -> None:
     """Validate a registered component geometry.
 
     :param geometry: Geometry to validate.
@@ -277,7 +285,7 @@ def _index_geometries(
     result: dict[StagingComponentId, StagingComponentGeometry] = {}
     state_indices: set[int] = set()
     for geometry in geometries:
-        _validate_geometry(geometry, label)
+        validate_staging_component_geometry(geometry, label)
         if geometry.component_id in result:
             raise ValueError(f"{label} component geometry is duplicated")
         state_index = geometry.component_id.state_index
@@ -768,6 +776,12 @@ def build_staging_chunk_layout(
         chunk_id=chunk_id,
         is_last=is_last,
         component_spans=ordered_spans,
+        source_components=tuple(
+            active_source_components[span.component_id] for span in ordered_spans
+        ),
+        destination_components=tuple(
+            active_destination_components[span.component_id] for span in ordered_spans
+        ),
         writers=immutable_writers,
         total_bytes=total_bytes,
         digest=hashlib.sha256(encoded_payload).digest(),
