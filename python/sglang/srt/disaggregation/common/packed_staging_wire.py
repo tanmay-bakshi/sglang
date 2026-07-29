@@ -1,0 +1,503 @@
+import msgspec
+
+from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedChunkKey,
+    PackedCommit,
+    PackedLayoutSpec,
+    PackedPrepare,
+    PackedReady,
+    PackedTopology,
+)
+from sglang.srt.disaggregation.common.staging_layout import (
+    StagingComponentGeometry,
+    StagingComponentId,
+    StagingComponentSpan,
+    StagingWriterId,
+)
+
+PACKED_WIRE_VERSION: int = 1
+MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
+
+
+class PackedWireError(ValueError):
+    """Invalid or unsupported packed staging wire payload."""
+
+
+class _WireChunkKey(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`PackedChunkKey`."""
+
+    room_id: int
+    chunk_id: int
+
+
+class _WireComponentId(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`StagingComponentId`."""
+
+    state_index: int | None
+    state_type: str | None
+
+
+class _WireComponentSpan(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`StagingComponentSpan`."""
+
+    component_id: _WireComponentId
+    source_index_offset: int
+    destination_index_offset: int
+    logical_token_count: int
+    physical_token_count: int
+
+
+class _WireComponentGeometry(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`StagingComponentGeometry`."""
+
+    component_id: _WireComponentId
+    item_lens: tuple[int, ...]
+    layer_ids: tuple[int, ...]
+    page_size: int
+
+
+class _WireWriterId(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`StagingWriterId`."""
+
+    transfer_source_rank: int
+    source_attn_tp_rank: int
+    source_pp_rank: int
+    source_cp_rank: int
+
+
+class _WireTopology(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`PackedTopology`."""
+
+    source_tp_size: int
+    destination_tp_size: int
+    destination_tp_rank: int
+    alignment_bytes: int
+
+
+class _WireLayoutSpec(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`PackedLayoutSpec`."""
+
+    chunk_id: int
+    is_last: bool
+    spans: tuple[_WireComponentSpan, ...]
+    source_components: tuple[_WireComponentGeometry, ...]
+    destination_components: tuple[_WireComponentGeometry, ...]
+    writers: tuple[_WireWriterId, ...]
+    topology: _WireTopology
+
+
+class _WirePrepare(
+    msgspec.Struct,
+    tag="prepare",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned PREPARE envelope."""
+
+    version: int
+    key: _WireChunkKey
+    writer_id: _WireWriterId
+    spec: _WireLayoutSpec
+    digest: bytes
+
+
+class _WireReady(
+    msgspec.Struct,
+    tag="ready",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned READY envelope."""
+
+    version: int
+    key: _WireChunkKey
+    writer_id: _WireWriterId
+    digest: bytes
+    lease_id: int
+    lease_base_address: int
+    projection_offset: int
+    projection_length: int
+
+
+class _WireCommit(
+    msgspec.Struct,
+    tag="commit",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned COMMIT envelope."""
+
+    version: int
+    key: _WireChunkKey
+    writer_id: _WireWriterId
+    digest: bytes
+    lease_id: int
+
+
+PackedWireMessage = PackedPrepare | PackedReady | PackedCommit
+_WireMessage = _WirePrepare | _WireReady | _WireCommit
+_ENCODER = msgspec.msgpack.Encoder()
+_DECODER = msgspec.msgpack.Decoder(_WireMessage, strict=True)
+
+
+def _encode_chunk_key(key: PackedChunkKey) -> _WireChunkKey:
+    """Convert a domain chunk key into its wire shape.
+
+    :param key: Domain chunk identity.
+    :returns: Immutable wire identity.
+    """
+
+    return _WireChunkKey(room_id=key.room_id, chunk_id=key.chunk_id)
+
+
+def _decode_chunk_key(key: _WireChunkKey) -> PackedChunkKey:
+    """Convert a wire chunk key into its validated domain shape.
+
+    :param key: Wire chunk identity.
+    :returns: Validated domain identity.
+    """
+
+    return PackedChunkKey(room_id=key.room_id, chunk_id=key.chunk_id)
+
+
+def _encode_component_id(component_id: StagingComponentId) -> _WireComponentId:
+    """Convert a domain component identity into its wire shape.
+
+    :param component_id: Main-KV or auxiliary-state identity.
+    :returns: Immutable wire identity.
+    """
+
+    state_type = component_id.state_type
+    return _WireComponentId(
+        state_index=component_id.state_index,
+        state_type=state_type.value if state_type is not None else None,
+    )
+
+
+def _decode_component_id(component_id: _WireComponentId) -> StagingComponentId:
+    """Convert a wire component identity into its validated domain shape.
+
+    :param component_id: Wire component identity.
+    :returns: Main-KV or auxiliary-state identity.
+    """
+
+    state_type = (
+        StateType(component_id.state_type)
+        if component_id.state_type is not None
+        else None
+    )
+    return StagingComponentId(
+        state_index=component_id.state_index,
+        state_type=state_type,
+    )
+
+
+def _encode_span(span: StagingComponentSpan) -> _WireComponentSpan:
+    """Convert a domain component span into its wire shape.
+
+    :param span: Domain component span.
+    :returns: Immutable wire span.
+    """
+
+    return _WireComponentSpan(
+        component_id=_encode_component_id(span.component_id),
+        source_index_offset=span.source_index_offset,
+        destination_index_offset=span.destination_index_offset,
+        logical_token_count=span.logical_token_count,
+        physical_token_count=span.physical_token_count,
+    )
+
+
+def _decode_span(span: _WireComponentSpan) -> StagingComponentSpan:
+    """Convert a wire component span into its domain shape.
+
+    :param span: Wire component span.
+    :returns: Domain component span.
+    """
+
+    return StagingComponentSpan(
+        component_id=_decode_component_id(span.component_id),
+        source_index_offset=span.source_index_offset,
+        destination_index_offset=span.destination_index_offset,
+        logical_token_count=span.logical_token_count,
+        physical_token_count=span.physical_token_count,
+    )
+
+
+def _encode_geometry(
+    geometry: StagingComponentGeometry,
+) -> _WireComponentGeometry:
+    """Convert a domain component geometry into its wire shape.
+
+    :param geometry: Domain registration geometry.
+    :returns: Immutable wire geometry.
+    """
+
+    return _WireComponentGeometry(
+        component_id=_encode_component_id(geometry.component_id),
+        item_lens=geometry.item_lens,
+        layer_ids=geometry.layer_ids,
+        page_size=geometry.page_size,
+    )
+
+
+def _decode_geometry(
+    geometry: _WireComponentGeometry,
+) -> StagingComponentGeometry:
+    """Convert a wire component geometry into its domain shape.
+
+    :param geometry: Wire registration geometry.
+    :returns: Domain registration geometry.
+    """
+
+    return StagingComponentGeometry(
+        component_id=_decode_component_id(geometry.component_id),
+        item_lens=geometry.item_lens,
+        layer_ids=geometry.layer_ids,
+        page_size=geometry.page_size,
+    )
+
+
+def _encode_writer_id(writer_id: StagingWriterId) -> _WireWriterId:
+    """Convert a domain writer identity into its wire shape.
+
+    :param writer_id: Domain writer identity.
+    :returns: Immutable wire identity.
+    """
+
+    return _WireWriterId(
+        transfer_source_rank=writer_id.transfer_source_rank,
+        source_attn_tp_rank=writer_id.source_attn_tp_rank,
+        source_pp_rank=writer_id.source_pp_rank,
+        source_cp_rank=writer_id.source_cp_rank,
+    )
+
+
+def _decode_writer_id(writer_id: _WireWriterId) -> StagingWriterId:
+    """Convert a wire writer identity into its domain shape.
+
+    :param writer_id: Wire writer identity.
+    :returns: Domain writer identity.
+    """
+
+    return StagingWriterId(
+        transfer_source_rank=writer_id.transfer_source_rank,
+        source_attn_tp_rank=writer_id.source_attn_tp_rank,
+        source_pp_rank=writer_id.source_pp_rank,
+        source_cp_rank=writer_id.source_cp_rank,
+    )
+
+
+def _encode_topology(topology: PackedTopology) -> _WireTopology:
+    """Convert a domain topology into its wire shape.
+
+    :param topology: Domain tensor-parallel topology.
+    :returns: Immutable wire topology.
+    """
+
+    return _WireTopology(
+        source_tp_size=topology.source_tp_size,
+        destination_tp_size=topology.destination_tp_size,
+        destination_tp_rank=topology.destination_tp_rank,
+        alignment_bytes=topology.alignment_bytes,
+    )
+
+
+def _decode_topology(topology: _WireTopology) -> PackedTopology:
+    """Convert a wire topology into its validated domain shape.
+
+    :param topology: Wire tensor-parallel topology.
+    :returns: Validated domain topology.
+    """
+
+    return PackedTopology(
+        source_tp_size=topology.source_tp_size,
+        destination_tp_size=topology.destination_tp_size,
+        destination_tp_rank=topology.destination_tp_rank,
+        alignment_bytes=topology.alignment_bytes,
+    )
+
+
+def _encode_layout_spec(spec: PackedLayoutSpec) -> _WireLayoutSpec:
+    """Convert a domain layout spec into its wire shape.
+
+    :param spec: Complete domain layout input.
+    :returns: Immutable wire layout input.
+    """
+
+    return _WireLayoutSpec(
+        chunk_id=spec.chunk_id,
+        is_last=spec.is_last,
+        spans=tuple(_encode_span(span) for span in spec.spans),
+        source_components=tuple(
+            _encode_geometry(geometry) for geometry in spec.source_components
+        ),
+        destination_components=tuple(
+            _encode_geometry(geometry) for geometry in spec.destination_components
+        ),
+        writers=tuple(_encode_writer_id(writer_id) for writer_id in spec.writers),
+        topology=_encode_topology(spec.topology),
+    )
+
+
+def _decode_layout_spec(spec: _WireLayoutSpec) -> PackedLayoutSpec:
+    """Convert a wire layout spec into its validated domain shape.
+
+    :param spec: Complete wire layout input.
+    :returns: Immutable domain layout input.
+    """
+
+    return PackedLayoutSpec(
+        chunk_id=spec.chunk_id,
+        is_last=spec.is_last,
+        spans=tuple(_decode_span(span) for span in spec.spans),
+        source_components=tuple(
+            _decode_geometry(geometry) for geometry in spec.source_components
+        ),
+        destination_components=tuple(
+            _decode_geometry(geometry) for geometry in spec.destination_components
+        ),
+        writers=tuple(_decode_writer_id(writer_id) for writer_id in spec.writers),
+        topology=_decode_topology(spec.topology),
+    )
+
+
+def encode_packed_message(message: PackedWireMessage) -> bytes:
+    """Encode one versioned packed staging envelope.
+
+    ZMQ supplies message framing, so the returned bytes contain exactly one
+    deterministic msgpack object and no delimiter protocol.
+
+    :param message: PREPARE, READY, or COMMIT domain payload.
+    :returns: Versioned msgpack frame.
+    :raises TypeError: If the message type is unsupported.
+    :raises PackedWireError: If the encoded frame exceeds the protocol bound.
+    """
+
+    wire_message: _WireMessage
+    if type(message) is PackedPrepare:
+        wire_message = _WirePrepare(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_chunk_key(message.key),
+            writer_id=_encode_writer_id(message.writer_id),
+            spec=_encode_layout_spec(message.spec),
+            digest=message.digest,
+        )
+    elif type(message) is PackedReady:
+        wire_message = _WireReady(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_chunk_key(message.key),
+            writer_id=_encode_writer_id(message.writer_id),
+            digest=message.digest,
+            lease_id=message.lease_id,
+            lease_base_address=message.lease_base_address,
+            projection_offset=message.projection_offset,
+            projection_length=message.projection_length,
+        )
+    elif type(message) is PackedCommit:
+        wire_message = _WireCommit(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_chunk_key(message.key),
+            writer_id=_encode_writer_id(message.writer_id),
+            digest=message.digest,
+            lease_id=message.lease_id,
+        )
+    else:
+        raise TypeError(f"unsupported packed wire message: {type(message)!r}")
+
+    payload = _ENCODER.encode(wire_message)
+    if len(payload) > MAX_PACKED_WIRE_BYTES:
+        raise PackedWireError(
+            f"packed wire payload exceeds {MAX_PACKED_WIRE_BYTES} bytes"
+        )
+    return payload
+
+
+def decode_packed_message(payload: bytes) -> PackedWireMessage:
+    """Decode and validate one versioned packed staging envelope.
+
+    :param payload: Complete msgpack ZMQ frame.
+    :returns: PREPARE, READY, or COMMIT domain payload.
+    :raises PackedWireError: If framing, schema, version, or domain values fail.
+    """
+
+    if type(payload) is not bytes:
+        raise PackedWireError(
+            f"packed wire payload must be bytes, got {type(payload)!r}"
+        )
+    if len(payload) == 0:
+        raise PackedWireError("packed wire payload must not be empty")
+    if len(payload) > MAX_PACKED_WIRE_BYTES:
+        raise PackedWireError(
+            f"packed wire payload exceeds {MAX_PACKED_WIRE_BYTES} bytes"
+        )
+    try:
+        wire_message = _DECODER.decode(payload)
+        if wire_message.version != PACKED_WIRE_VERSION:
+            raise PackedWireError(
+                "unsupported packed wire version "
+                f"{wire_message.version}; expected {PACKED_WIRE_VERSION}"
+            )
+        if type(wire_message) is _WirePrepare:
+            return PackedPrepare(
+                key=_decode_chunk_key(wire_message.key),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                spec=_decode_layout_spec(wire_message.spec),
+                digest=wire_message.digest,
+            )
+        if type(wire_message) is _WireReady:
+            return PackedReady(
+                key=_decode_chunk_key(wire_message.key),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                digest=wire_message.digest,
+                lease_id=wire_message.lease_id,
+                lease_base_address=wire_message.lease_base_address,
+                projection_offset=wire_message.projection_offset,
+                projection_length=wire_message.projection_length,
+            )
+        if type(wire_message) is _WireCommit:
+            return PackedCommit(
+                key=_decode_chunk_key(wire_message.key),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                digest=wire_message.digest,
+                lease_id=wire_message.lease_id,
+            )
+        raise PackedWireError(
+            f"unsupported packed wire message: {type(wire_message)!r}"
+        )
+    except PackedWireError:
+        raise
+    except (msgspec.DecodeError, TypeError, ValueError) as error:
+        raise PackedWireError(f"invalid packed wire payload: {error}") from error
