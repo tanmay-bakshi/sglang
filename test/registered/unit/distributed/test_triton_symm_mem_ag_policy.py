@@ -200,6 +200,7 @@ def test_dedicated_flag_is_independent_from_nccl_policies(
 
     :param monkeypatch: Pytest patching fixture.
     """
+    tp_group = _TensorParallelGroup()
     _install_runtime(
         monkeypatch,
         _ServerArgs(
@@ -207,24 +208,12 @@ def test_dedicated_flag_is_independent_from_nccl_policies(
             enable_symm_mem=True,
             enable_nccl_nvls=True,
         ),
+        tp_group,
     )
+    consensus_calls: list[object] = []
+    _install_replicated_consensus(monkeypatch, consensus_calls)
     ordinary_calls: list[torch.Tensor] = []
     _install_ordinary_all_gather(monkeypatch, ordinary_calls)
-
-    def unexpected_consensus(*args: object, **kwargs: object) -> None:
-        """Reject control-plane work while the dedicated policy is disabled.
-
-        :param args: Forbidden positional arguments.
-        :param kwargs: Forbidden keyword arguments.
-        """
-        del args, kwargs
-        raise AssertionError("disabled multimem attempted initialization consensus")
-
-    monkeypatch.setattr(
-        triton_symm_mem_ag,
-        "_all_gather_consensus_values",
-        unexpected_consensus,
-    )
     gatherer = triton_symm_mem_ag.MultimemAllGatherer(
         max_tokens=_TEST_MAX_TOKENS,
         name="policy-test",
@@ -237,6 +226,74 @@ def test_dedicated_flag_is_independent_from_nccl_policies(
     assert torch.equal(output, x)
     assert gatherer._initialized
     assert gatherer._state is None
+    assert len(consensus_calls) == 1
+    record = cast(triton_symm_mem_ag._InitializationRecord, consensus_calls[0])
+    assert not record.process_enabled
+
+
+def test_mixed_dedicated_flag_is_fatal_before_rendezvous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed process flags must fail only after every rank enters consensus.
+
+    :param monkeypatch: Pytest patching fixture.
+    """
+    _install_runtime(
+        monkeypatch,
+        _ServerArgs(enable_multimem_all_gather=False),
+        _TensorParallelGroup(),
+    )
+
+    def mixed_flag_consensus(
+        value: object,
+        group: dist.ProcessGroup,
+        world_size: int,
+    ) -> list[object]:
+        """Return records representing one disabled and one enabled rank.
+
+        :param value: Rank-local initialization record.
+        :param group: Unused process-group placeholder.
+        :param world_size: Expected group size.
+        :returns: Initialization records with divergent process flags.
+        """
+        del group
+        assert world_size == _TEST_WORLD_SIZE
+        record = cast(triton_symm_mem_ag._InitializationRecord, value)
+        return [record, replace(record, process_enabled=not record.process_enabled)]
+
+    monkeypatch.setattr(
+        triton_symm_mem_ag,
+        "_all_gather_consensus_values",
+        mixed_flag_consensus,
+    )
+
+    def unexpected_create_state(*args: object, **kwargs: object) -> None:
+        """Reject rendezvous after process-flag consensus fails.
+
+        :param args: Forbidden positional arguments.
+        :param kwargs: Forbidden keyword arguments.
+        """
+        del args, kwargs
+        raise AssertionError("mixed process flags reached rendezvous")
+
+    monkeypatch.setattr(
+        triton_symm_mem_ag,
+        "create_state",
+        unexpected_create_state,
+    )
+    ordinary_calls: list[torch.Tensor] = []
+    _install_ordinary_all_gather(monkeypatch, ordinary_calls)
+    gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+        max_tokens=_TEST_MAX_TOKENS,
+        name="policy-test",
+    )
+    x = torch.arange(16, dtype=torch.bfloat16).reshape(1, 16)
+
+    with pytest.raises(RuntimeError, match="contract differs across TP ranks"):
+        gatherer(x)
+
+    assert len(ordinary_calls) == 0
+    assert not gatherer._initialized
 
 
 def test_initialization_consensus_builds_once(

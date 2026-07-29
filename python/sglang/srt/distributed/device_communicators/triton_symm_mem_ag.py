@@ -467,6 +467,8 @@ class _InitializationRecord:
     """Replicated contract used to select one permanent dispatch mode.
 
     :ivar caller_name: Stable call-site identity.
+    :ivar process_enabled: Whether the dedicated process-wide multimem policy is
+        enabled.
     :ivar caller_enabled: Whether this call site can use tensor-parallel multimem.
     :ivar max_tokens: Symmetric-buffer token capacity.
     :ivar skip_entry_sync: Whether the reusable-buffer entry barrier is omitted.
@@ -480,6 +482,7 @@ class _InitializationRecord:
     """
 
     caller_name: str
+    process_enabled: bool
     caller_enabled: bool
     max_tokens: int
     skip_entry_sync: bool
@@ -560,8 +563,9 @@ def _static_ineligibility_reason(record: _InitializationRecord) -> str | None:
 class MultimemAllGatherer:
     """Tensor-parallel all-gather with one-time replicated multimem selection.
 
-    The dedicated process flag controls whether initialization is attempted.
-    The first call reaches TP consensus on the static input contract, then
+    The dedicated process flag is part of the first-call consensus and controls
+    whether symmetric-memory initialization is attempted. The first call
+    reaches TP consensus on the static input contract, then
     permanently selects NCCL or builds one symmetric buffer. A rendezvous
     failure after that consensus is fatal; it never becomes a rank-local NCCL
     fallback. Committed multimem calls require the same dtype, device, and local
@@ -649,9 +653,6 @@ class MultimemAllGatherer:
         from sglang.srt.runtime_context import get_server_args
 
         server_args = get_server_args()
-        if not server_args.enable_multimem_all_gather:
-            return None
-
         tp_group = get_tp_group()
         if tp_group.world_size <= 1:
             return None
@@ -664,6 +665,7 @@ class MultimemAllGatherer:
         )
         local_record = _InitializationRecord(
             caller_name=self._name,
+            process_enabled=server_args.enable_multimem_all_gather,
             caller_enabled=self._caller_enabled,
             max_tokens=self._max_tokens,
             skip_entry_sync=self._skip_entry_sync,
@@ -681,6 +683,8 @@ class MultimemAllGatherer:
             tp_group.world_size,
         )
         record = _require_identical_records(records)
+        if not record.process_enabled:
+            return None
         if record.stream_capturing:
             raise RuntimeError(
                 f"{self._name} multimem initialization must run before CUDA "
