@@ -221,6 +221,7 @@ class Eagle3MLAModel(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=True, floor=512
             ),
+            name="kimi_k25_eagle3.fc",
             skip_entry_sync=False,
         )
 
