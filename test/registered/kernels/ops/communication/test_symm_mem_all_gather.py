@@ -20,6 +20,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -27,6 +28,8 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.srt import distributed, runtime_context
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
@@ -35,7 +38,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=240, stage="extra-b", runner_config="8-gpu-h200")
-# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
+# Nightly sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand the parameter sweep.
 register_cuda_ci(est_time=240, suite="nightly-kernel-8-gpu-h200", nightly=True)
 
 # ---------------------------------------------------------------------------
@@ -53,6 +56,19 @@ TEST_NUM_TOKENS = get_ci_test_range(TEST_NUM_TOKENS, [16])
 
 MAX_HIDDEN = max(TEST_HIDDEN)
 MAX_TOKENS = max(TEST_NUM_TOKENS)
+
+
+@dataclass(frozen=True)
+class _ServerArgs:
+    """Runtime policy for the guarded distributed test.
+
+    :ivar enable_multimem_all_gather: Dedicated multimem policy.
+    :ivar nnodes: Deployment node count.
+    """
+
+    enable_multimem_all_gather: bool = True
+    nnodes: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Per-rank distributed setup (run once per torchrun worker)
@@ -159,6 +175,73 @@ def test_symm_mem_all_gather(
         out = gather(x)
         # Pure copy gather: exact bitwise equality.
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_guarded_all_gather_commits_one_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise replicated initialization and oversized NCCL dispatch.
+
+    :param monkeypatch: Pytest patching fixture.
+    """
+    gpu_group = _init_nccl_group_once()
+    coord = ps._WORLD
+    assert coord is not None
+    world_size = coord.world_size
+    hidden = MAX_HIDDEN
+    local_hidden = hidden // world_size
+    if hidden % world_size != 0 or local_hidden % 8 != 0:
+        pytest.skip(f"hidden={hidden} incompatible with world_size={world_size}")
+
+    def get_server_args() -> _ServerArgs:
+        """Return an enabled dedicated multimem policy.
+
+        :returns: Test server arguments.
+        """
+        return _ServerArgs()
+
+    def get_tp_group() -> ps.GroupCoordinator:
+        """Return the initialized distributed test group.
+
+        :returns: Test tensor-parallel group.
+        """
+        return coord
+
+    monkeypatch.setattr(runtime_context, "get_server_args", get_server_args)
+    monkeypatch.setattr(distributed, "get_tp_group", get_tp_group)
+    gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+        max_tokens=MAX_TOKENS,
+        name="distributed-policy-test",
+        skip_entry_sync=False,
+    )
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    x = torch.randn(
+        MAX_TOKENS,
+        local_hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    reference = _nccl_all_gather(x, gpu_group, world_size)
+    output = gatherer(x).clone()
+    if gatherer._state is None:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)
+
+    oversized_x = torch.randn(
+        MAX_TOKENS + 1,
+        local_hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    oversized_reference = _nccl_all_gather(oversized_x, gpu_group, world_size)
+    oversized_output = gatherer(oversized_x)
+    torch.testing.assert_close(
+        oversized_output,
+        oversized_reference,
+        atol=0,
+        rtol=0,
+    )
 
 
 if __name__ == "__main__":

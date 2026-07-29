@@ -381,8 +381,9 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
+            name="logits",
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
-            skip_entry_sync=True,
+            skip_entry_sync=False,
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
