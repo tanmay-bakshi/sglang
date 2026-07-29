@@ -1,9 +1,12 @@
 import ctypes
+import multiprocessing
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
+from multiprocessing.connection import Connection
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +14,7 @@ from sglang.srt.utils.numa_utils import (
     _create_numactl_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
+    _mp_set_executable,
     _node_cpus,
     _numactl_cpu_mem_args,
     _probe_numactl_args,
@@ -27,59 +31,154 @@ register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 
 
+def _report_spawned_process(connection: Connection) -> None:
+    """Report that a spawned interpreter reached its Python target.
+
+    :param connection: Parent pipe connection.
+    """
+
+    connection.send(os.getpid())
+    connection.close()
+
+
+def _write_fake_numactl(path: Path) -> None:
+    """Write a test executable that strips numactl flags and runs the command.
+
+    :param path: Executable path.
+    """
+
+    path.write_text(
+        """#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --*) shift ;;
+        *) break ;;
+    esac
+done
+exec "$@"
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
 class TestNumactlExecutable(unittest.TestCase):
     """Tests private launcher placement, permissions, and lifetime."""
 
-    def test_uses_configured_temp_directory_and_removes_launcher(self) -> None:
-        """The wrapper exists only inside its configured spawn context."""
+    def test_uses_configured_temp_directory_and_private_permissions(self) -> None:
+        """The wrapper uses the configured temporary directory and mode."""
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            with patch(
-                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
-                return_value=temporary_directory,
+            with (
+                patch(
+                    "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                    return_value=temporary_directory,
+                ),
+                patch("sglang.srt.utils.numa_utils.atexit.register") as mock_register,
             ):
-                with _create_numactl_executable(
+                executable, debug_description = _create_numactl_executable(
                     "--cpunodebind=1 --membind=1"
-                ) as executable_info:
-                    executable, debug_description = executable_info
-                    executable_path = Path(executable)
+                )
+                executable_path = Path(executable)
 
-                    self.assertEqual(
-                        executable_path.parent,
-                        Path(temporary_directory),
-                    )
-                    self.assertEqual(
-                        stat.S_IMODE(executable_path.stat().st_mode),
-                        0o700,
-                    )
-                    self.assertIn(
-                        "exec numactl --cpunodebind=1 --membind=1",
-                        executable_path.read_text(encoding="utf-8"),
-                    )
-                    self.assertIn("script=", debug_description)
+                self.assertEqual(
+                    executable_path.parent,
+                    Path(temporary_directory),
+                )
+                self.assertEqual(
+                    stat.S_IMODE(executable_path.stat().st_mode),
+                    0o700,
+                )
+                self.assertIn(
+                    "exec numactl --cpunodebind=1 --membind=1",
+                    executable_path.read_text(encoding="utf-8"),
+                )
+                self.assertIn("script=", debug_description)
+                mock_register.assert_called_once()
+                self.assertEqual(
+                    mock_register.call_args.kwargs,
+                    {"missing_ok": True},
+                )
 
-                self.assertFalse(executable_path.exists())
+    @patch("multiprocessing.get_start_method", return_value="spawn")
+    def test_launcher_outlives_asynchronous_process_start(
+        self, _mock_start_method: MagicMock
+    ) -> None:
+        """A spawned child can open the launcher after ``Process.start`` returns."""
 
-    def test_removes_launcher_when_spawn_context_raises(self) -> None:
-        """A failed child launch cannot leak its temporary executable."""
-
-        executable_path: Path | None = None
         with tempfile.TemporaryDirectory() as temporary_directory:
-            with patch(
-                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
-                return_value=temporary_directory,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "spawn failed"):
-                    with _create_numactl_executable(
-                        "--cpunodebind=1"
-                    ) as executable_info:
-                        executable_path = Path(executable_info[0])
-                        raise RuntimeError("spawn failed")
+            temporary_path = Path(temporary_directory)
+            fake_numactl = temporary_path / "numactl"
+            _write_fake_numactl(fake_numactl)
+            spawn_context = multiprocessing.get_context("spawn")
+            reader, writer = spawn_context.Pipe(duplex=False)
+            process = spawn_context.Process(
+                target=_report_spawned_process,
+                args=(writer,),
+            )
+            path_value = os.environ.get("PATH", "")
 
-                self.assertIsNotNone(executable_path)
-                if executable_path is None:
-                    self.fail("launcher path was not captured")
-                self.assertFalse(executable_path.exists())
+            with (
+                patch.dict(
+                    os.environ,
+                    {"PATH": f"{temporary_directory}{os.pathsep}{path_value}"},
+                ),
+                patch(
+                    "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                    return_value=temporary_directory,
+                ),
+            ):
+                executable, debug_description = _create_numactl_executable(
+                    "--cpunodebind=0"
+                )
+                executable_path = Path(executable)
+                with _mp_set_executable(executable, debug_description):
+                    process.start()
+
+                writer.close()
+                try:
+                    self.assertTrue(executable_path.is_file())
+                    self.assertTrue(reader.poll(10))
+                    self.assertGreater(reader.recv(), 0)
+                    process.join(10)
+                    self.assertEqual(process.exitcode, 0)
+                finally:
+                    reader.close()
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(10)
+                    process.close()
+                    executable_path.unlink(missing_ok=True)
+
+    def test_launcher_executes_the_original_interpreter(self) -> None:
+        """The launcher preserves Python arguments while applying numactl."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            fake_numactl = temporary_path / "numactl"
+            _write_fake_numactl(fake_numactl)
+            path_value = os.environ.get("PATH", "")
+            with (
+                patch.dict(
+                    os.environ,
+                    {"PATH": f"{temporary_directory}{os.pathsep}{path_value}"},
+                ),
+                patch(
+                    "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                    return_value=temporary_directory,
+                ),
+            ):
+                executable, _debug_description = _create_numactl_executable(
+                    "--cpunodebind=0"
+                )
+                result = subprocess.run(
+                    [executable, "-c", "print('ready')"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertEqual(result.stdout, "ready\n")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
