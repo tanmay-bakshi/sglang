@@ -46,12 +46,17 @@ class StagingComponentBuffer:
     page_array: npt.NDArray[np.int32]
 
     def __post_init__(self) -> None:
-        """Validate one complete component registration.
+        """Own and validate one complete component registration.
 
         :raises TypeError: If the page array is not a one-dimensional int32
             NumPy array.
         :raises ValueError: If tensor metadata is incomplete or invalid.
         """
+
+        object.__setattr__(self, "tensor_ptrs", tuple(self.tensor_ptrs))
+        object.__setattr__(self, "data_lens", tuple(self.data_lens))
+        object.__setattr__(self, "item_lens", tuple(self.item_lens))
+        object.__setattr__(self, "layer_ids", tuple(self.layer_ids))
 
         if not isinstance(self.page_array, np.ndarray):
             raise TypeError("component page_array must be a NumPy array")
@@ -135,9 +140,10 @@ class StagingComponentBufferRegistry:
         :raises ValueError: If a component identity or state index is duplicated.
         """
 
+        immutable_components = tuple(components)
         by_component: dict[StagingComponentId, StagingComponentBuffer] = {}
         state_indices: set[int] = set()
-        for component in components:
+        for component in immutable_components:
             if type(component) is not StagingComponentBuffer:
                 raise TypeError(
                     f"expected StagingComponentBuffer, got {type(component)!r}"
@@ -155,7 +161,7 @@ class StagingComponentBufferRegistry:
                     )
                 state_indices.add(state_index)
             by_component[component.component_id] = component
-        self._components = components
+        self._components = immutable_components
         self._by_component = by_component
 
     @property
@@ -329,7 +335,12 @@ def bind_staging_endpoint_buffers(
                 f"{page_count} pages = {page_end}, array length "
                 f"{page_array_length}"
             )
-        active_page_array = component.page_array[page_offset:page_end]
+        active_page_array = np.array(
+            component.page_array[page_offset:page_end],
+            dtype=np.int32,
+            order="C",
+            copy=True,
+        )
         if np.any(active_page_array < 0):
             raise ValueError(
                 f"{endpoint.value} active page array contains a negative index for "
@@ -342,6 +353,7 @@ def bind_staging_endpoint_buffers(
                 f"capacity {page_capacity} for "
                 f"{_component_label(span.component_id)}"
             )
+        active_page_array.setflags(write=False)
         active_components.append(
             StagingActiveComponentBuffer(
                 component=component,

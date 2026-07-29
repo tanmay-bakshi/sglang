@@ -1,4 +1,5 @@
 import dataclasses
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 )
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
 MAIN_KV = StagingComponentId(state_index=None, state_type=None)
 SWA = StagingComponentId(state_index=0, state_type=StateType.SWA)
@@ -189,6 +191,95 @@ def test_main_only_component_binding() -> None:
     assert binding.components[0].component is component
     assert binding.components[0].page_count == 2
     np.testing.assert_array_equal(binding.components[0].page_array, [11, 12])
+
+
+def test_layout_owns_immutable_geometry_metadata() -> None:
+    """Caller mutations cannot desynchronize a layout from its digest."""
+
+    source_item_lens = [64, 64, 64, 64]
+    source_layer_ids = [2, 5, 2, 5]
+    destination_item_lens = [64, 64, 64, 64]
+    destination_layer_ids = [2, 5, 2, 5]
+    source = StagingComponentGeometry(
+        component_id=MAIN_KV,
+        item_lens=source_item_lens,
+        layer_ids=source_layer_ids,
+        page_size=4,
+    )
+    destination = StagingComponentGeometry(
+        component_id=MAIN_KV,
+        item_lens=destination_item_lens,
+        layer_ids=destination_layer_ids,
+        page_size=4,
+    )
+    layout = _layout(
+        (_span(MAIN_KV),),
+        (source,),
+        (destination,),
+    )
+    digest = layout.digest
+
+    source_item_lens[0] = 128
+    source_layer_ids[0] = 59
+    destination_item_lens[0] = 128
+    destination_layer_ids[0] = 59
+
+    assert layout.digest == digest
+    assert layout.source_components[0].item_lens == (64, 64, 64, 64)
+    assert layout.source_components[0].layer_ids == (2, 5, 2, 5)
+    assert layout.destination_components[0].item_lens == (64, 64, 64, 64)
+    assert layout.destination_components[0].layer_ids == (2, 5, 2, 5)
+    assert layout.writers[0].copy_groups[0].source_token_bytes == 16
+    assert layout.writers[0].copy_groups[0].destination_token_bytes == 16
+
+
+def test_component_registry_owns_registration_metadata() -> None:
+    """Registries retain immutable registration sequences and component order."""
+
+    tensor_ptrs = [0x100000, 0x101000]
+    data_lens = [1024, 1024]
+    item_lens = [64, 64]
+    layer_ids = [5, 5]
+    component = StagingComponentBuffer(
+        component_id=MAIN_KV,
+        tensor_ptrs=tensor_ptrs,
+        data_lens=data_lens,
+        item_lens=item_lens,
+        layer_ids=layer_ids,
+        page_size=4,
+        page_array=np.asarray((1, 2), dtype=np.int32),
+    )
+    components = [component]
+    registry = StagingComponentBufferRegistry(components)
+
+    tensor_ptrs[0] = 0
+    data_lens[0] = 0
+    item_lens[0] = 128
+    layer_ids[0] = 59
+    components.clear()
+
+    assert component.tensor_ptrs == (0x100000, 0x101000)
+    assert component.data_lens == (1024, 1024)
+    assert component.item_lens == (64, 64)
+    assert component.layer_ids == (5, 5)
+    assert registry.components == (component,)
+
+
+def test_active_page_binding_is_an_immutable_snapshot() -> None:
+    """Allocator mutations after binding cannot change asynchronous DMA indices."""
+
+    geometry = _geometry(MAIN_KV)
+    layout = _layout((_span(MAIN_KV),), (geometry,))
+    component = _buffer(geometry, (11, 12))
+
+    binding = _bind(layout, StagingEndpoint.SOURCE, component)
+    active_page_array = binding.require(MAIN_KV).page_array
+    component.page_array[:] = (21, 22)
+
+    np.testing.assert_array_equal(active_page_array, [11, 12])
+    assert not active_page_array.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        active_page_array[0] = 31
 
 
 def test_swa_only_component_binding() -> None:
@@ -433,6 +524,45 @@ def test_swa_pool_exposes_global_k_then_v_layer_ids() -> None:
 
     assert pool.get_kv_layer_ids() == [1, 3, 5, 1, 3, 5]
     assert pool.get_state_layer_ids() == [0, 2, 4, 0, 2, 4]
+
+
+def test_unified_swa_pool_owns_global_layer_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unified SWA registration works without invoking the static-pool initializer."""
+
+    full_attention_layer_ids = [1, 3, 5]
+    swa_attention_layer_ids = [0, 2]
+    spec = SimpleNamespace(
+        store_dtype="bf16",
+        head_num=4,
+        head_dim=8,
+    )
+    unified_buffer = SimpleNamespace(
+        device="cpu",
+        max_slots=lambda component_name: 257,
+        mha_spec=lambda component_name: spec,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.unified_memory_pool.UnifiedMHATokenToKVPool",
+        lambda **kwargs: _SWAStateBufferPool(),
+    )
+    pool = UnifiedSWAKVPool(
+        unified_buffer=unified_buffer,
+        swa_attention_layer_ids=swa_attention_layer_ids,
+        full_attention_layer_ids=full_attention_layer_ids,
+    )
+
+    full_attention_layer_ids[0] = 59
+    swa_attention_layer_ids[0] = 58
+
+    kv_args = KVArgs()
+    setup_state_kv_args(kv_args, pool)
+
+    assert pool.get_kv_layer_ids() == [1, 3, 5, 1, 3, 5]
+    assert pool.get_state_layer_ids() == [0, 2, 0, 2]
+    assert kv_args.state_types == [StateType.SWA]
+    assert kv_args.state_layer_ids == [[0, 2, 0, 2]]
 
 
 def test_swa_state_registration_propagates_global_layer_ids() -> None:

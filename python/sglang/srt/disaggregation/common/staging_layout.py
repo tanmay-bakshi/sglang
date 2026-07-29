@@ -54,6 +54,12 @@ class StagingComponentGeometry:
     layer_ids: tuple[int, ...]
     page_size: int
 
+    def __post_init__(self) -> None:
+        """Own immutable copies of all registration sequences."""
+
+        object.__setattr__(self, "item_lens", tuple(self.item_lens))
+        object.__setattr__(self, "layer_ids", tuple(self.layer_ids))
+
 
 @dataclasses.dataclass(frozen=True, order=True)
 class StagingWriterId:
@@ -101,6 +107,16 @@ class StagingCopyGroup:
     copy_bytes_per_token: int
     length_bytes: int
 
+    def __post_init__(self) -> None:
+        """Own immutable copies of all registration-index sequences."""
+
+        object.__setattr__(
+            self, "source_entry_indices", tuple(self.source_entry_indices)
+        )
+        object.__setattr__(
+            self, "destination_entry_indices", tuple(self.destination_entry_indices)
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class StagingWriterLayout:
@@ -116,6 +132,11 @@ class StagingWriterLayout:
     lease_offset: int
     length_bytes: int
     copy_groups: tuple[StagingCopyGroup, ...]
+
+    def __post_init__(self) -> None:
+        """Own an immutable copy of the writer's copy groups."""
+
+        object.__setattr__(self, "copy_groups", tuple(self.copy_groups))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,6 +163,17 @@ class StagingChunkLayout:
     writers: tuple[StagingWriterLayout, ...]
     total_bytes: int
     digest: bytes
+
+    def __post_init__(self) -> None:
+        """Own immutable copies of every digest-bearing layout sequence."""
+
+        object.__setattr__(self, "component_spans", tuple(self.component_spans))
+        object.__setattr__(self, "source_components", tuple(self.source_components))
+        object.__setattr__(
+            self, "destination_components", tuple(self.destination_components)
+        )
+        object.__setattr__(self, "writers", tuple(self.writers))
+        object.__setattr__(self, "digest", bytes(self.digest))
 
 
 @dataclasses.dataclass(frozen=True)
