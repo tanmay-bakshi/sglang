@@ -950,6 +950,7 @@ def setup_state_kv_args(
         HybridLinearKVPool,
         MiniMaxSparseKVPool,
     )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -986,8 +987,18 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids()
+                if isinstance(token_to_kv_pool, SWAKVPool)
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=state_layer_ids,
             )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
