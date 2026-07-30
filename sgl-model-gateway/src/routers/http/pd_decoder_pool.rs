@@ -1,20 +1,21 @@
 //! Request-affine admission and lifecycle accounting for disaggregated decoders.
 //!
-//! A cohort is one stock PDRouter request: it targets one decoder and owns one
-//! bootstrap room per child request. Once its first external submission begins,
-//! every child remains pinned to that decoder until the whole cohort completes or
-//! every transfer operation is proven quiescent.
+//! A cohort binds an allocator-issued engine grant to one logical request,
+//! decoder process generation, request-slot allocation generation, and ordered
+//! room vector. Once its first external submission begins, every child remains
+//! pinned to that binding until the engine proves the whole cohort complete or
+//! terminally quiescent.
 //!
 //! The metadata checks in this module are eligibility checks only. They do not
 //! prove asymmetric TP slicing, DMA lane selection, destination correctness, or
-//! transfer quiescence. The caller must provide exact demand bounds, a single
-//! authoritative routing process, and externally verified handle-bound
-//! quiescence before invoking `confirm_quiesced`.
+//! transfer quiescence. Configured scales are advisory and never override an
+//! allocator grant. The caller must provide one authoritative routing process,
+//! an engine reservation capability, and an exact engine terminal receipt
+//! before invoking `confirm_quiesced`.
 
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    fmt,
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -23,35 +24,10 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_BOOTSTRAP_SEQUENCE: u64 = u32::MAX as u64;
-
-/// Stable identity for one decoder process generation.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DecoderId(Arc<str>);
-
-impl DecoderId {
-    /// Construct a decoder identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, DecoderPoolError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(DecoderPoolError::InvalidConfiguration(
-                "decoder identity cannot be empty".to_string(),
-            ));
-        }
-        Ok(Self(Arc::from(value)))
-    }
-
-    /// Return the identity as a string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for DecoderId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+use super::pd_decoder_grant::{
+    DecoderAllocationKey, DecoderGrantBinding, DecoderGrantDigest, DecoderId,
+    DecoderSlotGeneration, EngineDecoderGrant, EngineReleaseKind, EngineReleaseReceipt, PrefillId,
+};
 
 /// Engine-declared fields used to reject obviously incompatible PD pairings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,30 +76,31 @@ fn nonempty(name: &str, value: String) -> Result<String, DecoderPoolError> {
     Ok(value)
 }
 
-/// Hard child-request admission limits and relative service weight.
+/// Advisory load scales and relative service weight for one decoder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecoderCapacity {
-    max_concurrent_child_requests: NonZeroUsize,
-    max_kv_tokens: NonZeroUsize,
+pub struct DecoderSchedulingHints {
+    child_request_scale: NonZeroUsize,
+    kv_token_scale: NonZeroUsize,
     service_weight: NonZeroUsize,
 }
 
-impl DecoderCapacity {
-    /// Construct decoder capacity.
+impl DecoderSchedulingHints {
+    /// Construct advisory scheduling scales.
     pub fn new(
-        max_concurrent_child_requests: usize,
-        max_kv_tokens: usize,
+        child_request_scale: usize,
+        kv_token_scale: usize,
         service_weight: usize,
     ) -> Result<Self, DecoderPoolError> {
         Ok(Self {
-            max_concurrent_child_requests: NonZeroUsize::new(max_concurrent_child_requests)
-                .ok_or_else(|| {
-                    DecoderPoolError::InvalidConfiguration(
-                        "max concurrent child requests must be nonzero".to_string(),
-                    )
-                })?,
-            max_kv_tokens: NonZeroUsize::new(max_kv_tokens).ok_or_else(|| {
-                DecoderPoolError::InvalidConfiguration("max KV tokens must be nonzero".to_string())
+            child_request_scale: NonZeroUsize::new(child_request_scale).ok_or_else(|| {
+                DecoderPoolError::InvalidConfiguration(
+                    "child request scheduling scale must be nonzero".to_string(),
+                )
+            })?,
+            kv_token_scale: NonZeroUsize::new(kv_token_scale).ok_or_else(|| {
+                DecoderPoolError::InvalidConfiguration(
+                    "KV token scheduling scale must be nonzero".to_string(),
+                )
             })?,
             service_weight: NonZeroUsize::new(service_weight).ok_or_else(|| {
                 DecoderPoolError::InvalidConfiguration("service weight must be nonzero".to_string())
@@ -131,24 +108,24 @@ impl DecoderCapacity {
         })
     }
 
-    /// Maximum concurrently owned child requests across all cohorts.
-    pub fn max_concurrent_child_requests(&self) -> usize {
-        self.max_concurrent_child_requests.get()
+    /// Advisory child-request normalization scale.
+    pub fn child_request_scale(&self) -> usize {
+        self.child_request_scale.get()
     }
 
-    /// Maximum conservatively reserved KV tokens.
-    pub fn max_kv_tokens(&self) -> usize {
-        self.max_kv_tokens.get()
+    /// Advisory KV-token normalization scale.
+    pub fn kv_token_scale(&self) -> usize {
+        self.kv_token_scale.get()
     }
 }
 
-/// Engine-declared metadata and configured admission limits for one TP1 decoder.
+/// Engine-declared metadata and advisory scheduling scales for one TP1 decoder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecoderReplicaMetadata {
     id: DecoderId,
     declared_decode_tp_size: NonZeroUsize,
     compatibility: EngineCompatibilityMetadata,
-    capacity: DecoderCapacity,
+    scheduling: DecoderSchedulingHints,
 }
 
 impl DecoderReplicaMetadata {
@@ -157,7 +134,7 @@ impl DecoderReplicaMetadata {
         id: DecoderId,
         declared_decode_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
-        capacity: DecoderCapacity,
+        scheduling: DecoderSchedulingHints,
     ) -> Result<Self, DecoderPoolError> {
         let declared_decode_tp_size =
             NonZeroUsize::new(declared_decode_tp_size).ok_or_else(|| {
@@ -169,115 +146,13 @@ impl DecoderReplicaMetadata {
             id,
             declared_decode_tp_size,
             compatibility,
-            capacity,
+            scheduling,
         })
     }
 
     /// Return the decoder process-generation identity.
     pub fn id(&self) -> &DecoderId {
         &self.id
-    }
-}
-
-/// Conservative resource bound for one child request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecoderDemand {
-    kv_tokens: NonZeroUsize,
-    decode_tokens: NonZeroUsize,
-}
-
-impl DecoderDemand {
-    /// Construct a caller-supplied child demand bound.
-    pub fn new(kv_tokens: usize, decode_tokens: usize) -> Result<Self, DecoderPoolError> {
-        Ok(Self {
-            kv_tokens: NonZeroUsize::new(kv_tokens).ok_or_else(|| {
-                DecoderPoolError::InvalidDemand("KV token demand must be nonzero".to_string())
-            })?,
-            decode_tokens: NonZeroUsize::new(decode_tokens).ok_or_else(|| {
-                DecoderPoolError::InvalidDemand("decode token demand must be nonzero".to_string())
-            })?,
-        })
-    }
-
-    /// Conservatively reserved KV tokens.
-    pub fn kv_tokens(&self) -> usize {
-        self.kv_tokens.get()
-    }
-
-    /// Upper bound on generated tokens.
-    pub fn decode_tokens(&self) -> usize {
-        self.decode_tokens.get()
-    }
-}
-
-/// Immutable aggregate demand for one PDRouter batch or scalar request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DecoderCohortDemand {
-    children: Arc<[DecoderDemand]>,
-    total_kv_tokens: usize,
-    total_decode_tokens: usize,
-}
-
-impl DecoderCohortDemand {
-    /// Construct aggregate demand while preserving child order.
-    pub fn new(children: Vec<DecoderDemand>) -> Result<Self, DecoderPoolError> {
-        if children.is_empty() {
-            return Err(DecoderPoolError::InvalidDemand(
-                "a decoder cohort must contain at least one child".to_string(),
-            ));
-        }
-        let mut total_kv_tokens = 0usize;
-        let mut total_decode_tokens = 0usize;
-        for child in &children {
-            total_kv_tokens = total_kv_tokens
-                .checked_add(child.kv_tokens.get())
-                .ok_or_else(|| {
-                    DecoderPoolError::InvalidDemand(
-                        "cohort KV token demand overflows usize".to_string(),
-                    )
-                })?;
-            total_decode_tokens = total_decode_tokens
-                .checked_add(child.decode_tokens.get())
-                .ok_or_else(|| {
-                    DecoderPoolError::InvalidDemand(
-                        "cohort decode token demand overflows usize".to_string(),
-                    )
-                })?;
-        }
-        Ok(Self {
-            children: Arc::from(children),
-            total_kv_tokens,
-            total_decode_tokens,
-        })
-    }
-
-    /// Construct a scalar cohort.
-    pub fn single(child: DecoderDemand) -> Self {
-        Self {
-            children: Arc::from([child]),
-            total_kv_tokens: child.kv_tokens.get(),
-            total_decode_tokens: child.decode_tokens.get(),
-        }
-    }
-
-    /// Ordered child demands corresponding one-to-one with bootstrap rooms.
-    pub fn children(&self) -> &[DecoderDemand] {
-        &self.children
-    }
-
-    /// Number of child requests owned by the cohort.
-    pub fn child_count(&self) -> usize {
-        self.children.len()
-    }
-
-    /// Aggregate KV reservation.
-    pub fn total_kv_tokens(&self) -> usize {
-        self.total_kv_tokens
-    }
-
-    /// Aggregate upper bound on generated tokens.
-    pub fn total_decode_tokens(&self) -> usize {
-        self.total_decode_tokens
     }
 }
 
@@ -353,20 +228,29 @@ pub struct DecoderAssignmentCohort {
     pool_id: Uuid,
     chain_id: Uuid,
     assignment_id: Uuid,
-    decoder_id: DecoderId,
-    bootstrap_rooms: Arc<[u64]>,
+    binding: DecoderGrantBinding,
     phase: CohortPhase,
 }
 
 impl DecoderAssignmentCohort {
     /// Stable identity of the selected decoder process generation.
     pub fn decoder_id(&self) -> &DecoderId {
-        &self.decoder_id
+        self.binding.decoder_id()
     }
 
     /// Ordered rooms corresponding one-to-one with the original child order.
     pub fn bootstrap_rooms(&self) -> &[u64] {
-        &self.bootstrap_rooms
+        self.binding.bootstrap_rooms()
+    }
+
+    /// Ordered engine request-slot generations bound to this cohort.
+    pub fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        self.binding.slot_generations()
+    }
+
+    /// Digest that every transport permit and receipt must match.
+    pub fn grant_digest(&self) -> DecoderGrantDigest {
+        self.binding.digest()
     }
 
     /// Opaque identity for lifecycle telemetry and abort acknowledgement.
@@ -385,12 +269,13 @@ pub struct DecoderReplicaSnapshot {
     pub quiescing_cohorts: usize,
     pub reserved_kv_tokens: usize,
     pub remaining_decode_tokens: usize,
-    pub capacity: DecoderCapacity,
+    pub scheduling: DecoderSchedulingHints,
 }
 
 /// Immutable pool accounting snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecoderPoolSnapshot {
+    pub prefill_id: PrefillId,
     pub declared_prefill_tp_size: usize,
     pub active_logical_requests: usize,
     pub replicas: Vec<DecoderReplicaSnapshot>,
@@ -401,8 +286,8 @@ pub struct DecoderPoolSnapshot {
 pub enum DecoderPoolError {
     #[error("invalid decoder-pool configuration: {0}")]
     InvalidConfiguration(String),
-    #[error("invalid decoder demand: {0}")]
-    InvalidDemand(String),
+    #[error("invalid engine decoder grant: {0}")]
+    InvalidGrant(String),
     #[error("decoder {0} is already registered")]
     DuplicateDecoder(DecoderId),
     #[error("decoder {0} is not registered")]
@@ -441,18 +326,59 @@ pub enum DecoderPoolError {
     RequestChainTerminal(String),
     #[error("no ready decoder replica is registered")]
     NoReadyDecoder,
-    #[error("every ready decoder is at its configured admission limit")]
-    AtCapacity,
-    #[error("unfailed retry alternatives exist but are temporarily at capacity")]
-    RetryAlternativesTemporarilyFull,
     #[error("the logical request has exhausted every registered retry alternative")]
     RetryAlternativesExhausted,
-    #[error("bootstrap-room sequence exhausted for this pool process generation")]
-    BootstrapRoomExhausted,
+    #[error("allocator grant targets prefill {actual}, expected {expected}")]
+    GrantPrefillMismatch {
+        expected: PrefillId,
+        actual: PrefillId,
+    },
+    #[error("allocator grant targets logical chain {actual}, expected {expected}")]
+    GrantRequestMismatch { expected: Uuid, actual: Uuid },
+    #[error("allocator grant describes source TP{actual}, expected TP{expected}")]
+    GrantSourceTpMismatch { expected: usize, actual: usize },
+    #[error("allocator grant selected decoder {0}, which is not eligible for this request")]
+    GrantDecoderIneligible(DecoderId),
+    #[error("allocator grant selected decoder {0}, which no longer accepts admissions")]
+    GrantDecoderUnavailable(DecoderId),
+    #[error(
+        "allocator grant has {room_count} rooms but its accounting describes {child_count} children"
+    )]
+    GrantChildCountMismatch {
+        room_count: usize,
+        child_count: usize,
+    },
+    #[error(
+        "allocator child {child_index} slot generation {slot_generation} on decoder {decoder_id} was already bound by this request"
+    )]
+    GrantAlreadyBound {
+        child_index: usize,
+        decoder_id: DecoderId,
+        slot_generation: Uuid,
+    },
+    #[error(
+        "allocator child {child_index} slot generation {slot_generation} on decoder {decoder_id} changed binding digest"
+    )]
+    GrantGenerationRebound {
+        child_index: usize,
+        decoder_id: DecoderId,
+        slot_generation: Uuid,
+    },
+    #[error(
+        "allocator bootstrap room {room} on decoder {decoder_id} is already owned by an active cohort"
+    )]
+    GrantRoomInUse { decoder_id: DecoderId, room: u64 },
+    #[error("allocator grant identity {0} is already active")]
+    GrantAlreadyActive(Uuid),
     #[error("assignment capability was not issued by this decoder pool")]
     ForeignAssignment,
     #[error("assignment {0} is unknown or already terminal")]
     UnknownAssignment(Uuid),
+    #[error("engine release receipt does not match assignment {assignment_id}: {reason}")]
+    InvalidEngineReleaseReceipt {
+        assignment_id: Uuid,
+        reason: &'static str,
+    },
     #[error("assignment {assignment_id} cannot transition from {actual} to {requested}")]
     InvalidTransition {
         assignment_id: Uuid,
@@ -467,8 +393,6 @@ pub enum DecoderPoolError {
         generated_tokens: usize,
         remaining_tokens: usize,
     },
-    #[error("decoder {decoder_id} capacity is below its current reservation")]
-    CapacityBelowReservation { decoder_id: DecoderId },
 }
 
 #[derive(Debug)]
@@ -482,36 +406,6 @@ struct ReplicaState {
     remaining_decode_tokens: usize,
 }
 
-impl ReplicaState {
-    fn can_admit(&self, demand: &DecoderCohortDemand) -> bool {
-        if self.availability != DecoderAvailability::Ready {
-            return false;
-        }
-        let Some(active_child_requests) =
-            self.active_child_requests.checked_add(demand.child_count())
-        else {
-            return false;
-        };
-        if active_child_requests > self.metadata.capacity.max_concurrent_child_requests.get() {
-            return false;
-        }
-        if self
-            .remaining_decode_tokens
-            .checked_add(demand.total_decode_tokens())
-            .is_none()
-        {
-            return false;
-        }
-        let Some(kv_tokens) = self
-            .reserved_kv_tokens
-            .checked_add(demand.total_kv_tokens())
-        else {
-            return false;
-        };
-        kv_tokens <= self.metadata.capacity.max_kv_tokens.get()
-    }
-}
-
 #[derive(Debug)]
 struct RequestChainRecord {
     request_id: Arc<str>,
@@ -519,13 +413,13 @@ struct RequestChainRecord {
     owner_alive: bool,
     active_assignment: Option<Uuid>,
     failed_decoders: HashSet<DecoderId>,
+    used_grants: HashMap<DecoderAllocationKey, DecoderGrantDigest>,
 }
 
 #[derive(Debug)]
 struct AssignmentRecord {
     chain_id: Uuid,
-    decoder_id: DecoderId,
-    bootstrap_rooms: Arc<[u64]>,
+    binding: DecoderGrantBinding,
     phase: CohortPhase,
     child_count: usize,
     kv_tokens: usize,
@@ -534,45 +428,14 @@ struct AssignmentRecord {
 
 #[derive(Debug)]
 struct PoolState {
+    prefill_id: PrefillId,
     declared_prefill_tp_size: NonZeroUsize,
     compatibility: EngineCompatibilityMetadata,
-    room_prefix: u64,
-    next_room_sequence: u64,
     replicas: HashMap<DecoderId, ReplicaState>,
     request_chains: HashMap<Uuid, RequestChainRecord>,
     active_request_ids: HashMap<Arc<str>, Uuid>,
     assignments: HashMap<Uuid, AssignmentRecord>,
-}
-
-impl PoolState {
-    fn allocate_bootstrap_rooms(
-        &mut self,
-        child_count: usize,
-    ) -> Result<Arc<[u64]>, DecoderPoolError> {
-        let child_count =
-            u64::try_from(child_count).map_err(|_| DecoderPoolError::BootstrapRoomExhausted)?;
-        let last_offset = child_count.checked_sub(1).ok_or_else(|| {
-            DecoderPoolError::InvalidDemand(
-                "a decoder cohort must contain at least one child".to_string(),
-            )
-        })?;
-        let last_sequence = self
-            .next_room_sequence
-            .checked_add(last_offset)
-            .ok_or(DecoderPoolError::BootstrapRoomExhausted)?;
-        if last_sequence > MAX_BOOTSTRAP_SEQUENCE {
-            return Err(DecoderPoolError::BootstrapRoomExhausted);
-        }
-
-        let capacity =
-            usize::try_from(child_count).map_err(|_| DecoderPoolError::BootstrapRoomExhausted)?;
-        let mut rooms = Vec::with_capacity(capacity);
-        for sequence in self.next_room_sequence..=last_sequence {
-            rooms.push((self.room_prefix << 32) | sequence);
-        }
-        self.next_room_sequence = last_sequence + 1;
-        Ok(Arc::from(rooms))
-    }
+    active_rooms: HashSet<(DecoderId, u64)>,
 }
 
 #[derive(Debug)]
@@ -607,28 +470,29 @@ pub struct DecoderPool {
 impl DecoderPool {
     /// Construct an empty pool from declared prefill metadata.
     pub fn new(
+        prefill_id: PrefillId,
         declared_prefill_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
     ) -> Result<Self, DecoderPoolError> {
+        if declared_prefill_tp_size != 2 && declared_prefill_tp_size != 4 {
+            return Err(DecoderPoolError::InvalidConfiguration(
+                "declared prefill tensor parallel size must be 2 or 4".to_string(),
+            ));
+        }
         let declared_prefill_tp_size =
-            NonZeroUsize::new(declared_prefill_tp_size).ok_or_else(|| {
-                DecoderPoolError::InvalidConfiguration(
-                    "declared prefill tensor parallel size must be nonzero".to_string(),
-                )
-            })?;
-        let room_prefix = u64::from(rand::random::<u32>() & 0x7fff_ffff);
+            NonZeroUsize::new(declared_prefill_tp_size).expect("2 and 4 are nonzero");
         Ok(Self {
             inner: Arc::new(DecoderPoolInner {
                 pool_id: Uuid::new_v4(),
                 state: Mutex::new(PoolState {
+                    prefill_id,
                     declared_prefill_tp_size,
                     compatibility,
-                    room_prefix,
-                    next_room_sequence: 0,
                     replicas: HashMap::new(),
                     request_chains: HashMap::new(),
                     active_request_ids: HashMap::new(),
                     assignments: HashMap::new(),
+                    active_rooms: HashSet::new(),
                 }),
             }),
         })
@@ -692,7 +556,7 @@ impl DecoderPool {
     ) -> Result<LogicalRequestOwner, DecoderPoolError> {
         let request_id = request_id.into();
         if request_id.trim().is_empty() {
-            return Err(DecoderPoolError::InvalidDemand(
+            return Err(DecoderPoolError::InvalidGrant(
                 "request identity cannot be empty".to_string(),
             ));
         }
@@ -712,6 +576,7 @@ impl DecoderPool {
                 owner_alive: true,
                 active_assignment: None,
                 failed_decoders: HashSet::new(),
+                used_grants: HashMap::new(),
             },
         );
         state
@@ -762,25 +627,18 @@ impl DecoderPool {
         Ok(())
     }
 
-    /// Update hard limits after an authoritative decoder capacity report.
-    pub fn update_capacity(
+    /// Update advisory load scales without changing allocator authority.
+    pub fn update_scheduling_hints(
         &self,
         decoder_id: &DecoderId,
-        capacity: DecoderCapacity,
+        scheduling: DecoderSchedulingHints,
     ) -> Result<(), DecoderPoolError> {
         let mut state = self.inner.state.lock();
         let replica = state
             .replicas
             .get_mut(decoder_id)
             .ok_or_else(|| DecoderPoolError::UnknownDecoder(decoder_id.clone()))?;
-        if replica.active_child_requests > capacity.max_concurrent_child_requests.get()
-            || replica.reserved_kv_tokens > capacity.max_kv_tokens.get()
-        {
-            return Err(DecoderPoolError::CapacityBelowReservation {
-                decoder_id: decoder_id.clone(),
-            });
-        }
-        replica.metadata.capacity = capacity;
+        replica.metadata.scheduling = scheduling;
         Ok(())
     }
 
@@ -807,14 +665,13 @@ impl DecoderPool {
         Ok(())
     }
 
-    /// Atomically select one decoder and reserve an immutable child cohort.
-    pub fn reserve(
+    /// Return ordered decoder candidates for an allocator reservation attempt.
+    pub fn admission_candidates(
         &self,
         request: &LogicalRequestOwner,
-        demand: DecoderCohortDemand,
-    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+    ) -> Result<Vec<DecoderId>, DecoderPoolError> {
         self.validate_request_owner(request)?;
-        let mut state = self.inner.state.lock();
+        let state = self.inner.state.lock();
         let failed_decoders = {
             let chain = state
                 .request_chains
@@ -833,44 +690,175 @@ impl DecoderPool {
             }
             chain.failed_decoders.clone()
         };
+        select_decoders(&state.replicas, &failed_decoders)
+    }
 
-        let selected_id = select_decoder(&state.replicas, &failed_decoders, &demand)?;
-        let bootstrap_rooms = state.allocate_bootstrap_rooms(demand.child_count())?;
-        let assignment_id = Uuid::new_v4();
+    /// Atomically bind an allocator-issued grant to this logical request.
+    pub fn bind_grant(
+        &self,
+        request: &LogicalRequestOwner,
+        grant: &EngineDecoderGrant,
+    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+        self.validate_request_owner(request)?;
+        let binding = grant.binding();
+        let accounting = binding.accounting();
+        if binding.bootstrap_rooms().len() != accounting.child_count() {
+            return Err(DecoderPoolError::GrantChildCountMismatch {
+                room_count: binding.bootstrap_rooms().len(),
+                child_count: accounting.child_count(),
+            });
+        }
+
+        let mut state = self.inner.state.lock();
+        if binding.prefill_id() != &state.prefill_id {
+            return Err(DecoderPoolError::GrantPrefillMismatch {
+                expected: state.prefill_id.clone(),
+                actual: binding.prefill_id().clone(),
+            });
+        }
+        if binding.request_chain_id() != request.chain_id {
+            return Err(DecoderPoolError::GrantRequestMismatch {
+                expected: request.chain_id,
+                actual: binding.request_chain_id(),
+            });
+        }
+        if binding.source_tp_size() != state.declared_prefill_tp_size.get() {
+            return Err(DecoderPoolError::GrantSourceTpMismatch {
+                expected: state.declared_prefill_tp_size.get(),
+                actual: binding.source_tp_size(),
+            });
+        }
+        if state.assignments.contains_key(&binding.grant_id()) {
+            return Err(DecoderPoolError::GrantAlreadyActive(binding.grant_id()));
+        }
+        let failed_decoders = {
+            let chain = state
+                .request_chains
+                .get(&request.chain_id)
+                .ok_or(DecoderPoolError::UnknownRequestChain(request.chain_id))?;
+            if let Some(assignment_id) = chain.active_assignment {
+                return Err(DecoderPoolError::RequestHasActiveCohort {
+                    request_id: chain.request_id.to_string(),
+                    assignment_id,
+                });
+            }
+            if chain.phase == RequestChainPhase::Terminal {
+                return Err(DecoderPoolError::RequestChainTerminal(
+                    chain.request_id.to_string(),
+                ));
+            }
+            for (child_index, allocation_key) in binding.allocation_keys().enumerate() {
+                let Some(existing_digest) = chain.used_grants.get(&allocation_key).copied() else {
+                    continue;
+                };
+                if existing_digest == binding.digest() {
+                    return Err(DecoderPoolError::GrantAlreadyBound {
+                        child_index,
+                        decoder_id: binding.decoder_id().clone(),
+                        slot_generation: binding.slot_generations()[child_index].as_uuid(),
+                    });
+                }
+                return Err(DecoderPoolError::GrantGenerationRebound {
+                    child_index,
+                    decoder_id: binding.decoder_id().clone(),
+                    slot_generation: binding.slot_generations()[child_index].as_uuid(),
+                });
+            }
+            chain.failed_decoders.clone()
+        };
+
+        let candidates = select_decoders(&state.replicas, &failed_decoders)?;
+        if !candidates.contains(binding.decoder_id()) {
+            return Err(DecoderPoolError::GrantDecoderIneligible(
+                binding.decoder_id().clone(),
+            ));
+        }
+        let replica = state
+            .replicas
+            .get(binding.decoder_id())
+            .expect("eligible grant decoder disappeared while pool lock was held");
+        if replica.availability != DecoderAvailability::Ready {
+            return Err(DecoderPoolError::GrantDecoderUnavailable(
+                binding.decoder_id().clone(),
+            ));
+        }
+        if let Some(room) = binding.bootstrap_rooms().iter().find(|room| {
+            state
+                .active_rooms
+                .contains(&(binding.decoder_id().clone(), **room))
+        }) {
+            return Err(DecoderPoolError::GrantRoomInUse {
+                decoder_id: binding.decoder_id().clone(),
+                room: *room,
+            });
+        }
+
+        let active_child_requests = replica
+            .active_child_requests
+            .checked_add(accounting.child_count())
+            .ok_or_else(|| {
+                DecoderPoolError::InvalidGrant(
+                    "active child-request accounting overflows usize".to_string(),
+                )
+            })?;
+        let reserved_kv_tokens = replica
+            .reserved_kv_tokens
+            .checked_add(accounting.total_reserved_kv_tokens())
+            .ok_or_else(|| {
+                DecoderPoolError::InvalidGrant(
+                    "active KV-token accounting overflows usize".to_string(),
+                )
+            })?;
+        let remaining_decode_tokens = replica
+            .remaining_decode_tokens
+            .checked_add(accounting.total_remaining_decode_tokens())
+            .ok_or_else(|| {
+                DecoderPoolError::InvalidGrant(
+                    "active decode-token accounting overflows usize".to_string(),
+                )
+            })?;
+        let assignment_id = binding.grant_id();
 
         let replica = state
             .replicas
-            .get_mut(&selected_id)
-            .expect("selected decoder disappeared while pool lock was held");
+            .get_mut(binding.decoder_id())
+            .expect("eligible grant decoder disappeared while pool lock was held");
         replica.active_cohorts += 1;
-        replica.active_child_requests += demand.child_count();
-        replica.reserved_kv_tokens += demand.total_kv_tokens();
-        replica.remaining_decode_tokens += demand.total_decode_tokens();
+        replica.active_child_requests = active_child_requests;
+        replica.reserved_kv_tokens = reserved_kv_tokens;
+        replica.remaining_decode_tokens = remaining_decode_tokens;
+        state.active_rooms.extend(
+            binding
+                .bootstrap_rooms()
+                .iter()
+                .map(|room| (binding.decoder_id().clone(), *room)),
+        );
 
         state.assignments.insert(
             assignment_id,
             AssignmentRecord {
                 chain_id: request.chain_id,
-                decoder_id: selected_id.clone(),
-                bootstrap_rooms: Arc::clone(&bootstrap_rooms),
+                binding: binding.clone(),
                 phase: CohortPhase::Reserved,
-                child_count: demand.child_count(),
-                kv_tokens: demand.total_kv_tokens(),
-                remaining_decode_tokens: demand.total_decode_tokens(),
+                child_count: accounting.child_count(),
+                kv_tokens: accounting.total_reserved_kv_tokens(),
+                remaining_decode_tokens: accounting.total_remaining_decode_tokens(),
             },
         );
-        state
+        let chain = state
             .request_chains
             .get_mut(&request.chain_id)
-            .expect("request chain disappeared while pool lock was held")
-            .active_assignment = Some(assignment_id);
+            .expect("request chain disappeared while pool lock was held");
+        for allocation_key in binding.allocation_keys() {
+            chain.used_grants.insert(allocation_key, binding.digest());
+        }
+        chain.active_assignment = Some(assignment_id);
 
         Ok(DecoderAssignmentCohort {
             pool_id: self.inner.pool_id,
             chain_id: request.chain_id,
             assignment_id,
-            decoder_id: selected_id,
-            bootstrap_rooms,
+            binding: binding.clone(),
             phase: CohortPhase::Reserved,
         })
     }
@@ -904,7 +892,10 @@ impl DecoderPool {
                     "record decode progress",
                 ));
             }
-            (record.decoder_id.clone(), record.remaining_decode_tokens)
+            (
+                record.binding.decoder_id().clone(),
+                record.remaining_decode_tokens,
+            )
         };
         if generated_tokens > remaining_tokens {
             return Err(DecoderPoolError::InvalidProgress {
@@ -946,7 +937,7 @@ impl DecoderPool {
                     phase_name(CohortPhase::Quiescing),
                 ));
             }
-            record.decoder_id.clone()
+            record.binding.decoder_id().clone()
         };
         state
             .replicas
@@ -966,25 +957,31 @@ impl DecoderPool {
     pub fn finish_before_dispatch(
         &self,
         cohort: DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
         disposition: RetryDisposition,
     ) -> Result<(), DecoderPoolError> {
+        validate_engine_release_receipt(&cohort, receipt, EngineReleaseKind::PreparedCancelled)?;
         self.release(cohort, CohortPhase::Reserved, disposition)
     }
 
     /// Terminalize a successfully completed child cohort.
-    pub fn complete(&self, cohort: DecoderAssignmentCohort) -> Result<(), DecoderPoolError> {
+    pub fn complete(
+        &self,
+        cohort: DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        validate_engine_release_receipt(&cohort, receipt, EngineReleaseKind::Completed)?;
         self.release(cohort, CohortPhase::Dispatched, RetryDisposition::Terminal)
     }
 
-    /// Release every child after externally verified handle-bound quiescence.
-    ///
-    /// This state container does not create or verify the proof. Production
-    /// integration must do so before calling this method.
+    /// Release every child after the engine attests exact terminal quiescence.
     pub fn confirm_quiesced(
         &self,
         cohort: DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
         disposition: RetryDisposition,
     ) -> Result<(), DecoderPoolError> {
+        validate_engine_release_receipt(&cohort, receipt, EngineReleaseKind::Aborted)?;
         self.release(cohort, CohortPhase::Quiescing, disposition)
     }
 
@@ -1002,11 +999,12 @@ impl DecoderPool {
                 quiescing_cohorts: replica.quiescing_cohorts,
                 reserved_kv_tokens: replica.reserved_kv_tokens,
                 remaining_decode_tokens: replica.remaining_decode_tokens,
-                capacity: replica.metadata.capacity,
+                scheduling: replica.metadata.scheduling,
             })
             .collect();
         replicas.sort_by(|left, right| left.id.cmp(&right.id));
         DecoderPoolSnapshot {
+            prefill_id: state.prefill_id.clone(),
             declared_prefill_tp_size: state.declared_prefill_tp_size.get(),
             active_logical_requests: state.request_chains.len(),
             replicas,
@@ -1065,7 +1063,7 @@ impl DecoderPool {
             .expect("assignment disappeared while pool lock was held");
         let replica = state
             .replicas
-            .get_mut(&record.decoder_id)
+            .get_mut(record.binding.decoder_id())
             .expect("assigned decoder disappeared while pool lock was held");
         replica.active_cohorts -= 1;
         replica.active_child_requests -= record.child_count;
@@ -1073,6 +1071,12 @@ impl DecoderPool {
         replica.remaining_decode_tokens -= record.remaining_decode_tokens;
         if expected == CohortPhase::Quiescing {
             replica.quiescing_cohorts -= 1;
+        }
+        for room in record.binding.bootstrap_rooms() {
+            let removed = state
+                .active_rooms
+                .remove(&(record.binding.decoder_id().clone(), *room));
+            debug_assert!(removed);
         }
 
         let remove_request = {
@@ -1091,7 +1095,9 @@ impl DecoderPool {
                     debug_assert_eq!(chain.phase, RequestChainPhase::Open);
                 }
                 RetryDisposition::DecoderFailed => {
-                    chain.failed_decoders.insert(record.decoder_id);
+                    chain
+                        .failed_decoders
+                        .insert(record.binding.decoder_id().clone());
                 }
             }
             !chain.owner_alive
@@ -1126,47 +1132,29 @@ impl DecoderPool {
     }
 }
 
-fn select_decoder(
+fn select_decoders(
     replicas: &HashMap<DecoderId, ReplicaState>,
     failed_decoders: &HashSet<DecoderId>,
-    demand: &DecoderCohortDemand,
-) -> Result<DecoderId, DecoderPoolError> {
-    if failed_decoders.is_empty() {
-        let ready: Vec<&ReplicaState> = replicas
-            .values()
-            .filter(|replica| replica.availability == DecoderAvailability::Ready)
-            .collect();
-        if ready.is_empty() {
-            return Err(DecoderPoolError::NoReadyDecoder);
-        }
-        return ready
-            .into_iter()
-            .filter(|replica| replica.can_admit(demand))
-            .min_by(|left, right| compare_projected_load(left, right, demand))
-            .map(|replica| replica.metadata.id.clone())
-            .ok_or(DecoderPoolError::AtCapacity);
-    }
-
+) -> Result<Vec<DecoderId>, DecoderPoolError> {
     let unfailed: Vec<&ReplicaState> = replicas
         .values()
         .filter(|replica| !failed_decoders.contains(&replica.metadata.id))
         .collect();
-    if unfailed.is_empty() {
+    if !failed_decoders.is_empty() && unfailed.is_empty() {
         return Err(DecoderPoolError::RetryAlternativesExhausted);
     }
-    let ready: Vec<&ReplicaState> = unfailed
+    let mut ready: Vec<&ReplicaState> = unfailed
         .into_iter()
         .filter(|replica| replica.availability == DecoderAvailability::Ready)
         .collect();
     if ready.is_empty() {
         return Err(DecoderPoolError::NoReadyDecoder);
     }
-    ready
+    ready.sort_by(|left, right| compare_current_load(left, right));
+    Ok(ready
         .into_iter()
-        .filter(|replica| replica.can_admit(demand))
-        .min_by(|left, right| compare_projected_load(left, right, demand))
         .map(|replica| replica.metadata.id.clone())
-        .ok_or(DecoderPoolError::RetryAlternativesTemporarilyFull)
+        .collect())
 }
 
 fn remove_request_chain(state: &mut PoolState, chain_id: Uuid) {
@@ -1181,40 +1169,72 @@ fn validate_assignment_record(
     record: &AssignmentRecord,
     cohort: &DecoderAssignmentCohort,
 ) -> Result<(), DecoderPoolError> {
-    if record.chain_id != cohort.chain_id
-        || record.decoder_id != cohort.decoder_id
-        || record.bootstrap_rooms != cohort.bootstrap_rooms
-    {
+    if record.chain_id != cohort.chain_id || record.binding != cohort.binding {
         return Err(DecoderPoolError::ForeignAssignment);
     }
     Ok(())
 }
 
-fn compare_projected_load(
-    left: &ReplicaState,
-    right: &ReplicaState,
-    demand: &DecoderCohortDemand,
-) -> Ordering {
+fn validate_engine_release_receipt(
+    cohort: &DecoderAssignmentCohort,
+    receipt: &EngineReleaseReceipt,
+    expected_kind: EngineReleaseKind,
+) -> Result<(), DecoderPoolError> {
+    let mismatch = if receipt.grant_id() != cohort.assignment_id {
+        Some("assignment identity differs")
+    } else if receipt.decoder_id() != cohort.binding.decoder_id() {
+        Some("decoder process generation differs")
+    } else if !cohort
+        .binding
+        .child_request_ids()
+        .eq(receipt.child_request_ids().iter().copied())
+    {
+        Some("ordered child request identities differ")
+    } else if receipt.prefill_bootstrap_endpoint() != cohort.binding.prefill_bootstrap_endpoint() {
+        Some("prefill bootstrap endpoint differs")
+    } else if receipt.slot_generations() != cohort.binding.slot_generations() {
+        Some("ordered decoder slot generations differ")
+    } else if receipt.bootstrap_rooms() != cohort.binding.bootstrap_rooms() {
+        Some("ordered bootstrap rooms differ")
+    } else if receipt.grant_digest() != cohort.binding.digest() {
+        Some("grant digest differs")
+    } else if receipt.kind() != expected_kind {
+        Some("release kind differs")
+    } else if !receipt.take_once() {
+        Some("receipt does not attest take-once reconciliation")
+    } else {
+        None
+    };
+    if let Some(reason) = mismatch {
+        return Err(DecoderPoolError::InvalidEngineReleaseReceipt {
+            assignment_id: cohort.assignment_id,
+            reason,
+        });
+    }
+    Ok(())
+}
+
+fn compare_current_load(left: &ReplicaState, right: &ReplicaState) -> Ordering {
     compare_ratio(
-        left.remaining_decode_tokens + demand.total_decode_tokens(),
-        left.metadata.capacity.service_weight.get(),
-        right.remaining_decode_tokens + demand.total_decode_tokens(),
-        right.metadata.capacity.service_weight.get(),
+        left.remaining_decode_tokens,
+        left.metadata.scheduling.service_weight.get(),
+        right.remaining_decode_tokens,
+        right.metadata.scheduling.service_weight.get(),
     )
     .then_with(|| {
         compare_ratio(
-            left.reserved_kv_tokens + demand.total_kv_tokens(),
-            left.metadata.capacity.max_kv_tokens.get(),
-            right.reserved_kv_tokens + demand.total_kv_tokens(),
-            right.metadata.capacity.max_kv_tokens.get(),
+            left.reserved_kv_tokens,
+            left.metadata.scheduling.kv_token_scale.get(),
+            right.reserved_kv_tokens,
+            right.metadata.scheduling.kv_token_scale.get(),
         )
     })
     .then_with(|| {
         compare_ratio(
-            left.active_child_requests + demand.child_count(),
-            left.metadata.capacity.max_concurrent_child_requests.get(),
-            right.active_child_requests + demand.child_count(),
-            right.metadata.capacity.max_concurrent_child_requests.get(),
+            left.active_child_requests,
+            left.metadata.scheduling.child_request_scale.get(),
+            right.active_child_requests,
+            right.metadata.scheduling.child_request_scale.get(),
         )
     })
     .then_with(|| left.metadata.id.cmp(&right.metadata.id))
@@ -1252,9 +1272,36 @@ fn phase_name(phase: CohortPhase) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc, thread};
+    use std::{
+        collections::HashSet,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        thread,
+    };
 
     use super::*;
+    use crate::routers::http::pd_decoder_grant::{
+        issue_test_grant, issue_test_release_receipt, DecoderGrantChildAccounting,
+    };
+
+    static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
+
+    fn stable_instance_id(name: &str) -> Uuid {
+        let digest = blake3::hash(name.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        Uuid::from_bytes(bytes)
+    }
+
+    fn prefill_id(name: &str) -> PrefillId {
+        PrefillId::new("http://prefill.test:30000", stable_instance_id(name)).unwrap()
+    }
+
+    fn decoder_id(name: &str) -> DecoderId {
+        DecoderId::new("http://decode.test:30001", stable_instance_id(name)).unwrap()
+    }
 
     fn compatibility(protocol: &str) -> EngineCompatibilityMetadata {
         EngineCompatibilityMetadata::new(
@@ -1267,30 +1314,130 @@ mod tests {
         .unwrap()
     }
 
-    fn capacity(max_children: usize, max_tokens: usize) -> DecoderCapacity {
-        DecoderCapacity::new(max_children, max_tokens, 1).unwrap()
+    fn scheduling(child_scale: usize, kv_scale: usize) -> DecoderSchedulingHints {
+        DecoderSchedulingHints::new(child_scale, kv_scale, 1).unwrap()
     }
 
     fn replica(name: &str, protocol: &str) -> DecoderReplicaMetadata {
-        DecoderReplicaMetadata::new(
-            DecoderId::new(name).unwrap(),
-            1,
-            compatibility(protocol),
-            capacity(32, 32_000),
+        replica_with_id(decoder_id(name), protocol)
+    }
+
+    fn replica_with_id(id: DecoderId, protocol: &str) -> DecoderReplicaMetadata {
+        DecoderReplicaMetadata::new(id, 1, compatibility(protocol), scheduling(32, 32_000)).unwrap()
+    }
+
+    fn pool_for_prefill(prefill_name: &str, declared_prefill_tp_size: usize) -> DecoderPool {
+        DecoderPool::new(
+            prefill_id(prefill_name),
+            declared_prefill_tp_size,
+            compatibility("packed-v1"),
         )
         .unwrap()
     }
 
     fn pool(declared_prefill_tp_size: usize) -> DecoderPool {
-        DecoderPool::new(declared_prefill_tp_size, compatibility("packed-v1")).unwrap()
+        pool_for_prefill("prefill-0@generation-1", declared_prefill_tp_size)
     }
 
-    fn child_demand() -> DecoderDemand {
-        DecoderDemand::new(1_024, 128).unwrap()
+    fn child_accounting() -> DecoderGrantChildAccounting {
+        DecoderGrantChildAccounting::new(1_024, 128)
     }
 
-    fn scalar_demand() -> DecoderCohortDemand {
-        DecoderCohortDemand::single(child_demand())
+    fn scalar_accounting() -> Vec<DecoderGrantChildAccounting> {
+        vec![child_accounting()]
+    }
+
+    fn issue_grant(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        decoder_id: DecoderId,
+        grant_id: Uuid,
+        slot_generations: Vec<DecoderSlotGeneration>,
+        rooms: Vec<u64>,
+        accounting: Vec<DecoderGrantChildAccounting>,
+    ) -> EngineDecoderGrant {
+        let snapshot = pool.snapshot();
+        issue_test_grant(
+            snapshot.prefill_id,
+            owner.chain_id(),
+            snapshot.declared_prefill_tp_size,
+            decoder_id,
+            grant_id,
+            slot_generations,
+            rooms,
+            accounting,
+        )
+        .expect("test allocator grant must be valid")
+    }
+
+    fn release_receipt(
+        cohort: &DecoderAssignmentCohort,
+        kind: EngineReleaseKind,
+    ) -> EngineReleaseReceipt {
+        issue_test_release_receipt(
+            cohort.assignment_id(),
+            cohort.decoder_id().clone(),
+            cohort.slot_generations().to_vec(),
+            cohort.bootstrap_rooms().to_vec(),
+            cohort.grant_digest(),
+            kind,
+            true,
+        )
+    }
+
+    fn release_before_dispatch(
+        pool: &DecoderPool,
+        cohort: DecoderAssignmentCohort,
+        disposition: RetryDisposition,
+    ) -> Result<(), DecoderPoolError> {
+        let receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
+        pool.finish_before_dispatch(cohort, &receipt, disposition)
+    }
+
+    fn release_after_abort(
+        pool: &DecoderPool,
+        cohort: DecoderAssignmentCohort,
+        disposition: RetryDisposition,
+    ) -> Result<(), DecoderPoolError> {
+        let receipt = release_receipt(&cohort, EngineReleaseKind::Aborted);
+        pool.confirm_quiesced(cohort, &receipt, disposition)
+    }
+
+    fn release_after_completion(
+        pool: &DecoderPool,
+        cohort: DecoderAssignmentCohort,
+    ) -> Result<(), DecoderPoolError> {
+        let receipt = release_receipt(&cohort, EngineReleaseKind::Completed);
+        pool.complete(cohort, &receipt)
+    }
+
+    fn bind_next(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        accounting: Vec<DecoderGrantChildAccounting>,
+    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+        let decoder_id = pool
+            .admission_candidates(owner)?
+            .into_iter()
+            .next()
+            .expect("candidate list cannot be empty");
+        let child_count = accounting.len();
+        let first_room = NEXT_ROOM.fetch_add(child_count as u64, Ordering::Relaxed);
+        let rooms = (0..child_count)
+            .map(|offset| first_room + offset as u64)
+            .collect();
+        let grant = issue_grant(
+            pool,
+            owner,
+            decoder_id,
+            Uuid::new_v4(),
+            (0..child_count)
+                .map(|_| DecoderSlotGeneration::new(Uuid::new_v4()))
+                .collect(),
+            rooms,
+            accounting,
+        );
+        pool.bind_grant(owner, &grant)
     }
 
     #[test]
@@ -1306,13 +1453,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_prefill_tensor_parallelism() {
+        for declared_prefill_tp_size in [0, 1, 3, 8] {
+            assert!(DecoderPool::new(
+                prefill_id("prefill-invalid"),
+                declared_prefill_tp_size,
+                compatibility("packed-v1"),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn rejects_ineligible_declared_decoder_metadata() {
         let pool = pool(4);
         let tp2 = DecoderReplicaMetadata::new(
-            DecoderId::new("decode-tp2").unwrap(),
+            decoder_id("decode-tp2"),
             2,
             compatibility("packed-v1"),
-            capacity(32, 32_000),
+            scheduling(32, 32_000),
         )
         .unwrap();
         assert!(matches!(
@@ -1337,7 +1496,7 @@ mod tests {
         let mut cohorts = Vec::new();
         for index in 0..9 {
             let request = pool.begin_request(format!("request-{index}")).unwrap();
-            let cohort = pool.reserve(&request, scalar_demand()).unwrap();
+            let cohort = bind_next(&pool, &request, scalar_accounting()).unwrap();
             requests.push(request);
             cohorts.push(cohort);
         }
@@ -1351,8 +1510,7 @@ mod tests {
         );
 
         for (mut request, cohort) in requests.into_iter().zip(cohorts) {
-            pool.finish_before_dispatch(cohort, RetryDisposition::Terminal)
-                .unwrap();
+            release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
             pool.finalize_request(&mut request).unwrap();
         }
     }
@@ -1362,16 +1520,25 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let request = pool.begin_request("batch").unwrap();
-        let demand = DecoderCohortDemand::new(vec![
-            DecoderDemand::new(100, 10).unwrap(),
-            DecoderDemand::new(200, 20).unwrap(),
-            DecoderDemand::new(300, 30).unwrap(),
-        ])
-        .unwrap();
-        let mut cohort = pool.reserve(&request, demand).unwrap();
-        assert_eq!(cohort.bootstrap_rooms().len(), 3);
-        assert_eq!(cohort.bootstrap_rooms()[1], cohort.bootstrap_rooms()[0] + 1);
-        assert_eq!(cohort.bootstrap_rooms()[2], cohort.bootstrap_rooms()[1] + 1);
+        let accounting = vec![
+            DecoderGrantChildAccounting::new(100, 10),
+            DecoderGrantChildAccounting::new(200, 20),
+            DecoderGrantChildAccounting::new(300, 30),
+        ];
+        let decoder_id = pool.admission_candidates(&request).unwrap().remove(0);
+        let grant = issue_grant(
+            &pool,
+            &request,
+            decoder_id,
+            Uuid::new_v4(),
+            (0..3)
+                .map(|_| DecoderSlotGeneration::new(Uuid::new_v4()))
+                .collect(),
+            vec![41, 43, 42],
+            accounting,
+        );
+        let mut cohort = pool.bind_grant(&request, &grant).unwrap();
+        assert_eq!(cohort.bootstrap_rooms(), &[41, 43, 42]);
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
         assert_eq!(snapshot.replicas[0].active_child_requests, 3);
@@ -1381,12 +1548,310 @@ mod tests {
         pool.mark_dispatched(&mut cohort).unwrap();
         pool.begin_quiescence(&mut cohort).unwrap();
         assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 1);
-        pool.confirm_quiesced(cohort, RetryDisposition::Terminal)
-            .unwrap();
+        release_after_abort(&pool, cohort, RetryDisposition::Terminal).unwrap();
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 0);
         assert_eq!(snapshot.replicas[0].active_child_requests, 0);
         assert_eq!(snapshot.replicas[0].quiescing_cohorts, 0);
+    }
+
+    #[test]
+    fn grant_cannot_cross_logical_request_owners() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
+        let grant = issue_grant(
+            &pool,
+            &first_owner,
+            decoder_id,
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![11],
+            scalar_accounting(),
+        );
+
+        assert_eq!(
+            pool.bind_grant(&second_owner, &grant).unwrap_err(),
+            DecoderPoolError::GrantRequestMismatch {
+                expected: second_owner.chain_id(),
+                actual: first_owner.chain_id(),
+            }
+        );
+        let cohort = pool.bind_grant(&first_owner, &grant).unwrap();
+        release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn grant_cannot_cross_prefill_process_generations() {
+        let pool = pool_for_prefill("prefill-0@generation-2", 2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let decoder_id = pool.admission_candidates(&owner).unwrap().remove(0);
+        let grant = issue_test_grant(
+            prefill_id("prefill-0@generation-1"),
+            owner.chain_id(),
+            2,
+            decoder_id,
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![11],
+            scalar_accounting(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pool.bind_grant(&owner, &grant).unwrap_err(),
+            DecoderPoolError::GrantPrefillMismatch {
+                expected: prefill_id("prefill-0@generation-2"),
+                actual: prefill_id("prefill-0@generation-1"),
+            }
+        );
+    }
+
+    #[test]
+    fn release_requires_an_exact_engine_receipt() {
+        let expected_reasons = [
+            "assignment identity differs",
+            "decoder process generation differs",
+            "ordered decoder slot generations differ",
+            "ordered bootstrap rooms differ",
+            "grant digest differs",
+            "release kind differs",
+            "receipt does not attest take-once reconciliation",
+        ];
+        for (mismatch, expected_reason) in expected_reasons.into_iter().enumerate() {
+            let pool = pool(2);
+            pool.register(replica("decode-0", "packed-v1")).unwrap();
+            let owner = pool.begin_request(format!("request-{mismatch}")).unwrap();
+            let selected_decoder = pool.admission_candidates(&owner).unwrap().remove(0);
+            let grant = issue_grant(
+                &pool,
+                &owner,
+                selected_decoder.clone(),
+                Uuid::new_v4(),
+                vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+                vec![11],
+                scalar_accounting(),
+            );
+            let cohort = pool.bind_grant(&owner, &grant).unwrap();
+            let alternate_grant = issue_grant(
+                &pool,
+                &owner,
+                selected_decoder.clone(),
+                Uuid::new_v4(),
+                vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+                vec![12],
+                scalar_accounting(),
+            );
+            let receipt = issue_test_release_receipt(
+                if mismatch == 0 {
+                    Uuid::new_v4()
+                } else {
+                    cohort.assignment_id()
+                },
+                if mismatch == 1 {
+                    decoder_id("decode-other")
+                } else {
+                    selected_decoder
+                },
+                if mismatch == 2 {
+                    vec![DecoderSlotGeneration::new(Uuid::new_v4())]
+                } else {
+                    cohort.slot_generations().to_vec()
+                },
+                if mismatch == 3 {
+                    vec![12]
+                } else {
+                    cohort.bootstrap_rooms().to_vec()
+                },
+                if mismatch == 4 {
+                    alternate_grant.grant_digest()
+                } else {
+                    cohort.grant_digest()
+                },
+                if mismatch == 5 {
+                    EngineReleaseKind::Completed
+                } else {
+                    EngineReleaseKind::PreparedCancelled
+                },
+                mismatch != 6,
+            );
+            let assignment_id = cohort.assignment_id();
+
+            assert_eq!(
+                pool.finish_before_dispatch(cohort, &receipt, RetryDisposition::Terminal)
+                    .unwrap_err(),
+                DecoderPoolError::InvalidEngineReleaseReceipt {
+                    assignment_id,
+                    reason: expected_reason,
+                }
+            );
+            assert_eq!(pool.snapshot().replicas[0].active_cohorts, 1);
+        }
+    }
+
+    #[test]
+    fn retry_cannot_replay_or_alter_a_decoder_slot_binding() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let decoder_id = pool.admission_candidates(&owner).unwrap().remove(0);
+        let slot_generations = vec![
+            DecoderSlotGeneration::new(Uuid::new_v4()),
+            DecoderSlotGeneration::new(Uuid::new_v4()),
+        ];
+        let original = issue_grant(
+            &pool,
+            &owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            slot_generations.clone(),
+            vec![101, 102],
+            vec![child_accounting(), child_accounting()],
+        );
+        let first = pool.bind_grant(&owner, &original).unwrap();
+        release_before_dispatch(&pool, first, RetryDisposition::Retryable).unwrap();
+
+        assert_eq!(
+            pool.bind_grant(&owner, &original).unwrap_err(),
+            DecoderPoolError::GrantAlreadyBound {
+                child_index: 0,
+                decoder_id: decoder_id.clone(),
+                slot_generation: slot_generations[0].as_uuid(),
+            }
+        );
+        for rooms in [vec![101, 103], vec![102, 101]] {
+            let altered = issue_grant(
+                &pool,
+                &owner,
+                decoder_id.clone(),
+                Uuid::new_v4(),
+                slot_generations.clone(),
+                rooms,
+                vec![child_accounting(), child_accounting()],
+            );
+            assert_eq!(
+                pool.bind_grant(&owner, &altered).unwrap_err(),
+                DecoderPoolError::GrantGenerationRebound {
+                    child_index: 0,
+                    decoder_id: decoder_id.clone(),
+                    slot_generation: slot_generations[0].as_uuid(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn slot_generations_are_decoder_process_local() {
+        let pool = pool(2);
+        let first_decoder = decoder_id("decode-0");
+        let second_decoder = decoder_id("decode-1");
+        pool.register(replica_with_id(first_decoder.clone(), "packed-v1"))
+            .unwrap();
+        pool.register(replica_with_id(second_decoder.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let slot_generation = DecoderSlotGeneration::new(Uuid::new_v4());
+        let first_grant = issue_grant(
+            &pool,
+            &owner,
+            first_decoder,
+            Uuid::new_v4(),
+            vec![slot_generation],
+            vec![101],
+            scalar_accounting(),
+        );
+        let first = pool.bind_grant(&owner, &first_grant).unwrap();
+        release_before_dispatch(&pool, first, RetryDisposition::DecoderFailed).unwrap();
+
+        let second_grant = issue_grant(
+            &pool,
+            &owner,
+            second_decoder.clone(),
+            Uuid::new_v4(),
+            vec![slot_generation],
+            vec![101],
+            scalar_accounting(),
+        );
+        let second = pool.bind_grant(&owner, &second_grant).unwrap();
+        assert_eq!(second.decoder_id(), &second_decoder);
+        release_before_dispatch(&pool, second, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn active_bootstrap_room_cannot_be_owned_twice_on_one_decoder() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
+        let first_grant = issue_grant(
+            &pool,
+            &first_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        let first = pool.bind_grant(&first_owner, &first_grant).unwrap();
+        let second_grant = issue_grant(
+            &pool,
+            &second_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        assert_eq!(
+            pool.bind_grant(&second_owner, &second_grant).unwrap_err(),
+            DecoderPoolError::GrantRoomInUse {
+                decoder_id,
+                room: 700,
+            }
+        );
+        release_before_dispatch(&pool, first, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn equal_active_room_numbers_are_valid_on_separate_decoders() {
+        let pool = pool(2);
+        let first_decoder = decoder_id("decode-0");
+        let second_decoder = decoder_id("decode-1");
+        pool.register(replica_with_id(first_decoder.clone(), "packed-v1"))
+            .unwrap();
+        pool.register(replica_with_id(second_decoder.clone(), "packed-v1"))
+            .unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let first_grant = issue_grant(
+            &pool,
+            &first_owner,
+            first_decoder.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        let second_grant = issue_grant(
+            &pool,
+            &second_owner,
+            second_decoder.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+
+        let first = pool.bind_grant(&first_owner, &first_grant).unwrap();
+        let second = pool.bind_grant(&second_owner, &second_grant).unwrap();
+        assert_eq!(first.decoder_id(), &first_decoder);
+        assert_eq!(second.decoder_id(), &second_decoder);
+        release_before_dispatch(&pool, first, RetryDisposition::Terminal).unwrap();
+        release_before_dispatch(&pool, second, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1396,17 +1861,15 @@ mod tests {
         pool.register(replica("decode-1", "packed-v1")).unwrap();
 
         let mut first_owner = pool.begin_request("reused-id").unwrap();
-        let first = pool.reserve(&first_owner, scalar_demand()).unwrap();
+        let first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
         let failed_decoder = first.decoder_id().clone();
-        pool.finish_before_dispatch(first, RetryDisposition::DecoderFailed)
-            .unwrap();
+        release_before_dispatch(&pool, first, RetryDisposition::DecoderFailed).unwrap();
         pool.finalize_request(&mut first_owner).unwrap();
 
         let second_owner = pool.begin_request("reused-id").unwrap();
-        let second = pool.reserve(&second_owner, scalar_demand()).unwrap();
+        let second = bind_next(&pool, &second_owner, scalar_accounting()).unwrap();
         assert_eq!(second.decoder_id(), &failed_decoder);
-        pool.finish_before_dispatch(second, RetryDisposition::Terminal)
-            .unwrap();
+        release_before_dispatch(&pool, second, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1414,12 +1877,11 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let mut owner = pool.begin_request("request").unwrap();
-        let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
-        pool.finish_before_dispatch(cohort, RetryDisposition::Terminal)
-            .unwrap();
+        let cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
 
         assert_eq!(
-            pool.reserve(&owner, scalar_demand()).unwrap_err(),
+            pool.admission_candidates(&owner).unwrap_err(),
             DecoderPoolError::RequestChainTerminal("request".to_string())
         );
         pool.finalize_request(&mut owner).unwrap();
@@ -1430,16 +1892,14 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
+        let cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         drop(owner);
         assert_eq!(pool.snapshot().active_logical_requests, 1);
-        pool.finish_before_dispatch(cohort, RetryDisposition::DecoderFailed)
-            .unwrap();
+        release_before_dispatch(&pool, cohort, RetryDisposition::DecoderFailed).unwrap();
         assert_eq!(pool.snapshot().active_logical_requests, 0);
         let replacement = pool.begin_request("request").unwrap();
-        let replacement_cohort = pool.reserve(&replacement, scalar_demand()).unwrap();
-        pool.finish_before_dispatch(replacement_cohort, RetryDisposition::Terminal)
-            .unwrap();
+        let replacement_cohort = bind_next(&pool, &replacement, scalar_accounting()).unwrap();
+        release_before_dispatch(&pool, replacement_cohort, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1447,15 +1907,13 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let first = pool.reserve(&owner, scalar_demand()).unwrap();
+        let first = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         let decoder_id = first.decoder_id().clone();
-        pool.finish_before_dispatch(first, RetryDisposition::Retryable)
-            .unwrap();
+        release_before_dispatch(&pool, first, RetryDisposition::Retryable).unwrap();
 
-        let retry = pool.reserve(&owner, scalar_demand()).unwrap();
+        let retry = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         assert_eq!(retry.decoder_id(), &decoder_id);
-        pool.finish_before_dispatch(retry, RetryDisposition::Terminal)
-            .unwrap();
+        release_before_dispatch(&pool, retry, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1463,32 +1921,30 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let mut owner = pool.begin_request("request").unwrap();
-        let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
-        pool.finish_before_dispatch(cohort, RetryDisposition::DecoderFailed)
-            .unwrap();
+        let cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        release_before_dispatch(&pool, cohort, RetryDisposition::DecoderFailed).unwrap();
         assert_eq!(
-            pool.reserve(&owner, scalar_demand()).unwrap_err(),
+            pool.admission_candidates(&owner).unwrap_err(),
             DecoderPoolError::RetryAlternativesExhausted
         );
         pool.finalize_request(&mut owner).unwrap();
 
         let replacement = pool.begin_request("request").unwrap();
-        let replacement_cohort = pool.reserve(&replacement, scalar_demand()).unwrap();
-        pool.finish_before_dispatch(replacement_cohort, RetryDisposition::Terminal)
-            .unwrap();
+        let replacement_cohort = bind_next(&pool, &replacement, scalar_accounting()).unwrap();
+        release_before_dispatch(&pool, replacement_cohort, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
-    fn temporarily_full_retry_alternative_never_falls_back_to_failed_decoder() {
+    fn allocator_candidates_never_fall_back_to_a_failed_decoder() {
         let pool = pool(2);
-        let small_capacity = capacity(1, 2_048);
+        let small_scheduling_scale = scheduling(1, 2_048);
         for name in ["decode-0", "decode-1"] {
             pool.register(
                 DecoderReplicaMetadata::new(
-                    DecoderId::new(name).unwrap(),
+                    decoder_id(name),
                     1,
                     compatibility("packed-v1"),
-                    small_capacity,
+                    small_scheduling_scale,
                 )
                 .unwrap(),
             )
@@ -1496,28 +1952,25 @@ mod tests {
         }
 
         let retry_owner = pool.begin_request("retry").unwrap();
-        let failed = pool.reserve(&retry_owner, scalar_demand()).unwrap();
+        let failed = bind_next(&pool, &retry_owner, scalar_accounting()).unwrap();
         let failed_decoder = failed.decoder_id().clone();
-        pool.finish_before_dispatch(failed, RetryDisposition::DecoderFailed)
-            .unwrap();
+        release_before_dispatch(&pool, failed, RetryDisposition::DecoderFailed).unwrap();
         pool.set_availability(&failed_decoder, DecoderAvailability::Draining)
             .unwrap();
 
         let blocker_owner = pool.begin_request("blocker").unwrap();
-        let blocker = pool.reserve(&blocker_owner, scalar_demand()).unwrap();
+        let blocker = bind_next(&pool, &blocker_owner, scalar_accounting()).unwrap();
         assert_ne!(blocker.decoder_id(), &failed_decoder);
         assert_eq!(
-            pool.reserve(&retry_owner, scalar_demand()).unwrap_err(),
-            DecoderPoolError::RetryAlternativesTemporarilyFull
+            pool.admission_candidates(&retry_owner).unwrap(),
+            vec![blocker.decoder_id().clone()]
         );
 
         let available_decoder = blocker.decoder_id().clone();
-        pool.finish_before_dispatch(blocker, RetryDisposition::Terminal)
-            .unwrap();
-        let retry = pool.reserve(&retry_owner, scalar_demand()).unwrap();
+        release_before_dispatch(&pool, blocker, RetryDisposition::Terminal).unwrap();
+        let retry = bind_next(&pool, &retry_owner, scalar_accounting()).unwrap();
         assert_eq!(retry.decoder_id(), &available_decoder);
-        pool.finish_before_dispatch(retry, RetryDisposition::Terminal)
-            .unwrap();
+        release_before_dispatch(&pool, retry, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1525,21 +1978,20 @@ mod tests {
         let pool = pool(4);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let mut cohort = pool.reserve(&owner, scalar_demand()).unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         pool.mark_dispatched(&mut cohort).unwrap();
         pool.begin_quiescence(&mut cohort).unwrap();
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
         assert_eq!(snapshot.replicas[0].quiescing_cohorts, 1);
-        pool.confirm_quiesced(cohort, RetryDisposition::Terminal)
-            .unwrap();
+        release_after_abort(&pool, cohort, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
     fn removal_requires_draining_and_zero_owned_cohorts() {
         let pool = pool(4);
-        let decoder_id = DecoderId::new("decode-0").unwrap();
-        pool.register(replica(decoder_id.as_str(), "packed-v1"))
+        let decoder_id = decoder_id("decode-0");
+        pool.register(replica_with_id(decoder_id.clone(), "packed-v1"))
             .unwrap();
         assert!(matches!(
             pool.remove(&decoder_id),
@@ -1547,42 +1999,41 @@ mod tests {
         ));
 
         let owner = pool.begin_request("request").unwrap();
-        let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
+        let cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         pool.set_availability(&decoder_id, DecoderAvailability::Draining)
             .unwrap();
         assert!(matches!(
             pool.remove(&decoder_id),
             Err(DecoderPoolError::DecoderInUse { .. })
         ));
-        pool.finish_before_dispatch(cohort, RetryDisposition::Terminal)
-            .unwrap();
+        release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
         pool.remove(&decoder_id).unwrap();
     }
 
     #[test]
-    fn batch_admission_counts_children_against_capacity() {
+    fn valid_allocator_grant_is_not_vetoed_by_advisory_scales() {
         let pool = pool(2);
         pool.register(
             DecoderReplicaMetadata::new(
-                DecoderId::new("decode-0").unwrap(),
+                decoder_id("decode-0"),
                 1,
                 compatibility("packed-v1"),
-                capacity(2, 10_000),
+                scheduling(1, 1),
             )
             .unwrap(),
         )
         .unwrap();
         let owner = pool.begin_request("batch").unwrap();
-        let demand = DecoderCohortDemand::new(vec![
-            DecoderDemand::new(1, 1).unwrap(),
-            DecoderDemand::new(1, 1).unwrap(),
-            DecoderDemand::new(1, 1).unwrap(),
-        ])
-        .unwrap();
-        assert_eq!(
-            pool.reserve(&owner, demand).unwrap_err(),
-            DecoderPoolError::AtCapacity
-        );
+        let accounting = vec![
+            DecoderGrantChildAccounting::new(10_000, 1),
+            DecoderGrantChildAccounting::new(10_000, 1),
+            DecoderGrantChildAccounting::new(10_000, 1),
+        ];
+        let cohort = bind_next(&pool, &owner, accounting).unwrap();
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].active_child_requests, 3);
+        assert_eq!(snapshot.replicas[0].reserved_kv_tokens, 30_000);
+        release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -1590,7 +2041,7 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let mut cohort = pool.reserve(&owner, scalar_demand()).unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         pool.mark_dispatched(&mut cohort).unwrap();
         pool.observe_decode_progress(&cohort, 100).unwrap();
         let snapshot = pool.snapshot();
@@ -1601,18 +2052,18 @@ mod tests {
             pool.observe_decode_progress(&cohort, 29),
             Err(DecoderPoolError::InvalidProgress { .. })
         ));
-        pool.complete(cohort).unwrap();
+        release_after_completion(&pool, cohort).unwrap();
     }
 
     #[test]
-    fn concurrent_cohort_admission_never_oversubscribes_or_reuses_rooms() {
+    fn concurrent_grant_binding_never_reuses_active_rooms() {
         let pool = Arc::new(pool(2));
         pool.register(
             DecoderReplicaMetadata::new(
-                DecoderId::new("decode-0").unwrap(),
+                decoder_id("decode-0"),
                 1,
                 compatibility("packed-v1"),
-                capacity(32, 320),
+                scheduling(32, 320),
             )
             .unwrap(),
         )
@@ -1623,26 +2074,21 @@ mod tests {
                 let pool = Arc::clone(&pool);
                 thread::spawn(move || {
                     let owner = pool.begin_request(format!("request-{index}"))?;
-                    let cohort = pool.reserve(
-                        &owner,
-                        DecoderCohortDemand::single(DecoderDemand::new(10, 1).unwrap()),
-                    )?;
+                    let accounting = vec![DecoderGrantChildAccounting::new(10, 1)];
+                    let cohort = bind_next(&pool, &owner, accounting)?;
                     Ok::<_, DecoderPoolError>((owner, cohort))
                 })
             })
             .collect();
         let mut admitted = Vec::new();
-        let mut capacity_errors = 0;
         for handle in handles {
             match handle.join().unwrap() {
                 Ok(pair) => admitted.push(pair),
-                Err(DecoderPoolError::AtCapacity) => capacity_errors += 1,
                 Err(error) => panic!("unexpected admission error: {error}"),
             }
         }
 
-        assert_eq!(admitted.len(), 32);
-        assert_eq!(capacity_errors, 32);
+        assert_eq!(admitted.len(), 64);
         assert_eq!(
             admitted
                 .iter()
@@ -1652,13 +2098,12 @@ mod tests {
             admitted.len()
         );
         let snapshot = pool.snapshot();
-        assert_eq!(snapshot.replicas[0].active_cohorts, 32);
-        assert_eq!(snapshot.replicas[0].active_child_requests, 32);
-        assert_eq!(snapshot.replicas[0].reserved_kv_tokens, 320);
+        assert_eq!(snapshot.replicas[0].active_cohorts, 64);
+        assert_eq!(snapshot.replicas[0].active_child_requests, 64);
+        assert_eq!(snapshot.replicas[0].reserved_kv_tokens, 640);
 
         for (mut owner, cohort) in admitted {
-            pool.finish_before_dispatch(cohort, RetryDisposition::Terminal)
-                .unwrap();
+            release_before_dispatch(&pool, cohort, RetryDisposition::Terminal).unwrap();
             pool.finalize_request(&mut owner).unwrap();
         }
     }
