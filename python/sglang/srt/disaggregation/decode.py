@@ -29,8 +29,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -68,6 +66,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation_pin import RequestSlotPinOwner
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
@@ -91,6 +90,7 @@ from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-class DecodeReqToTokenPool:
+class DecodeReqToTokenPool(RequestSlotPinOwner):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
     DecodeReqToTokenPool subscribes memory for pre-allocated requests.
@@ -150,6 +150,7 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._initialize_request_slot_pins(type(self).__name__)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -184,10 +185,11 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.release_detached_request_slot(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        self._assert_request_slots_resettable()
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 
@@ -255,6 +257,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
+        self.assert_request_slots_resettable("clear hybrid decode request pool")
+        self.mamba_allocator.assert_allocation_resettable(
+            "clear hybrid decode request pool"
+        )
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_allocator.clear()
 

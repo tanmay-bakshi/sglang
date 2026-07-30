@@ -26,9 +26,16 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPin,
+    AllocationPinnedError,
+)
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedSWATokenToKVPoolAllocator,
@@ -250,6 +257,72 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._free(full_alloc, full_kv, a)
         self._check_invariants(full_alloc, full_kv)
         self.assertEqual(full_alloc.allocated_count(), 0)
+
+    def test_allocation_pin_allows_unrelated_eager_free(self):
+        """Pinned mappings remain immutable while unrelated eager frees proceed."""
+
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        prefix = self._alloc(full_alloc, full_kv, 3)
+        interior = self._alloc(full_alloc, full_kv, 4)
+        pinned = self._alloc(full_alloc, full_kv, 2)
+        owner = object()
+        pin = full_alloc.acquire_allocation_pin(pinned, owner)
+        before = full_alloc.allocation_pin_snapshot(pin)
+
+        interior_physical = full_alloc.virtual_to_physical[interior]
+        full_kv.buf[interior_physical] = -1
+        full_alloc.free(interior)
+        with self.assertRaises(AllocationPinnedError):
+            full_alloc.clear()
+        with self.assertRaises(AllocationPinnedError):
+            full_alloc.restore_state(full_alloc.backup_state())
+
+        after = full_alloc.allocation_pin_snapshot(pin)
+        self.assertEqual(before.virtual_pages, after.virtual_pages)
+        self.assertEqual(before.physical_pages, after.physical_pages)
+        self.assertEqual(full_alloc.allocated_count(), 5)
+        self.assertEqual(int(full_alloc._free_phys_pages.numel()), 4)
+
+        full_alloc.release_allocation_pin(pin, owner)
+        full_alloc.flush_opportunistic()
+        self._check_invariants(full_alloc, full_kv)
+        self.assertTrue(
+            all(
+                int(full_alloc.virtual_to_physical[virtual].item()) > 0
+                for virtual in prefix.tolist() + pinned.tolist()
+            )
+        )
+
+    def test_allocation_pin_allows_unrelated_lazy_compaction(self):
+        """Lazy compaction retains only holes blocked by pinned survivors."""
+
+        _, allocator, kv = self._build_lazy_full(n_full_slots=48, move_cap=8)
+        prefix = self._alloc(allocator, kv, 3)
+        interior = self._alloc(allocator, kv, 4)
+        pinned = self._alloc(allocator, kv, 2)
+        owner = object()
+        pin = allocator.acquire_allocation_pin(pinned, owner)
+        before = allocator.allocation_pin_snapshot(pin)
+
+        interior_physical = allocator.virtual_to_physical[interior]
+        kv.buf[interior_physical] = -1
+        allocator.free(interior)
+        allocator.flush_opportunistic()
+        after = allocator.allocation_pin_snapshot(pin)
+        self.assertEqual(before.physical_pages, after.physical_pages)
+        self.assertEqual(allocator.allocated_count(), 5)
+        self.assertEqual(int(allocator._free_phys_pages.numel()), 4)
+
+        allocator.release_allocation_pin(pin, owner)
+        allocator.flush_opportunistic()
+        allocator.flush_opportunistic()
+        self._check_invariants(allocator, kv)
+        self.assertTrue(
+            all(
+                int(allocator.virtual_to_physical[virtual].item()) > 0
+                for virtual in prefix.tolist() + pinned.tolist()
+            )
+        )
 
     def test_grow_down_side(self):
         _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
@@ -523,6 +596,94 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(int(buf[1].item()), 0)
 
 
+class TestStaticSWAAllocationPins(unittest.TestCase):
+    """Transactional pin exclusion across the static FULL/SWA allocator pair."""
+
+    def _build(self):
+        allocator = object.__new__(SWATokenToKVPoolAllocator)
+        allocator._size_full = 16
+        allocator._size_swa = 16
+        allocator.page_size = 1
+        allocator.full_attn_allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device=_DEV,
+            kvcache=object(),
+            need_sort=False,
+        )
+        allocator.swa_attn_allocator = TokenToKVPoolAllocator(
+            size=16,
+            dtype=torch.float16,
+            device=_DEV,
+            kvcache=object(),
+            need_sort=False,
+        )
+        allocator.full_to_swa_index_mapping = torch.zeros(
+            18,
+            dtype=torch.int64,
+            device=_DEV,
+        )
+        allocator.full_to_swa_index_mapping[-1] = -1
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        return allocator
+
+    def test_second_child_pin_blocks_every_composite_mutation(self):
+        """An SWA pin is detected before the FULL child can be changed."""
+
+        allocator = self._build()
+        full_indices = allocator.full_attn_allocator.alloc(3)
+        swa_indices = allocator.swa_attn_allocator.alloc(3)
+        self.assertIsNotNone(full_indices)
+        self.assertIsNotNone(swa_indices)
+        allocator.set_full_to_swa_mapping(full_indices, swa_indices)
+        owner = object()
+
+        with self.assertRaisesRegex(TypeError, "child allocators"):
+            allocator.acquire_allocation_pin(full_indices, owner)
+
+        swa_pin = allocator.swa_attn_allocator.acquire_allocation_pin(
+            swa_indices,
+            owner,
+        )
+        full_available = allocator.full_attn_allocator.available_size()
+        swa_available = allocator.swa_attn_allocator.available_size()
+        mapping = allocator.full_to_swa_index_mapping.clone()
+
+        with self.assertRaises(AllocationPinnedError):
+            allocator.free(full_indices)
+        with self.assertRaises(AllocationPinnedError):
+            allocator.restore_state(allocator.backup_state())
+        with self.assertRaises(AllocationPinnedError):
+            allocator.clear()
+        with self.assertRaises(AllocationPinnedError):
+            allocator.resize(
+                SimpleNamespace(
+                    full_max_total_num_tokens=8,
+                    swa_max_total_num_tokens=8,
+                )
+            )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(),
+            swa_available,
+        )
+        self.assertTrue(
+            torch.equal(allocator.full_to_swa_index_mapping, mapping)
+        )
+        self.assertEqual(allocator._size_full, 16)
+        self.assertEqual(allocator._size_swa, 16)
+
+        allocator.swa_attn_allocator.release_allocation_pin(swa_pin, owner)
+        allocator.free(full_indices)
+        self.assertEqual(allocator.full_attn_allocator.available_size(), 16)
+        self.assertEqual(allocator.swa_attn_allocator.available_size(), 16)
+
+
 # ---------------------------------------------------------------------------
 # Shared SWA composite — unit tests
 # ---------------------------------------------------------------------------
@@ -690,6 +851,59 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
         )
         self.assertTrue(set(v.tolist()).issubset(free_full))
+
+    def test_composite_pin_preflight_prevents_partial_free_and_reset(self):
+        """A FULL pin blocks both sides before the SWA child can mutate."""
+
+        _, allocator, kvcache = self._build()
+        virtual_indices = self._alloc(allocator, kvcache, 3)
+        self.assertIsNotNone(virtual_indices)
+        owner = object()
+
+        with self.assertRaisesRegex(TypeError, "child allocators"):
+            allocator.acquire_allocation_pin(virtual_indices, owner)
+
+        full_pin = allocator.full_attn_allocator.acquire_allocation_pin(
+            virtual_indices,
+            owner,
+        )
+        full_mapping = (
+            allocator.full_attn_allocator.virtual_to_physical[
+                virtual_indices
+            ].clone()
+        )
+        swa_mapping = (
+            allocator.swa_attn_allocator.virtual_to_physical[
+                virtual_indices
+            ].clone()
+        )
+
+        with self.assertRaises(AllocationPinnedError):
+            allocator.free(virtual_indices)
+        with self.assertRaises(AllocationPinnedError):
+            allocator.restore_state(allocator.backup_state())
+        with self.assertRaises(AllocationPinnedError):
+            allocator.clear()
+
+        self.assertTrue(
+            torch.equal(
+                allocator.full_attn_allocator.virtual_to_physical[
+                    virtual_indices
+                ],
+                full_mapping,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                allocator.swa_attn_allocator.virtual_to_physical[
+                    virtual_indices
+                ],
+                swa_mapping,
+            )
+        )
+
+        allocator.full_attn_allocator.release_allocation_pin(full_pin, owner)
+        self._free(allocator, kvcache, virtual_indices)
 
     # 3. `free_swa` tombstones swa side only; virtual + full-physical stay live.
     def test_swa_free_swa_keeps_virtual_alive(self):
@@ -2193,6 +2407,512 @@ class TestLazyCompaction(unittest.TestCase):
         fa._drain_pending_reuse(urgent=False)
         self.assertEqual(len(fa._pending_reuse), 0)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
+
+
+class TestPinAwareCompaction(unittest.TestCase):
+    """Pin-aware compaction invariants across allocator layouts and modes."""
+
+    def _build(
+        self,
+        *,
+        lazy: bool,
+        grow_direction: str,
+        page_size: int,
+    ) -> tuple[MultiEndedAllocator, MultiEndedAllocator, _FakeKVCache]:
+        """Build a symmetric allocator pair and select one growth direction.
+
+        :param lazy: Whether the selected pair uses lazy compaction.
+        :param grow_direction: Growth direction of the allocator under test.
+        :param page_size: Number of tokens represented by each allocator page.
+        :returns: Selected allocator, its peer, and selected physical KV storage.
+        """
+
+        low = _make_mha_spec("low", "up", layer_num=2)
+        high = _make_mha_spec("high", "down", layer_num=2)
+        pages_per_side = 24
+        total = page_size * pages_per_side * (
+            low.entry_bytes() + high.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[low, high],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        low_kv = _FakeKVCache(pool.max_slots("low"))
+        high_kv = _FakeKVCache(pool.max_slots("high"))
+        low_allocator = MultiEndedAllocator(
+            kvcache=low_kv,
+            unified_buffer=pool,
+            sub_pool_name="low",
+            device=_DEV,
+            is_id_owner=True,
+            page_size=page_size,
+            lazy_compaction=lazy,
+        )
+        high_allocator = MultiEndedAllocator(
+            kvcache=high_kv,
+            unified_buffer=pool,
+            sub_pool_name="high",
+            device=_DEV,
+            is_id_owner=True,
+            page_size=page_size,
+            lazy_compaction=lazy,
+        )
+        low_allocator.bind_peer(high_allocator)
+        high_allocator.bind_peer(low_allocator)
+        low_allocator._lazy_max_moves_per_call = 64
+        high_allocator._lazy_max_moves_per_call = 64
+        if grow_direction == "up":
+            return low_allocator, high_allocator, low_kv
+        if grow_direction == "down":
+            return high_allocator, low_allocator, high_kv
+        raise ValueError(f"unsupported growth direction: {grow_direction}")
+
+    def _stamp(
+        self,
+        allocator: MultiEndedAllocator,
+        kv: _FakeKVCache,
+        virtual_tokens: torch.Tensor,
+    ) -> None:
+        """Stamp every virtual token into its current physical location.
+
+        :param allocator: Allocator owning the virtual token IDs.
+        :param kv: Physical storage marker used to validate relocations.
+        :param virtual_tokens: Newly allocated virtual token IDs.
+        """
+
+        physical_tokens = allocator.translate_kv_loc(virtual_tokens)
+        kv.buf[physical_tokens] = virtual_tokens
+
+    def _erase(
+        self,
+        allocator: MultiEndedAllocator,
+        kv: _FakeKVCache,
+        virtual_tokens: torch.Tensor,
+    ) -> None:
+        """Erase markers at the current physical locations before a free.
+
+        :param allocator: Allocator owning the virtual token IDs.
+        :param kv: Physical storage marker used to validate relocations.
+        :param virtual_tokens: Virtual token IDs about to be freed.
+        """
+
+        physical_tokens = allocator.translate_kv_loc(virtual_tokens)
+        kv.buf[physical_tokens] = -1
+
+    def _active_band(self, allocator: MultiEndedAllocator) -> set[int]:
+        """Return physical pages retained behind the allocator watermark.
+
+        :param allocator: Allocator whose physical frontier is inspected.
+        :returns: Physical page IDs inside the retained frontier.
+        """
+
+        if allocator.grow_direction == "up":
+            return set(
+                range(allocator.min_page_index, allocator.watermark_physical)
+            )
+        return set(range(allocator.watermark_physical + 1, allocator.num_pages))
+
+    def _assert_consistent(
+        self,
+        allocator: MultiEndedAllocator,
+        kv: _FakeKVCache,
+        *,
+        initial_capacity: int,
+        expect_packed: bool,
+    ) -> None:
+        """Validate live mappings, hole accounting, data, and capacity.
+
+        :param allocator: Allocator whose state is validated.
+        :param kv: Physical storage marker used to validate relocations.
+        :param initial_capacity: Empty-peer capacity measured before allocations.
+        :param expect_packed: Whether the retained frontier must be hole-free.
+        """
+
+        live_virtual = {
+            virtual
+            for virtual in range(
+                allocator.min_page_index,
+                allocator.num_pages,
+            )
+            if int(allocator.virtual_to_physical[virtual].item()) > 0
+        }
+        free_virtual = set(
+            int(virtual) for virtual in allocator.free_virtual_ids.tolist()
+        )
+        all_virtual = set(
+            range(allocator.min_page_index, allocator.num_pages)
+        )
+        self.assertEqual(live_virtual | free_virtual, all_virtual)
+        self.assertEqual(live_virtual & free_virtual, set())
+
+        active_band = self._active_band(allocator)
+        free_physical_list = [
+            int(physical) for physical in allocator._free_phys_pages.tolist()
+        ]
+        free_physical = set(free_physical_list)
+        pending_physical = set(allocator._pending_reuse_pages_cpu)
+        self.assertEqual(len(free_physical_list), len(free_physical))
+        self.assertEqual(free_physical & pending_physical, set())
+
+        tombstoned_physical = {
+            physical
+            for physical in active_band
+            if int(allocator.physical_to_virtual[physical].item()) < 0
+        }
+        self.assertEqual(
+            tombstoned_physical,
+            free_physical | pending_physical,
+        )
+        if expect_packed:
+            self.assertEqual(tombstoned_physical, set())
+
+        for virtual in live_virtual:
+            physical = int(
+                allocator.virtual_to_physical[virtual].item()
+            )
+            self.assertIn(physical, active_band)
+            self.assertEqual(
+                int(allocator.physical_to_virtual[physical].item()),
+                virtual,
+            )
+            for offset in range(allocator.page_size):
+                virtual_token = virtual * allocator.page_size + offset
+                physical_token = physical * allocator.page_size + offset
+                self.assertEqual(
+                    int(kv.buf[physical_token].item()),
+                    virtual_token,
+                )
+
+        self.assertEqual(
+            allocator.allocated_count(),
+            len(live_virtual) * allocator.page_size,
+        )
+        self.assertEqual(
+            allocator.available_size() + allocator.allocated_count(),
+            initial_capacity,
+        )
+
+    def test_pins_preserve_only_claimed_mappings(self) -> None:
+        """Unrelated frees and compaction remain live around exact pinned pages."""
+
+        for lazy in (False, True):
+            for grow_direction in ("up", "down"):
+                for page_size in (1, 4):
+                    with self.subTest(
+                        lazy=lazy,
+                        grow_direction=grow_direction,
+                        page_size=page_size,
+                    ):
+                        allocator, peer, kv = self._build(
+                            lazy=lazy,
+                            grow_direction=grow_direction,
+                            page_size=page_size,
+                        )
+                        initial_capacity = allocator.available_size()
+                        prefix = allocator.alloc(2 * page_size)
+                        interior = allocator.alloc(2 * page_size)
+                        pinned = allocator.alloc(page_size)
+                        self.assertIsNotNone(prefix)
+                        self.assertIsNotNone(interior)
+                        self.assertIsNotNone(pinned)
+                        self._stamp(allocator, kv, prefix)
+                        self._stamp(allocator, kv, interior)
+                        self._stamp(allocator, kv, pinned)
+
+                        owner = object()
+                        pin = allocator.acquire_allocation_pin(pinned, owner)
+                        pin_before = allocator.allocation_pin_snapshot(pin)
+                        restore_point = allocator.backup_state()
+
+                        with self.assertRaises(AllocationPinnedError):
+                            allocator.free(pinned)
+                        with self.assertRaises(AllocationPinnedError):
+                            allocator.clear()
+                        with self.assertRaises(AllocationPinnedError):
+                            allocator.restore_state(restore_point)
+
+                        self._erase(allocator, kv, interior)
+                        allocator.free(interior)
+                        if lazy:
+                            allocator._flush(urgent=True)
+                        else:
+                            allocator.flush_opportunistic()
+                        pin_after_free = allocator.allocation_pin_snapshot(pin)
+                        self.assertEqual(
+                            pin_after_free.physical_pages,
+                            pin_before.physical_pages,
+                        )
+                        self.assertEqual(
+                            int(allocator._free_phys_pages.numel()),
+                            2,
+                        )
+                        self.assertEqual(
+                            peer.schedulable_available_size(),
+                            peer.available_size(),
+                        )
+                        self._assert_consistent(
+                            allocator,
+                            kv,
+                            initial_capacity=initial_capacity,
+                            expect_packed=False,
+                        )
+
+                        retained_holes = set(
+                            int(physical)
+                            for physical in allocator._free_phys_pages.tolist()
+                        )
+                        watermark_before_reuse = allocator.watermark_physical
+                        replacement = allocator.alloc(page_size)
+                        self.assertIsNotNone(replacement)
+                        self._stamp(allocator, kv, replacement)
+                        replacement_pages = set(
+                            int(physical) // page_size
+                            for physical in allocator.translate_kv_loc(
+                                replacement[::page_size]
+                            ).tolist()
+                        )
+                        self.assertTrue(
+                            replacement_pages <= retained_holes
+                        )
+                        self.assertEqual(
+                            allocator.watermark_physical,
+                            watermark_before_reuse,
+                        )
+                        pin_after_reuse = allocator.allocation_pin_snapshot(pin)
+                        self.assertEqual(
+                            pin_after_reuse.physical_pages,
+                            pin_before.physical_pages,
+                        )
+
+                        allocator.release_allocation_pin(pin, owner)
+                        self.assertGreater(
+                            peer.schedulable_available_size(),
+                            peer.available_size(),
+                        )
+                        for _ in range(4):
+                            allocator.flush_opportunistic()
+                            if allocator._free_phys_pages.numel() == 0:
+                                break
+                        self._assert_consistent(
+                            allocator,
+                            kv,
+                            initial_capacity=initial_capacity,
+                            expect_packed=True,
+                        )
+                        self.assertEqual(
+                            peer.schedulable_available_size(),
+                            peer.available_size(),
+                        )
+
+    def test_randomized_pin_churn_preserves_allocator_state(self) -> None:
+        """Pin, free, allocate, and compact churn preserves every live identity."""
+
+        rng = random.Random(0xA110CA7E)
+        for lazy in (False, True):
+            for grow_direction in ("up", "down"):
+                for page_size in (1, 4):
+                    with self.subTest(
+                        lazy=lazy,
+                        grow_direction=grow_direction,
+                        page_size=page_size,
+                    ):
+                        allocator, _, kv = self._build(
+                            lazy=lazy,
+                            grow_direction=grow_direction,
+                            page_size=page_size,
+                        )
+                        initial_capacity = allocator.available_size()
+                        live: dict[int, torch.Tensor] = {}
+                        pins: dict[
+                            int,
+                            tuple[AllocationPin, object, tuple[int, ...]],
+                        ] = {}
+
+                        for _ in range(12):
+                            tokens = allocator.alloc(page_size)
+                            self.assertIsNotNone(tokens)
+                            self._stamp(allocator, kv, tokens)
+                            virtual_page = int(tokens[0].item()) // page_size
+                            live[virtual_page] = tokens
+
+                        for step in range(240):
+                            unpinned = sorted(set(live) - set(pins))
+                            action = rng.random()
+                            if action < 0.18 and len(unpinned) > 0:
+                                virtual_page = rng.choice(unpinned)
+                                owner = object()
+                                pin = allocator.acquire_allocation_pin(
+                                    live[virtual_page],
+                                    owner,
+                                )
+                                snapshot = allocator.allocation_pin_snapshot(pin)
+                                pins[virtual_page] = (
+                                    pin,
+                                    owner,
+                                    snapshot.physical_pages,
+                                )
+                            elif action < 0.34 and len(pins) > 0:
+                                virtual_page = rng.choice(sorted(pins))
+                                pin, owner, _ = pins.pop(virtual_page)
+                                allocator.release_allocation_pin(pin, owner)
+                            elif action < 0.68 and len(unpinned) > 0:
+                                virtual_page = rng.choice(unpinned)
+                                tokens = live.pop(virtual_page)
+                                self._erase(allocator, kv, tokens)
+                                allocator.free(tokens)
+                            elif allocator.available_size() >= page_size:
+                                tokens = allocator.alloc(page_size)
+                                self.assertIsNotNone(tokens)
+                                self._stamp(allocator, kv, tokens)
+                                virtual_page = int(tokens[0].item()) // page_size
+                                live[virtual_page] = tokens
+
+                            if step % 3 == 0:
+                                if lazy and step % 11 == 0:
+                                    allocator._flush(urgent=True)
+                                else:
+                                    allocator.flush_opportunistic()
+
+                            for pin, _, physical_pages in pins.values():
+                                snapshot = allocator.allocation_pin_snapshot(pin)
+                                self.assertEqual(
+                                    snapshot.physical_pages,
+                                    physical_pages,
+                                )
+                            self._assert_consistent(
+                                allocator,
+                                kv,
+                                initial_capacity=initial_capacity,
+                                expect_packed=False,
+                            )
+
+                        for pin, owner, _ in pins.values():
+                            allocator.release_allocation_pin(pin, owner)
+                        for _ in range(64):
+                            allocator.flush_opportunistic()
+                            if allocator._free_phys_pages.numel() == 0:
+                                break
+                        self._assert_consistent(
+                            allocator,
+                            kv,
+                            initial_capacity=initial_capacity,
+                            expect_packed=True,
+                        )
+
+    def test_interior_pin_skips_and_continues_compaction(self) -> None:
+        """Compaction moves survivors on both sides of one interior pin."""
+
+        for lazy in (False, True):
+            for grow_direction in ("up", "down"):
+                for page_size in (1, 4):
+                    with self.subTest(
+                        lazy=lazy,
+                        grow_direction=grow_direction,
+                        page_size=page_size,
+                    ):
+                        allocator, _, kv = self._build(
+                            lazy=lazy,
+                            grow_direction=grow_direction,
+                            page_size=page_size,
+                        )
+                        initial_capacity = allocator.available_size()
+                        prefix = allocator.alloc(page_size)
+                        holes = allocator.alloc(3 * page_size)
+                        bridge = allocator.alloc(page_size)
+                        pinned = allocator.alloc(page_size)
+                        suffix = allocator.alloc(2 * page_size)
+                        self.assertIsNotNone(prefix)
+                        self.assertIsNotNone(holes)
+                        self.assertIsNotNone(bridge)
+                        self.assertIsNotNone(pinned)
+                        self.assertIsNotNone(suffix)
+                        for tokens in (prefix, holes, bridge, pinned, suffix):
+                            self._stamp(allocator, kv, tokens)
+
+                        movable = torch.cat((bridge, suffix))
+                        movable_virtual_pages = tuple(
+                            int(virtual) // page_size
+                            for virtual in movable[::page_size].tolist()
+                        )
+                        movable_before = {
+                            virtual: int(
+                                allocator.virtual_to_physical[virtual].item()
+                            )
+                            for virtual in movable_virtual_pages
+                        }
+                        owner = object()
+                        pin = allocator.acquire_allocation_pin(pinned, owner)
+                        pin_before = allocator.allocation_pin_snapshot(pin)
+
+                        self._erase(allocator, kv, holes)
+                        allocator.free(holes)
+                        if lazy:
+                            allocator._flush(urgent=True)
+                        else:
+                            allocator.flush_opportunistic()
+
+                        pin_after = allocator.allocation_pin_snapshot(pin)
+                        self.assertEqual(
+                            pin_after.physical_pages,
+                            pin_before.physical_pages,
+                        )
+                        movable_after = {
+                            virtual: int(
+                                allocator.virtual_to_physical[virtual].item()
+                            )
+                            for virtual in movable_virtual_pages
+                        }
+                        for virtual in movable_virtual_pages:
+                            self.assertNotEqual(
+                                movable_after[virtual],
+                                movable_before[virtual],
+                            )
+                        self.assertEqual(
+                            int(allocator._free_phys_pages.numel()),
+                            1,
+                        )
+                        self._assert_consistent(
+                            allocator,
+                            kv,
+                            initial_capacity=initial_capacity,
+                            expect_packed=False,
+                        )
+
+                        retained_hole = int(
+                            allocator._free_phys_pages[0].item()
+                        )
+                        allocator.release_allocation_pin(pin, owner)
+                        watermark_before_reuse = allocator.watermark_physical
+                        replacement = allocator.alloc(page_size)
+                        self.assertIsNotNone(replacement)
+                        self._stamp(allocator, kv, replacement)
+                        replacement_physical = int(
+                            allocator.translate_kv_loc(replacement[:1]).item()
+                        ) // page_size
+                        self.assertEqual(replacement_physical, retained_hole)
+                        self.assertEqual(
+                            allocator.watermark_physical,
+                            watermark_before_reuse,
+                        )
+                        self.assertEqual(
+                            int(allocator._free_phys_pages.numel()),
+                            0,
+                        )
+
+                        self._erase(allocator, kv, replacement)
+                        allocator.free(replacement)
+                        for _ in range(4):
+                            allocator.flush_opportunistic()
+                            if allocator._free_phys_pages.numel() == 0:
+                                break
+                        self._assert_consistent(
+                            allocator,
+                            kv,
+                            initial_capacity=initial_capacity,
+                            expect_packed=True,
+                        )
 
 
 class TestO3FusedAllocBind(unittest.TestCase):

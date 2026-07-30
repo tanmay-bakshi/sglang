@@ -25,6 +25,11 @@ from __future__ import annotations
 from typing import Iterator, Optional
 
 import torch
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPin,
+    AllocationPinRegistry,
+    AllocationPinSnapshot,
+)
 
 
 class MambaSlotAllocator:
@@ -38,6 +43,8 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str):
         self.size = size
         self.device = device
+        self.page_size = 1
+        self._allocation_pin_registry = AllocationPinRegistry(type(self).__name__)
         # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
         # When non-None, `alloc(1)` consumes the next slot from this iterator
         # instead of calling `_do_alloc(1)` per request. Reset to None outside
@@ -88,10 +95,124 @@ class MambaSlotAllocator:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self.assert_allocation_indices_reusable(free_index)
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
+        self._allocation_pin_registry.assert_resettable("clear")
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Pin exact request-scoped Mamba slots.
+
+        :param indices: Allocator-visible Mamba slot IDs.
+        :param owner: Exact authority allowed to release the pin.
+        :returns: Opaque allocator-owned pin.
+        """
+
+        return self._allocation_pin_registry.acquire(
+            self._allocation_slot_ids(indices),
+            owner,
+        )
+
+    def allocation_pin_snapshot(
+        self,
+        pin: AllocationPin,
+    ) -> AllocationPinSnapshot:
+        """Resolve immutable static Mamba slot identities.
+
+        :param pin: Exact allocator-owned pin.
+        :returns: Immutable identity mapping.
+        """
+
+        slot_ids = self._allocation_pin_registry.page_ids(pin)
+        return AllocationPinSnapshot(
+            allocator_label=type(self).__name__,
+            page_size=1,
+            virtual_pages=slot_ids,
+            physical_pages=slot_ids,
+            quarantined=self._allocation_pin_registry.is_quarantined(pin),
+        )
+
+    def release_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Release one exact Mamba allocation pin.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._allocation_pin_registry.release(pin, owner)
+
+    def quarantine_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Permanently retain one ambiguous Mamba allocation.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._allocation_pin_registry.quarantine(pin, owner)
+
+    def assert_allocation_resettable(self, operation: str) -> None:
+        """Reject allocator-wide mutation while any Mamba slot is pinned.
+
+        :param operation: Reader-facing allocator operation.
+        """
+
+        self._allocation_pin_registry.assert_resettable(operation)
+
+    def assert_allocation_indices_reusable(
+        self,
+        indices: torch.Tensor,
+    ) -> None:
+        """Reject mutation of exact pinned Mamba slots.
+
+        :param indices: Allocator-visible Mamba slot IDs about to be mutated.
+        """
+
+        if indices.numel() == 0:
+            return
+        self._allocation_pin_registry.assert_pages_reusable(
+            self._allocation_slot_ids(indices)
+        )
+
+    def _allocation_slot_ids(self, indices: torch.Tensor) -> tuple[int, ...]:
+        """Canonicalize exact positive Mamba slot IDs.
+
+        :param indices: Allocator-visible slot IDs.
+        :returns: Sorted unique slot IDs.
+        """
+
+        if not isinstance(indices, torch.Tensor):
+            raise TypeError("Mamba allocation pin indices must be a torch.Tensor")
+        if indices.ndim != 1:
+            raise ValueError("Mamba allocation pin indices must be one-dimensional")
+        if indices.numel() == 0:
+            raise ValueError("Mamba allocation pin indices must not be empty")
+        slot_ids = tuple(
+            sorted(
+                int(slot_id)
+                for slot_id in torch.unique(
+                    indices.detach().to(dtype=torch.int64)
+                )
+                .cpu()
+                .tolist()
+            )
+        )
+        if slot_ids[0] <= 0:
+            raise ValueError("Mamba allocation pin includes reserved slot zero")
+        return slot_ids
