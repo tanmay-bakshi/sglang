@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -310,6 +311,28 @@ class _DecodeMetadataSubmission:
     page_indices: np.ndarray
     state_indices: list[Any] | None
     decode_prefix_len: int
+
+
+@dataclass
+class _DecodeAllocationPreparation:
+    """Pre-publication transaction state for one scheduler cohort.
+
+    :ivar prepared_decode_reqs: Children whose migration leases are prepared.
+    :ivar publication_started: Whether metadata may have armed any writer.
+    """
+
+    prepared_decode_reqs: list[DecodeRequest] = field(default_factory=list)
+    publication_started: bool = False
+
+    def record_prepared(self, decode_req: DecodeRequest) -> None:
+        """Record one child immediately after its lease is acquired.
+
+        :param decode_req: Child whose live allocation may now be pinned.
+        """
+
+        if decode_req.allocation_lease is None:
+            return
+        self.prepared_decode_reqs.append(decode_req)
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -896,7 +919,62 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Prepare and publish one preallocation cohort transactionally.
+
+        :param rids_to_check: Optional request IDs eligible for this pass.
+        :returns: Preallocated and failed decode requests.
+        """
+
+        preparation = _DecodeAllocationPreparation()
+        try:
+            return self._prepare_and_publish_preallocated(
+                rids_to_check,
+                preparation,
+            )
+        except Exception:
+            preparation_traceback = traceback.format_exc()
+            prepared_count = len(preparation.prepared_decode_reqs)
+            if preparation.publication_started:
+                logger.critical(
+                    "Decode preallocation failed after metadata publication began; "
+                    "retaining %d prepared allocation leases:\n%s",
+                    prepared_count,
+                    preparation_traceback,
+                )
+                raise
+
+            logger.error(
+                "Decode preallocation failed before metadata publication; "
+                "rolling back %d prepared allocation leases:\n%s",
+                prepared_count,
+                preparation_traceback,
+            )
+            try:
+                self._rollback_decode_allocation_leases(
+                    preparation.prepared_decode_reqs
+                )
+            except Exception:
+                logger.critical(
+                    "Decode allocation rollback failed. Preparation traceback:\n"
+                    "%s\nRollback traceback:\n%s",
+                    preparation_traceback,
+                    traceback.format_exc(),
+                )
+                raise
+            raise
+
+    def _prepare_and_publish_preallocated(
+        self,
+        rids_to_check: Optional[List[str]],
+        preparation: _DecodeAllocationPreparation,
+    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+        """Execute one cohort through the first metadata publication.
+
+        :param rids_to_check: Optional request IDs eligible for this pass.
+        :param preparation: Transaction state shared with the exception boundary.
+        :returns: Preallocated and failed decode requests.
+        """
+
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -1091,18 +1169,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "for PD + chunked prefill."
                 )
 
-            try:
-                dst_kv_indices = self._pre_alloc(
-                    decode_req.req,
-                    prefix_indices,
-                    prefix_len,
-                    total_prefix_len,
-                    decode_req=decode_req,
-                    migration_end=origin_input_len,
-                )
-            except DecodeAllocationLeaseError:
-                self._rollback_decode_allocation_leases(preallocated_reqs)
-                raise
+            dst_kv_indices = self._pre_alloc(
+                decode_req.req,
+                prefix_indices,
+                prefix_len,
+                total_prefix_len,
+                decode_req=decode_req,
+                migration_end=origin_input_len,
+            )
+            preparation.record_prepared(decode_req)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1267,6 +1342,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            preparation.publication_started = True
             decode_req.kv_receiver.send_metadata(
                 submission.page_indices,
                 decode_req.metadata_buffer_index,

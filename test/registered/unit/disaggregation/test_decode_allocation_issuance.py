@@ -1,5 +1,6 @@
 import dataclasses
 from types import SimpleNamespace
+from typing import Never
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeReqToTokenPool,
     DecodeRequest,
+    _DecodeAllocationPreparation,
 )
 from sglang.srt.mem_cache.allocation_pin import AllocationPinnedError
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -277,3 +279,119 @@ def test_failed_child_rolls_back_every_prepared_child_lease() -> None:
     assert first.decode_request.allocation_lease is None
     allocator.free(first_indices)
     first.request_pool.free(first.request)
+
+
+def test_post_acquire_prepublication_failure_rolls_back_entire_cohort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Any preparation failure releases current and earlier child leases."""
+
+    allocator = _token_allocator()
+    first = _fixture(allocator, source_tp_size=4)
+    second_request = _Request()
+    selected = first.request_pool.alloc([second_request])
+    assert selected is not None
+    second = DecodeRequest(
+        req=second_request,
+        kv_receiver=SimpleNamespace(
+            require_staging=True,
+            prefill_info=SimpleNamespace(attn_tp_size=4),
+        ),
+    )
+    indices = allocator.alloc(8)
+    assert indices is not None
+    first_slot = first.request.req_pool_idx
+    second_slot = second_request.req_pool_idx
+    assert first_slot is not None
+    assert second_slot is not None
+    first.request_pool.write((first_slot, slice(0, 4)), indices[:4])
+    first.request_pool.write((second_slot, slice(0, 4)), indices[4:])
+
+    def fail_after_acquisition(
+        rids_to_check: list[str] | None,
+        preparation: _DecodeAllocationPreparation,
+    ) -> Never:
+        """Inject failure after both leases exist but before publication.
+
+        :param rids_to_check: Unused request filter.
+        :param preparation: Live cohort transaction.
+        :raises RuntimeError: Always, after both leases are prepared.
+        """
+
+        del rids_to_check
+        first.queue._acquire_decode_allocation_lease(
+            first.decode_request,
+            prefix_len=0,
+            migration_end=4,
+        )
+        preparation.record_prepared(first.decode_request)
+        first.queue._acquire_decode_allocation_lease(
+            second,
+            prefix_len=0,
+            migration_end=4,
+        )
+        preparation.record_prepared(second)
+        raise RuntimeError("injected state payload failure")
+
+    monkeypatch.setattr(
+        first.queue,
+        "_prepare_and_publish_preallocated",
+        fail_after_acquisition,
+    )
+    with pytest.raises(RuntimeError, match="injected state payload failure"):
+        first.queue.pop_preallocated()
+
+    assert first.decode_request.allocation_lease is None
+    assert second.allocation_lease is None
+    allocator.free(indices)
+    first.request_pool.free(first.request)
+    first.request_pool.free(second_request)
+
+
+def test_failure_after_publication_boundary_retains_prepared_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A possibly armed writer keeps its allocation pinned fail closed."""
+
+    allocator = _token_allocator()
+    fixture = _fixture(allocator, source_tp_size=2)
+    indices = allocator.alloc(4)
+    assert indices is not None
+    slot = fixture.request.req_pool_idx
+    assert slot is not None
+    fixture.request_pool.write((slot, slice(0, 4)), indices)
+
+    def fail_after_publication_boundary(
+        rids_to_check: list[str] | None,
+        preparation: _DecodeAllocationPreparation,
+    ) -> Never:
+        """Inject failure after metadata may have armed a writer.
+
+        :param rids_to_check: Unused request filter.
+        :param preparation: Live cohort transaction.
+        :raises RuntimeError: Always, after crossing the publication boundary.
+        """
+
+        del rids_to_check
+        fixture.queue._acquire_decode_allocation_lease(
+            fixture.decode_request,
+            prefix_len=0,
+            migration_end=4,
+        )
+        preparation.record_prepared(fixture.decode_request)
+        preparation.publication_started = True
+        raise RuntimeError("injected post-publication failure")
+
+    monkeypatch.setattr(
+        fixture.queue,
+        "_prepare_and_publish_preallocated",
+        fail_after_publication_boundary,
+    )
+    with pytest.raises(RuntimeError, match="injected post-publication failure"):
+        fixture.queue.pop_preallocated()
+
+    assert fixture.decode_request.allocation_lease is not None
+    with pytest.raises(AllocationPinnedError):
+        allocator.free(indices)
+    with pytest.raises(AllocationPinnedError):
+        fixture.request_pool.free(fixture.request)
