@@ -1,16 +1,19 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use super::{
-    AuthorityDigest, DecoderGrantBinding, DecoderGrantChildAccounting, DecoderGrantChildBinding,
-    DecoderGrantDigest, DecoderId, DecoderInferenceRoute, DecoderSlotGeneration,
-    EngineAbortOutcome, EngineDecoderGrant, EngineGrantError, EngineQuarantineReceipt,
+    digest_reserve_attempt, AuthorityDigest, DecoderGrantBinding, DecoderGrantChildAccounting,
+    DecoderGrantChildBinding, DecoderGrantDigest, DecoderId, DecoderInferenceRoute,
+    DecoderRequestShape, DecoderReservationDigest, DecoderReserveAttemptDigest,
+    DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt,
     EngineReleaseKind, EngineReleaseReceipt, PrefillBootstrapEndpoint, PrefillId,
+    PreparedGrantCancellationReceipt, UnboundGrantBinding, UnboundPreparedGrant,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -18,38 +21,206 @@ const CONTROL_PATH: &str = "/_internal/pd/v1/decode-reservations";
 const GRANT_TOKEN_BYTES: usize = 32;
 const MAX_REASON_CODE_BYTES: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
+const RID_KEY: &str = "rid";
+const BOOTSTRAP_HOST_KEY: &str = "bootstrap_host";
+const BOOTSTRAP_PORT_KEY: &str = "bootstrap_port";
+const BOOTSTRAP_ROOM_KEY: &str = "bootstrap_room";
+const GATEWAY_OWNED_REQUEST_KEYS: [&str; 10] = [
+    RID_KEY,
+    BOOTSTRAP_HOST_KEY,
+    BOOTSTRAP_PORT_KEY,
+    BOOTSTRAP_ROOM_KEY,
+    "bootstrap_pair_key",
+    "decode_tp_size",
+    "disagg_prefill_dp_rank",
+    "routed_dp_rank",
+    "data_parallel_rank",
+    "http_worker_ipc",
+];
 
-/// Exact immutable input to one batch-atomic decoder reservation.
-#[derive(Clone, Debug)]
-pub struct DecoderGrantReservation {
-    prefill_id: PrefillId,
-    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
-    decoder_id: DecoderId,
-    logical_request_chain_id: Uuid,
-    source_tp_size: usize,
-    prepared_ttl_ms: u64,
+/// Validated client request before gateway identities are assigned.
+#[derive(Clone)]
+pub struct DecoderRequestTemplate {
     inference_route: DecoderInferenceRoute,
-    request_body_json: Arc<str>,
-    child_request_ids: Arc<[Uuid]>,
+    request_shape: DecoderRequestShape,
+    input_count: usize,
+    request_body: Map<String, Value>,
+    original_body_bytes: usize,
 }
 
-impl DecoderGrantReservation {
-    /// Construct a reservation for one exact enriched inference request.
-    #[allow(clippy::too_many_arguments)]
+impl fmt::Debug for DecoderRequestTemplate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecoderRequestTemplate")
+            .field("inference_route", &self.inference_route)
+            .field("request_shape", &self.request_shape)
+            .field("input_count", &self.input_count)
+            .field("original_body_bytes", &self.original_body_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecoderRequestTemplate {
+    /// Parse and validate a client request without admitting topology metadata.
     pub fn new(
+        inference_route: DecoderInferenceRoute,
+        request_body: Bytes,
+    ) -> Result<Self, EngineGrantError> {
+        let original_body_bytes = request_body.len();
+        let request_body_json: Value = serde_json::from_slice(&request_body).map_err(|error| {
+            EngineGrantError::InvalidGrant(format!(
+                "request template body is not valid JSON: {error}"
+            ))
+        })?;
+        let request_body = request_body_json.as_object().cloned().ok_or_else(|| {
+            EngineGrantError::InvalidGrant(
+                "request template body must be a JSON object".to_string(),
+            )
+        })?;
+        for key in GATEWAY_OWNED_REQUEST_KEYS {
+            if request_body.contains_key(key) {
+                return Err(EngineGrantError::InvalidGrant(format!(
+                    "request template cannot contain gateway-owned field {key}"
+                )));
+            }
+        }
+        let (request_shape, input_count) = derive_request_shape(&request_body, inference_route)?;
+        validate_no_parallel_sampling(&request_body, inference_route, request_shape, input_count)?;
+        Ok(Self {
+            inference_route,
+            request_shape,
+            input_count,
+            request_body,
+            original_body_bytes,
+        })
+    }
+
+    /// Derived scalar or batch representation.
+    pub fn request_shape(&self) -> DecoderRequestShape {
+        self.request_shape
+    }
+
+    /// Closed inference route used to validate and dispatch this request.
+    pub fn inference_route(&self) -> DecoderInferenceRoute {
+        self.inference_route
+    }
+
+    /// Number of independently allocated child requests.
+    pub fn child_count(&self) -> usize {
+        self.input_count
+    }
+
+    /// Assign one exact attempt and inject its ordered child identities.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_reservation(
+        &self,
         prefill_id: PrefillId,
         prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
         decoder_id: DecoderId,
         logical_request_chain_id: Uuid,
         source_tp_size: usize,
         prepared_ttl: Duration,
+    ) -> Result<DecoderGrantReservation, EngineGrantError> {
+        let mut child_request_ids = Vec::with_capacity(self.input_count);
+        let mut unique = std::collections::HashSet::with_capacity(self.input_count);
+        while child_request_ids.len() < self.input_count {
+            let child_request_id = Uuid::new_v4();
+            if unique.insert(child_request_id) {
+                child_request_ids.push(child_request_id);
+            }
+        }
+        let rid = match self.request_shape {
+            DecoderRequestShape::Scalar => Value::String(child_request_ids[0].to_string()),
+            DecoderRequestShape::Batch => Value::Array(
+                child_request_ids
+                    .iter()
+                    .map(|child_request_id| Value::String(child_request_id.to_string()))
+                    .collect(),
+            ),
+        };
+        let mut request_body = self.request_body.clone();
+        request_body.insert(RID_KEY.to_string(), rid);
+        let base_request_body = Bytes::from(
+            serde_json::to_vec(&Value::Object(request_body)).map_err(|error| {
+                EngineGrantError::InvalidGrant(format!(
+                    "failed to serialize prepared request body: {error}"
+                ))
+            })?,
+        );
+        DecoderGrantReservation::from_prepared(
+            prefill_id,
+            prefill_bootstrap_endpoint,
+            decoder_id,
+            logical_request_chain_id,
+            Uuid::new_v4(),
+            source_tp_size,
+            prepared_ttl,
+            self.inference_route,
+            self.request_shape,
+            base_request_body,
+            Arc::from(child_request_ids),
+        )
+    }
+}
+
+/// Exact immutable input to one batch-atomic decoder reservation.
+pub struct DecoderGrantReservation {
+    prefill_id: PrefillId,
+    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+    decoder_id: DecoderId,
+    logical_request_chain_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    source_tp_size: usize,
+    prepared_ttl_ms: u64,
+    inference_route: DecoderInferenceRoute,
+    request_shape: DecoderRequestShape,
+    base_request_body: Bytes,
+    child_request_ids: Arc<[Uuid]>,
+}
+
+impl fmt::Debug for DecoderGrantReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecoderGrantReservation")
+            .field("prefill_id", &self.prefill_id)
+            .field("decoder_id", &self.decoder_id)
+            .field("logical_request_chain_id", &self.logical_request_chain_id)
+            .field("reservation_attempt_id", &self.reservation_attempt_id)
+            .field("reserve_attempt_digest", &self.reserve_attempt_digest)
+            .field("source_tp_size", &self.source_tp_size)
+            .field("prepared_ttl_ms", &self.prepared_ttl_ms)
+            .field("inference_route", &self.inference_route)
+            .field("request_shape", &self.request_shape)
+            .field("base_request_body_bytes", &self.base_request_body.len())
+            .field("child_count", &self.child_request_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecoderGrantReservation {
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared(
+        prefill_id: PrefillId,
+        prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+        decoder_id: DecoderId,
+        logical_request_chain_id: Uuid,
+        reservation_attempt_id: Uuid,
+        source_tp_size: usize,
+        prepared_ttl: Duration,
         inference_route: DecoderInferenceRoute,
-        request_body_json: impl Into<String>,
-        child_request_ids: Vec<Uuid>,
+        request_shape: DecoderRequestShape,
+        base_request_body: Bytes,
+        child_request_ids: Arc<[Uuid]>,
     ) -> Result<Self, EngineGrantError> {
         if logical_request_chain_id.is_nil() {
             return Err(EngineGrantError::InvalidGrant(
                 "logical request-chain identity cannot be the nil UUID".to_string(),
+            ));
+        }
+        if reservation_attempt_id.is_nil() {
+            return Err(EngineGrantError::InvalidGrant(
+                "reservation attempt identity cannot be the nil UUID".to_string(),
             ));
         }
         if source_tp_size != 2 && source_tp_size != 4 {
@@ -68,20 +239,33 @@ impl DecoderGrantReservation {
             ));
         }
         validate_child_request_ids(&child_request_ids)?;
-
-        let request_body_json = request_body_json.into();
-        validate_request_rids(&request_body_json, &child_request_ids)?;
+        let reserve_attempt_digest = digest_reserve_attempt(
+            reservation_attempt_id,
+            inference_route,
+            request_shape,
+            prepared_ttl_ms,
+            &base_request_body,
+            &prefill_id,
+            &prefill_bootstrap_endpoint,
+            logical_request_chain_id,
+            source_tp_size,
+            &decoder_id,
+            &child_request_ids,
+        );
 
         Ok(Self {
             prefill_id,
             prefill_bootstrap_endpoint,
             decoder_id,
             logical_request_chain_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
             source_tp_size,
             prepared_ttl_ms,
             inference_route,
-            request_body_json: Arc::from(request_body_json),
-            child_request_ids: Arc::from(child_request_ids),
+            request_shape,
+            base_request_body,
+            child_request_ids,
         })
     }
 
@@ -105,6 +289,16 @@ impl DecoderGrantReservation {
         self.logical_request_chain_id
     }
 
+    /// Stable idempotency identity for one allocator attempt.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    /// Digest of the exact idempotent reserve-attempt request.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
     /// Exact prefill tensor-parallel width.
     pub fn source_tp_size(&self) -> usize {
         self.source_tp_size
@@ -120,9 +314,19 @@ impl DecoderGrantReservation {
         self.inference_route
     }
 
-    /// Exact once-serialized enriched request JSON bound by the grant digest.
-    pub fn request_body_json(&self) -> &str {
-        &self.request_body_json
+    /// Whether normalized request fields use scalar or array JSON.
+    pub fn request_shape(&self) -> DecoderRequestShape {
+        self.request_shape
+    }
+
+    /// Cheap clone of the exact RID-enriched provisional request bytes.
+    pub fn base_request_body(&self) -> Bytes {
+        self.base_request_body.clone()
+    }
+
+    fn base_request_body_json(&self) -> &str {
+        std::str::from_utf8(&self.base_request_body)
+            .expect("validated JSON request bodies are UTF-8")
     }
 
     /// Ordered gateway-owned child identities represented by ``rid``.
@@ -151,57 +355,291 @@ fn validate_child_request_ids(child_request_ids: &[Uuid]) -> Result<(), EngineGr
     Ok(())
 }
 
-fn validate_request_rids(
-    request_body_json: &str,
-    child_request_ids: &[Uuid],
-) -> Result<(), EngineGrantError> {
-    let request_body: Value = serde_json::from_str(request_body_json).map_err(|error| {
+fn derive_request_shape(
+    request: &Map<String, Value>,
+    inference_route: DecoderInferenceRoute,
+) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    match inference_route {
+        DecoderInferenceRoute::ChatCompletions => Ok((DecoderRequestShape::Scalar, 1)),
+        DecoderInferenceRoute::Completions => {
+            let prompt = request.get("prompt").ok_or_else(|| {
+                EngineGrantError::InvalidGrant(
+                    "completion request must contain prompt before reservation".to_string(),
+                )
+            })?;
+            derive_text_or_token_shape(prompt, "completion prompt")
+        }
+        DecoderInferenceRoute::Generate => derive_generate_shape(request),
+    }
+}
+
+fn derive_generate_shape(
+    request: &Map<String, Value>,
+) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    let inputs: Vec<(&str, &Value)> = ["text", "input_ids", "input_embeds"]
+        .into_iter()
+        .filter_map(|key| {
+            request
+                .get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| (key, value))
+        })
+        .collect();
+    if inputs.len() != 1 {
+        return Err(EngineGrantError::InvalidGrant(
+            "generate request must contain exactly one of text, input_ids, or input_embeds"
+                .to_string(),
+        ));
+    }
+    let (name, value) = inputs[0];
+    match name {
+        "text" => derive_generate_text_shape(value),
+        "input_ids" => derive_token_ids_shape(value),
+        "input_embeds" => derive_embedding_shape(value),
+        _ => unreachable!("generate input names are closed above"),
+    }
+}
+
+fn derive_generate_text_shape(
+    value: &Value,
+) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    if value.is_string() {
+        return Ok((DecoderRequestShape::Scalar, 1));
+    }
+    let values = value.as_array().ok_or_else(|| {
+        EngineGrantError::InvalidGrant(
+            "generate text must be a string or a nonempty string batch".to_string(),
+        )
+    })?;
+    if values.is_empty() || !values.iter().all(Value::is_string) {
+        return Err(EngineGrantError::InvalidGrant(
+            "generate text must be a string or a nonempty string batch".to_string(),
+        ));
+    }
+    Ok((DecoderRequestShape::Batch, values.len()))
+}
+
+fn derive_token_ids_shape(value: &Value) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    let values = value.as_array().ok_or_else(|| {
+        EngineGrantError::InvalidGrant(
+            "input_ids must be a nonempty token array or homogeneous batch".to_string(),
+        )
+    })?;
+    if values.is_empty() {
+        return Err(EngineGrantError::InvalidGrant(
+            "input_ids cannot be an empty array".to_string(),
+        ));
+    }
+    if values.iter().all(is_token_id) {
+        return Ok((DecoderRequestShape::Scalar, 1));
+    }
+    if values.iter().all(|entry| {
+        entry
+            .as_array()
+            .is_some_and(|tokens| !tokens.is_empty() && tokens.iter().all(is_token_id))
+    }) {
+        return Ok((DecoderRequestShape::Batch, values.len()));
+    }
+    Err(EngineGrantError::InvalidGrant(
+        "input_ids has a mixed or unsupported batch representation".to_string(),
+    ))
+}
+
+fn derive_text_or_token_shape(
+    value: &Value,
+    name: &str,
+) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    if value.is_string() {
+        return Ok((DecoderRequestShape::Scalar, 1));
+    }
+    let values = value.as_array().ok_or_else(|| {
         EngineGrantError::InvalidGrant(format!(
-            "reservation request body is not valid JSON: {error}"
+            "{name} must be a string, token array, or homogeneous batch"
         ))
     })?;
-    let request_object = request_body.as_object().ok_or_else(|| {
-        EngineGrantError::InvalidGrant("reservation request body must be a JSON object".to_string())
-    })?;
-    let rid = request_object.get("rid").ok_or_else(|| {
-        EngineGrantError::InvalidGrant(
-            "enriched reservation request body must contain rid".to_string(),
-        )
-    })?;
-
-    if child_request_ids.len() == 1 {
-        let expected = child_request_ids[0].to_string();
-        if rid.as_str() != Some(expected.as_str()) {
-            return Err(EngineGrantError::InvalidGrant(
-                "scalar request rid must be the canonical gateway child UUID".to_string(),
-            ));
-        }
-        return Ok(());
-    }
-
-    let rid_values = rid.as_array().ok_or_else(|| {
-        EngineGrantError::InvalidGrant(
-            "batched request rid must be an ordered UUID array".to_string(),
-        )
-    })?;
-    if rid_values.len() != child_request_ids.len() {
+    if values.is_empty() {
         return Err(EngineGrantError::InvalidGrant(format!(
-            "batched request rid length {} differs from child count {}",
-            rid_values.len(),
-            child_request_ids.len()
+            "{name} cannot be an empty array"
         )));
     }
-    for (index, (rid_value, child_request_id)) in
-        rid_values.iter().zip(child_request_ids).enumerate()
+    if values.iter().all(is_token_id) {
+        return Ok((DecoderRequestShape::Scalar, 1));
+    }
+    if values.iter().all(Value::is_string)
+        || values.iter().all(|entry| {
+            entry
+                .as_array()
+                .is_some_and(|tokens| !tokens.is_empty() && tokens.iter().all(is_token_id))
+        })
     {
-        let expected = child_request_id.to_string();
-        if rid_value.as_str() != Some(expected.as_str()) {
-            return Err(EngineGrantError::InvalidGrant(format!(
-                "batched request rid {index} is not its canonical gateway child UUID"
-            )));
+        return Ok((DecoderRequestShape::Batch, values.len()));
+    }
+    Err(EngineGrantError::InvalidGrant(format!(
+        "{name} has a mixed or unsupported batch representation"
+    )))
+}
+
+fn is_token_id(value: &Value) -> bool {
+    value.as_i64().is_some_and(|token_id| token_id >= 0)
+}
+
+fn derive_embedding_shape(value: &Value) -> Result<(DecoderRequestShape, usize), EngineGrantError> {
+    let outer = value.as_array().ok_or_else(|| {
+        EngineGrantError::InvalidGrant("input_embeds must be a nonempty array".to_string())
+    })?;
+    if outer.is_empty() {
+        return Err(EngineGrantError::InvalidGrant(
+            "input_embeds cannot be an empty array".to_string(),
+        ));
+    }
+    let scalar = outer.iter().all(|token| {
+        token.as_array().is_some_and(|embedding| {
+            !embedding.is_empty() && embedding.iter().all(Value::is_number)
+        })
+    });
+    if scalar {
+        return Ok((DecoderRequestShape::Scalar, 1));
+    }
+    let batch = outer.iter().all(|sample| {
+        sample.as_array().is_some_and(|tokens| {
+            !tokens.is_empty()
+                && tokens.iter().all(|token| {
+                    token.as_array().is_some_and(|embedding| {
+                        !embedding.is_empty() && embedding.iter().all(Value::is_number)
+                    })
+                })
+        })
+    });
+    if batch {
+        return Ok((DecoderRequestShape::Batch, outer.len()));
+    }
+    Err(EngineGrantError::InvalidGrant(
+        "input_embeds has a mixed or unsupported batch representation".to_string(),
+    ))
+}
+
+fn validate_no_parallel_sampling(
+    request: &Map<String, Value>,
+    inference_route: DecoderInferenceRoute,
+    request_shape: DecoderRequestShape,
+    input_count: usize,
+) -> Result<(), EngineGrantError> {
+    validate_sampling_count(request.get("n"))?;
+    if inference_route == DecoderInferenceRoute::Completions {
+        validate_sampling_count(request.get("best_of"))?;
+    }
+    if inference_route != DecoderInferenceRoute::Generate {
+        return Ok(());
+    }
+    match request.get("sampling_params") {
+        Some(Value::Object(parameters)) => validate_sampling_count(parameters.get("n"))?,
+        Some(Value::Array(parameter_sets)) => {
+            if request_shape != DecoderRequestShape::Batch {
+                return Err(EngineGrantError::InvalidGrant(
+                    "scalar generate requests cannot use per-input sampling_params".to_string(),
+                ));
+            }
+            if parameter_sets.len() != input_count {
+                return Err(EngineGrantError::InvalidGrant(format!(
+                    "generate sampling_params count {} differs from input count {input_count}",
+                    parameter_sets.len()
+                )));
+            }
+            for parameters in parameter_sets {
+                let parameters = parameters.as_object().ok_or_else(|| {
+                    EngineGrantError::InvalidGrant(
+                        "generate sampling_params batches must contain only objects".to_string(),
+                    )
+                })?;
+                validate_sampling_count(parameters.get("n"))?;
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => {
+            return Err(EngineGrantError::InvalidGrant(
+                "generate sampling_params must be an object or a per-input object batch"
+                    .to_string(),
+            ));
         }
     }
     Ok(())
+}
+
+fn validate_sampling_count(value: Option<&Value>) -> Result<(), EngineGrantError> {
+    if value.is_none() || value == Some(&Value::Null) || value.and_then(Value::as_u64) == Some(1) {
+        return Ok(());
+    }
+    Err(EngineGrantError::InvalidGrant(
+        "prepared decoder grants currently require parallel sampling n=1".to_string(),
+    ))
+}
+
+pub(super) fn build_bound_request(
+    binding: &UnboundGrantBinding,
+) -> Result<Bytes, EngineGrantError> {
+    let mut request_body: Value =
+        serde_json::from_slice(&binding.base_request_body()).map_err(|error| {
+            EngineGrantError::ProtocolViolation(format!(
+                "prepared request body is not valid JSON: {error}"
+            ))
+        })?;
+    let request_object = request_body.as_object_mut().ok_or_else(|| {
+        EngineGrantError::ProtocolViolation(
+            "prepared request body is not a JSON object".to_string(),
+        )
+    })?;
+    for key in [BOOTSTRAP_HOST_KEY, BOOTSTRAP_PORT_KEY, BOOTSTRAP_ROOM_KEY] {
+        if request_object.contains_key(key) {
+            return Err(EngineGrantError::ProtocolViolation(format!(
+                "prepared request body already contains gateway-owned field {key}"
+            )));
+        }
+    }
+    let child_count = binding.children().len();
+    let host = shaped_value(
+        binding.request_shape(),
+        child_count,
+        Value::String(binding.prefill_bootstrap_endpoint().host().to_string()),
+    );
+    let port = shaped_value(
+        binding.request_shape(),
+        child_count,
+        Value::from(binding.prefill_bootstrap_endpoint().port()),
+    );
+    let rooms = match binding.request_shape() {
+        DecoderRequestShape::Scalar => Value::from(binding.bootstrap_rooms()[0]),
+        DecoderRequestShape::Batch => Value::Array(
+            binding
+                .bootstrap_rooms()
+                .iter()
+                .copied()
+                .map(Value::from)
+                .collect(),
+        ),
+    };
+    for (key, value) in [
+        (BOOTSTRAP_HOST_KEY, host),
+        (BOOTSTRAP_PORT_KEY, port),
+        (BOOTSTRAP_ROOM_KEY, rooms),
+    ] {
+        request_object.insert(key.to_string(), value);
+    }
+    serde_json::to_vec(&request_body)
+        .map(Bytes::from)
+        .map_err(|error| {
+            EngineGrantError::ProtocolViolation(format!(
+                "failed to serialize bound request body: {error}"
+            ))
+        })
+}
+
+fn shaped_value(shape: DecoderRequestShape, child_count: usize, value: Value) -> Value {
+    match shape {
+        DecoderRequestShape::Scalar => value,
+        DecoderRequestShape::Batch => {
+            Value::Array((0..child_count).map(|_| value.clone()).collect())
+        }
+    }
 }
 
 /// Concrete HTTP client for decoder reservation lifecycle authority.
@@ -216,11 +654,22 @@ impl DecoderGrantControlClient {
         Self { client }
     }
 
-    /// Reserve one batch atomically on the exact candidate decoder generation.
-    pub async fn reserve(
+    /// Pin one exact reserve attempt before any allocator I/O.
+    pub fn begin_reserve(
+        &self,
+        reservation: DecoderGrantReservation,
+    ) -> ReserveReconciliationGrant {
+        ReserveReconciliationGrant {
+            client: self.clone(),
+            reservation: Some(reservation),
+            polled: false,
+        }
+    }
+
+    async fn reserve_once(
         &self,
         reservation: &DecoderGrantReservation,
-    ) -> Result<EngineDecoderGrant, EngineGrantError> {
+    ) -> Result<UnboundPreparedGrant, EngineGrantError> {
         let endpoint = format!("{}{CONTROL_PATH}/reserve", reservation.decoder_id.url());
         let request = ReserveRequest {
             schema_version: SCHEMA_VERSION,
@@ -230,10 +679,13 @@ impl DecoderGrantControlClient {
             ),
             decoder_process: WireProcessIdentity::from_decoder(&reservation.decoder_id),
             logical_request_chain_id: reservation.logical_request_chain_id,
+            reservation_attempt_id: reservation.reservation_attempt_id,
+            reserve_attempt_digest: reservation.reserve_attempt_digest.to_hex(),
             source_tp_size: reservation.source_tp_size,
             prepared_ttl_ms: reservation.prepared_ttl_ms,
             inference_route: reservation.inference_route.as_str(),
-            request_body_json: reservation.request_body_json(),
+            request_shape: reservation.request_shape.as_str(),
+            base_request_body_json: reservation.base_request_body_json(),
             child_request_ids: reservation.child_request_ids(),
         };
         let response = self
@@ -242,27 +694,32 @@ impl DecoderGrantControlClient {
             .json(&request)
             .send()
             .await
-            .map_err(|error| EngineGrantError::ControlRequestFailed {
-                operation: "reserve",
-                message: error.to_string(),
-            })?;
+            .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
         if response.status() == StatusCode::CONFLICT
             || response.status() == StatusCode::TOO_MANY_REQUESTS
         {
-            return Err(EngineGrantError::AllocatorRefused(
-                response_error_message(response).await,
-            ));
+            let receipt: WireReserveRefusalReceipt = response.json().await.map_err(|error| {
+                EngineGrantError::AmbiguousReserve(format!(
+                    "allocator refusal lacked an authoritative receipt: {error}"
+                ))
+            })?;
+            validate_reserve_refusal_receipt(&receipt, reservation)
+                .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
+            let message = match receipt.diagnostic {
+                Some(diagnostic) => format!("{}: {diagnostic}", receipt.reason_code),
+                None => receipt.reason_code,
+            };
+            return Err(EngineGrantError::AllocatorRefused(message));
         }
         if !response.status().is_success() {
-            return Err(EngineGrantError::ControlRequestFailed {
-                operation: "reserve",
-                message: response_error_message(response).await,
-            });
+            return Err(EngineGrantError::AmbiguousReserve(
+                response_error_message(response).await,
+            ));
         }
         let response: ReserveResponse = response
             .json()
             .await
-            .map_err(|error| EngineGrantError::ProtocolViolation(error.to_string()))?;
+            .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
         self.validate_reserve_response(reservation, response)
     }
 
@@ -270,7 +727,7 @@ impl DecoderGrantControlClient {
         &self,
         reservation: &DecoderGrantReservation,
         response: ReserveResponse,
-    ) -> Result<EngineDecoderGrant, EngineGrantError> {
+    ) -> Result<UnboundPreparedGrant, EngineGrantError> {
         validate_schema(response.schema_version)?;
         if response.state != WireGrantState::Prepared {
             return Err(EngineGrantError::ProtocolViolation(format!(
@@ -297,6 +754,28 @@ impl DecoderGrantControlClient {
         if response.logical_request_chain_id != reservation.logical_request_chain_id {
             return Err(EngineGrantError::ProtocolViolation(
                 "reserve response changed the logical request chain".to_string(),
+            ));
+        }
+        if response.reservation_attempt_id != reservation.reservation_attempt_id {
+            return Err(EngineGrantError::ProtocolViolation(
+                "reserve response changed the reservation attempt identity".to_string(),
+            ));
+        }
+        if DecoderReserveAttemptDigest::from_hex(&response.reserve_attempt_digest)?
+            != reservation.reserve_attempt_digest
+        {
+            return Err(EngineGrantError::ProtocolViolation(
+                "reserve response changed the exact reserve-attempt digest".to_string(),
+            ));
+        }
+        if response.source_tp_size != reservation.source_tp_size
+            || response.prepared_ttl_ms != reservation.prepared_ttl_ms
+            || response.inference_route != reservation.inference_route.as_str()
+            || response.request_shape != reservation.request_shape.as_str()
+        {
+            return Err(EngineGrantError::ProtocolViolation(
+                "reserve response changed route, shape, lease TTL, or source tensor parallelism"
+                    .to_string(),
             ));
         }
         if response.grant_id.is_nil() {
@@ -356,10 +835,15 @@ impl DecoderGrantControlClient {
                 DecoderGrantChildAccounting::new(reserved_kv_tokens, remaining_decode_tokens),
             )?);
         }
-        let binding = DecoderGrantBinding::new(
+        let binding = UnboundGrantBinding::new(
             response.grant_id,
+            reservation.reservation_attempt_id,
+            reservation.reserve_attempt_digest,
             reservation.inference_route,
-            reservation.request_body_json(),
+            reservation.request_shape,
+            reservation.prepared_ttl_ms,
+            response.prepared_expires_at_unix_ms,
+            reservation.base_request_body(),
             reservation.prefill_id.clone(),
             reservation.prefill_bootstrap_endpoint.clone(),
             reservation.logical_request_chain_id,
@@ -367,10 +851,10 @@ impl DecoderGrantControlClient {
             reservation.decoder_id.clone(),
             children,
         )?;
-        let engine_digest = DecoderGrantDigest::from_hex(&response.grant_digest)?;
+        let engine_digest = DecoderReservationDigest::from_hex(&response.reservation_digest)?;
         if engine_digest != binding.digest() {
             return Err(EngineGrantError::ProtocolViolation(format!(
-                "engine grant digest {} differs from gateway digest {}",
+                "engine reservation digest {} differs from gateway digest {}",
                 engine_digest.to_hex(),
                 binding.digest().to_hex()
             )));
@@ -384,7 +868,141 @@ impl DecoderGrantControlClient {
             )),
             token,
         };
-        Ok(EngineDecoderGrant::from_control(binding, control))
+        Ok(UnboundPreparedGrant::from_control(binding, control))
+    }
+}
+
+fn validate_reserve_refusal_receipt(
+    receipt: &WireReserveRefusalReceipt,
+    reservation: &DecoderGrantReservation,
+) -> Result<(), EngineGrantError> {
+    validate_schema(receipt.schema_version)?;
+    if receipt.operation != WireOperation::Reserve || receipt.state != WireGrantState::Refused {
+        return Err(EngineGrantError::ProtocolViolation(format!(
+            "allocator refusal returned operation/state {:?}/{:?}, expected reserve/refused",
+            receipt.operation, receipt.state
+        )));
+    }
+    validate_process(
+        "prefill",
+        &receipt.prefill_process,
+        reservation.prefill_id.url(),
+        reservation.prefill_id.instance_id(),
+    )?;
+    validate_bootstrap_endpoint(
+        &receipt.prefill_bootstrap_endpoint,
+        &reservation.prefill_bootstrap_endpoint,
+    )?;
+    validate_process(
+        "decoder",
+        &receipt.decoder_process,
+        reservation.decoder_id.url(),
+        reservation.decoder_id.instance_id(),
+    )?;
+    if receipt.logical_request_chain_id != reservation.logical_request_chain_id
+        || receipt.reservation_attempt_id != reservation.reservation_attempt_id
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "allocator refusal changed request-chain or reserve-attempt identity".to_string(),
+        ));
+    }
+    if receipt.source_tp_size != reservation.source_tp_size
+        || receipt.prepared_ttl_ms != reservation.prepared_ttl_ms
+        || receipt.inference_route != reservation.inference_route.as_str()
+        || receipt.request_shape != reservation.request_shape.as_str()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "allocator refusal changed route, shape, lease TTL, or source tensor parallelism"
+                .to_string(),
+        ));
+    }
+    if DecoderReserveAttemptDigest::from_hex(&receipt.reserve_attempt_digest)?
+        != reservation.reserve_attempt_digest
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "allocator refusal changed the exact reserve-attempt digest".to_string(),
+        ));
+    }
+    validate_failure_context(&receipt.reason_code, receipt.diagnostic.as_deref())?;
+    if receipt.receipt_id.is_nil() {
+        return Err(EngineGrantError::ProtocolViolation(
+            "allocator refusal receipt contains a nil identity".to_string(),
+        ));
+    }
+    AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?;
+    if !receipt.take_once {
+        return Err(EngineGrantError::ProtocolViolation(
+            "allocator refusal does not attest a take-once attempt tombstone".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact reserve attempt retained across every allocation-ambiguous outcome.
+pub struct ReserveReconciliationGrant {
+    client: DecoderGrantControlClient,
+    reservation: Option<DecoderGrantReservation>,
+    polled: bool,
+}
+
+impl fmt::Debug for ReserveReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReserveReconciliationGrant")
+            .field("reservation", &self.reservation)
+            .field("polled", &self.polled)
+            .finish()
+    }
+}
+
+impl ReserveReconciliationGrant {
+    /// Gateway-issued idempotency identity reused by every reserve retry.
+    pub fn reservation_attempt_id(&self) -> Result<Uuid, EngineGrantError> {
+        Ok(self.reservation()?.reservation_attempt_id())
+    }
+
+    /// Reconcile the same exact reserve attempt without pivoting on ambiguity.
+    pub async fn reconcile_reserve(&mut self) -> Result<UnboundPreparedGrant, EngineGrantError> {
+        self.polled = true;
+        let client = self.client.clone();
+        let result = client.reserve_once(self.reservation()?).await;
+        match result {
+            Ok(grant) => {
+                self.reservation = None;
+                Ok(grant)
+            }
+            Err(error @ EngineGrantError::AllocatorRefused(_)) => {
+                self.reservation = None;
+                Err(error)
+            }
+            Err(error @ EngineGrantError::AmbiguousReserve(_)) => Err(error),
+            Err(error) => Err(EngineGrantError::AmbiguousReserve(error.to_string())),
+        }
+    }
+
+    fn reservation(&self) -> Result<&DecoderGrantReservation, EngineGrantError> {
+        self.reservation.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "reserve reconciliation has no exact attempt capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for ReserveReconciliationGrant {
+    fn drop(&mut self) {
+        if !self.polled || self.reservation.is_none() {
+            return;
+        }
+        let reservation = self
+            .reservation
+            .as_ref()
+            .expect("checked reserve reconciliation ownership");
+        tracing::warn!(
+            reservation_attempt_id = %reservation.reservation_attempt_id(),
+            decoder_id = %reservation.decoder_id(),
+            "Reserve reconciliation capability was dropped after an allocation-ambiguous outcome"
+        );
     }
 }
 
@@ -441,6 +1059,91 @@ pub(super) struct PreparedGrantControl {
 }
 
 impl PreparedGrantControl {
+    pub(super) async fn bind(&self, binding: &DecoderGrantBinding) -> Result<(), EngineGrantError> {
+        let response = self
+            .client
+            .post(format!("{}/bind", self.grant_url))
+            .bearer_auth(self.token.expose())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(binding.request_body())
+            .send()
+            .await
+            .map_err(|error| EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                message: error.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                message: response_error_message(response).await,
+            });
+        }
+        let receipt: WireControlReceipt =
+            response
+                .json()
+                .await
+                .map_err(|error| EngineGrantError::AmbiguousControl {
+                    operation: "bind",
+                    message: format!("engine returned an invalid receipt: {error}"),
+                })?;
+        validate_control_receipt(
+            &receipt,
+            WireOperation::Bind,
+            WireGrantState::Prepared,
+            binding,
+        )
+    }
+
+    pub(super) async fn cancel_unbound(
+        &self,
+        binding: &UnboundGrantBinding,
+        attempted_binding: Option<&DecoderGrantBinding>,
+    ) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
+        let request = UnboundCancellationRequest::new(binding, attempted_binding);
+        let response = self
+            .client
+            .post(format!("{}/cancel", self.grant_url))
+            .bearer_auth(self.token.expose())
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| EngineGrantError::AmbiguousControl {
+                operation: "cancel",
+                message: error.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(EngineGrantError::AmbiguousControl {
+                operation: "cancel",
+                message: response_error_message(response).await,
+            });
+        }
+        let receipt: WireUnboundCancellationReceipt =
+            response
+                .json()
+                .await
+                .map_err(|error| EngineGrantError::AmbiguousControl {
+                    operation: "cancel",
+                    message: format!("engine returned an invalid receipt: {error}"),
+                })?;
+        validate_unbound_cancellation_receipt(&receipt, binding, attempted_binding)?;
+        Ok(PreparedGrantCancellationReceipt::from_control(
+            binding.grant_id(),
+            binding.reservation_attempt_id(),
+            binding.reserve_attempt_digest(),
+            binding.decoder_id().clone(),
+            binding.child_request_ids().collect(),
+            binding.slot_generations().to_vec(),
+            binding.bootstrap_rooms().to_vec(),
+            binding.prepared_ttl_ms(),
+            binding.prepared_expires_at_unix_ms(),
+            binding.digest(),
+            attempted_binding.map(DecoderGrantBinding::digest),
+            receipt.receipt_id,
+            AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?,
+            receipt.take_once,
+        ))
+    }
+
     pub(super) async fn promote(
         &self,
         binding: &DecoderGrantBinding,
@@ -735,10 +1438,19 @@ fn validate_control_receipt(
 ) -> Result<(), EngineGrantError> {
     validate_schema(receipt.schema_version)?;
     if receipt.grant_id != binding.grant_id()
+        || receipt.reservation_attempt_id != binding.reservation_attempt_id()
         || receipt.logical_request_chain_id != binding.request_chain_id()
     {
         return Err(EngineGrantError::ProtocolViolation(
-            "control receipt changed grant or request-chain identity".to_string(),
+            "control receipt changed grant, reservation-attempt, or request-chain identity"
+                .to_string(),
+        ));
+    }
+    if DecoderReserveAttemptDigest::from_hex(&receipt.reserve_attempt_digest)?
+        != binding.reserve_attempt_digest()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "control receipt changed the exact reserve-attempt digest".to_string(),
         ));
     }
     validate_process(
@@ -758,10 +1470,13 @@ fn validate_control_receipt(
         binding.decoder_id().instance_id(),
     )?;
     if receipt.inference_route != binding.inference_route().as_str()
+        || receipt.request_shape != binding.request_shape().as_str()
         || receipt.source_tp_size != binding.source_tp_size()
+        || receipt.prepared_ttl_ms != binding.prepared_ttl_ms()
+        || receipt.prepared_expires_at_unix_ms != binding.prepared_expires_at_unix_ms()
     {
         return Err(EngineGrantError::ProtocolViolation(
-            "control receipt changed inference route or source tensor parallelism".to_string(),
+            "control receipt changed route, shape, lease, or source tensor parallelism".to_string(),
         ));
     }
     let child_request_ids: Vec<Uuid> = binding.child_request_ids().collect();
@@ -776,6 +1491,13 @@ fn validate_control_receipt(
     {
         return Err(EngineGrantError::ProtocolViolation(
             "control receipt changed ordered child, slot-generation, or room bindings".to_string(),
+        ));
+    }
+    if DecoderReservationDigest::from_hex(&receipt.reservation_digest)?
+        != binding.reservation_digest()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "control receipt changed the exact reservation digest".to_string(),
         ));
     }
     if DecoderGrantDigest::from_hex(&receipt.grant_digest)? != binding.digest() {
@@ -798,6 +1520,101 @@ fn validate_control_receipt(
     if !receipt.take_once {
         return Err(EngineGrantError::ProtocolViolation(
             "control receipt does not attest take-once reconciliation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unbound_cancellation_receipt(
+    receipt: &WireUnboundCancellationReceipt,
+    binding: &UnboundGrantBinding,
+    attempted_binding: Option<&DecoderGrantBinding>,
+) -> Result<(), EngineGrantError> {
+    validate_schema(receipt.schema_version)?;
+    if receipt.grant_id != binding.grant_id()
+        || receipt.reservation_attempt_id != binding.reservation_attempt_id()
+        || receipt.logical_request_chain_id != binding.request_chain_id()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed grant, reservation-attempt, or request-chain identity"
+                .to_string(),
+        ));
+    }
+    if DecoderReserveAttemptDigest::from_hex(&receipt.reserve_attempt_digest)?
+        != binding.reserve_attempt_digest()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed the exact reserve-attempt digest".to_string(),
+        ));
+    }
+    validate_process(
+        "prefill",
+        &receipt.prefill_process,
+        binding.prefill_id().url(),
+        binding.prefill_id().instance_id(),
+    )?;
+    validate_bootstrap_endpoint(
+        &receipt.prefill_bootstrap_endpoint,
+        binding.prefill_bootstrap_endpoint(),
+    )?;
+    validate_process(
+        "decoder",
+        &receipt.decoder_process,
+        binding.decoder_id().url(),
+        binding.decoder_id().instance_id(),
+    )?;
+    if receipt.inference_route != binding.inference_route().as_str()
+        || receipt.request_shape != binding.request_shape().as_str()
+        || receipt.source_tp_size != binding.source_tp_size()
+        || receipt.prepared_ttl_ms != binding.prepared_ttl_ms()
+        || receipt.prepared_expires_at_unix_ms != binding.prepared_expires_at_unix_ms()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed route, shape, lease, or source tensor parallelism"
+                .to_string(),
+        ));
+    }
+    let child_request_ids: Vec<Uuid> = binding.child_request_ids().collect();
+    let slot_generations: Vec<Uuid> = binding
+        .slot_generations()
+        .iter()
+        .map(|generation| generation.as_uuid())
+        .collect();
+    if receipt.child_request_ids != child_request_ids
+        || receipt.decoder_slot_generations != slot_generations
+        || receipt.bootstrap_rooms != binding.bootstrap_rooms()
+    {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed ordered child, slot-generation, or room bindings"
+                .to_string(),
+        ));
+    }
+    if DecoderReservationDigest::from_hex(&receipt.reservation_digest)? != binding.digest() {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed the exact reservation digest".to_string(),
+        ));
+    }
+    let expected_digest = attempted_binding.map(|value| value.digest().to_hex());
+    if receipt.attempted_grant_digest != expected_digest {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt changed the attempted grant digest".to_string(),
+        ));
+    }
+    if receipt.operation != WireOperation::Cancel || receipt.state != WireGrantState::Cancelled {
+        return Err(EngineGrantError::ProtocolViolation(format!(
+            "unbound cancellation receipt returned operation/state {:?}/{:?}, expected cancel/cancelled",
+            receipt.operation, receipt.state
+        )));
+    }
+    if receipt.receipt_id.is_nil() {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt contains a nil identity".to_string(),
+        ));
+    }
+    AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?;
+    if !receipt.take_once {
+        return Err(EngineGrantError::ProtocolViolation(
+            "unbound cancellation receipt does not attest take-once reconciliation".to_string(),
         ));
     }
     Ok(())
@@ -832,6 +1649,8 @@ fn quarantine_receipt(
         binding.decoder_id().clone(),
         binding.child_request_ids().collect(),
         binding.prefill_bootstrap_endpoint().clone(),
+        binding.slot_generations().to_vec(),
+        binding.bootstrap_rooms().to_vec(),
         binding.digest(),
         receipt.receipt_id,
         AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?,
@@ -925,17 +1744,20 @@ impl From<&PrefillBootstrapEndpoint> for WireBootstrapEndpoint {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct ReserveRequest<'a> {
     schema_version: u32,
     prefill_process: WireProcessIdentity,
     prefill_bootstrap_endpoint: WireBootstrapEndpoint,
     decoder_process: WireProcessIdentity,
     logical_request_chain_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
     source_tp_size: usize,
     prepared_ttl_ms: u64,
     inference_route: &'a str,
-    request_body_json: &'a str,
+    request_shape: &'a str,
+    base_request_body_json: &'a str,
     child_request_ids: &'a [Uuid],
 }
 
@@ -950,9 +1772,38 @@ struct ReserveResponse {
     prefill_bootstrap_endpoint: WireBootstrapEndpoint,
     decoder_process: WireProcessIdentity,
     logical_request_chain_id: Uuid,
-    grant_digest: String,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
+    source_tp_size: usize,
+    prepared_ttl_ms: u64,
+    inference_route: String,
+    request_shape: String,
+    reservation_digest: String,
     allocations: Vec<WireAllocation>,
     prepared_expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReserveRefusalReceipt {
+    schema_version: u32,
+    operation: WireOperation,
+    state: WireGrantState,
+    prefill_process: WireProcessIdentity,
+    prefill_bootstrap_endpoint: WireBootstrapEndpoint,
+    decoder_process: WireProcessIdentity,
+    logical_request_chain_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
+    source_tp_size: usize,
+    prepared_ttl_ms: u64,
+    inference_route: String,
+    request_shape: String,
+    reason_code: String,
+    diagnostic: Option<String>,
+    receipt_id: Uuid,
+    receipt_digest: String,
+    take_once: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -973,15 +1824,21 @@ struct WireAllocation {
 struct BindingControlRequest<'a> {
     schema_version: u32,
     grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
     prefill_process: WireProcessIdentity,
     prefill_bootstrap_endpoint: WireBootstrapEndpoint,
     decoder_process: WireProcessIdentity,
     logical_request_chain_id: Uuid,
     source_tp_size: usize,
     inference_route: &'a str,
+    request_shape: &'a str,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
     child_request_ids: Vec<Uuid>,
     decoder_slot_generations: Vec<Uuid>,
     bootstrap_rooms: &'a [u64],
+    reservation_digest: String,
     grant_digest: String,
 }
 
@@ -990,6 +1847,8 @@ impl<'a> BindingControlRequest<'a> {
         Self {
             schema_version: SCHEMA_VERSION,
             grant_id: binding.grant_id(),
+            reservation_attempt_id: binding.reservation_attempt_id(),
+            reserve_attempt_digest: binding.reserve_attempt_digest().to_hex(),
             prefill_process: WireProcessIdentity::from_prefill(binding.prefill_id()),
             prefill_bootstrap_endpoint: WireBootstrapEndpoint::from(
                 binding.prefill_bootstrap_endpoint(),
@@ -998,6 +1857,9 @@ impl<'a> BindingControlRequest<'a> {
             logical_request_chain_id: binding.request_chain_id(),
             source_tp_size: binding.source_tp_size(),
             inference_route: binding.inference_route().as_str(),
+            request_shape: binding.request_shape().as_str(),
+            prepared_ttl_ms: binding.prepared_ttl_ms(),
+            prepared_expires_at_unix_ms: binding.prepared_expires_at_unix_ms(),
             child_request_ids: binding.child_request_ids().collect(),
             decoder_slot_generations: binding
                 .slot_generations()
@@ -1005,7 +1867,64 @@ impl<'a> BindingControlRequest<'a> {
                 .map(|generation| generation.as_uuid())
                 .collect(),
             bootstrap_rooms: binding.bootstrap_rooms(),
+            reservation_digest: binding.reservation_digest().to_hex(),
             grant_digest: binding.digest().to_hex(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UnboundCancellationRequest<'a> {
+    schema_version: u32,
+    grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
+    prefill_process: WireProcessIdentity,
+    prefill_bootstrap_endpoint: WireBootstrapEndpoint,
+    decoder_process: WireProcessIdentity,
+    logical_request_chain_id: Uuid,
+    source_tp_size: usize,
+    inference_route: &'a str,
+    request_shape: &'a str,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+    child_request_ids: Vec<Uuid>,
+    decoder_slot_generations: Vec<Uuid>,
+    bootstrap_rooms: &'a [u64],
+    reservation_digest: String,
+    attempted_grant_digest: Option<String>,
+}
+
+impl<'a> UnboundCancellationRequest<'a> {
+    fn new(
+        binding: &'a UnboundGrantBinding,
+        attempted_binding: Option<&'a DecoderGrantBinding>,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            grant_id: binding.grant_id(),
+            reservation_attempt_id: binding.reservation_attempt_id(),
+            reserve_attempt_digest: binding.reserve_attempt_digest().to_hex(),
+            prefill_process: WireProcessIdentity::from_prefill(binding.prefill_id()),
+            prefill_bootstrap_endpoint: WireBootstrapEndpoint::from(
+                binding.prefill_bootstrap_endpoint(),
+            ),
+            decoder_process: WireProcessIdentity::from_decoder(binding.decoder_id()),
+            logical_request_chain_id: binding.request_chain_id(),
+            source_tp_size: binding.source_tp_size(),
+            inference_route: binding.inference_route().as_str(),
+            request_shape: binding.request_shape().as_str(),
+            prepared_ttl_ms: binding.prepared_ttl_ms(),
+            prepared_expires_at_unix_ms: binding.prepared_expires_at_unix_ms(),
+            child_request_ids: binding.child_request_ids().collect(),
+            decoder_slot_generations: binding
+                .slot_generations()
+                .iter()
+                .map(|generation| generation.as_uuid())
+                .collect(),
+            bootstrap_rooms: binding.bootstrap_rooms(),
+            reservation_digest: binding.digest().to_hex(),
+            attempted_grant_digest: attempted_binding.map(|value| value.digest().to_hex()),
         }
     }
 }
@@ -1021,6 +1940,8 @@ struct FailureControlRequest<'a> {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireOperation {
+    Reserve,
+    Bind,
     Promote,
     Cancel,
     Complete,
@@ -1031,6 +1952,7 @@ enum WireOperation {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireGrantState {
+    Refused,
     Prepared,
     Promoted,
     Cancelled,
@@ -1044,16 +1966,50 @@ enum WireGrantState {
 struct WireControlReceipt {
     schema_version: u32,
     grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
     prefill_process: WireProcessIdentity,
     prefill_bootstrap_endpoint: WireBootstrapEndpoint,
     decoder_process: WireProcessIdentity,
     logical_request_chain_id: Uuid,
     source_tp_size: usize,
     inference_route: String,
+    request_shape: String,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
     child_request_ids: Vec<Uuid>,
     decoder_slot_generations: Vec<Uuid>,
     bootstrap_rooms: Vec<u64>,
+    reservation_digest: String,
     grant_digest: String,
+    operation: WireOperation,
+    state: WireGrantState,
+    receipt_id: Uuid,
+    receipt_digest: String,
+    take_once: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireUnboundCancellationReceipt {
+    schema_version: u32,
+    grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: String,
+    prefill_process: WireProcessIdentity,
+    prefill_bootstrap_endpoint: WireBootstrapEndpoint,
+    decoder_process: WireProcessIdentity,
+    logical_request_chain_id: Uuid,
+    source_tp_size: usize,
+    inference_route: String,
+    request_shape: String,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+    child_request_ids: Vec<Uuid>,
+    decoder_slot_generations: Vec<Uuid>,
+    bootstrap_rooms: Vec<u64>,
+    reservation_digest: String,
+    attempted_grant_digest: Option<String>,
     operation: WireOperation,
     state: WireGrantState,
     receipt_id: Uuid,
@@ -1074,6 +2030,7 @@ fn hex_digest(digest: AuthorityDigest) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Ref, RefCell},
         collections::{HashMap, VecDeque},
         sync::{Arc, Mutex},
     };
@@ -1083,7 +2040,10 @@ mod tests {
     use serde_json::json;
     use tokio::{net::TcpListener, task::JoinHandle};
 
+    use super::super::BoundPreparedGrant;
     use super::*;
+
+    const PROMPT_SECRET: &str = "prompt-secret-never-log-7d33f2";
 
     #[derive(Clone)]
     struct PlannedResponse {
@@ -1095,6 +2055,7 @@ mod tests {
     struct CapturedRequest {
         path: String,
         authorization: Option<String>,
+        body_bytes: Bytes,
         body: Value,
     }
 
@@ -1118,7 +2079,8 @@ mod tests {
         state.requests.lock().unwrap().push(CapturedRequest {
             path: path.clone(),
             authorization,
-            body,
+            body_bytes: body_bytes.clone(),
+            body: body.clone(),
         });
         let planned = state
             .responses
@@ -1156,13 +2118,44 @@ mod tests {
     }
 
     struct Fixture {
-        reservation: DecoderGrantReservation,
+        reservation: RefCell<Option<DecoderGrantReservation>>,
         binding: DecoderGrantBinding,
+        final_request_body: Bytes,
         reserve_response: Value,
         token: String,
     }
 
+    impl Fixture {
+        fn reservation(&self) -> Ref<'_, DecoderGrantReservation> {
+            Ref::map(self.reservation.borrow(), |reservation| {
+                reservation
+                    .as_ref()
+                    .expect("fixture reservation was already consumed")
+            })
+        }
+
+        fn take_reservation(&self) -> DecoderGrantReservation {
+            self.reservation
+                .borrow_mut()
+                .take()
+                .expect("fixture reservation was already consumed")
+        }
+    }
+
     fn fixture(decoder_url: &str, child_count: usize) -> Fixture {
+        let request_shape = if child_count == 1 {
+            DecoderRequestShape::Scalar
+        } else {
+            DecoderRequestShape::Batch
+        };
+        fixture_with_shape(decoder_url, child_count, request_shape)
+    }
+
+    fn fixture_with_shape(
+        decoder_url: &str,
+        child_count: usize,
+        request_shape: DecoderRequestShape,
+    ) -> Fixture {
         let prefill_id = PrefillId::new(
             "http://prefill.test:30000",
             uuid("10000000-0000-4000-8000-000000000001"),
@@ -1173,33 +2166,36 @@ mod tests {
         let bootstrap = PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 42000).unwrap();
         let chain_id = uuid("30000000-0000-4000-8000-000000000003");
         let grant_id = uuid("40000000-0000-4000-8000-000000000004");
-        let child_request_ids: Vec<Uuid> = (0..child_count)
-            .map(|index| Uuid::from_u128(0x50000000000040008000000000000000 + index as u128 + 5))
-            .collect();
-        let rid = if child_count == 1 {
-            Value::String(child_request_ids[0].to_string())
-        } else {
-            Value::Array(
-                child_request_ids
-                    .iter()
-                    .map(|value| Value::String(value.to_string()))
+        let prepared_ttl_ms = 2_000u64;
+        let prepared_expires_at_unix_ms = 1_900_000_000_000u64;
+        let text = match request_shape {
+            DecoderRequestShape::Scalar => Value::String(PROMPT_SECRET.to_string()),
+            DecoderRequestShape::Batch => Value::Array(
+                (0..child_count)
+                    .map(|_| Value::String(PROMPT_SECRET.to_string()))
                     .collect(),
-            )
+            ),
         };
-        let request_body_json =
-            serde_json::to_string(&json!({"prompt": "hello", "rid": rid})).unwrap();
-        let reservation = DecoderGrantReservation::new(
-            prefill_id.clone(),
-            bootstrap.clone(),
-            decoder_id.clone(),
-            chain_id,
-            2,
-            Duration::from_secs(2),
+        let template = DecoderRequestTemplate::new(
             DecoderInferenceRoute::Generate,
-            request_body_json.clone(),
-            child_request_ids.clone(),
+            Bytes::from(serde_json::to_vec(&json!({"text": text})).unwrap()),
         )
         .unwrap();
+        assert_eq!(template.request_shape(), request_shape);
+        assert_eq!(template.child_count(), child_count);
+        let reservation = template
+            .prepare_reservation(
+                prefill_id.clone(),
+                bootstrap.clone(),
+                decoder_id.clone(),
+                chain_id,
+                2,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let reservation_attempt_id = reservation.reservation_attempt_id();
+        let child_request_ids = reservation.child_request_ids().to_vec();
+        let base_request_body = reservation.base_request_body();
 
         let mut allocation_json = Vec::new();
         let mut children = Vec::new();
@@ -1234,10 +2230,15 @@ mod tests {
                 "remaining_decode_tokens": 500 + index,
             }));
         }
-        let binding = DecoderGrantBinding::new(
+        let unbound_binding = UnboundGrantBinding::new(
             grant_id,
+            reservation_attempt_id,
+            reservation.reserve_attempt_digest(),
             DecoderInferenceRoute::Generate,
-            &request_body_json,
+            request_shape,
+            prepared_ttl_ms,
+            prepared_expires_at_unix_ms,
+            base_request_body,
             prefill_id.clone(),
             bootstrap.clone(),
             chain_id,
@@ -1246,6 +2247,8 @@ mod tests {
             children,
         )
         .unwrap();
+        let final_request_body = build_bound_request(&unbound_binding).unwrap();
+        let binding = unbound_binding.bind(final_request_body.clone());
         let token = URL_SAFE_NO_PAD.encode([0xA5; GRANT_TOKEN_BYTES]);
         let reserve_response = json!({
             "schema_version": SCHEMA_VERSION,
@@ -1256,13 +2259,20 @@ mod tests {
             "prefill_bootstrap_endpoint": WireBootstrapEndpoint::from(&bootstrap),
             "decoder_process": WireProcessIdentity::from_decoder(&decoder_id),
             "logical_request_chain_id": chain_id,
-            "grant_digest": binding.digest().to_hex(),
+            "reservation_attempt_id": reservation_attempt_id,
+            "reserve_attempt_digest": binding.reserve_attempt_digest().to_hex(),
+            "source_tp_size": 2,
+            "prepared_ttl_ms": prepared_ttl_ms,
+            "inference_route": DecoderInferenceRoute::Generate.as_str(),
+            "request_shape": request_shape.as_str(),
+            "reservation_digest": binding.reservation_digest().to_hex(),
             "allocations": allocation_json,
-            "prepared_expires_at_unix_ms": 1_900_000_000_000u64,
+            "prepared_expires_at_unix_ms": prepared_expires_at_unix_ms,
         });
         Fixture {
-            reservation,
+            reservation: RefCell::new(Some(reservation)),
             binding,
+            final_request_body,
             reserve_response,
             token,
         }
@@ -1276,6 +2286,8 @@ mod tests {
         json!({
             "schema_version": SCHEMA_VERSION,
             "grant_id": binding.grant_id(),
+            "reservation_attempt_id": binding.reservation_attempt_id(),
+            "reserve_attempt_digest": binding.reserve_attempt_digest().to_hex(),
             "prefill_process": WireProcessIdentity::from_prefill(binding.prefill_id()),
             "prefill_bootstrap_endpoint":
                 WireBootstrapEndpoint::from(binding.prefill_bootstrap_endpoint()),
@@ -1283,6 +2295,9 @@ mod tests {
             "logical_request_chain_id": binding.request_chain_id(),
             "source_tp_size": binding.source_tp_size(),
             "inference_route": binding.inference_route().as_str(),
+            "request_shape": binding.request_shape().as_str(),
+            "prepared_ttl_ms": binding.prepared_ttl_ms(),
+            "prepared_expires_at_unix_ms": binding.prepared_expires_at_unix_ms(),
             "child_request_ids": binding.child_request_ids().collect::<Vec<_>>(),
             "decoder_slot_generations": binding
                 .slot_generations()
@@ -1290,11 +2305,73 @@ mod tests {
                 .map(|generation| generation.as_uuid())
                 .collect::<Vec<_>>(),
             "bootstrap_rooms": binding.bootstrap_rooms(),
+            "reservation_digest": binding.reservation_digest().to_hex(),
             "grant_digest": binding.digest().to_hex(),
             "operation": operation,
             "state": state,
             "receipt_id": uuid("70000000-0000-4000-8000-000000000007"),
             "receipt_digest": hex_digest(AuthorityDigest([0x77; 32])),
+            "take_once": true,
+        })
+    }
+
+    fn unbound_cancellation_receipt(
+        binding: &DecoderGrantBinding,
+        attempted_binding: bool,
+    ) -> Value {
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "grant_id": binding.grant_id(),
+            "reservation_attempt_id": binding.reservation_attempt_id(),
+            "reserve_attempt_digest": binding.reserve_attempt_digest().to_hex(),
+            "prefill_process": WireProcessIdentity::from_prefill(binding.prefill_id()),
+            "prefill_bootstrap_endpoint":
+                WireBootstrapEndpoint::from(binding.prefill_bootstrap_endpoint()),
+            "decoder_process": WireProcessIdentity::from_decoder(binding.decoder_id()),
+            "logical_request_chain_id": binding.request_chain_id(),
+            "source_tp_size": binding.source_tp_size(),
+            "inference_route": binding.inference_route().as_str(),
+            "request_shape": binding.request_shape().as_str(),
+            "prepared_ttl_ms": binding.prepared_ttl_ms(),
+            "prepared_expires_at_unix_ms": binding.prepared_expires_at_unix_ms(),
+            "child_request_ids": binding.child_request_ids().collect::<Vec<_>>(),
+            "decoder_slot_generations": binding
+                .slot_generations()
+                .iter()
+                .map(|generation| generation.as_uuid())
+                .collect::<Vec<_>>(),
+            "bootstrap_rooms": binding.bootstrap_rooms(),
+            "reservation_digest": binding.reservation_digest().to_hex(),
+            "attempted_grant_digest":
+                attempted_binding.then(|| binding.digest().to_hex()),
+            "operation": WireOperation::Cancel,
+            "state": WireGrantState::Cancelled,
+            "receipt_id": uuid("72000000-0000-4000-8000-000000000007"),
+            "receipt_digest": hex_digest(AuthorityDigest([0x72; 32])),
+            "take_once": true,
+        })
+    }
+
+    fn reserve_refusal_receipt(reservation: &DecoderGrantReservation) -> Value {
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "operation": WireOperation::Reserve,
+            "state": WireGrantState::Refused,
+            "prefill_process": WireProcessIdentity::from_prefill(reservation.prefill_id()),
+            "prefill_bootstrap_endpoint":
+                WireBootstrapEndpoint::from(reservation.prefill_bootstrap_endpoint()),
+            "decoder_process": WireProcessIdentity::from_decoder(reservation.decoder_id()),
+            "logical_request_chain_id": reservation.logical_request_chain_id(),
+            "reservation_attempt_id": reservation.reservation_attempt_id(),
+            "reserve_attempt_digest": reservation.reserve_attempt_digest().to_hex(),
+            "source_tp_size": reservation.source_tp_size(),
+            "prepared_ttl_ms": reservation.prepared_ttl_ms(),
+            "inference_route": reservation.inference_route().as_str(),
+            "request_shape": reservation.request_shape().as_str(),
+            "reason_code": "capacity_exhausted",
+            "diagnostic": "decoder admission control refused the exact attempt",
+            "receipt_id": uuid("73000000-0000-4000-8000-000000000007"),
+            "receipt_digest": hex_digest(AuthorityDigest([0x73; 32])),
             "take_once": true,
         })
     }
@@ -1316,40 +2393,258 @@ mod tests {
         plans
     }
 
+    async fn reserve_bound(state: &TestServerState, fixture: &Fixture) -> BoundPreparedGrant {
+        let bind_path = format!("{CONTROL_PATH}/{}/bind", fixture.binding.grant_id());
+        let mut responses = state.responses.lock().unwrap();
+        let bind_responses = responses.entry(bind_path).or_default();
+        if bind_responses.is_empty() {
+            bind_responses.push_back(response(receipt(
+                &fixture.binding,
+                WireOperation::Bind,
+                WireGrantState::Prepared,
+            )));
+        }
+        drop(responses);
+
+        let client = DecoderGrantControlClient::new(Client::new());
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let mut unbound = reserve.reconcile_reserve().await.unwrap();
+        let mut binding = unbound.begin_bind().unwrap();
+        binding.reconcile_bind().await.unwrap()
+    }
+
     #[test]
-    fn reservation_requires_exact_scalar_and_batched_rids() {
+    fn reservation_derives_route_shape_and_requires_exact_rids() {
         let prefill_id = PrefillId::new("http://prefill.test:30000", Uuid::new_v4()).unwrap();
         let decoder_id = DecoderId::new("http://decoder.test:30001", Uuid::new_v4()).unwrap();
         let bootstrap = PrefillBootstrapEndpoint::new("bootstrap.test", 40000).unwrap();
-        let child_0 = Uuid::new_v4();
-        let child_1 = Uuid::new_v4();
-        let make = |body: &str, children: Vec<Uuid>| {
-            DecoderGrantReservation::new(
+        let prepare = |route: DecoderInferenceRoute, body: Value| {
+            DecoderRequestTemplate::new(route, Bytes::from(serde_json::to_vec(&body).unwrap()))?
+                .prepare_reservation(
+                    prefill_id.clone(),
+                    bootstrap.clone(),
+                    decoder_id.clone(),
+                    Uuid::new_v4(),
+                    4,
+                    Duration::from_secs(1),
+                )
+        };
+
+        let chat = prepare(
+            DecoderInferenceRoute::ChatCompletions,
+            json!({"messages": [{"role": "user", "content": PROMPT_SECRET}]}),
+        )
+        .unwrap();
+        assert_eq!(chat.request_shape(), DecoderRequestShape::Scalar);
+        assert_eq!(chat.child_request_ids().len(), 1);
+        let chat_body: Value = serde_json::from_slice(&chat.base_request_body()).unwrap();
+        assert_eq!(
+            chat_body[RID_KEY],
+            Value::String(chat.child_request_ids()[0].to_string())
+        );
+
+        let completion_tokens = prepare(
+            DecoderInferenceRoute::Completions,
+            json!({"prompt": [1, 2, 3]}),
+        )
+        .unwrap();
+        assert_eq!(
+            completion_tokens.request_shape(),
+            DecoderRequestShape::Scalar
+        );
+
+        let completion_batch = prepare(
+            DecoderInferenceRoute::Completions,
+            json!({"prompt": [PROMPT_SECRET]}),
+        )
+        .unwrap();
+        assert_eq!(completion_batch.request_shape(), DecoderRequestShape::Batch);
+        assert_eq!(completion_batch.child_request_ids().len(), 1);
+        let completion_body: Value =
+            serde_json::from_slice(&completion_batch.base_request_body()).unwrap();
+        assert_eq!(
+            completion_body[RID_KEY],
+            json!([completion_batch.child_request_ids()[0].to_string()])
+        );
+
+        let completion_token_batch = prepare(
+            DecoderInferenceRoute::Completions,
+            json!({"prompt": [[1, 2], [3]]}),
+        )
+        .unwrap();
+        assert_eq!(
+            completion_token_batch.request_shape(),
+            DecoderRequestShape::Batch
+        );
+        assert_eq!(completion_token_batch.child_request_ids().len(), 2);
+
+        let generate_text_batch = prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"text": [PROMPT_SECRET]}),
+        )
+        .unwrap();
+        assert_eq!(
+            generate_text_batch.request_shape(),
+            DecoderRequestShape::Batch
+        );
+
+        let generate_tokens = prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"text": Value::Null, "input_ids": [1, 2, 3]}),
+        )
+        .unwrap();
+        assert_eq!(generate_tokens.request_shape(), DecoderRequestShape::Scalar);
+
+        let generate_token_batch = prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"input_ids": [[1, 2], [3]]}),
+        )
+        .unwrap();
+        assert_eq!(
+            generate_token_batch.request_shape(),
+            DecoderRequestShape::Batch
+        );
+        assert_eq!(generate_token_batch.child_request_ids().len(), 2);
+
+        let generate_embedding_batch = prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"input_embeds": [[[0.1, 0.2]], [[0.3, 0.4]]]}),
+        )
+        .unwrap();
+        assert_eq!(
+            generate_embedding_batch.request_shape(),
+            DecoderRequestShape::Batch
+        );
+
+        assert!(prepare(DecoderInferenceRoute::Generate, json!({"text": [1]}),).is_err());
+        assert!(prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"input_ids": "invalid"}),
+        )
+        .is_err());
+        assert!(prepare(DecoderInferenceRoute::Generate, json!({"input_ids": [-1]}),).is_err());
+        assert!(prepare(DecoderInferenceRoute::Generate, json!({"input_ids": [1.5]}),).is_err());
+        assert!(prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"input_ids": [u64::MAX]}),
+        )
+        .is_err());
+        assert!(prepare(
+            DecoderInferenceRoute::Generate,
+            json!({"text": PROMPT_SECRET, "input_ids": [1, 2]}),
+        )
+        .is_err());
+
+        for key in GATEWAY_OWNED_REQUEST_KEYS {
+            let error = prepare(
+                DecoderInferenceRoute::Generate,
+                json!({
+                    "text": PROMPT_SECRET,
+                    (key): Value::Null,
+                }),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                EngineGrantError::InvalidGrant(message)
+                    if message.contains("gateway-owned field")
+            ));
+        }
+
+        let template = DecoderRequestTemplate::new(
+            DecoderInferenceRoute::Generate,
+            Bytes::from_static(br#"{"text":"retry"}"#),
+        )
+        .unwrap();
+        let first = template
+            .prepare_reservation(
                 prefill_id.clone(),
                 bootstrap.clone(),
                 decoder_id.clone(),
                 Uuid::new_v4(),
                 4,
                 Duration::from_secs(1),
-                DecoderInferenceRoute::ChatCompletions,
-                body,
-                children,
             )
+            .unwrap();
+        let second = template
+            .prepare_reservation(
+                prefill_id,
+                bootstrap,
+                decoder_id,
+                Uuid::new_v4(),
+                4,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_ne!(
+            first.reservation_attempt_id(),
+            second.reservation_attempt_id()
+        );
+        assert_ne!(first.child_request_ids(), second.child_request_ids());
+    }
+
+    #[test]
+    fn reservation_rejects_parallel_sampling_for_scalar_and_batch_bodies() {
+        let make = |route: DecoderInferenceRoute, body: Value| {
+            DecoderRequestTemplate::new(route, Bytes::from(serde_json::to_vec(&body).unwrap()))
         };
 
-        assert!(make(&format!(r#"{{"rid":"{child_0}"}}"#), vec![child_0]).is_ok());
         assert!(make(
-            &format!(r#"{{"rid":["{child_0}","{child_1}"]}}"#),
-            vec![child_0, child_1]
-        )
-        .is_ok());
-        assert!(make(&format!(r#"{{"rid":["{child_0}"]}}"#), vec![child_0]).is_err());
-        assert!(make(
-            &format!(r#"{{"rid":["{child_1}","{child_0}"]}}"#),
-            vec![child_0, child_1]
+            DecoderInferenceRoute::ChatCompletions,
+            json!({
+                "messages": [{"role": "user", "content": PROMPT_SECRET}],
+                "n": 2,
+            }),
         )
         .is_err());
-        assert!(make(r#"{"prompt":"missing"}"#, vec![child_0]).is_err());
+        assert!(make(
+            DecoderInferenceRoute::Completions,
+            json!({
+                "prompt": PROMPT_SECRET,
+                "best_of": 2,
+            }),
+        )
+        .is_err());
+        assert!(make(
+            DecoderInferenceRoute::Generate,
+            json!({
+                "text": PROMPT_SECRET,
+                "sampling_params": [{"n": 1}],
+            }),
+        )
+        .is_err());
+        assert!(make(
+            DecoderInferenceRoute::Generate,
+            json!({
+                "text": [PROMPT_SECRET],
+                "sampling_params": [{"n": 1}],
+            }),
+        )
+        .is_ok());
+        assert!(make(
+            DecoderInferenceRoute::Generate,
+            json!({
+                "text": [PROMPT_SECRET, PROMPT_SECRET],
+                "sampling_params": [{"n": 1}, {"n": 2}],
+            }),
+        )
+        .is_err());
+        assert!(make(
+            DecoderInferenceRoute::Generate,
+            json!({
+                "text": [PROMPT_SECRET, PROMPT_SECRET],
+                "sampling_params": [{"n": 1}],
+            }),
+        )
+        .is_err());
+        assert!(make(
+            DecoderInferenceRoute::Generate,
+            json!({
+                "text": [PROMPT_SECRET, PROMPT_SECRET],
+                "sampling_params": [{"n": 1}, Value::Null],
+            }),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1383,12 +2678,12 @@ mod tests {
         ]);
         install_plans(&state, plans);
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let reservation_debug = format!("{:?}", fixture.reservation());
+        assert!(!reservation_debug.contains(PROMPT_SECRET));
+        let grant = reserve_bound(&state, &fixture).await;
         let debug = format!("{grant:?}");
         assert!(!debug.contains(&fixture.token));
+        assert!(!debug.contains(PROMPT_SECRET));
         let token_debug = format!(
             "{:?}",
             SecretGrantToken::new(fixture.token.clone()).unwrap()
@@ -1400,9 +2695,17 @@ mod tests {
         assert_eq!(release.kind(), EngineReleaseKind::Completed);
 
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[1].path, promote_path);
-        assert_eq!(requests[2].path, complete_path);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1].path, format!("{CONTROL_PATH}/{grant_id}/bind"));
+        assert_eq!(requests[1].body_bytes, fixture.final_request_body);
+        assert_eq!(
+            requests[1].body,
+            serde_json::from_slice::<Value>(&fixture.final_request_body).unwrap()
+        );
+        assert!(requests[1].body.get("base_request_body_json").is_none());
+        assert!(requests[1].body.get("request_body_json").is_none());
+        assert_eq!(requests[2].path, promote_path);
+        assert_eq!(requests[3].path, complete_path);
         for request in &requests[1..] {
             assert_eq!(
                 request.authorization.as_deref(),
@@ -1412,6 +2715,174 @@ mod tests {
             assert!(!serialized.contains(&fixture.token));
             assert!(request.body.get("grant_token").is_none());
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reserve_ambiguity_retries_the_same_attempt_transcript() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    PlannedResponse {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: json!({"error": "receipt delivery ambiguous"}),
+                    },
+                ),
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::new(Client::new());
+        let attempt_id = fixture.binding.reservation_attempt_id();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        assert!(matches!(
+            reserve.reconcile_reserve().await,
+            Err(EngineGrantError::AmbiguousReserve(_))
+        ));
+        assert_eq!(reserve.reservation_attempt_id().unwrap(), attempt_id);
+        let grant = reserve.reconcile_reserve().await.unwrap();
+        assert_eq!(grant.reservation_attempt_id(), attempt_id);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body_bytes, requests[1].body_bytes);
+        assert_eq!(
+            requests[0].body["reservation_attempt_id"],
+            attempt_id.to_string()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bind_ambiguity_retries_the_same_raw_body() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let bind_path = format!("{CONTROL_PATH}/{}/bind", fixture.binding.grant_id());
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    bind_path.clone(),
+                    PlannedResponse {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: json!({"error": "bind receipt delivery ambiguous"}),
+                    },
+                ),
+                (
+                    bind_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Bind,
+                        WireGrantState::Prepared,
+                    )),
+                ),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::new(Client::new());
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let mut unbound = reserve.reconcile_reserve().await.unwrap();
+        let mut binding = unbound.begin_bind().unwrap();
+        assert!(matches!(
+            binding.reconcile_bind().await,
+            Err(EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                ..
+            })
+        ));
+        let bound = binding.reconcile_bind().await.unwrap();
+        assert_eq!(bound.request_body(), fixture.final_request_body);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].body_bytes, fixture.final_request_body);
+        assert_eq!(requests[2].body_bytes, fixture.final_request_body);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bind_failure_cancels_prepared_with_exact_attempt_receipt() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    format!("{CONTROL_PATH}/{grant_id}/bind"),
+                    PlannedResponse {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: json!({"error": "bind outcome ambiguous"}),
+                    },
+                ),
+                (
+                    format!("{CONTROL_PATH}/{grant_id}/cancel"),
+                    response(unbound_cancellation_receipt(&fixture.binding, true)),
+                ),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::new(Client::new());
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let mut unbound = reserve.reconcile_reserve().await.unwrap();
+        let mut binding = unbound.begin_bind().unwrap();
+        assert!(binding.reconcile_bind().await.is_err());
+        let cancellation = binding.cancel().await.unwrap();
+        assert_eq!(
+            cancellation.reservation_attempt_id(),
+            fixture.binding.reservation_attempt_id()
+        );
+        assert_eq!(
+            cancellation.reservation_digest(),
+            fixture.binding.reservation_digest()
+        );
+        assert_eq!(
+            cancellation.attempted_grant_digest(),
+            Some(fixture.binding.digest())
+        );
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].body_bytes, fixture.final_request_body);
+        assert_eq!(
+            requests[2].body["attempted_grant_digest"],
+            fixture.binding.digest().to_hex()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn one_element_batch_preserves_array_rid_and_bootstrap_shape() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture_with_shape(&server_url, 1, DecoderRequestShape::Batch);
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                response(fixture.reserve_response.clone()),
+            )]),
+        );
+        let bound = reserve_bound(&state, &fixture).await;
+        let body: Value = serde_json::from_slice(&bound.request_body()).unwrap();
+        assert!(body["rid"].is_array());
+        assert!(body[BOOTSTRAP_HOST_KEY].is_array());
+        assert!(body[BOOTSTRAP_PORT_KEY].is_array());
+        assert!(body[BOOTSTRAP_ROOM_KEY].is_array());
         task.abort();
     }
 
@@ -1435,15 +2906,16 @@ mod tests {
             ),
         ]);
         install_plans(&state, plans);
-        let mut grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let mut grant = reserve_bound(&state, &fixture).await;
         let release = grant.cancel().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::PreparedCancelled);
         assert_eq!(
             release.child_request_ids(),
-            fixture.reservation.child_request_ids()
+            fixture
+                .binding
+                .child_request_ids()
+                .collect::<Vec<_>>()
+                .as_slice()
         );
         task.abort();
     }
@@ -1476,10 +2948,7 @@ mod tests {
             ]),
         );
 
-        let mut grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let mut grant = reserve_bound(&state, &fixture).await;
         assert!(matches!(
             grant.cancel().await,
             Err(EngineGrantError::AmbiguousControl {
@@ -1490,7 +2959,7 @@ mod tests {
         assert!(format!("{grant:?}").contains("has_control: true"));
         let release = grant.cancel().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::PreparedCancelled);
-        assert_eq!(state.requests.lock().unwrap().len(), 3);
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
         task.abort();
     }
 
@@ -1522,10 +2991,7 @@ mod tests {
             ]),
         );
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         assert!(matches!(
             promotion.reconcile_promotion().await,
@@ -1537,7 +3003,7 @@ mod tests {
         assert!(format!("{promotion:?}").contains("has_control: true"));
         let retained = promotion.reconcile_promotion().await.unwrap();
         assert_eq!(retained.grant_id(), fixture.binding.grant_id());
-        assert_eq!(state.requests.lock().unwrap().len(), 3);
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
         task.abort();
     }
 
@@ -1570,10 +3036,7 @@ mod tests {
             ]),
         );
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         assert!(promotion.reconcile_promotion().await.is_err());
         let outcome = promotion
@@ -1593,7 +3056,12 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            vec![format!("{CONTROL_PATH}/reserve"), promote_path, abort_path,]
+            vec![
+                format!("{CONTROL_PATH}/reserve"),
+                format!("{CONTROL_PATH}/{grant_id}/bind"),
+                promote_path,
+                abort_path,
+            ]
         );
         task.abort();
     }
@@ -1621,10 +3089,7 @@ mod tests {
             ),
         ]);
         install_plans(&server_state, plans);
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&server_state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
         let outcome = retained
@@ -1673,10 +3138,7 @@ mod tests {
                 ),
             ]),
         );
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
         let quarantine = retained
@@ -1686,7 +3148,11 @@ mod tests {
         assert_eq!(quarantine.grant_id(), fixture.binding.grant_id());
         assert_eq!(
             quarantine.child_request_ids(),
-            fixture.reservation.child_request_ids()
+            fixture
+                .binding
+                .child_request_ids()
+                .collect::<Vec<_>>()
+                .as_slice()
         );
         task.abort();
     }
@@ -1728,17 +3194,14 @@ mod tests {
             ]),
         );
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
         assert!(retained.complete().await.is_err());
         assert!(format!("{retained:?}").contains("has_control: true"));
         let release = retained.complete().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::Completed);
-        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        assert_eq!(state.requests.lock().unwrap().len(), 5);
         task.abort();
     }
 
@@ -1783,10 +3246,7 @@ mod tests {
             ]),
         );
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
         assert!(retained
@@ -1799,7 +3259,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, EngineAbortOutcome::Aborted(_)));
-        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        assert_eq!(state.requests.lock().unwrap().len(), 5);
         task.abort();
     }
 
@@ -1843,10 +3303,7 @@ mod tests {
             ]),
         );
 
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &fixture).await;
         let mut promotion = grant.begin_promotion();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
         assert!(matches!(
@@ -1864,7 +3321,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(quarantine.grant_id(), fixture.binding.grant_id());
-        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        assert_eq!(state.requests.lock().unwrap().len(), 5);
         task.abort();
     }
 
@@ -1879,13 +3336,10 @@ mod tests {
                 response(prepared_fixture.reserve_response.clone()),
             )]),
         );
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&prepared_fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &prepared_fixture).await;
         drop(grant);
         tokio::task::yield_now().await;
-        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        assert_eq!(state.requests.lock().unwrap().len(), 2);
         task.abort();
 
         let (server_url, state, task) = start_server().await;
@@ -1897,13 +3351,10 @@ mod tests {
                 response(promotion_fixture.reserve_response.clone()),
             )]),
         );
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&promotion_fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &promotion_fixture).await;
         drop(grant.begin_promotion());
         tokio::task::yield_now().await;
-        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        assert_eq!(state.requests.lock().unwrap().len(), 2);
         task.abort();
 
         let (server_url, state, task) = start_server().await;
@@ -1926,39 +3377,53 @@ mod tests {
                 ),
             ]),
         );
-        let grant = DecoderGrantControlClient::new(Client::new())
-            .reserve(&retained_fixture.reservation)
-            .await
-            .unwrap();
+        let grant = reserve_bound(&state, &retained_fixture).await;
         let mut promotion = grant.begin_promotion();
         let retained = promotion.reconcile_promotion().await.unwrap();
         drop(retained);
         tokio::task::yield_now().await;
-        assert_eq!(state.requests.lock().unwrap().len(), 2);
+        assert_eq!(state.requests.lock().unwrap().len(), 3);
         task.abort();
     }
 
     #[tokio::test]
     async fn reserve_refusal_and_allocation_identity_mismatch_are_distinct() {
         let (server_url, state, task) = start_server().await;
+        let refused_fixture = fixture(&server_url, 1);
+        let refusal_receipt = reserve_refusal_receipt(&refused_fixture.reservation());
         install_plans(
             &state,
-            plan([(
-                format!("{CONTROL_PATH}/reserve"),
-                PlannedResponse {
-                    status: StatusCode::CONFLICT,
-                    body: json!({"error": "capacity"}),
-                },
-            )]),
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    PlannedResponse {
+                        status: StatusCode::CONFLICT,
+                        body: json!({"error": "capacity"}),
+                    },
+                ),
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    PlannedResponse {
+                        status: StatusCode::CONFLICT,
+                        body: refusal_receipt,
+                    },
+                ),
+            ]),
         );
-        let refused_fixture = fixture(&server_url, 1);
-        let refused = DecoderGrantControlClient::new(Client::new())
-            .reserve(&refused_fixture.reservation)
-            .await;
+        let client = DecoderGrantControlClient::new(Client::new());
+        let attempt_id = refused_fixture.binding.reservation_attempt_id();
+        let mut reserve = client.begin_reserve(refused_fixture.take_reservation());
+        assert!(matches!(
+            reserve.reconcile_reserve().await,
+            Err(EngineGrantError::AmbiguousReserve(_))
+        ));
+        assert_eq!(reserve.reservation_attempt_id().unwrap(), attempt_id);
+        let refused = reserve.reconcile_reserve().await;
         assert!(matches!(
             refused,
             Err(EngineGrantError::AllocatorRefused(_))
         ));
+        assert!(reserve.reservation_attempt_id().is_err());
         task.abort();
 
         let (server_url, state, task) = start_server().await;
@@ -1972,12 +3437,12 @@ mod tests {
                 response(mismatch_fixture.reserve_response.clone()),
             )]),
         );
-        let mismatch = DecoderGrantControlClient::new(Client::new())
-            .reserve(&mismatch_fixture.reservation)
-            .await;
+        let client = DecoderGrantControlClient::new(Client::new());
+        let mut reserve = client.begin_reserve(mismatch_fixture.take_reservation());
+        let mismatch = reserve.reconcile_reserve().await;
         assert!(matches!(
             mismatch,
-            Err(EngineGrantError::ProtocolViolation(_))
+            Err(EngineGrantError::AmbiguousReserve(_))
         ));
         task.abort();
     }

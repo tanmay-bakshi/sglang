@@ -7,6 +7,7 @@
 
 use std::{collections::HashSet, fmt, sync::Arc};
 
+use bytes::Bytes;
 use reqwest::Url;
 use thiserror::Error;
 use tracing::warn;
@@ -14,9 +15,14 @@ use uuid::Uuid;
 
 mod control;
 
-pub use control::{DecoderGrantControlClient, DecoderGrantReservation};
+pub use control::{
+    DecoderGrantControlClient, DecoderGrantReservation, DecoderRequestTemplate,
+    ReserveReconciliationGrant,
+};
 
-const GRANT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-grant-v3";
+const GRANT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-grant-v4";
+const RESERVATION_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-reservation-v1";
+const RESERVE_ATTEMPT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-reserve-attempt-v1";
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ProcessIdentity {
@@ -202,6 +208,23 @@ impl fmt::Display for DecoderInferenceRoute {
     }
 }
 
+/// JSON representation of normalized child request fields.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DecoderRequestShape {
+    Scalar,
+    Batch,
+}
+
+impl DecoderRequestShape {
+    /// Canonical control-protocol representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Batch => "batch",
+        }
+    }
+}
+
 /// Engine allocation generation for one decoder request slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DecoderSlotGeneration(Uuid);
@@ -223,6 +246,74 @@ impl DecoderSlotGeneration {
 pub(crate) struct DecoderAllocationKey {
     decoder_id: DecoderId,
     slot_generation: DecoderSlotGeneration,
+}
+
+/// BLAKE3 digest of the exact gateway-issued reserve-attempt transcript.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DecoderReserveAttemptDigest([u8; 32]);
+
+impl DecoderReserveAttemptDigest {
+    /// Return the digest bytes for reservation transcript chaining.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn to_hex(self) -> String {
+        blake3::Hash::from(self.0).to_hex().to_string()
+    }
+
+    fn from_hex(value: &str) -> Result<Self, EngineGrantError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(EngineGrantError::ProtocolViolation(
+                "reserve-attempt digest must be exactly 64 lowercase hexadecimal characters"
+                    .to_string(),
+            ));
+        }
+        let digest = blake3::Hash::from_hex(value).map_err(|error| {
+            EngineGrantError::ProtocolViolation(format!(
+                "reserve-attempt digest is not 32-byte hexadecimal: {error}"
+            ))
+        })?;
+        Ok(Self(*digest.as_bytes()))
+    }
+}
+
+/// BLAKE3 digest of the exact provisional reservation transcript.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DecoderReservationDigest([u8; 32]);
+
+impl DecoderReservationDigest {
+    /// Return the digest bytes for final-grant transcript chaining.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn to_hex(self) -> String {
+        blake3::Hash::from(self.0).to_hex().to_string()
+    }
+
+    fn from_hex(value: &str) -> Result<Self, EngineGrantError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(EngineGrantError::ProtocolViolation(
+                "reservation digest must be exactly 64 lowercase hexadecimal characters"
+                    .to_string(),
+            ));
+        }
+        let digest = blake3::Hash::from_hex(value).map_err(|error| {
+            EngineGrantError::ProtocolViolation(format!(
+                "reservation digest is not 32-byte hexadecimal: {error}"
+            ))
+        })?;
+        Ok(Self(*digest.as_bytes()))
+    }
 }
 
 /// BLAKE3 digest of every authority-bearing grant field.
@@ -463,10 +554,16 @@ impl DecoderGrantChildBinding {
 }
 
 /// Immutable identity sealed inside an engine-issued reservation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecoderGrantBinding {
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct UnboundGrantBinding {
     grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
     inference_route: DecoderInferenceRoute,
+    request_shape: DecoderRequestShape,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+    base_request_body: Bytes,
     prefill_id: PrefillId,
     prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
     request_chain_id: Uuid,
@@ -476,15 +573,45 @@ pub(crate) struct DecoderGrantBinding {
     slot_generations: Arc<[DecoderSlotGeneration]>,
     bootstrap_rooms: Arc<[u64]>,
     accounting: DecoderGrantAccounting,
-    digest: DecoderGrantDigest,
+    digest: DecoderReservationDigest,
 }
 
-impl DecoderGrantBinding {
+impl fmt::Debug for UnboundGrantBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnboundGrantBinding")
+            .field("grant_id", &self.grant_id)
+            .field("reservation_attempt_id", &self.reservation_attempt_id)
+            .field("reserve_attempt_digest", &self.reserve_attempt_digest)
+            .field("inference_route", &self.inference_route)
+            .field("request_shape", &self.request_shape)
+            .field("prepared_ttl_ms", &self.prepared_ttl_ms)
+            .field(
+                "prepared_expires_at_unix_ms",
+                &self.prepared_expires_at_unix_ms,
+            )
+            .field("base_request_body_bytes", &self.base_request_body.len())
+            .field("prefill_id", &self.prefill_id)
+            .field("request_chain_id", &self.request_chain_id)
+            .field("source_tp_size", &self.source_tp_size)
+            .field("decoder_id", &self.decoder_id)
+            .field("child_count", &self.children.len())
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UnboundGrantBinding {
     #[allow(clippy::too_many_arguments)]
     fn new(
         grant_id: Uuid,
+        reservation_attempt_id: Uuid,
+        reserve_attempt_digest: DecoderReserveAttemptDigest,
         inference_route: DecoderInferenceRoute,
-        request_body_json: &str,
+        request_shape: DecoderRequestShape,
+        prepared_ttl_ms: u64,
+        prepared_expires_at_unix_ms: u64,
+        base_request_body: Bytes,
         prefill_id: PrefillId,
         prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
         request_chain_id: Uuid,
@@ -492,77 +619,34 @@ impl DecoderGrantBinding {
         decoder_id: DecoderId,
         children: Vec<DecoderGrantChildBinding>,
     ) -> Result<Self, EngineGrantError> {
-        if grant_id.is_nil() {
+        validate_grant_identity(grant_id, request_chain_id, source_tp_size)?;
+        if reservation_attempt_id.is_nil() {
             return Err(EngineGrantError::InvalidGrant(
-                "engine grant identity cannot be the nil UUID".to_string(),
+                "reservation attempt identity cannot be the nil UUID".to_string(),
             ));
         }
-        if request_chain_id.is_nil() {
+        validate_prepared_lease(prepared_ttl_ms, prepared_expires_at_unix_ms)?;
+        let (slot_generations, bootstrap_rooms, accounting) = validate_child_bindings(&children)?;
+        if request_shape == DecoderRequestShape::Scalar && children.len() != 1 {
             return Err(EngineGrantError::InvalidGrant(
-                "logical request-chain identity cannot be the nil UUID".to_string(),
+                "a scalar engine grant must contain exactly one child".to_string(),
             ));
         }
-        if source_tp_size != 2 && source_tp_size != 4 {
-            return Err(EngineGrantError::InvalidGrant(
-                "source tensor-parallel size must be 2 or 4".to_string(),
-            ));
-        }
-        if children.is_empty() {
-            return Err(EngineGrantError::InvalidGrant(
-                "an engine grant must contain at least one child".to_string(),
-            ));
-        }
-
-        let request_ids: HashSet<Uuid> = children
-            .iter()
-            .map(|child| child.child_request_id())
-            .collect();
-        if request_ids.len() != children.len() {
-            return Err(EngineGrantError::InvalidGrant(
-                "an engine grant cannot repeat a child request identity".to_string(),
-            ));
-        }
-        let slot_generations: Vec<DecoderSlotGeneration> =
-            children.iter().map(|child| child.slot_generation).collect();
-        if slot_generations
-            .iter()
-            .any(|generation| generation.as_uuid().is_nil())
-        {
-            return Err(EngineGrantError::InvalidGrant(
-                "an engine grant cannot contain a nil decoder slot generation".to_string(),
-            ));
-        }
-        let unique_slots: HashSet<DecoderSlotGeneration> =
-            slot_generations.iter().copied().collect();
-        if unique_slots.len() != children.len() {
-            return Err(EngineGrantError::InvalidGrant(
-                "an engine grant cannot repeat a decoder slot generation".to_string(),
-            ));
-        }
-        let bootstrap_rooms: Vec<u64> = children.iter().map(|child| child.bootstrap_room).collect();
-        let unique_rooms: HashSet<u64> = bootstrap_rooms.iter().copied().collect();
-        if unique_rooms.len() != children.len() {
-            return Err(EngineGrantError::InvalidGrant(
-                "an engine grant cannot repeat a decoder-local bootstrap room".to_string(),
-            ));
-        }
-        let accounting =
-            DecoderGrantAccounting::new(children.iter().map(|child| child.accounting).collect())?;
-        let digest = digest_binding(
+        let digest = digest_reservation(
             grant_id,
-            inference_route,
-            request_body_json,
-            &prefill_id,
-            &prefill_bootstrap_endpoint,
-            request_chain_id,
-            source_tp_size,
-            &decoder_id,
+            reserve_attempt_digest,
+            prepared_expires_at_unix_ms,
             &children,
         );
-
         Ok(Self {
             grant_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
             inference_route,
+            request_shape,
+            prepared_ttl_ms,
+            prepared_expires_at_unix_ms,
+            base_request_body,
             prefill_id,
             prefill_bootstrap_endpoint,
             request_chain_id,
@@ -576,12 +660,327 @@ impl DecoderGrantBinding {
         })
     }
 
+    fn bind(&self, request_body: Bytes) -> DecoderGrantBinding {
+        let digest = digest_binding(self.digest, &request_body);
+        DecoderGrantBinding {
+            grant_id: self.grant_id,
+            reservation_attempt_id: self.reservation_attempt_id,
+            reserve_attempt_digest: self.reserve_attempt_digest,
+            inference_route: self.inference_route,
+            request_shape: self.request_shape,
+            prepared_ttl_ms: self.prepared_ttl_ms,
+            prepared_expires_at_unix_ms: self.prepared_expires_at_unix_ms,
+            request_body,
+            prefill_id: self.prefill_id.clone(),
+            prefill_bootstrap_endpoint: self.prefill_bootstrap_endpoint.clone(),
+            request_chain_id: self.request_chain_id,
+            source_tp_size: self.source_tp_size,
+            decoder_id: self.decoder_id.clone(),
+            children: Arc::clone(&self.children),
+            slot_generations: Arc::clone(&self.slot_generations),
+            bootstrap_rooms: Arc::clone(&self.bootstrap_rooms),
+            accounting: self.accounting.clone(),
+            reservation_digest: self.digest,
+            digest,
+        }
+    }
+
     pub(crate) fn grant_id(&self) -> Uuid {
         self.grant_id
     }
 
+    pub(crate) fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    pub(crate) fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
     pub(crate) fn inference_route(&self) -> DecoderInferenceRoute {
         self.inference_route
+    }
+
+    pub(crate) fn request_shape(&self) -> DecoderRequestShape {
+        self.request_shape
+    }
+
+    pub(crate) fn prepared_ttl_ms(&self) -> u64 {
+        self.prepared_ttl_ms
+    }
+
+    pub(crate) fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.prepared_expires_at_unix_ms
+    }
+
+    pub(crate) fn base_request_body(&self) -> Bytes {
+        self.base_request_body.clone()
+    }
+
+    pub(crate) fn prefill_id(&self) -> &PrefillId {
+        &self.prefill_id
+    }
+
+    pub(crate) fn prefill_bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
+        &self.prefill_bootstrap_endpoint
+    }
+
+    pub(crate) fn request_chain_id(&self) -> Uuid {
+        self.request_chain_id
+    }
+
+    pub(crate) fn source_tp_size(&self) -> usize {
+        self.source_tp_size
+    }
+
+    pub(crate) fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
+
+    pub(crate) fn children(&self) -> &[DecoderGrantChildBinding] {
+        &self.children
+    }
+
+    pub(crate) fn child_request_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.children.iter().map(|child| child.child_request_id)
+    }
+
+    pub(crate) fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        &self.slot_generations
+    }
+
+    pub(crate) fn bootstrap_rooms(&self) -> &[u64] {
+        &self.bootstrap_rooms
+    }
+
+    pub(crate) fn digest(&self) -> DecoderReservationDigest {
+        self.digest
+    }
+}
+
+fn validate_grant_identity(
+    grant_id: Uuid,
+    request_chain_id: Uuid,
+    source_tp_size: usize,
+) -> Result<(), EngineGrantError> {
+    if grant_id.is_nil() {
+        return Err(EngineGrantError::InvalidGrant(
+            "engine grant identity cannot be the nil UUID".to_string(),
+        ));
+    }
+    if request_chain_id.is_nil() {
+        return Err(EngineGrantError::InvalidGrant(
+            "logical request-chain identity cannot be the nil UUID".to_string(),
+        ));
+    }
+    if source_tp_size != 2 && source_tp_size != 4 {
+        return Err(EngineGrantError::InvalidGrant(
+            "source tensor-parallel size must be 2 or 4".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_lease(
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+) -> Result<(), EngineGrantError> {
+    if prepared_ttl_ms == 0 {
+        return Err(EngineGrantError::InvalidGrant(
+            "prepared reservation TTL must be nonzero".to_string(),
+        ));
+    }
+    if prepared_expires_at_unix_ms == 0 {
+        return Err(EngineGrantError::InvalidGrant(
+            "prepared reservation expiry must be nonzero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_child_bindings(
+    children: &[DecoderGrantChildBinding],
+) -> Result<(Vec<DecoderSlotGeneration>, Vec<u64>, DecoderGrantAccounting), EngineGrantError> {
+    if children.is_empty() {
+        return Err(EngineGrantError::InvalidGrant(
+            "an engine grant must contain at least one child".to_string(),
+        ));
+    }
+    let request_ids: HashSet<Uuid> = children
+        .iter()
+        .map(DecoderGrantChildBinding::child_request_id)
+        .collect();
+    if request_ids.len() != children.len() {
+        return Err(EngineGrantError::InvalidGrant(
+            "an engine grant cannot repeat a child request identity".to_string(),
+        ));
+    }
+    let slot_generations: Vec<DecoderSlotGeneration> =
+        children.iter().map(|child| child.slot_generation).collect();
+    if slot_generations
+        .iter()
+        .any(|generation| generation.as_uuid().is_nil())
+    {
+        return Err(EngineGrantError::InvalidGrant(
+            "an engine grant cannot contain a nil decoder slot generation".to_string(),
+        ));
+    }
+    let unique_slots: HashSet<DecoderSlotGeneration> = slot_generations.iter().copied().collect();
+    if unique_slots.len() != children.len() {
+        return Err(EngineGrantError::InvalidGrant(
+            "an engine grant cannot repeat a decoder slot generation".to_string(),
+        ));
+    }
+    let bootstrap_rooms: Vec<u64> = children
+        .iter()
+        .map(DecoderGrantChildBinding::bootstrap_room)
+        .collect();
+    let unique_rooms: HashSet<u64> = bootstrap_rooms.iter().copied().collect();
+    if unique_rooms.len() != children.len() {
+        return Err(EngineGrantError::InvalidGrant(
+            "an engine grant cannot repeat a decoder-local bootstrap room".to_string(),
+        ));
+    }
+    let accounting =
+        DecoderGrantAccounting::new(children.iter().map(|child| child.accounting).collect())?;
+    Ok((slot_generations, bootstrap_rooms, accounting))
+}
+
+/// Immutable identity sealed inside a bound engine-issued reservation.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DecoderGrantBinding {
+    grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    inference_route: DecoderInferenceRoute,
+    request_shape: DecoderRequestShape,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+    request_body: Bytes,
+    prefill_id: PrefillId,
+    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+    request_chain_id: Uuid,
+    source_tp_size: usize,
+    decoder_id: DecoderId,
+    children: Arc<[DecoderGrantChildBinding]>,
+    slot_generations: Arc<[DecoderSlotGeneration]>,
+    bootstrap_rooms: Arc<[u64]>,
+    accounting: DecoderGrantAccounting,
+    reservation_digest: DecoderReservationDigest,
+    digest: DecoderGrantDigest,
+}
+
+impl fmt::Debug for DecoderGrantBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecoderGrantBinding")
+            .field("grant_id", &self.grant_id)
+            .field("reservation_attempt_id", &self.reservation_attempt_id)
+            .field("reserve_attempt_digest", &self.reserve_attempt_digest)
+            .field("inference_route", &self.inference_route)
+            .field("request_shape", &self.request_shape)
+            .field("prepared_ttl_ms", &self.prepared_ttl_ms)
+            .field(
+                "prepared_expires_at_unix_ms",
+                &self.prepared_expires_at_unix_ms,
+            )
+            .field("request_body_bytes", &self.request_body.len())
+            .field("prefill_id", &self.prefill_id)
+            .field("request_chain_id", &self.request_chain_id)
+            .field("source_tp_size", &self.source_tp_size)
+            .field("decoder_id", &self.decoder_id)
+            .field("child_count", &self.children.len())
+            .field("reservation_digest", &self.reservation_digest)
+            .field("digest", &self.digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecoderGrantBinding {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        grant_id: Uuid,
+        reservation_attempt_id: Uuid,
+        inference_route: DecoderInferenceRoute,
+        request_shape: DecoderRequestShape,
+        prepared_ttl_ms: u64,
+        prepared_expires_at_unix_ms: u64,
+        base_request_body: Bytes,
+        request_body: Bytes,
+        prefill_id: PrefillId,
+        prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+        request_chain_id: Uuid,
+        source_tp_size: usize,
+        decoder_id: DecoderId,
+        children: Vec<DecoderGrantChildBinding>,
+    ) -> Result<Self, EngineGrantError> {
+        let child_request_ids: Vec<Uuid> = children
+            .iter()
+            .map(DecoderGrantChildBinding::child_request_id)
+            .collect();
+        let reserve_attempt_digest = digest_reserve_attempt(
+            reservation_attempt_id,
+            inference_route,
+            request_shape,
+            prepared_ttl_ms,
+            &base_request_body,
+            &prefill_id,
+            &prefill_bootstrap_endpoint,
+            request_chain_id,
+            source_tp_size,
+            &decoder_id,
+            &child_request_ids,
+        );
+        let unbound = UnboundGrantBinding::new(
+            grant_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
+            inference_route,
+            request_shape,
+            prepared_ttl_ms,
+            prepared_expires_at_unix_ms,
+            base_request_body,
+            prefill_id,
+            prefill_bootstrap_endpoint,
+            request_chain_id,
+            source_tp_size,
+            decoder_id,
+            children,
+        )?;
+        Ok(unbound.bind(request_body))
+    }
+
+    pub(crate) fn grant_id(&self) -> Uuid {
+        self.grant_id
+    }
+
+    pub(crate) fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    pub(crate) fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
+    pub(crate) fn inference_route(&self) -> DecoderInferenceRoute {
+        self.inference_route
+    }
+
+    pub(crate) fn request_shape(&self) -> DecoderRequestShape {
+        self.request_shape
+    }
+
+    pub(crate) fn prepared_ttl_ms(&self) -> u64 {
+        self.prepared_ttl_ms
+    }
+
+    pub(crate) fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.prepared_expires_at_unix_ms
+    }
+
+    pub(crate) fn request_body(&self) -> Bytes {
+        self.request_body.clone()
     }
 
     pub(crate) fn prefill_id(&self) -> &PrefillId {
@@ -631,34 +1030,61 @@ impl DecoderGrantBinding {
         &self.accounting
     }
 
+    pub(crate) fn reservation_digest(&self) -> DecoderReservationDigest {
+        self.reservation_digest
+    }
+
     pub(crate) fn digest(&self) -> DecoderGrantDigest {
         self.digest
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn digest_binding(
-    grant_id: Uuid,
+fn digest_reserve_attempt(
+    reservation_attempt_id: Uuid,
     inference_route: DecoderInferenceRoute,
-    request_body_json: &str,
+    request_shape: DecoderRequestShape,
+    prepared_ttl_ms: u64,
+    base_request_body: &[u8],
     prefill_id: &PrefillId,
     prefill_bootstrap_endpoint: &PrefillBootstrapEndpoint,
     request_chain_id: Uuid,
     source_tp_size: usize,
     decoder_id: &DecoderId,
-    children: &[DecoderGrantChildBinding],
-) -> DecoderGrantDigest {
+    child_request_ids: &[Uuid],
+) -> DecoderReserveAttemptDigest {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(GRANT_DIGEST_DOMAIN);
-    hasher.update(grant_id.as_bytes());
+    hasher.update(RESERVE_ATTEMPT_DIGEST_DOMAIN);
+    hasher.update(reservation_attempt_id.as_bytes());
     hash_text(&mut hasher, inference_route.as_str());
-    hash_text(&mut hasher, request_body_json);
+    hash_text(&mut hasher, request_shape.as_str());
+    hasher.update(&prepared_ttl_ms.to_le_bytes());
+    hash_bytes(&mut hasher, base_request_body);
     hash_process(&mut hasher, &prefill_id.0);
     hash_text(&mut hasher, prefill_bootstrap_endpoint.host());
     hasher.update(&u64::from(prefill_bootstrap_endpoint.port()).to_le_bytes());
     hasher.update(request_chain_id.as_bytes());
     hasher.update(&(source_tp_size as u64).to_le_bytes());
     hash_process(&mut hasher, &decoder_id.0);
+    hasher.update(&(child_request_ids.len() as u64).to_le_bytes());
+    for (index, child_request_id) in child_request_ids.iter().enumerate() {
+        hasher.update(&(index as u64).to_le_bytes());
+        hasher.update(child_request_id.as_bytes());
+    }
+    DecoderReserveAttemptDigest(*hasher.finalize().as_bytes())
+}
+
+fn digest_reservation(
+    grant_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    prepared_expires_at_unix_ms: u64,
+    children: &[DecoderGrantChildBinding],
+) -> DecoderReservationDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(RESERVATION_DIGEST_DOMAIN);
+    hasher.update(grant_id.as_bytes());
+    hasher.update(reserve_attempt_digest.as_bytes());
+    hasher.update(&prepared_expires_at_unix_ms.to_le_bytes());
     hasher.update(&(children.len() as u64).to_le_bytes());
     for (index, child) in children.iter().enumerate() {
         hasher.update(&(index as u64).to_le_bytes());
@@ -672,6 +1098,17 @@ fn digest_binding(
         hasher.update(&(child.accounting.reserved_kv_tokens as u64).to_le_bytes());
         hasher.update(&(child.accounting.remaining_decode_tokens as u64).to_le_bytes());
     }
+    DecoderReservationDigest(*hasher.finalize().as_bytes())
+}
+
+fn digest_binding(
+    reservation_digest: DecoderReservationDigest,
+    request_body: &[u8],
+) -> DecoderGrantDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(GRANT_DIGEST_DOMAIN);
+    hasher.update(reservation_digest.as_bytes());
+    hash_bytes(&mut hasher, request_body);
     DecoderGrantDigest(*hasher.finalize().as_bytes())
 }
 
@@ -681,27 +1118,274 @@ fn hash_process(hasher: &mut blake3::Hasher, process: &ProcessIdentity) {
 }
 
 fn hash_text(hasher: &mut blake3::Hasher, value: &str) {
-    hasher.update(&(value.len() as u64).to_le_bytes());
-    hasher.update(value.as_bytes());
+    hash_bytes(hasher, value.as_bytes());
 }
 
-/// Concrete engine-issued prepared reservation.
-pub struct EngineDecoderGrant {
-    binding: DecoderGrantBinding,
+fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+/// Engine-issued PREPARED reservation whose final inference body is not yet bound.
+pub struct UnboundPreparedGrant {
+    binding: UnboundGrantBinding,
     control: Option<control::PreparedGrantControl>,
 }
 
-impl fmt::Debug for EngineDecoderGrant {
+impl fmt::Debug for UnboundPreparedGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("EngineDecoderGrant")
+            .debug_struct("UnboundPreparedGrant")
             .field("binding", &self.binding)
             .field("has_control", &self.control.is_some())
             .finish()
     }
 }
 
-impl EngineDecoderGrant {
+impl UnboundPreparedGrant {
+    fn from_control(binding: UnboundGrantBinding, control: control::PreparedGrantControl) -> Self {
+        Self {
+            binding,
+            control: Some(control),
+        }
+    }
+
+    /// Engine grant identity, also used as the eventual pool assignment identity.
+    pub fn grant_id(&self) -> Uuid {
+        self.binding.grant_id()
+    }
+
+    /// Gateway-issued idempotency identity for this reserve attempt.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.binding.reservation_attempt_id()
+    }
+
+    /// Digest of the exact idempotent reserve-attempt request.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.binding.reserve_attempt_digest()
+    }
+
+    /// Requested PREPARED lease duration in milliseconds.
+    pub fn prepared_ttl_ms(&self) -> u64 {
+        self.binding.prepared_ttl_ms()
+    }
+
+    /// Engine-issued absolute PREPARED expiry in Unix milliseconds.
+    pub fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.binding.prepared_expires_at_unix_ms()
+    }
+
+    /// Whether normalized request fields use scalar or array JSON.
+    pub fn request_shape(&self) -> DecoderRequestShape {
+        self.binding.request_shape()
+    }
+
+    /// Selected decoder process generation.
+    pub fn decoder_id(&self) -> &DecoderId {
+        self.binding.decoder_id()
+    }
+
+    /// Exact generation-scoped prefill endpoint consumed by decoder bootstrap.
+    pub fn prefill_bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
+        self.binding.prefill_bootstrap_endpoint()
+    }
+
+    /// Exact ordered normalized child allocations.
+    pub fn children(&self) -> &[DecoderGrantChildBinding] {
+        self.binding.children()
+    }
+
+    /// Exact ordered decoder slot generations.
+    pub fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        self.binding.slot_generations()
+    }
+
+    /// Exact ordered engine-issued decoder-local bootstrap rooms.
+    pub fn bootstrap_rooms(&self) -> &[u64] {
+        self.binding.bootstrap_rooms()
+    }
+
+    /// Exact RID-enriched request bytes supplied to provisional allocation.
+    pub fn base_request_body(&self) -> Bytes {
+        self.binding.base_request_body()
+    }
+
+    /// Digest of the exact provisional allocation transcript.
+    pub fn reservation_digest(&self) -> DecoderReservationDigest {
+        self.binding.digest()
+    }
+
+    /// Canonically enrich and pin the final inference body before any bind I/O.
+    ///
+    /// The returned reconciliation capability has no operation that accepts
+    /// replacement bytes. Bind retry and cancellation therefore refer to the
+    /// same exact transcript even after an ambiguous network outcome.
+    pub fn begin_bind(&mut self) -> Result<BindReconciliationGrant, EngineGrantError> {
+        let request_body = control::build_bound_request(&self.binding)?;
+        let binding = self.binding.bind(request_body);
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "unbound prepared grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(BindReconciliationGrant {
+            unbound_binding: self.binding.clone(),
+            binding,
+            control: Some(control),
+        })
+    }
+
+    /// Cancel an unbound PREPARED reservation and prove allocator release.
+    ///
+    /// No decoder-pool accounting exists before a bind succeeds.
+    pub async fn cancel(&mut self) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
+        let receipt = self.control()?.cancel_unbound(&self.binding, None).await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "unbound prepared grant has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for UnboundPreparedGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Unbound PREPARED grant capability was dropped; engine-owned expiry remains authoritative"
+        );
+    }
+}
+
+/// PREPARED capability with one exact final body pinned for idempotent binding.
+pub struct BindReconciliationGrant {
+    unbound_binding: UnboundGrantBinding,
+    binding: DecoderGrantBinding,
+    control: Option<control::PreparedGrantControl>,
+}
+
+impl fmt::Debug for BindReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl BindReconciliationGrant {
+    /// Engine grant identity, also used as the eventual pool assignment identity.
+    pub fn grant_id(&self) -> Uuid {
+        self.binding.grant_id()
+    }
+
+    /// Gateway-issued idempotency identity for this reserve attempt.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.binding.reservation_attempt_id()
+    }
+
+    /// Digest of the exact idempotent reserve-attempt request.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.binding.reserve_attempt_digest()
+    }
+
+    /// Requested PREPARED lease duration in milliseconds.
+    pub fn prepared_ttl_ms(&self) -> u64 {
+        self.binding.prepared_ttl_ms()
+    }
+
+    /// Engine-issued absolute PREPARED expiry in Unix milliseconds.
+    pub fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.binding.prepared_expires_at_unix_ms()
+    }
+
+    /// Cheap clone of the exact once-serialized body pinned before bind I/O.
+    pub fn request_body(&self) -> Bytes {
+        self.binding.request_body()
+    }
+
+    /// Digest covering both reserve input and the final bound transcript.
+    pub fn grant_digest(&self) -> DecoderGrantDigest {
+        self.binding.digest()
+    }
+
+    /// Digest of the exact provisional allocation transcript.
+    pub fn reservation_digest(&self) -> DecoderReservationDigest {
+        self.binding.reservation_digest()
+    }
+
+    /// Bind or reconcile the same exact body without surrendering ownership on error.
+    pub async fn reconcile_bind(&mut self) -> Result<BoundPreparedGrant, EngineGrantError> {
+        self.control()?.bind(&self.binding).await?;
+        let control = self
+            .control
+            .take()
+            .expect("successful bind reconciliation lost its concrete control capability");
+        Ok(BoundPreparedGrant::from_control(
+            self.binding.clone(),
+            control,
+        ))
+    }
+
+    /// Cancel the PREPARED allocation after a failed or ambiguous bind.
+    pub async fn cancel(&mut self) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
+        let receipt = self
+            .control()?
+            .cancel_unbound(&self.unbound_binding, Some(&self.binding))
+            .await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "bind reconciliation grant has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for BindReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Bind reconciliation capability was dropped; PREPARED engine allocation remains authoritative"
+        );
+    }
+}
+
+/// Concrete engine-issued PREPARED reservation bound to exact inference bytes.
+pub struct BoundPreparedGrant {
+    binding: DecoderGrantBinding,
+    control: Option<control::PreparedGrantControl>,
+}
+
+impl fmt::Debug for BoundPreparedGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundPreparedGrant")
+            .field("binding", &self.binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl BoundPreparedGrant {
     fn from_control(binding: DecoderGrantBinding, control: control::PreparedGrantControl) -> Self {
         Self {
             binding,
@@ -716,6 +1400,26 @@ impl EngineDecoderGrant {
     /// Engine grant identity, also used as the pool assignment identity.
     pub fn grant_id(&self) -> Uuid {
         self.binding.grant_id
+    }
+
+    /// Gateway-issued idempotency identity for this reserve attempt.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.binding.reservation_attempt_id()
+    }
+
+    /// Digest of the exact idempotent reserve-attempt request.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.binding.reserve_attempt_digest()
+    }
+
+    /// Requested PREPARED lease duration in milliseconds.
+    pub fn prepared_ttl_ms(&self) -> u64 {
+        self.binding.prepared_ttl_ms()
+    }
+
+    /// Engine-issued absolute PREPARED expiry in Unix milliseconds.
+    pub fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.binding.prepared_expires_at_unix_ms()
     }
 
     /// Selected decoder process generation.
@@ -743,9 +1447,19 @@ impl EngineDecoderGrant {
         self.binding.bootstrap_rooms()
     }
 
+    /// Cheap clone of the exact once-serialized body both inference sends reuse.
+    pub fn request_body(&self) -> Bytes {
+        self.binding.request_body()
+    }
+
     /// Digest covering the request and every ordered child allocation.
     pub fn grant_digest(&self) -> DecoderGrantDigest {
         self.binding.digest()
+    }
+
+    /// Digest of the exact provisional allocation transcript.
+    pub fn reservation_digest(&self) -> DecoderReservationDigest {
+        self.binding.reservation_digest()
     }
 
     /// Explicitly cancel a reservation that never crossed the activation boundary.
@@ -780,7 +1494,7 @@ impl EngineDecoderGrant {
     }
 }
 
-impl Drop for EngineDecoderGrant {
+impl Drop for BoundPreparedGrant {
     fn drop(&mut self) {
         if self.control.is_none() {
             return;
@@ -837,6 +1551,11 @@ impl PromotionReconciliationGrant {
     /// Exact ordered decoder-local bootstrap rooms.
     pub fn bootstrap_rooms(&self) -> &[u64] {
         self.binding.bootstrap_rooms()
+    }
+
+    /// Cheap clone of the exact once-serialized body both inference sends reuse.
+    pub fn request_body(&self) -> Bytes {
+        self.binding.request_body()
     }
 
     /// Digest covering the request and every ordered child allocation.
@@ -949,6 +1668,11 @@ impl RetainedEngineGrant {
         self.binding.bootstrap_rooms()
     }
 
+    /// Cheap clone of the exact once-serialized body both inference sends reuse.
+    pub fn request_body(&self) -> Bytes {
+        self.binding.request_body()
+    }
+
     /// Digest covering the request and every ordered child allocation.
     pub fn grant_digest(&self) -> DecoderGrantDigest {
         self.binding.digest()
@@ -1015,6 +1739,132 @@ impl Drop for RetainedEngineGrant {
     }
 }
 
+/// Engine receipt proving release of an unbound PREPARED allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedGrantCancellationReceipt {
+    grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    decoder_id: DecoderId,
+    child_request_ids: Arc<[Uuid]>,
+    slot_generations: Arc<[DecoderSlotGeneration]>,
+    bootstrap_rooms: Arc<[u64]>,
+    prepared_ttl_ms: u64,
+    prepared_expires_at_unix_ms: u64,
+    reservation_digest: DecoderReservationDigest,
+    attempted_grant_digest: Option<DecoderGrantDigest>,
+    receipt_id: Uuid,
+    receipt_digest: AuthorityDigest,
+    take_once: bool,
+}
+
+impl PreparedGrantCancellationReceipt {
+    #[allow(clippy::too_many_arguments)]
+    fn from_control(
+        grant_id: Uuid,
+        reservation_attempt_id: Uuid,
+        reserve_attempt_digest: DecoderReserveAttemptDigest,
+        decoder_id: DecoderId,
+        child_request_ids: Vec<Uuid>,
+        slot_generations: Vec<DecoderSlotGeneration>,
+        bootstrap_rooms: Vec<u64>,
+        prepared_ttl_ms: u64,
+        prepared_expires_at_unix_ms: u64,
+        reservation_digest: DecoderReservationDigest,
+        attempted_grant_digest: Option<DecoderGrantDigest>,
+        receipt_id: Uuid,
+        receipt_digest: AuthorityDigest,
+        take_once: bool,
+    ) -> Self {
+        Self {
+            grant_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
+            decoder_id,
+            child_request_ids: Arc::from(child_request_ids),
+            slot_generations: Arc::from(slot_generations),
+            bootstrap_rooms: Arc::from(bootstrap_rooms),
+            prepared_ttl_ms,
+            prepared_expires_at_unix_ms,
+            reservation_digest,
+            attempted_grant_digest,
+            receipt_id,
+            receipt_digest,
+            take_once,
+        }
+    }
+
+    /// Engine-issued reservation identity.
+    pub fn grant_id(&self) -> Uuid {
+        self.grant_id
+    }
+
+    /// Gateway-issued idempotency identity whose allocation was released.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    /// Exact idempotent reserve-attempt transcript released by the engine.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
+    /// Decoder generation whose provisional allocations were released.
+    pub fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
+
+    /// Exact ordered gateway-owned child identities.
+    pub fn child_request_ids(&self) -> &[Uuid] {
+        &self.child_request_ids
+    }
+
+    /// Exact ordered decoder request-slot generations.
+    pub fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        &self.slot_generations
+    }
+
+    /// Exact ordered decoder-local bootstrap rooms.
+    pub fn bootstrap_rooms(&self) -> &[u64] {
+        &self.bootstrap_rooms
+    }
+
+    /// Requested PREPARED lease duration in milliseconds.
+    pub fn prepared_ttl_ms(&self) -> u64 {
+        self.prepared_ttl_ms
+    }
+
+    /// Engine-issued absolute PREPARED expiry in Unix milliseconds.
+    pub fn prepared_expires_at_unix_ms(&self) -> u64 {
+        self.prepared_expires_at_unix_ms
+    }
+
+    /// Exact provisional reservation transcript released by the engine.
+    pub fn reservation_digest(&self) -> DecoderReservationDigest {
+        self.reservation_digest
+    }
+
+    /// Final digest pinned by a bind attempt, if binding was attempted.
+    pub fn attempted_grant_digest(&self) -> Option<DecoderGrantDigest> {
+        self.attempted_grant_digest
+    }
+
+    /// Immutable engine receipt identity.
+    pub fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+
+    /// Immutable engine receipt digest.
+    pub fn receipt_digest(&self) -> AuthorityDigest {
+        self.receipt_digest
+    }
+
+    /// Whether engine reconciliation is take-once and retry-observable.
+    pub fn take_once(&self) -> bool {
+        self.take_once
+    }
+}
+
 /// Authoritative terminal release kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineReleaseKind {
@@ -1039,6 +1889,8 @@ pub struct EngineQuarantineReceipt {
     decoder_id: DecoderId,
     child_request_ids: Arc<[Uuid]>,
     prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+    slot_generations: Arc<[DecoderSlotGeneration]>,
+    bootstrap_rooms: Arc<[u64]>,
     grant_digest: DecoderGrantDigest,
     receipt_id: Uuid,
     receipt_digest: AuthorityDigest,
@@ -1052,6 +1904,8 @@ impl EngineQuarantineReceipt {
         decoder_id: DecoderId,
         child_request_ids: Vec<Uuid>,
         prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+        slot_generations: Vec<DecoderSlotGeneration>,
+        bootstrap_rooms: Vec<u64>,
         grant_digest: DecoderGrantDigest,
         receipt_id: Uuid,
         receipt_digest: AuthorityDigest,
@@ -1062,6 +1916,8 @@ impl EngineQuarantineReceipt {
             decoder_id,
             child_request_ids: Arc::from(child_request_ids),
             prefill_bootstrap_endpoint,
+            slot_generations: Arc::from(slot_generations),
+            bootstrap_rooms: Arc::from(bootstrap_rooms),
             grant_digest,
             receipt_id,
             receipt_digest,
@@ -1087,6 +1943,16 @@ impl EngineQuarantineReceipt {
     /// Exact prefill bootstrap endpoint bound into the grant.
     pub fn prefill_bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
         &self.prefill_bootstrap_endpoint
+    }
+
+    /// Exact ordered decoder request-slot generations retained by the engine.
+    pub fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        &self.slot_generations
+    }
+
+    /// Exact ordered decoder-local bootstrap rooms retained by the engine.
+    pub fn bootstrap_rooms(&self) -> &[u64] {
+        &self.bootstrap_rooms
     }
 
     /// Exact grant digest echoed by the engine.
@@ -1221,11 +2087,8 @@ pub enum EngineGrantError {
     InvalidGrant(String),
     #[error("decoder allocator refused the reservation: {0}")]
     AllocatorRefused(String),
-    #[error("decoder control request failed during {operation}: {message}")]
-    ControlRequestFailed {
-        operation: &'static str,
-        message: String,
-    },
+    #[error("decoder reserve outcome is allocation-ambiguous: {0}")]
+    AmbiguousReserve(String),
     #[error("decoder control outcome is ambiguous during {operation}: {message}")]
     AmbiguousControl {
         operation: &'static str,
@@ -1246,13 +2109,18 @@ pub(crate) fn issue_test_grant(
     slot_generations: Vec<DecoderSlotGeneration>,
     bootstrap_rooms: Vec<u64>,
     accounting: Vec<DecoderGrantChildAccounting>,
-) -> Result<EngineDecoderGrant, EngineGrantError> {
+) -> Result<BoundPreparedGrant, EngineGrantError> {
     if slot_generations.len() != bootstrap_rooms.len() || slot_generations.len() != accounting.len()
     {
         return Err(EngineGrantError::InvalidGrant(
             "test grant vectors must have identical lengths".to_string(),
         ));
     }
+    let request_shape = if slot_generations.len() == 1 {
+        DecoderRequestShape::Scalar
+    } else {
+        DecoderRequestShape::Batch
+    };
     let children = slot_generations
         .into_iter()
         .zip(bootstrap_rooms)
@@ -1274,8 +2142,13 @@ pub(crate) fn issue_test_grant(
         .collect::<Result<Vec<_>, _>>()?;
     let binding = DecoderGrantBinding::new(
         grant_id,
+        Uuid::from_u128(0xaaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa),
         DecoderInferenceRoute::Generate,
-        "{}",
+        request_shape,
+        1_000,
+        1_900_000_000_000,
+        Bytes::from_static(b"{}"),
+        Bytes::from_static(b"{}"),
         prefill_id,
         PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000)?,
         request_chain_id,
@@ -1283,7 +2156,7 @@ pub(crate) fn issue_test_grant(
         decoder_id,
         children,
     )?;
-    Ok(EngineDecoderGrant {
+    Ok(BoundPreparedGrant {
         binding,
         control: None,
     })
@@ -1293,6 +2166,8 @@ pub(crate) fn issue_test_grant(
 pub(crate) fn issue_test_release_receipt(
     grant_id: Uuid,
     decoder_id: DecoderId,
+    child_request_ids: Vec<Uuid>,
+    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
     slot_generations: Vec<DecoderSlotGeneration>,
     bootstrap_rooms: Vec<u64>,
     grant_digest: DecoderGrantDigest,
@@ -1302,17 +2177,39 @@ pub(crate) fn issue_test_release_receipt(
     EngineReleaseReceipt::from_control(
         grant_id,
         decoder_id,
-        (0..slot_generations.len())
-            .map(|index| Uuid::from_u128(index as u128 + 1))
-            .collect(),
-        PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000)
-            .expect("fixed test bootstrap endpoint must be valid"),
+        child_request_ids,
+        prefill_bootstrap_endpoint,
         slot_generations,
         bootstrap_rooms,
         grant_digest,
         kind,
         Uuid::new_v4(),
         AuthorityDigest([7; 32]),
+        take_once,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn issue_test_quarantine_receipt(
+    grant_id: Uuid,
+    decoder_id: DecoderId,
+    child_request_ids: Vec<Uuid>,
+    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+    slot_generations: Vec<DecoderSlotGeneration>,
+    bootstrap_rooms: Vec<u64>,
+    grant_digest: DecoderGrantDigest,
+    take_once: bool,
+) -> EngineQuarantineReceipt {
+    EngineQuarantineReceipt::from_control(
+        grant_id,
+        decoder_id,
+        child_request_ids,
+        prefill_bootstrap_endpoint,
+        slot_generations,
+        bootstrap_rooms,
+        grant_digest,
+        Uuid::new_v4(),
+        AuthorityDigest([8; 32]),
         take_once,
     )
 }
@@ -1344,6 +2241,148 @@ mod tests {
             DecoderGrantChildAccounting::new(100, 10),
         )
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct DigestFixture {
+        grant_id: Uuid,
+        reservation_attempt_id: Uuid,
+        inference_route: DecoderInferenceRoute,
+        request_shape: DecoderRequestShape,
+        prepared_ttl_ms: u64,
+        prepared_expires_at_unix_ms: u64,
+        base_request_body: Bytes,
+        request_body: Bytes,
+        prefill_id: PrefillId,
+        prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+        request_chain_id: Uuid,
+        source_tp_size: usize,
+        decoder_id: DecoderId,
+        children: Vec<DecoderGrantChildBinding>,
+    }
+
+    impl DigestFixture {
+        fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+            digest_reserve_attempt(
+                self.reservation_attempt_id,
+                self.inference_route,
+                self.request_shape,
+                self.prepared_ttl_ms,
+                &self.base_request_body,
+                &self.prefill_id,
+                &self.prefill_bootstrap_endpoint,
+                self.request_chain_id,
+                self.source_tp_size,
+                &self.decoder_id,
+                &self
+                    .children
+                    .iter()
+                    .map(DecoderGrantChildBinding::child_request_id)
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn reservation_digest(&self) -> DecoderReservationDigest {
+            digest_reservation(
+                self.grant_id,
+                self.reserve_attempt_digest(),
+                self.prepared_expires_at_unix_ms,
+                &self.children,
+            )
+        }
+
+        fn grant_digest(&self) -> DecoderGrantDigest {
+            digest_binding(self.reservation_digest(), &self.request_body)
+        }
+
+        fn try_binding(&self) -> Result<DecoderGrantBinding, EngineGrantError> {
+            DecoderGrantBinding::new(
+                self.grant_id,
+                self.reservation_attempt_id,
+                self.inference_route,
+                self.request_shape,
+                self.prepared_ttl_ms,
+                self.prepared_expires_at_unix_ms,
+                self.base_request_body.clone(),
+                self.request_body.clone(),
+                self.prefill_id.clone(),
+                self.prefill_bootstrap_endpoint.clone(),
+                self.request_chain_id,
+                self.source_tp_size,
+                self.decoder_id.clone(),
+                self.children.clone(),
+            )
+        }
+
+        fn binding(&self) -> DecoderGrantBinding {
+            self.try_binding().unwrap()
+        }
+    }
+
+    fn digest_fixture() -> DigestFixture {
+        DigestFixture {
+            grant_id: Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap(),
+            reservation_attempt_id: Uuid::parse_str(
+                "fedcba98-7654-4321-8fed-cba987654321",
+            )
+            .unwrap(),
+            inference_route: DecoderInferenceRoute::Generate,
+            request_shape: DecoderRequestShape::Batch,
+            prepared_ttl_ms: 2_500,
+            prepared_expires_at_unix_ms: 1_900_000_000_123,
+            base_request_body: Bytes::from_static(
+                br#"{"input_ids":[[1,2,3],[4,5]],"rid":["01020304-0506-4708-890a-0b0c0d0e0f10","f0e0d0c0-b0a0-4908-8706-050403020100"]}"#,
+            ),
+            request_body: Bytes::from_static(
+                br#"{"input_ids":[[1,2,3],[4,5]],"rid":["01020304-0506-4708-890a-0b0c0d0e0f10","f0e0d0c0-b0a0-4908-8706-050403020100"],"bootstrap_host":["10.20.30.40","10.20.30.40"],"bootstrap_port":[50051,50051],"bootstrap_room":[41,42]}"#,
+            ),
+            prefill_id: PrefillId::new(
+                "https://prefill.example:8443",
+                Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
+            )
+            .unwrap(),
+            prefill_bootstrap_endpoint: PrefillBootstrapEndpoint::new(
+                "10.20.30.40",
+                50051,
+            )
+            .unwrap(),
+            request_chain_id: Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                .unwrap(),
+            source_tp_size: 4,
+            decoder_id: DecoderId::new(
+                "http://decode.example:30001",
+                Uuid::parse_str("12345678-9abc-4def-8123-456789abcdef").unwrap(),
+            )
+            .unwrap(),
+            children: vec![
+                DecoderGrantChildBinding::new(
+                    Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap(),
+                    DecoderSlotGeneration::new(
+                        Uuid::parse_str("10203040-5060-4780-8900-a0b0c0d0e0f0").unwrap(),
+                    ),
+                    41,
+                    7,
+                    3,
+                    AuthorityDigest([0x11; 32]),
+                    AuthorityDigest([0x22; 32]),
+                    DecoderGrantChildAccounting::new(12_345, 321),
+                )
+                .unwrap(),
+                DecoderGrantChildBinding::new(
+                    Uuid::parse_str("f0e0d0c0-b0a0-4908-8706-050403020100").unwrap(),
+                    DecoderSlotGeneration::new(
+                        Uuid::parse_str("0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0ff").unwrap(),
+                    ),
+                    42,
+                    8,
+                    9,
+                    AuthorityDigest([0x33; 32]),
+                    AuthorityDigest([0x44; 32]),
+                    DecoderGrantChildAccounting::new(67_890, 654),
+                )
+                .unwrap(),
+            ],
+        }
     }
 
     #[test]
@@ -1381,88 +2420,133 @@ mod tests {
     }
 
     #[test]
-    fn grant_digest_binds_request_processes_and_exact_child_order() {
-        let (prefill_id, decoder_id) = process_ids();
-        let grant_id = Uuid::new_v4();
-        let chain_id = Uuid::new_v4();
-        let first_slot = Uuid::new_v4();
-        let second_slot = Uuid::new_v4();
-        let first_child = Uuid::new_v4();
-        let second_child = Uuid::new_v4();
-        let bootstrap_endpoint =
-            PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000).unwrap();
-        let base = DecoderGrantBinding::new(
-            grant_id,
-            DecoderInferenceRoute::Generate,
-            r#"{"prompt":"hello","temperature":1.0}"#,
-            prefill_id.clone(),
-            bootstrap_endpoint.clone(),
-            chain_id,
-            2,
-            decoder_id.clone(),
-            vec![
-                child(first_child, first_slot, 11),
-                child(second_child, second_slot, 12),
-            ],
-        )
-        .unwrap()
-        .digest();
-        let reordered = DecoderGrantBinding::new(
-            grant_id,
-            DecoderInferenceRoute::Generate,
-            r#"{"prompt":"hello","temperature":1.0}"#,
-            prefill_id.clone(),
-            bootstrap_endpoint.clone(),
-            chain_id,
-            2,
-            decoder_id.clone(),
-            vec![
-                child(second_child, second_slot, 12),
-                child(first_child, first_slot, 11),
-            ],
-        )
-        .unwrap()
-        .digest();
-        let changed_body = DecoderGrantBinding::new(
-            grant_id,
-            DecoderInferenceRoute::Generate,
-            r#"{"prompt":"goodbye","temperature":1.0}"#,
-            prefill_id.clone(),
-            bootstrap_endpoint.clone(),
-            chain_id,
-            2,
-            decoder_id.clone(),
-            vec![
-                child(first_child, first_slot, 11),
-                child(second_child, second_slot, 12),
-            ],
-        )
-        .unwrap()
-        .digest();
-        let changed_bootstrap = DecoderGrantBinding::new(
-            grant_id,
-            DecoderInferenceRoute::Generate,
-            r#"{"prompt":"hello","temperature":1.0}"#,
-            prefill_id,
-            PrefillBootstrapEndpoint::new("other-bootstrap.test", 5001).unwrap(),
-            chain_id,
-            2,
-            decoder_id,
-            vec![
-                child(first_child, first_slot, 11),
-                child(second_child, second_slot, 12),
-            ],
-        )
-        .unwrap()
-        .digest();
-        assert_ne!(base, reordered);
-        assert_ne!(base, changed_body);
-        assert_ne!(base, changed_bootstrap);
+    fn digest_chain_binds_every_authority_field() {
+        let fixture = digest_fixture();
+        let reserve_digest = fixture.reserve_attempt_digest();
+        let reservation_digest = fixture.reservation_digest();
+        let grant_digest = fixture.grant_digest();
+
+        let assert_reserve_change = |mutator: fn(&mut DigestFixture)| {
+            let mut changed = fixture.clone();
+            mutator(&mut changed);
+            assert_ne!(changed.reserve_attempt_digest(), reserve_digest);
+        };
+        assert_reserve_change(|value| value.reservation_attempt_id = Uuid::new_v4());
+        assert_reserve_change(|value| value.inference_route = DecoderInferenceRoute::Completions);
+        assert_reserve_change(|value| value.request_shape = DecoderRequestShape::Scalar);
+        assert_reserve_change(|value| value.prepared_ttl_ms += 1);
+        assert_reserve_change(|value| {
+            value.base_request_body = Bytes::from_static(b"{\"input_ids\":[[9],[4,5]]}")
+        });
+        assert_reserve_change(|value| {
+            value.prefill_id = PrefillId::new(
+                "https://other-prefill.example:8443",
+                value.prefill_id.instance_id(),
+            )
+            .unwrap()
+        });
+        assert_reserve_change(|value| {
+            value.prefill_id = PrefillId::new(value.prefill_id.url(), Uuid::new_v4()).unwrap()
+        });
+        assert_reserve_change(|value| {
+            value.prefill_bootstrap_endpoint =
+                PrefillBootstrapEndpoint::new("10.20.30.41", 50052).unwrap()
+        });
+        assert_reserve_change(|value| value.request_chain_id = Uuid::new_v4());
+        assert_reserve_change(|value| value.source_tp_size = 2);
+        assert_reserve_change(|value| {
+            value.decoder_id = DecoderId::new(
+                "http://other-decode.example:30001",
+                value.decoder_id.instance_id(),
+            )
+            .unwrap()
+        });
+        assert_reserve_change(|value| {
+            value.decoder_id = DecoderId::new(value.decoder_id.url(), Uuid::new_v4()).unwrap()
+        });
+        assert_reserve_change(|value| value.children.swap(0, 1));
+
+        assert_ne!(
+            digest_reservation(
+                Uuid::new_v4(),
+                reserve_digest,
+                fixture.prepared_expires_at_unix_ms,
+                &fixture.children,
+            ),
+            reservation_digest
+        );
+        assert_ne!(
+            digest_reservation(
+                fixture.grant_id,
+                DecoderReserveAttemptDigest([0xAB; 32]),
+                fixture.prepared_expires_at_unix_ms,
+                &fixture.children,
+            ),
+            reservation_digest
+        );
+        assert_ne!(
+            digest_reservation(
+                fixture.grant_id,
+                reserve_digest,
+                fixture.prepared_expires_at_unix_ms + 1,
+                &fixture.children,
+            ),
+            reservation_digest
+        );
+
+        let assert_allocation_change = |mutator: fn(&mut DecoderGrantChildBinding)| {
+            let mut children = fixture.children.clone();
+            mutator(&mut children[0]);
+            assert_ne!(
+                digest_reservation(
+                    fixture.grant_id,
+                    reserve_digest,
+                    fixture.prepared_expires_at_unix_ms,
+                    &children,
+                ),
+                reservation_digest
+            );
+        };
+        assert_allocation_change(|child| child.child_request_id = Uuid::new_v4());
+        assert_allocation_change(|child| {
+            child.slot_generation = DecoderSlotGeneration::new(Uuid::new_v4())
+        });
+        assert_allocation_change(|child| child.bootstrap_room += 1);
+        assert_allocation_change(|child| child.request_slot += 1);
+        assert_allocation_change(|child| child.request_generation += 1);
+        assert_allocation_change(|child| child.writer_manifest_digest = AuthorityDigest([5; 32]));
+        assert_allocation_change(|child| child.allocation_digest = AuthorityDigest([6; 32]));
+        assert_allocation_change(|child| child.accounting.reserved_kv_tokens += 1);
+        assert_allocation_change(|child| child.accounting.remaining_decode_tokens += 1);
+        let mut reordered_children = fixture.children.clone();
+        reordered_children.swap(0, 1);
+        assert_ne!(
+            digest_reservation(
+                fixture.grant_id,
+                reserve_digest,
+                fixture.prepared_expires_at_unix_ms,
+                &reordered_children,
+            ),
+            reservation_digest
+        );
+
+        assert_ne!(
+            digest_binding(DecoderReservationDigest([0xCD; 32]), &fixture.request_body,),
+            grant_digest
+        );
+        assert_ne!(
+            digest_binding(reservation_digest, b"{\"final\":\"changed\"}"),
+            grant_digest
+        );
+
+        let binding = fixture.binding();
+        assert_eq!(binding.reserve_attempt_digest(), reserve_digest);
+        assert_eq!(binding.reservation_digest(), reservation_digest);
+        assert_eq!(binding.digest(), grant_digest);
     }
 
     #[test]
     fn grant_rejects_invalid_or_duplicate_child_allocation_identity() {
-        let (prefill_id, decoder_id) = process_ids();
         let slot = Uuid::new_v4();
         let first_child = Uuid::new_v4();
         let second_child = Uuid::new_v4();
@@ -1478,79 +2562,31 @@ mod tests {
                 child(second_child, Uuid::new_v4(), 11),
             ],
         ] {
-            assert!(DecoderGrantBinding::new(
-                Uuid::new_v4(),
-                DecoderInferenceRoute::Generate,
-                "{}",
-                prefill_id.clone(),
-                PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000).unwrap(),
-                Uuid::new_v4(),
-                2,
-                decoder_id.clone(),
-                children,
-            )
-            .is_err());
+            let mut fixture = digest_fixture();
+            fixture.request_shape = if children.len() == 1 {
+                DecoderRequestShape::Scalar
+            } else {
+                DecoderRequestShape::Batch
+            };
+            fixture.children = children;
+            assert!(fixture.try_binding().is_err());
         }
     }
 
     #[test]
-    fn grant_digest_v3_matches_cross_language_golden_vector() {
-        let grant_id = Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap();
-        let prefill_id = PrefillId::new(
-            "https://prefill.example:8443",
-            Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
-        )
-        .unwrap();
-        let bootstrap_endpoint = PrefillBootstrapEndpoint::new("10.20.30.40", 50051).unwrap();
-        let chain_id = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
-        let decoder_id = DecoderId::new(
-            "http://decode.example:30001",
-            Uuid::parse_str("12345678-9abc-4def-8123-456789abcdef").unwrap(),
-        )
-        .unwrap();
-        let children = vec![
-            DecoderGrantChildBinding::new(
-                Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap(),
-                DecoderSlotGeneration::new(
-                    Uuid::parse_str("10203040-5060-4780-8900-a0b0c0d0e0f0").unwrap(),
-                ),
-                41,
-                7,
-                3,
-                AuthorityDigest([0x11; 32]),
-                AuthorityDigest([0x22; 32]),
-                DecoderGrantChildAccounting::new(12_345, 321),
-            )
-            .unwrap(),
-            DecoderGrantChildBinding::new(
-                Uuid::parse_str("f0e0d0c0-b0a0-4908-8706-050403020100").unwrap(),
-                DecoderSlotGeneration::new(
-                    Uuid::parse_str("0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0ff").unwrap(),
-                ),
-                42,
-                8,
-                9,
-                AuthorityDigest([0x33; 32]),
-                AuthorityDigest([0x44; 32]),
-                DecoderGrantChildAccounting::new(67_890, 654),
-            )
-            .unwrap(),
-        ];
-        let binding = DecoderGrantBinding::new(
-            grant_id,
-            DecoderInferenceRoute::ChatCompletions,
-            r#"{"model":"gemma","rid":["01020304-0506-4708-890a-0b0c0d0e0f10","f0e0d0c0-b0a0-4908-8706-050403020100"],"max_tokens":17}"#,
-            prefill_id,
-            bootstrap_endpoint,
-            chain_id,
-            4,
-            decoder_id,
-            children,
-        )
-        .unwrap();
+    fn digest_domains_match_cross_language_golden_vectors() {
+        let fixture = digest_fixture();
         assert_eq!(
-            binding.digest().to_hex(),
-            "5294f13bfa1b2f9ca5e553b96212737a7fe993f88b138ed3b063f24ff39b9938"
+            fixture.reserve_attempt_digest().to_hex(),
+            "1673ccc0b56472cbcf512f2caa4fb2989ecb82729791f3438a677af1b2582c14"
+        );
+        assert_eq!(
+            fixture.reservation_digest().to_hex(),
+            "d0b0b05dea2236839cc9bef079325e2ff0be11d93bcf9c97aa4718cfe5de495a"
+        );
+        assert_eq!(
+            fixture.grant_digest().to_hex(),
+            "1a47879143d21f3e0945673cd4b207d2a347cc83d326897967d8937568d0cd73"
         );
     }
 
