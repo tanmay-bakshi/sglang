@@ -11,23 +11,27 @@
 //! transfer quiescence. Configured scales are advisory and never override an
 //! allocator grant. The caller must provide one authoritative routing process,
 //! an engine reservation capability, and an exact engine terminal receipt
-//! before invoking `confirm_quiesced`.
+//! before invoking a receipt-backed terminal transition.
 
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    fmt,
     num::NonZeroUsize,
     sync::Arc,
 };
 
 use parking_lot::Mutex;
 use thiserror::Error;
+use tracing::warn;
 use uuid::Uuid;
 
 use super::pd_decoder_grant::{
-    BoundPreparedGrant, DecoderAllocationKey, DecoderGrantBinding, DecoderGrantDigest, DecoderId,
-    DecoderSlotGeneration, EngineQuarantineReceipt, EngineReleaseKind, EngineReleaseReceipt,
-    PrefillId,
+    AbortReconciliationGrant, BoundPreparedGrant, CompletionReconciliationGrant,
+    DecoderAllocationKey, DecoderGrantBinding, DecoderGrantDigest, DecoderId,
+    DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt,
+    EngineReleaseKind, EngineReleaseReceipt, PrefillId, PreparedCancellationReconciliationGrant,
+    PromotionReconciliationGrant, QuarantineReconciliationGrant, RetainedEngineGrant,
 };
 
 /// Engine-declared fields used to reject obviously incompatible PD pairings.
@@ -179,8 +183,11 @@ pub enum RetryDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CohortPhase {
     Reserved,
+    Cancelling,
     Active,
-    Quiescing,
+    Completing,
+    Aborting,
+    Quarantining,
     Quarantined,
     Terminal,
 }
@@ -233,6 +240,26 @@ pub struct DecoderAssignmentCohort {
     assignment_id: Uuid,
     binding: DecoderGrantBinding,
     phase: CohortPhase,
+    prepared_grant: Option<BoundPreparedGrant>,
+}
+
+/// Non-cloneable proof that the pool selected one exact grant transcript.
+pub(super) struct DecoderGrantPoolBinding {
+    grant_id: Uuid,
+    grant_digest: DecoderGrantDigest,
+}
+
+impl DecoderGrantPoolBinding {
+    fn new(binding: &DecoderGrantBinding) -> Self {
+        Self {
+            grant_id: binding.grant_id(),
+            grant_digest: binding.digest(),
+        }
+    }
+
+    pub(super) fn matches(&self, binding: &DecoderGrantBinding) -> bool {
+        self.grant_id == binding.grant_id() && self.grant_digest == binding.digest()
+    }
 }
 
 impl DecoderAssignmentCohort {
@@ -319,6 +346,8 @@ pub enum DecoderPoolError {
     ForeignRequestOwner,
     #[error("logical request owner is already finalized")]
     RequestOwnerFinalized,
+    #[error("logical request chain {0} no longer has a live owner")]
+    RequestChainOwnerDropped(Uuid),
     #[error("logical request chain {0} is unknown")]
     UnknownRequestChain(Uuid),
     #[error("logical request {request_id} still owns assignment {assignment_id}")]
@@ -372,12 +401,23 @@ pub enum DecoderPoolError {
         "allocator bootstrap room {room} on decoder {decoder_id} is already owned by an active cohort"
     )]
     GrantRoomInUse { decoder_id: DecoderId, room: u64 },
+    #[error(
+        "allocator slot generation {slot_generation} on decoder {decoder_id} is already owned by an active cohort"
+    )]
+    GrantSlotGenerationInUse {
+        decoder_id: DecoderId,
+        slot_generation: Uuid,
+    },
     #[error("allocator grant identity {0} is already active")]
     GrantAlreadyActive(Uuid),
     #[error("assignment capability was not issued by this decoder pool")]
     ForeignAssignment,
     #[error("assignment {0} is unknown or already terminal")]
     UnknownAssignment(Uuid),
+    #[error("assignment {0} is still waiting for an authoritative terminal proof")]
+    TerminalProofPending(Uuid),
+    #[error("assignment {0} already retains a conflicting terminal proof")]
+    ConflictingTerminalProof(Uuid),
     #[error("decoder-pool accounting for assignment {assignment_id} is inconsistent: {reason}")]
     InconsistentAssignment {
         assignment_id: Uuid,
@@ -409,6 +449,253 @@ pub enum DecoderPoolError {
     },
 }
 
+/// Failures while reconciling one pool-bound engine operation.
+#[derive(Debug, Error)]
+pub enum DecoderAssignmentReconciliationError {
+    #[error(transparent)]
+    Engine(#[from] EngineGrantError),
+    #[error(transparent)]
+    Pool(#[from] DecoderPoolError),
+    #[error("{0} reconciliation is already complete")]
+    AlreadyComplete(&'static str),
+}
+
+/// Pool-bound cancellation that can only terminalize its own reserved cohort.
+#[must_use = "cancellation reconciliation must be driven to an authoritative outcome"]
+pub struct PoolCancellationReconciliation<'a> {
+    pool: DecoderPool,
+    cohort: &'a mut DecoderAssignmentCohort,
+    engine: PreparedCancellationReconciliationGrant,
+    complete: bool,
+}
+
+impl fmt::Debug for PoolCancellationReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolCancellationReconciliation")
+            .field("assignment_id", &self.cohort.assignment_id)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// Pool-bound completion that can only terminalize its own active cohort.
+#[must_use = "completion reconciliation must be driven to an authoritative outcome"]
+pub struct PoolCompletionReconciliation<'a> {
+    pool: DecoderPool,
+    cohort: &'a mut DecoderAssignmentCohort,
+    engine: CompletionReconciliationGrant,
+    complete: bool,
+}
+
+impl fmt::Debug for PoolCompletionReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolCompletionReconciliation")
+            .field("assignment_id", &self.cohort.assignment_id)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// Pool-bound abort that applies either authoritative terminal outcome in place.
+#[must_use = "abort reconciliation must be driven to an authoritative outcome"]
+pub struct PoolAbortReconciliation<'a> {
+    pool: DecoderPool,
+    cohort: &'a mut DecoderAssignmentCohort,
+    engine: AbortReconciliationGrant,
+    complete: bool,
+}
+
+impl fmt::Debug for PoolAbortReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolAbortReconciliation")
+            .field("assignment_id", &self.cohort.assignment_id)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// Pool-bound quarantine that can only retain its own exact cohort.
+#[must_use = "quarantine reconciliation must be driven to an authoritative outcome"]
+pub struct PoolQuarantineReconciliation<'a> {
+    pool: DecoderPool,
+    cohort: &'a mut DecoderAssignmentCohort,
+    engine: QuarantineReconciliationGrant,
+    complete: bool,
+}
+
+impl fmt::Debug for PoolQuarantineReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PoolQuarantineReconciliation")
+            .field("assignment_id", &self.cohort.assignment_id)
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+impl PoolCancellationReconciliation<'_> {
+    /// Reconcile the pinned engine cancellation and its exact pool cohort.
+    ///
+    /// Once the engine returns a receipt, later retries only repeat pool
+    /// application. Engine I/O is never repeated after authoritative release.
+    pub async fn reconcile(&mut self) -> Result<(), DecoderAssignmentReconciliationError> {
+        if self.complete {
+            return Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "cancellation",
+            ));
+        }
+        match self.pool.resume_terminal_reconciliation(self.cohort) {
+            Ok(()) => {
+                self.complete = true;
+                return Ok(());
+            }
+            Err(DecoderPoolError::TerminalProofPending(assignment_id))
+                if assignment_id == self.cohort.assignment_id => {}
+            Err(error) => return Err(error.into()),
+        }
+        let receipt = self.engine.reconcile_cancellation().await?;
+        self.pool.install_cancellation_proof(self.cohort, receipt)?;
+        self.pool.resume_terminal_reconciliation(self.cohort)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl PoolCompletionReconciliation<'_> {
+    /// Reconcile the pinned engine completion and its exact pool cohort.
+    ///
+    /// Once the engine returns a receipt, later retries only repeat pool
+    /// application. Engine I/O is never repeated after authoritative release.
+    pub async fn reconcile(&mut self) -> Result<(), DecoderAssignmentReconciliationError> {
+        if self.complete {
+            return Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "completion",
+            ));
+        }
+        match self.pool.resume_terminal_reconciliation(self.cohort) {
+            Ok(()) => {
+                self.complete = true;
+                return Ok(());
+            }
+            Err(DecoderPoolError::TerminalProofPending(assignment_id))
+                if assignment_id == self.cohort.assignment_id => {}
+            Err(error) => return Err(error.into()),
+        }
+        let receipt = self.engine.reconcile_completion().await?;
+        self.pool.install_completion_proof(self.cohort, receipt)?;
+        self.pool.resume_terminal_reconciliation(self.cohort)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl PoolAbortReconciliation<'_> {
+    /// Reconcile the pinned engine abort and its exact pool cohort.
+    ///
+    /// The authoritative engine outcome is retained before pool application,
+    /// including quarantine fallbacks, so a pool retry cannot repeat abort I/O.
+    pub async fn reconcile(&mut self) -> Result<(), DecoderAssignmentReconciliationError> {
+        if self.complete {
+            return Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "abort",
+            ));
+        }
+        match self.pool.resume_terminal_reconciliation(self.cohort) {
+            Ok(()) => {
+                self.complete = true;
+                return Ok(());
+            }
+            Err(DecoderPoolError::TerminalProofPending(assignment_id))
+                if assignment_id == self.cohort.assignment_id => {}
+            Err(error) => return Err(error.into()),
+        }
+        let outcome = self.engine.reconcile_abort().await?;
+        self.pool.install_abort_proof(self.cohort, outcome)?;
+        self.pool.resume_terminal_reconciliation(self.cohort)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl PoolQuarantineReconciliation<'_> {
+    /// Reconcile the pinned engine quarantine and its exact pool cohort.
+    ///
+    /// Once the engine returns a receipt, later retries only repeat pool
+    /// application. Engine I/O is never repeated after authoritative retention.
+    pub async fn reconcile(&mut self) -> Result<(), DecoderAssignmentReconciliationError> {
+        if self.complete {
+            return Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "quarantine",
+            ));
+        }
+        match self.pool.resume_terminal_reconciliation(self.cohort) {
+            Ok(()) => {
+                self.complete = true;
+                return Ok(());
+            }
+            Err(DecoderPoolError::TerminalProofPending(assignment_id))
+                if assignment_id == self.cohort.assignment_id => {}
+            Err(error) => return Err(error.into()),
+        }
+        let receipt = self.engine.reconcile_quarantine().await?;
+        self.pool.install_quarantine_proof(self.cohort, receipt)?;
+        self.pool.resume_terminal_reconciliation(self.cohort)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl Drop for PoolCancellationReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        warn!(
+            assignment_id = %self.cohort.assignment_id,
+            "Pool-bound cancellation reconciliation was dropped before pool terminalization"
+        );
+    }
+}
+
+impl Drop for PoolCompletionReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        warn!(
+            assignment_id = %self.cohort.assignment_id,
+            "Pool-bound completion reconciliation was dropped before pool terminalization"
+        );
+    }
+}
+
+impl Drop for PoolAbortReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        warn!(
+            assignment_id = %self.cohort.assignment_id,
+            "Pool-bound abort reconciliation was dropped before pool terminalization"
+        );
+    }
+}
+
+impl Drop for PoolQuarantineReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        warn!(
+            assignment_id = %self.cohort.assignment_id,
+            "Pool-bound quarantine reconciliation was dropped before pool retention"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct ReplicaState {
     metadata: DecoderReplicaMetadata,
@@ -436,10 +723,48 @@ struct AssignmentRecord {
     chain_id: Uuid,
     binding: DecoderGrantBinding,
     phase: CohortPhase,
-    quarantine_receipt: Option<EngineQuarantineReceipt>,
+    terminal_reconciliation: Option<TerminalReconciliationRecord>,
     child_count: usize,
     kv_tokens: usize,
     remaining_decode_tokens: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TerminalReconciliationRecord {
+    Cancellation {
+        disposition: RetryDisposition,
+        proof: Option<EngineReleaseReceipt>,
+    },
+    Completion {
+        proof: Option<EngineReleaseReceipt>,
+    },
+    Abort {
+        disposition: RetryDisposition,
+        proof: Option<EngineAbortOutcome>,
+    },
+    Quarantine {
+        proof: Option<EngineQuarantineReceipt>,
+    },
+}
+
+enum TerminalApplication {
+    Release {
+        expected_phase: CohortPhase,
+        disposition: RetryDisposition,
+    },
+    Quarantine {
+        expected_phase: CohortPhase,
+    },
+}
+
+struct LiveAssignmentLedger {
+    decoder_id: DecoderId,
+    chain_id: Uuid,
+    child_count: usize,
+    kv_tokens: usize,
+    remaining_decode_tokens: usize,
+    rooms: Vec<u64>,
+    allocations: Vec<DecoderAllocationKey>,
 }
 
 #[derive(Debug)]
@@ -451,7 +776,8 @@ struct PoolState {
     request_chains: HashMap<Uuid, RequestChainRecord>,
     active_request_ids: HashMap<Arc<str>, Uuid>,
     assignments: HashMap<Uuid, AssignmentRecord>,
-    active_rooms: HashSet<(DecoderId, u64)>,
+    room_owners: HashMap<(DecoderId, u64), Uuid>,
+    allocation_owners: HashMap<DecoderAllocationKey, Uuid>,
 }
 
 #[derive(Debug)]
@@ -483,6 +809,82 @@ pub struct DecoderPool {
     inner: Arc<DecoderPoolInner>,
 }
 
+trait ActiveEngineGrant {
+    fn grant_id(&self) -> Uuid;
+
+    fn grant_digest(&self) -> DecoderGrantDigest;
+
+    fn begin_abort(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError>;
+
+    fn begin_quarantine(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError>;
+}
+
+impl ActiveEngineGrant for PromotionReconciliationGrant {
+    fn grant_id(&self) -> Uuid {
+        self.grant_id()
+    }
+
+    fn grant_digest(&self) -> DecoderGrantDigest {
+        self.grant_digest()
+    }
+
+    fn begin_abort(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        PromotionReconciliationGrant::begin_abort(self, pool_binding, reason_code, diagnostic)
+    }
+
+    fn begin_quarantine(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        PromotionReconciliationGrant::begin_quarantine(self, pool_binding, reason_code, diagnostic)
+    }
+}
+
+impl ActiveEngineGrant for RetainedEngineGrant {
+    fn grant_id(&self) -> Uuid {
+        self.grant_id()
+    }
+
+    fn grant_digest(&self) -> DecoderGrantDigest {
+        self.grant_digest()
+    }
+
+    fn begin_abort(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        RetainedEngineGrant::begin_abort(self, pool_binding, reason_code, diagnostic)
+    }
+
+    fn begin_quarantine(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        RetainedEngineGrant::begin_quarantine(self, pool_binding, reason_code, diagnostic)
+    }
+}
+
 impl DecoderPool {
     /// Construct an empty pool from declared prefill metadata.
     pub fn new(
@@ -508,7 +910,8 @@ impl DecoderPool {
                     request_chains: HashMap::new(),
                     active_request_ids: HashMap::new(),
                     assignments: HashMap::new(),
-                    active_rooms: HashSet::new(),
+                    room_owners: HashMap::new(),
+                    allocation_owners: HashMap::new(),
                 }),
             }),
         })
@@ -714,10 +1117,10 @@ impl DecoderPool {
     pub fn bind_grant(
         &self,
         request: &LogicalRequestOwner,
-        grant: &BoundPreparedGrant,
+        grant: &mut BoundPreparedGrant,
     ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
         self.validate_request_owner(request)?;
-        let binding = grant.binding();
+        let binding = grant.binding().clone();
         let accounting = binding.accounting();
         if binding.bootstrap_rooms().len() != accounting.child_count() {
             return Err(DecoderPoolError::GrantChildCountMismatch {
@@ -801,12 +1204,21 @@ impl DecoderPool {
         }
         if let Some(room) = binding.bootstrap_rooms().iter().find(|room| {
             state
-                .active_rooms
-                .contains(&(binding.decoder_id().clone(), **room))
+                .room_owners
+                .contains_key(&(binding.decoder_id().clone(), **room))
         }) {
             return Err(DecoderPoolError::GrantRoomInUse {
                 decoder_id: binding.decoder_id().clone(),
                 room: *room,
+            });
+        }
+        if let Some(child_index) = binding
+            .allocation_keys()
+            .position(|key| state.allocation_owners.contains_key(&key))
+        {
+            return Err(DecoderPoolError::GrantSlotGenerationInUse {
+                decoder_id: binding.decoder_id().clone(),
+                slot_generation: binding.slot_generations()[child_index].as_uuid(),
             });
         }
 
@@ -835,6 +1247,12 @@ impl DecoderPool {
                 )
             })?;
         let assignment_id = binding.grant_id();
+        let pool_binding = DecoderGrantPoolBinding::new(&binding);
+        let prepared_grant = grant.take_for_pool_binding(pool_binding).map_err(|_| {
+            DecoderPoolError::InvalidGrant(
+                "prepared grant has no pool-binding authority".to_string(),
+            )
+        })?;
 
         let replica = state
             .replicas
@@ -844,12 +1262,16 @@ impl DecoderPool {
         replica.active_child_requests = active_child_requests;
         replica.reserved_kv_tokens = reserved_kv_tokens;
         replica.remaining_decode_tokens = remaining_decode_tokens;
-        state.active_rooms.extend(
-            binding
-                .bootstrap_rooms()
-                .iter()
-                .map(|room| (binding.decoder_id().clone(), *room)),
-        );
+        for room in binding.bootstrap_rooms() {
+            let previous = state
+                .room_owners
+                .insert((binding.decoder_id().clone(), *room), assignment_id);
+            debug_assert!(previous.is_none());
+        }
+        for allocation in binding.allocation_keys() {
+            let previous = state.allocation_owners.insert(allocation, assignment_id);
+            debug_assert!(previous.is_none());
+        }
 
         state.assignments.insert(
             assignment_id,
@@ -857,7 +1279,7 @@ impl DecoderPool {
                 chain_id: request.chain_id,
                 binding: binding.clone(),
                 phase: CohortPhase::Reserved,
-                quarantine_receipt: None,
+                terminal_reconciliation: None,
                 child_count: accounting.child_count(),
                 kv_tokens: accounting.total_reserved_kv_tokens(),
                 remaining_decode_tokens: accounting.total_remaining_decode_tokens(),
@@ -878,20 +1300,127 @@ impl DecoderPool {
             assignment_id,
             binding: binding.clone(),
             phase: CohortPhase::Reserved,
+            prepared_grant: Some(prepared_grant),
         })
     }
 
-    /// Cross the irreversible activation/publication boundary.
-    ///
-    /// This transition must complete before the prepared grant is converted to
-    /// a promotion-reconciliation capability and before the promote request is
-    /// polled. From this point onward, ambiguity follows active quiescence and
-    /// abort semantics; prepared cancellation is no longer valid.
-    pub fn begin_activation(
+    /// Begin cancellation bound to one exact reserved cohort.
+    pub fn begin_cancellation<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        disposition: RetryDisposition,
+    ) -> Result<PoolCancellationReconciliation<'a>, DecoderPoolError> {
+        let engine = self.pin_cancellation(cohort, disposition)?;
+        Ok(PoolCancellationReconciliation {
+            pool: self.clone(),
+            cohort,
+            engine,
+            complete: false,
+        })
+    }
+
+    fn pin_cancellation(
         &self,
         cohort: &mut DecoderAssignmentCohort,
-    ) -> Result<(), DecoderPoolError> {
-        self.transition(cohort, CohortPhase::Reserved, CohortPhase::Active)
+        disposition: RetryDisposition,
+    ) -> Result<PreparedCancellationReconciliationGrant, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        preflight_live_assignment(
+            &state,
+            cohort,
+            CohortPhase::Reserved,
+            phase_name(CohortPhase::Cancelling),
+        )?;
+        let prepared_grant = cohort.prepared_grant.as_ref().ok_or_else(|| {
+            DecoderPoolError::InvalidGrant(
+                "reserved assignment has no prepared grant authority".to_string(),
+            )
+        })?;
+        validate_engine_grant_identity(
+            prepared_grant.grant_id(),
+            prepared_grant.grant_digest(),
+            cohort,
+            "cancellation",
+        )?;
+        let prepared_grant = cohort
+            .prepared_grant
+            .as_mut()
+            .expect("prepared grant authority was validated immediately before mutation");
+        let cancellation = prepared_grant.begin_cancellation().map_err(|_| {
+            DecoderPoolError::InvalidGrant(
+                "matching prepared grant has no cancellation authority".to_string(),
+            )
+        })?;
+        cohort.prepared_grant = None;
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .expect("assignment was preflighted under the same pool lock");
+        record.phase = CohortPhase::Cancelling;
+        record.terminal_reconciliation = Some(TerminalReconciliationRecord::Cancellation {
+            disposition,
+            proof: None,
+        });
+        cohort.phase = CohortPhase::Cancelling;
+        Ok(cancellation)
+    }
+
+    /// Atomically activate a cohort and consume its exact grant into promotion.
+    ///
+    /// A mismatched cohort/grant pair or unavailable grant authority leaves both
+    /// inputs reserved and unchanged. On success, prepared cancellation is no
+    /// longer available and the returned capability is the only engine control
+    /// authority.
+    pub fn begin_promotion(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+    ) -> Result<PromotionReconciliationGrant, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let ledger = preflight_live_assignment(
+            &state,
+            cohort,
+            CohortPhase::Reserved,
+            phase_name(CohortPhase::Active),
+        )?;
+        if !state
+            .request_chains
+            .get(&ledger.chain_id)
+            .expect("request chain was preflighted under the same pool lock")
+            .owner_alive
+        {
+            return Err(DecoderPoolError::RequestChainOwnerDropped(ledger.chain_id));
+        }
+        let prepared_grant = cohort.prepared_grant.as_ref().ok_or_else(|| {
+            DecoderPoolError::InvalidGrant(
+                "reserved assignment has no prepared grant authority".to_string(),
+            )
+        })?;
+        validate_engine_grant_identity(
+            prepared_grant.grant_id(),
+            prepared_grant.grant_digest(),
+            cohort,
+            "promotion",
+        )?;
+        let prepared_grant = cohort
+            .prepared_grant
+            .as_mut()
+            .expect("prepared grant authority was validated immediately before mutation");
+        let pool_binding = DecoderGrantPoolBinding::new(&cohort.binding);
+        let promotion = prepared_grant.begin_promotion(pool_binding).map_err(|_| {
+            DecoderPoolError::InvalidGrant(
+                "matching prepared grant has no promotion authority".to_string(),
+            )
+        })?;
+        cohort.prepared_grant = None;
+        state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .expect("assignment was preflighted under the same pool lock")
+            .phase = CohortPhase::Active;
+        cohort.phase = CohortPhase::Active;
+        Ok(promotion)
     }
 
     /// Reduce aggregate remaining work as child decode tokens are emitted.
@@ -940,154 +1469,535 @@ impl DecoderPool {
         Ok(())
     }
 
-    /// Enter quiescence while any child may still be transferring.
-    pub fn begin_quiescence(
+    /// Begin successful completion bound to one exact active cohort.
+    pub fn begin_completion<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut RetainedEngineGrant,
+    ) -> Result<PoolCompletionReconciliation<'a>, DecoderPoolError> {
+        let engine = self.pin_completion(cohort, grant)?;
+        Ok(PoolCompletionReconciliation {
+            pool: self.clone(),
+            cohort,
+            engine,
+            complete: false,
+        })
+    }
+
+    fn pin_completion(
         &self,
         cohort: &mut DecoderAssignmentCohort,
-    ) -> Result<(), DecoderPoolError> {
+        grant: &mut RetainedEngineGrant,
+    ) -> Result<CompletionReconciliationGrant, DecoderPoolError> {
         self.validate_assignment_pool(cohort)?;
         let mut state = self.inner.state.lock();
-        let decoder_id = {
-            let record = state
-                .assignments
-                .get(&cohort.assignment_id)
-                .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
-            validate_assignment_record(record, cohort)?;
-            if cohort.phase != CohortPhase::Active || record.phase != CohortPhase::Active {
-                return Err(invalid_transition(
-                    cohort.assignment_id,
-                    record.phase,
-                    phase_name(CohortPhase::Quiescing),
-                ));
-            }
-            record.binding.decoder_id().clone()
-        };
-        state
-            .replicas
-            .get_mut(&decoder_id)
-            .expect("assigned decoder disappeared while pool lock was held")
-            .quiescing_cohorts += 1;
-        state
-            .assignments
-            .get_mut(&cohort.assignment_id)
-            .expect("assignment disappeared while pool lock was held")
-            .phase = CohortPhase::Quiescing;
-        cohort.phase = CohortPhase::Quiescing;
-        Ok(())
-    }
-
-    /// Terminalize a cohort that never crossed the activation boundary.
-    pub fn finish_before_activation(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        receipt: &EngineReleaseReceipt,
-        disposition: RetryDisposition,
-    ) -> Result<(), DecoderPoolError> {
-        validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::PreparedCancelled)?;
-        self.release(cohort, CohortPhase::Reserved, disposition)
-    }
-
-    /// Terminalize a successfully completed child cohort.
-    pub fn complete(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        receipt: &EngineReleaseReceipt,
-    ) -> Result<(), DecoderPoolError> {
-        validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Completed)?;
-        self.release(cohort, CohortPhase::Active, RetryDisposition::Terminal)
-    }
-
-    /// Release every child after the engine attests exact terminal quiescence.
-    pub fn confirm_quiesced(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        receipt: &EngineReleaseReceipt,
-        disposition: RetryDisposition,
-    ) -> Result<(), DecoderPoolError> {
-        validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Aborted)?;
-        self.release(cohort, CohortPhase::Quiescing, disposition)
-    }
-
-    /// Record authoritative quarantine while retaining every allocation.
-    pub fn confirm_quarantined(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        receipt: &EngineQuarantineReceipt,
-    ) -> Result<(), DecoderPoolError> {
-        validate_engine_quarantine_receipt(cohort, receipt)?;
-        self.validate_assignment_pool(cohort)?;
-        let mut state = self.inner.state.lock();
-        let (decoder_id, chain_id) = {
-            let record = state
-                .assignments
-                .get(&cohort.assignment_id)
-                .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
-            validate_assignment_record(record, cohort)?;
-            if cohort.phase != CohortPhase::Quiescing || record.phase != CohortPhase::Quiescing {
-                return Err(invalid_transition(
-                    cohort.assignment_id,
-                    record.phase,
-                    phase_name(CohortPhase::Quarantined),
-                ));
-            }
-            if record.quarantine_receipt.is_some() {
-                return Err(DecoderPoolError::InconsistentAssignment {
-                    assignment_id: cohort.assignment_id,
-                    reason: "quarantine receipt was already recorded before quarantine",
-                });
-            }
-            (record.binding.decoder_id().clone(), record.chain_id)
-        };
-        let replica =
-            state
-                .replicas
-                .get(&decoder_id)
-                .ok_or(DecoderPoolError::InconsistentAssignment {
-                    assignment_id: cohort.assignment_id,
-                    reason: "assigned decoder is missing",
-                })?;
-        if replica.quiescing_cohorts == 0 {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "decoder has no quiescing cohort to quarantine",
-            });
-        }
-        let chain = state.request_chains.get(&chain_id).ok_or(
-            DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "request chain is missing",
-            },
+        preflight_live_assignment(
+            &state,
+            cohort,
+            CohortPhase::Active,
+            phase_name(CohortPhase::Completing),
         )?;
-        if chain.active_assignment != Some(cohort.assignment_id) {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "request chain does not own this assignment",
-            });
-        }
-
-        let replica = state
-            .replicas
-            .get_mut(&decoder_id)
-            .expect("assigned decoder was preflighted under the same pool lock");
-        replica.quiescing_cohorts -= 1;
-        replica.quarantined_cohorts += 1;
+        validate_engine_grant_identity(
+            grant.grant_id(),
+            grant.grant_digest(),
+            cohort,
+            "completion",
+        )?;
+        let pool_binding = DecoderGrantPoolBinding::new(&cohort.binding);
+        let completion = grant.begin_completion(pool_binding).map_err(|_| {
+            DecoderPoolError::InvalidGrant(
+                "matching retained grant has no completion authority".to_string(),
+            )
+        })?;
         let record = state
             .assignments
             .get_mut(&cohort.assignment_id)
             .expect("assignment was preflighted under the same pool lock");
-        record.phase = CohortPhase::Quarantined;
-        record.quarantine_receipt = Some(receipt.clone());
-        let chain = state
-            .request_chains
-            .get_mut(&chain_id)
-            .expect("request chain was preflighted under the same pool lock");
-        chain.phase = RequestChainPhase::Terminal;
-        chain.failed_decoders.clear();
-        cohort.phase = CohortPhase::Quarantined;
-        Ok(())
+        record.phase = CohortPhase::Completing;
+        record.terminal_reconciliation =
+            Some(TerminalReconciliationRecord::Completion { proof: None });
+        cohort.phase = CohortPhase::Completing;
+        Ok(completion)
     }
 
-    /// Return the authoritative receipt retained for a quarantined cohort.
+    /// Begin abort bound to an active cohort with ambiguous promotion.
+    pub fn begin_abort_from_promotion<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut PromotionReconciliationGrant,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+        disposition: RetryDisposition,
+    ) -> Result<PoolAbortReconciliation<'a>, DecoderPoolError> {
+        self.begin_abort(cohort, grant, reason_code, diagnostic, disposition)
+    }
+
+    /// Begin abort bound to an active cohort with retained engine authority.
+    pub fn begin_abort_from_retained<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut RetainedEngineGrant,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+        disposition: RetryDisposition,
+    ) -> Result<PoolAbortReconciliation<'a>, DecoderPoolError> {
+        self.begin_abort(cohort, grant, reason_code, diagnostic, disposition)
+    }
+
+    /// Begin quarantine bound to an active cohort with ambiguous promotion.
+    pub fn begin_quarantine_from_promotion<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut PromotionReconciliationGrant,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<PoolQuarantineReconciliation<'a>, DecoderPoolError> {
+        self.begin_quarantine(cohort, grant, reason_code, diagnostic)
+    }
+
+    /// Begin quarantine bound to an active cohort with retained engine authority.
+    pub fn begin_quarantine_from_retained<'a>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut RetainedEngineGrant,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<PoolQuarantineReconciliation<'a>, DecoderPoolError> {
+        self.begin_quarantine(cohort, grant, reason_code, diagnostic)
+    }
+
+    fn begin_abort<'a, G: ActiveEngineGrant>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut G,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+        disposition: RetryDisposition,
+    ) -> Result<PoolAbortReconciliation<'a>, DecoderPoolError> {
+        let engine = self.pin_abort(cohort, grant, reason_code, diagnostic, disposition)?;
+        Ok(PoolAbortReconciliation {
+            pool: self.clone(),
+            cohort,
+            engine,
+            complete: false,
+        })
+    }
+
+    fn pin_abort<G: ActiveEngineGrant>(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        grant: &mut G,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+        disposition: RetryDisposition,
+    ) -> Result<AbortReconciliationGrant, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let ledger = preflight_live_assignment(
+            &state,
+            cohort,
+            CohortPhase::Active,
+            phase_name(CohortPhase::Aborting),
+        )?;
+        validate_engine_grant_identity(grant.grant_id(), grant.grant_digest(), cohort, "abort")?;
+        let quiescing_cohorts = state
+            .replicas
+            .get(&ledger.decoder_id)
+            .expect("assigned decoder was preflighted under the same pool lock")
+            .quiescing_cohorts
+            .checked_add(1)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "decoder quiescing-cohort accounting overflows usize",
+            })?;
+        let pool_binding = DecoderGrantPoolBinding::new(&cohort.binding);
+        let abort = grant
+            .begin_abort(pool_binding, reason_code, diagnostic)
+            .map_err(|_| {
+                DecoderPoolError::InvalidGrant(
+                    "matching engine grant could not pin abort authority".to_string(),
+                )
+            })?;
+        state
+            .replicas
+            .get_mut(&ledger.decoder_id)
+            .expect("assigned decoder was preflighted under the same pool lock")
+            .quiescing_cohorts = quiescing_cohorts;
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .expect("assignment was preflighted under the same pool lock");
+        record.phase = CohortPhase::Aborting;
+        record.terminal_reconciliation = Some(TerminalReconciliationRecord::Abort {
+            disposition,
+            proof: None,
+        });
+        cohort.phase = CohortPhase::Aborting;
+        Ok(abort)
+    }
+
+    fn begin_quarantine<'a, G: ActiveEngineGrant>(
+        &self,
+        cohort: &'a mut DecoderAssignmentCohort,
+        grant: &mut G,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<PoolQuarantineReconciliation<'a>, DecoderPoolError> {
+        let engine = self.pin_quarantine(cohort, grant, reason_code, diagnostic)?;
+        Ok(PoolQuarantineReconciliation {
+            pool: self.clone(),
+            cohort,
+            engine,
+            complete: false,
+        })
+    }
+
+    fn pin_quarantine<G: ActiveEngineGrant>(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        grant: &mut G,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let ledger = preflight_live_assignment(
+            &state,
+            cohort,
+            CohortPhase::Active,
+            phase_name(CohortPhase::Quarantining),
+        )?;
+        validate_engine_grant_identity(
+            grant.grant_id(),
+            grant.grant_digest(),
+            cohort,
+            "quarantine",
+        )?;
+        let quiescing_cohorts = state
+            .replicas
+            .get(&ledger.decoder_id)
+            .expect("assigned decoder was preflighted under the same pool lock")
+            .quiescing_cohorts
+            .checked_add(1)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "decoder quiescing-cohort accounting overflows usize",
+            })?;
+        let pool_binding = DecoderGrantPoolBinding::new(&cohort.binding);
+        let quarantine = grant
+            .begin_quarantine(pool_binding, reason_code, diagnostic)
+            .map_err(|_| {
+                DecoderPoolError::InvalidGrant(
+                    "matching engine grant could not pin quarantine authority".to_string(),
+                )
+            })?;
+        state
+            .replicas
+            .get_mut(&ledger.decoder_id)
+            .expect("assigned decoder was preflighted under the same pool lock")
+            .quiescing_cohorts = quiescing_cohorts;
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .expect("assignment was preflighted under the same pool lock");
+        record.phase = CohortPhase::Quarantining;
+        record.terminal_reconciliation =
+            Some(TerminalReconciliationRecord::Quarantine { proof: None });
+        cohort.phase = CohortPhase::Quarantining;
+        Ok(quarantine)
+    }
+
+    fn install_cancellation_proof(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+        receipt: EngineReleaseReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        validate_engine_release_receipt(cohort, &receipt, EngineReleaseKind::PreparedCancelled)?;
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+        validate_assignment_record(record, cohort)?;
+        if cohort.phase != CohortPhase::Cancelling || record.phase != CohortPhase::Cancelling {
+            return Err(invalid_transition(
+                cohort.assignment_id,
+                record.phase,
+                "install cancellation proof",
+            ));
+        }
+        match record.terminal_reconciliation.as_mut() {
+            Some(TerminalReconciliationRecord::Cancellation { proof, .. }) => {
+                install_proof_once(proof, receipt, cohort.assignment_id)
+            }
+            _ => Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "cancelling assignment has no matching terminal intent",
+            }),
+        }
+    }
+
+    fn install_completion_proof(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+        receipt: EngineReleaseReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        validate_engine_release_receipt(cohort, &receipt, EngineReleaseKind::Completed)?;
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+        validate_assignment_record(record, cohort)?;
+        if cohort.phase != CohortPhase::Completing || record.phase != CohortPhase::Completing {
+            return Err(invalid_transition(
+                cohort.assignment_id,
+                record.phase,
+                "install completion proof",
+            ));
+        }
+        match record.terminal_reconciliation.as_mut() {
+            Some(TerminalReconciliationRecord::Completion { proof }) => {
+                install_proof_once(proof, receipt, cohort.assignment_id)
+            }
+            _ => Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "completing assignment has no matching terminal intent",
+            }),
+        }
+    }
+
+    fn install_abort_proof(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+        outcome: EngineAbortOutcome,
+    ) -> Result<(), DecoderPoolError> {
+        match &outcome {
+            EngineAbortOutcome::Aborted(receipt) => {
+                validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Aborted)?;
+            }
+            EngineAbortOutcome::Quarantined(receipt) => {
+                validate_engine_quarantine_receipt(cohort, receipt)?;
+            }
+        }
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+        validate_assignment_record(record, cohort)?;
+        if cohort.phase != CohortPhase::Aborting || record.phase != CohortPhase::Aborting {
+            return Err(invalid_transition(
+                cohort.assignment_id,
+                record.phase,
+                "install abort proof",
+            ));
+        }
+        match record.terminal_reconciliation.as_mut() {
+            Some(TerminalReconciliationRecord::Abort { proof, .. }) => {
+                install_proof_once(proof, outcome, cohort.assignment_id)
+            }
+            _ => Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "aborting assignment has no matching terminal intent",
+            }),
+        }
+    }
+
+    fn install_quarantine_proof(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+        receipt: EngineQuarantineReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        validate_engine_quarantine_receipt(cohort, &receipt)?;
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        let record = state
+            .assignments
+            .get_mut(&cohort.assignment_id)
+            .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+        validate_assignment_record(record, cohort)?;
+        if cohort.phase != CohortPhase::Quarantining || record.phase != CohortPhase::Quarantining {
+            return Err(invalid_transition(
+                cohort.assignment_id,
+                record.phase,
+                "install quarantine proof",
+            ));
+        }
+        match record.terminal_reconciliation.as_mut() {
+            Some(TerminalReconciliationRecord::Quarantine { proof }) => {
+                install_proof_once(proof, receipt, cohort.assignment_id)
+            }
+            _ => Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "quarantining assignment has no matching terminal intent",
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_cancellation_receipt(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
+        disposition: RetryDisposition,
+    ) -> Result<(), DecoderPoolError> {
+        validate_pinned_disposition(cohort, &self.inner, disposition, CohortPhase::Cancelling)?;
+        self.install_cancellation_proof(cohort, receipt.clone())?;
+        self.resume_terminal_reconciliation(cohort)
+    }
+
+    #[cfg(test)]
+    fn apply_completion_receipt(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        self.install_completion_proof(cohort, receipt.clone())?;
+        self.resume_terminal_reconciliation(cohort)
+    }
+
+    #[cfg(test)]
+    fn apply_abort_release_receipt(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        receipt: &EngineReleaseReceipt,
+        disposition: RetryDisposition,
+    ) -> Result<(), DecoderPoolError> {
+        validate_pinned_disposition(cohort, &self.inner, disposition, CohortPhase::Aborting)?;
+        self.install_abort_proof(cohort, EngineAbortOutcome::Aborted(receipt.clone()))?;
+        self.resume_terminal_reconciliation(cohort)
+    }
+
+    #[cfg(test)]
+    fn apply_quarantine_receipt(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+        receipt: &EngineQuarantineReceipt,
+    ) -> Result<(), DecoderPoolError> {
+        self.install_quarantine_proof(cohort, receipt.clone())?;
+        self.resume_terminal_reconciliation(cohort)
+    }
+
+    /// Apply a previously persisted authoritative terminal proof.
+    ///
+    /// This is idempotent for a cohort already released or quarantined. It
+    /// performs no engine I/O and takes no caller-supplied retry policy.
+    pub fn resume_terminal_reconciliation(
+        &self,
+        cohort: &mut DecoderAssignmentCohort,
+    ) -> Result<(), DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        let mut state = self.inner.state.lock();
+        if cohort.phase == CohortPhase::Terminal {
+            if state.assignments.contains_key(&cohort.assignment_id) {
+                return Err(DecoderPoolError::InconsistentAssignment {
+                    assignment_id: cohort.assignment_id,
+                    reason: "terminal cohort remains in the assignment ledger",
+                });
+            }
+            return Ok(());
+        }
+        let application = {
+            let record = state
+                .assignments
+                .get(&cohort.assignment_id)
+                .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+            validate_assignment_record(record, cohort)?;
+            validate_terminal_reconciliation_phase(record, cohort.assignment_id)?;
+            if cohort.phase == CohortPhase::Quarantined {
+                return validate_completed_quarantine(record, cohort);
+            }
+            match record.terminal_reconciliation.as_ref() {
+                Some(TerminalReconciliationRecord::Cancellation {
+                    disposition,
+                    proof: Some(receipt),
+                }) => {
+                    validate_engine_release_receipt(
+                        cohort,
+                        receipt,
+                        EngineReleaseKind::PreparedCancelled,
+                    )?;
+                    TerminalApplication::Release {
+                        expected_phase: CohortPhase::Cancelling,
+                        disposition: *disposition,
+                    }
+                }
+                Some(TerminalReconciliationRecord::Completion {
+                    proof: Some(receipt),
+                }) => {
+                    validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Completed)?;
+                    TerminalApplication::Release {
+                        expected_phase: CohortPhase::Completing,
+                        disposition: RetryDisposition::Terminal,
+                    }
+                }
+                Some(TerminalReconciliationRecord::Abort {
+                    disposition,
+                    proof: Some(EngineAbortOutcome::Aborted(receipt)),
+                }) => {
+                    validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Aborted)?;
+                    TerminalApplication::Release {
+                        expected_phase: CohortPhase::Aborting,
+                        disposition: *disposition,
+                    }
+                }
+                Some(TerminalReconciliationRecord::Abort {
+                    proof: Some(EngineAbortOutcome::Quarantined(receipt)),
+                    ..
+                }) => {
+                    validate_engine_quarantine_receipt(cohort, receipt)?;
+                    TerminalApplication::Quarantine {
+                        expected_phase: CohortPhase::Aborting,
+                    }
+                }
+                Some(TerminalReconciliationRecord::Quarantine {
+                    proof: Some(receipt),
+                }) => {
+                    validate_engine_quarantine_receipt(cohort, receipt)?;
+                    TerminalApplication::Quarantine {
+                        expected_phase: CohortPhase::Quarantining,
+                    }
+                }
+                Some(
+                    TerminalReconciliationRecord::Cancellation { proof: None, .. }
+                    | TerminalReconciliationRecord::Completion { proof: None }
+                    | TerminalReconciliationRecord::Abort { proof: None, .. }
+                    | TerminalReconciliationRecord::Quarantine { proof: None },
+                ) => {
+                    return Err(DecoderPoolError::TerminalProofPending(cohort.assignment_id));
+                }
+                None => {
+                    return Err(invalid_transition(
+                        cohort.assignment_id,
+                        record.phase,
+                        "resume terminal reconciliation",
+                    ));
+                }
+            }
+        };
+        let (expected_phase, requested_transition) = match application {
+            TerminalApplication::Release { expected_phase, .. } => (expected_phase, "terminal"),
+            TerminalApplication::Quarantine { expected_phase } => {
+                (expected_phase, phase_name(CohortPhase::Quarantined))
+            }
+        };
+        let ledger =
+            preflight_live_assignment(&state, cohort, expected_phase, requested_transition)?;
+        match application {
+            TerminalApplication::Release { disposition, .. } => {
+                release_assignment(&mut state, cohort, ledger, expected_phase, disposition)
+            }
+            TerminalApplication::Quarantine { .. } => {
+                quarantine_assignment(&mut state, cohort, ledger)
+            }
+        }
+    }
+
+    /// Return an authoritative quarantine proof retained for this cohort.
     pub fn quarantine_receipt(
         &self,
         cohort: &DecoderAssignmentCohort,
@@ -1099,7 +2009,17 @@ impl DecoderPool {
             .get(&cohort.assignment_id)
             .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
         validate_assignment_record(record, cohort)?;
-        Ok(record.quarantine_receipt.clone())
+        let receipt = match record.terminal_reconciliation.as_ref() {
+            Some(TerminalReconciliationRecord::Abort {
+                proof: Some(EngineAbortOutcome::Quarantined(receipt)),
+                ..
+            })
+            | Some(TerminalReconciliationRecord::Quarantine {
+                proof: Some(receipt),
+            }) => Some(receipt.clone()),
+            _ => None,
+        };
+        Ok(receipt)
     }
 
     /// Return immutable accounting suitable for metrics and tests.
@@ -1129,160 +2049,6 @@ impl DecoderPool {
         }
     }
 
-    fn transition(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        expected: CohortPhase,
-        next: CohortPhase,
-    ) -> Result<(), DecoderPoolError> {
-        self.validate_assignment_pool(cohort)?;
-        let mut state = self.inner.state.lock();
-        let record = state
-            .assignments
-            .get_mut(&cohort.assignment_id)
-            .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
-        validate_assignment_record(record, cohort)?;
-        if cohort.phase != expected || record.phase != expected {
-            return Err(invalid_transition(
-                cohort.assignment_id,
-                record.phase,
-                phase_name(next),
-            ));
-        }
-        cohort.phase = next;
-        record.phase = next;
-        Ok(())
-    }
-
-    fn release(
-        &self,
-        cohort: &mut DecoderAssignmentCohort,
-        expected: CohortPhase,
-        disposition: RetryDisposition,
-    ) -> Result<(), DecoderPoolError> {
-        self.validate_assignment_pool(cohort)?;
-        let mut state = self.inner.state.lock();
-        let (decoder_id, chain_id, child_count, kv_tokens, remaining_decode_tokens, rooms) = {
-            let record = state
-                .assignments
-                .get(&cohort.assignment_id)
-                .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
-            validate_assignment_record(record, cohort)?;
-            if cohort.phase != expected || record.phase != expected {
-                return Err(invalid_transition(
-                    cohort.assignment_id,
-                    record.phase,
-                    "terminal",
-                ));
-            }
-            (
-                record.binding.decoder_id().clone(),
-                record.chain_id,
-                record.child_count,
-                record.kv_tokens,
-                record.remaining_decode_tokens,
-                record.binding.bootstrap_rooms().to_vec(),
-            )
-        };
-        let replica =
-            state
-                .replicas
-                .get(&decoder_id)
-                .ok_or(DecoderPoolError::InconsistentAssignment {
-                    assignment_id: cohort.assignment_id,
-                    reason: "assigned decoder is missing",
-                })?;
-        if replica.active_cohorts == 0
-            || replica.active_child_requests < child_count
-            || replica.reserved_kv_tokens < kv_tokens
-            || replica.remaining_decode_tokens < remaining_decode_tokens
-        {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "decoder accounting is smaller than the assignment ledger",
-            });
-        }
-        if expected == CohortPhase::Quiescing && replica.quiescing_cohorts == 0 {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "decoder has no quiescing cohort to release",
-            });
-        }
-        if rooms
-            .iter()
-            .any(|room| !state.active_rooms.contains(&(decoder_id.clone(), *room)))
-        {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "an assigned bootstrap room is not retained",
-            });
-        }
-        let chain = state.request_chains.get(&chain_id).ok_or(
-            DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "request chain is missing",
-            },
-        )?;
-        if chain.active_assignment != Some(cohort.assignment_id) {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "request chain does not own this assignment",
-            });
-        }
-        if chain.phase != RequestChainPhase::Open {
-            return Err(DecoderPoolError::InconsistentAssignment {
-                assignment_id: cohort.assignment_id,
-                reason: "request chain became terminal before its assignment",
-            });
-        }
-
-        let _record = state
-            .assignments
-            .remove(&cohort.assignment_id)
-            .expect("assignment was preflighted under the same pool lock");
-        let replica = state
-            .replicas
-            .get_mut(&decoder_id)
-            .expect("assigned decoder was preflighted under the same pool lock");
-        replica.active_cohorts -= 1;
-        replica.active_child_requests -= child_count;
-        replica.reserved_kv_tokens -= kv_tokens;
-        replica.remaining_decode_tokens -= remaining_decode_tokens;
-        if expected == CohortPhase::Quiescing {
-            replica.quiescing_cohorts -= 1;
-        }
-        for room in rooms {
-            let removed = state.active_rooms.remove(&(decoder_id.clone(), room));
-            debug_assert!(removed);
-        }
-
-        let remove_request = {
-            let chain = state
-                .request_chains
-                .get_mut(&chain_id)
-                .expect("request chain was preflighted under the same pool lock");
-            chain.active_assignment = None;
-            match disposition {
-                RetryDisposition::Terminal => {
-                    chain.phase = RequestChainPhase::Terminal;
-                    chain.failed_decoders.clear();
-                }
-                RetryDisposition::Retryable => {
-                    debug_assert_eq!(chain.phase, RequestChainPhase::Open);
-                }
-                RetryDisposition::DecoderFailed => {
-                    chain.failed_decoders.insert(decoder_id);
-                }
-            }
-            !chain.owner_alive
-        };
-        if remove_request {
-            remove_request_chain(&mut state, chain_id);
-        }
-        cohort.phase = CohortPhase::Terminal;
-        Ok(())
-    }
-
     fn validate_request_owner(
         &self,
         request: &LogicalRequestOwner,
@@ -1305,6 +2071,90 @@ impl DecoderPool {
         }
         Ok(())
     }
+}
+
+fn release_assignment(
+    state: &mut PoolState,
+    cohort: &mut DecoderAssignmentCohort,
+    ledger: LiveAssignmentLedger,
+    expected_phase: CohortPhase,
+    disposition: RetryDisposition,
+) -> Result<(), DecoderPoolError> {
+    let _record = state
+        .assignments
+        .remove(&cohort.assignment_id)
+        .expect("assignment was preflighted under the same pool lock");
+    let replica = state
+        .replicas
+        .get_mut(&ledger.decoder_id)
+        .expect("assigned decoder was preflighted under the same pool lock");
+    replica.active_cohorts -= 1;
+    replica.active_child_requests -= ledger.child_count;
+    replica.reserved_kv_tokens -= ledger.kv_tokens;
+    replica.remaining_decode_tokens -= ledger.remaining_decode_tokens;
+    if phase_is_quiescing(expected_phase) {
+        replica.quiescing_cohorts -= 1;
+    }
+    for room in ledger.rooms {
+        let removed = state.room_owners.remove(&(ledger.decoder_id.clone(), room));
+        debug_assert_eq!(removed, Some(cohort.assignment_id));
+    }
+    for allocation in ledger.allocations {
+        let removed = state.allocation_owners.remove(&allocation);
+        debug_assert_eq!(removed, Some(cohort.assignment_id));
+    }
+
+    let remove_request = {
+        let chain = state
+            .request_chains
+            .get_mut(&ledger.chain_id)
+            .expect("request chain was preflighted under the same pool lock");
+        chain.active_assignment = None;
+        match disposition {
+            RetryDisposition::Terminal => {
+                chain.phase = RequestChainPhase::Terminal;
+                chain.failed_decoders.clear();
+            }
+            RetryDisposition::Retryable => {
+                debug_assert_eq!(chain.phase, RequestChainPhase::Open);
+            }
+            RetryDisposition::DecoderFailed => {
+                chain.failed_decoders.insert(ledger.decoder_id);
+            }
+        }
+        !chain.owner_alive
+    };
+    if remove_request {
+        remove_request_chain(state, ledger.chain_id);
+    }
+    cohort.phase = CohortPhase::Terminal;
+    Ok(())
+}
+
+fn quarantine_assignment(
+    state: &mut PoolState,
+    cohort: &mut DecoderAssignmentCohort,
+    ledger: LiveAssignmentLedger,
+) -> Result<(), DecoderPoolError> {
+    let replica = state
+        .replicas
+        .get_mut(&ledger.decoder_id)
+        .expect("assigned decoder was preflighted under the same pool lock");
+    replica.quiescing_cohorts -= 1;
+    replica.quarantined_cohorts += 1;
+    state
+        .assignments
+        .get_mut(&cohort.assignment_id)
+        .expect("assignment was preflighted under the same pool lock")
+        .phase = CohortPhase::Quarantined;
+    let chain = state
+        .request_chains
+        .get_mut(&ledger.chain_id)
+        .expect("request chain was preflighted under the same pool lock");
+    chain.phase = RequestChainPhase::Terminal;
+    chain.failed_decoders.clear();
+    cohort.phase = CohortPhase::Quarantined;
+    Ok(())
 }
 
 fn select_decoders(
@@ -1344,10 +2194,380 @@ fn validate_assignment_record(
     record: &AssignmentRecord,
     cohort: &DecoderAssignmentCohort,
 ) -> Result<(), DecoderPoolError> {
-    if record.chain_id != cohort.chain_id || record.binding != cohort.binding {
+    if record.chain_id != cohort.chain_id
+        || record.binding.grant_id() != cohort.assignment_id
+        || record.binding.digest() != cohort.binding.digest()
+    {
         return Err(DecoderPoolError::ForeignAssignment);
     }
     Ok(())
+}
+
+fn validate_completed_quarantine(
+    record: &AssignmentRecord,
+    cohort: &DecoderAssignmentCohort,
+) -> Result<(), DecoderPoolError> {
+    if cohort.phase != CohortPhase::Quarantined || record.phase != CohortPhase::Quarantined {
+        return Err(invalid_transition(
+            cohort.assignment_id,
+            record.phase,
+            "resume terminal reconciliation",
+        ));
+    }
+    let proof_receipt = match record.terminal_reconciliation.as_ref() {
+        Some(TerminalReconciliationRecord::Abort {
+            proof: Some(EngineAbortOutcome::Quarantined(receipt)),
+            ..
+        })
+        | Some(TerminalReconciliationRecord::Quarantine {
+            proof: Some(receipt),
+        }) => receipt,
+        _ => {
+            return Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "quarantined assignment has no matching terminal proof",
+            });
+        }
+    };
+    validate_engine_quarantine_receipt(cohort, proof_receipt)
+}
+
+fn validate_terminal_reconciliation_phase(
+    record: &AssignmentRecord,
+    assignment_id: Uuid,
+) -> Result<(), DecoderPoolError> {
+    let matches_phase = matches!(
+        (&record.terminal_reconciliation, record.phase),
+        (None, CohortPhase::Reserved | CohortPhase::Active)
+            | (
+                Some(TerminalReconciliationRecord::Cancellation { .. }),
+                CohortPhase::Cancelling
+            )
+            | (
+                Some(TerminalReconciliationRecord::Completion { .. }),
+                CohortPhase::Completing
+            )
+            | (
+                Some(TerminalReconciliationRecord::Abort { .. }),
+                CohortPhase::Aborting
+            )
+            | (
+                Some(TerminalReconciliationRecord::Quarantine { .. }),
+                CohortPhase::Quarantining
+            )
+            | (
+                Some(TerminalReconciliationRecord::Abort {
+                    proof: Some(EngineAbortOutcome::Quarantined(_)),
+                    ..
+                }),
+                CohortPhase::Quarantined,
+            )
+            | (
+                Some(TerminalReconciliationRecord::Quarantine { proof: Some(_) }),
+                CohortPhase::Quarantined,
+            )
+    );
+    if !matches_phase {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id,
+            reason: "assignment phase differs from its terminal reconciliation ledger",
+        });
+    }
+    Ok(())
+}
+
+fn install_proof_once<T: Eq>(
+    slot: &mut Option<T>,
+    proof: T,
+    assignment_id: Uuid,
+) -> Result<(), DecoderPoolError> {
+    if let Some(existing) = slot.as_ref() {
+        if existing == &proof {
+            return Ok(());
+        }
+        return Err(DecoderPoolError::ConflictingTerminalProof(assignment_id));
+    }
+    *slot = Some(proof);
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_pinned_disposition(
+    cohort: &DecoderAssignmentCohort,
+    inner: &DecoderPoolInner,
+    disposition: RetryDisposition,
+    expected_phase: CohortPhase,
+) -> Result<(), DecoderPoolError> {
+    if cohort.pool_id != inner.pool_id {
+        return Err(DecoderPoolError::ForeignAssignment);
+    }
+    let state = inner.state.lock();
+    let record = state
+        .assignments
+        .get(&cohort.assignment_id)
+        .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+    validate_assignment_record(record, cohort)?;
+    if cohort.phase != expected_phase || record.phase != expected_phase {
+        return Err(invalid_transition(
+            cohort.assignment_id,
+            record.phase,
+            "validate pinned retry disposition",
+        ));
+    }
+    let pinned = match record.terminal_reconciliation.as_ref() {
+        Some(TerminalReconciliationRecord::Cancellation { disposition, .. })
+            if expected_phase == CohortPhase::Cancelling =>
+        {
+            *disposition
+        }
+        Some(TerminalReconciliationRecord::Abort { disposition, .. })
+            if expected_phase == CohortPhase::Aborting =>
+        {
+            *disposition
+        }
+        _ => {
+            return Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "assignment has no matching pinned retry disposition",
+            });
+        }
+    };
+    if pinned != disposition {
+        return Err(DecoderPoolError::ConflictingTerminalProof(
+            cohort.assignment_id,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_engine_grant_identity(
+    grant_id: Uuid,
+    grant_digest: DecoderGrantDigest,
+    cohort: &DecoderAssignmentCohort,
+    operation: &'static str,
+) -> Result<(), DecoderPoolError> {
+    if grant_id != cohort.assignment_id || grant_digest != cohort.binding.digest() {
+        return Err(DecoderPoolError::InvalidGrant(format!(
+            "{operation} grant does not exactly match the assignment"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_decoder_ledger(
+    state: &PoolState,
+    decoder_id: &DecoderId,
+    assignment_id: Uuid,
+) -> Result<(), DecoderPoolError> {
+    let replica =
+        state
+            .replicas
+            .get(decoder_id)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id,
+                reason: "assigned decoder is missing",
+            })?;
+    let mut active_cohorts = 0usize;
+    let mut active_child_requests = 0usize;
+    let mut quiescing_cohorts = 0usize;
+    let mut quarantined_cohorts = 0usize;
+    let mut reserved_kv_tokens = 0usize;
+    let mut remaining_decode_tokens = 0usize;
+    let mut rooms = HashMap::new();
+    let mut allocations = HashMap::new();
+
+    for (record_assignment_id, record) in state
+        .assignments
+        .iter()
+        .filter(|(_, record)| record.binding.decoder_id() == decoder_id)
+    {
+        if record.phase == CohortPhase::Terminal {
+            return Err(DecoderPoolError::InconsistentAssignment {
+                assignment_id,
+                reason: "assignment ledger retains a terminal record",
+            });
+        }
+        validate_terminal_reconciliation_phase(record, assignment_id)?;
+
+        active_cohorts += 1;
+        active_child_requests = active_child_requests
+            .checked_add(record.child_count)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id,
+                reason: "assignment child-request accounting overflows usize",
+            })?;
+        reserved_kv_tokens = reserved_kv_tokens.checked_add(record.kv_tokens).ok_or(
+            DecoderPoolError::InconsistentAssignment {
+                assignment_id,
+                reason: "assignment KV-token accounting overflows usize",
+            },
+        )?;
+        remaining_decode_tokens = remaining_decode_tokens
+            .checked_add(record.remaining_decode_tokens)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id,
+                reason: "assignment decode-token accounting overflows usize",
+            })?;
+        if phase_is_quiescing(record.phase) {
+            quiescing_cohorts += 1;
+        }
+        if record.phase == CohortPhase::Quarantined {
+            quarantined_cohorts += 1;
+        }
+        for room in record.binding.bootstrap_rooms() {
+            if rooms
+                .insert((decoder_id.clone(), *room), *record_assignment_id)
+                .is_some()
+            {
+                return Err(DecoderPoolError::InconsistentAssignment {
+                    assignment_id,
+                    reason: "assignment ledger repeats a decoder bootstrap room",
+                });
+            }
+        }
+        for allocation in record.binding.allocation_keys() {
+            if allocations
+                .insert(allocation, *record_assignment_id)
+                .is_some()
+            {
+                return Err(DecoderPoolError::InconsistentAssignment {
+                    assignment_id,
+                    reason: "assignment ledger repeats a decoder slot generation",
+                });
+            }
+        }
+    }
+
+    if replica.active_cohorts != active_cohorts
+        || replica.active_child_requests != active_child_requests
+        || replica.quiescing_cohorts != quiescing_cohorts
+        || replica.quarantined_cohorts != quarantined_cohorts
+        || replica.reserved_kv_tokens != reserved_kv_tokens
+        || replica.remaining_decode_tokens != remaining_decode_tokens
+    {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id,
+            reason: "decoder accounting differs from the assignment ledger",
+        });
+    }
+    let room_owners: HashMap<(DecoderId, u64), Uuid> = state
+        .room_owners
+        .iter()
+        .filter(|((active_decoder_id, _), _)| active_decoder_id == decoder_id)
+        .map(|(room, owner)| (room.clone(), *owner))
+        .collect();
+    if room_owners != rooms {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id,
+            reason: "decoder room ownership differs from the assignment ledger",
+        });
+    }
+    let allocation_owners: HashMap<DecoderAllocationKey, Uuid> = state
+        .allocation_owners
+        .iter()
+        .filter(|(allocation, _)| allocation.decoder_id() == decoder_id)
+        .map(|(allocation, owner)| (allocation.clone(), *owner))
+        .collect();
+    if allocation_owners != allocations {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id,
+            reason: "decoder slot-generation ownership differs from the assignment ledger",
+        });
+    }
+    Ok(())
+}
+
+fn preflight_live_assignment(
+    state: &PoolState,
+    cohort: &DecoderAssignmentCohort,
+    expected_phase: CohortPhase,
+    requested_transition: &'static str,
+) -> Result<LiveAssignmentLedger, DecoderPoolError> {
+    let record = state
+        .assignments
+        .get(&cohort.assignment_id)
+        .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
+    validate_assignment_record(record, cohort)?;
+    if cohort.phase != expected_phase || record.phase != expected_phase {
+        return Err(invalid_transition(
+            cohort.assignment_id,
+            record.phase,
+            requested_transition,
+        ));
+    }
+    validate_terminal_reconciliation_phase(record, cohort.assignment_id)?;
+
+    let ledger = LiveAssignmentLedger {
+        decoder_id: record.binding.decoder_id().clone(),
+        chain_id: record.chain_id,
+        child_count: record.child_count,
+        kv_tokens: record.kv_tokens,
+        remaining_decode_tokens: record.remaining_decode_tokens,
+        rooms: record.binding.bootstrap_rooms().to_vec(),
+        allocations: record.binding.allocation_keys().collect(),
+    };
+    if ledger.rooms.iter().any(|room| {
+        state.room_owners.get(&(ledger.decoder_id.clone(), *room)) != Some(&cohort.assignment_id)
+    }) {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "an assigned bootstrap room is not retained",
+        });
+    }
+    if ledger
+        .allocations
+        .iter()
+        .any(|allocation| state.allocation_owners.get(allocation) != Some(&cohort.assignment_id))
+    {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "an assigned slot generation is not retained",
+        });
+    }
+    let replica =
+        state
+            .replicas
+            .get(&ledger.decoder_id)
+            .ok_or(DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id,
+                reason: "assigned decoder is missing",
+            })?;
+    if replica.active_cohorts == 0
+        || replica.active_child_requests < ledger.child_count
+        || replica.reserved_kv_tokens < ledger.kv_tokens
+        || replica.remaining_decode_tokens < ledger.remaining_decode_tokens
+    {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "decoder accounting is smaller than the assignment ledger",
+        });
+    }
+    if phase_is_quiescing(expected_phase) && replica.quiescing_cohorts == 0 {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "decoder has no quiescing cohort for this assignment",
+        });
+    }
+    let chain = state.request_chains.get(&ledger.chain_id).ok_or(
+        DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "request chain is missing",
+        },
+    )?;
+    if chain.active_assignment != Some(cohort.assignment_id) {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "request chain does not own this assignment",
+        });
+    }
+    if chain.phase != RequestChainPhase::Open {
+        return Err(DecoderPoolError::InconsistentAssignment {
+            assignment_id: cohort.assignment_id,
+            reason: "request chain became terminal before its assignment",
+        });
+    }
+    validate_decoder_ledger(state, &ledger.decoder_id, cohort.assignment_id)?;
+    Ok(ledger)
 }
 
 fn validate_engine_release_receipt(
@@ -1476,11 +2696,18 @@ fn invalid_transition(
 fn phase_name(phase: CohortPhase) -> &'static str {
     match phase {
         CohortPhase::Reserved => "reserved",
+        CohortPhase::Cancelling => "cancelling",
         CohortPhase::Active => "active",
-        CohortPhase::Quiescing => "quiescing",
+        CohortPhase::Completing => "completing",
+        CohortPhase::Aborting => "aborting",
+        CohortPhase::Quarantining => "quarantining",
         CohortPhase::Quarantined => "quarantined",
         CohortPhase::Terminal => "terminal",
     }
+}
+
+fn phase_is_quiescing(phase: CohortPhase) -> bool {
+    matches!(phase, CohortPhase::Aborting | CohortPhase::Quarantining)
 }
 
 #[cfg(test)]
@@ -1497,7 +2724,7 @@ mod tests {
     use super::*;
     use crate::routers::http::pd_decoder_grant::{
         issue_test_grant, issue_test_quarantine_receipt, issue_test_release_receipt,
-        DecoderGrantChildAccounting, PrefillBootstrapEndpoint,
+        DecoderGrantChildAccounting, PrefillBootstrapEndpoint, TestEngineReceiptBinding,
     };
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
@@ -1584,34 +2811,59 @@ mod tests {
         .expect("test allocator grant must be valid")
     }
 
+    fn receipt_binding(cohort: &DecoderAssignmentCohort) -> TestEngineReceiptBinding {
+        TestEngineReceiptBinding {
+            grant_id: cohort.assignment_id(),
+            decoder_id: cohort.decoder_id().clone(),
+            child_request_ids: cohort.binding.child_request_ids().collect(),
+            prefill_bootstrap_endpoint: cohort.binding.prefill_bootstrap_endpoint().clone(),
+            slot_generations: cohort.slot_generations().to_vec(),
+            bootstrap_rooms: cohort.bootstrap_rooms().to_vec(),
+            grant_digest: cohort.grant_digest(),
+        }
+    }
+
     fn release_receipt(
         cohort: &DecoderAssignmentCohort,
         kind: EngineReleaseKind,
     ) -> EngineReleaseReceipt {
-        issue_test_release_receipt(
-            cohort.assignment_id(),
-            cohort.decoder_id().clone(),
-            cohort.binding.child_request_ids().collect(),
-            cohort.binding.prefill_bootstrap_endpoint().clone(),
-            cohort.slot_generations().to_vec(),
-            cohort.bootstrap_rooms().to_vec(),
-            cohort.grant_digest(),
-            kind,
-            true,
-        )
+        issue_test_release_receipt(receipt_binding(cohort), kind, true)
     }
 
     fn quarantine_receipt(cohort: &DecoderAssignmentCohort) -> EngineQuarantineReceipt {
-        issue_test_quarantine_receipt(
-            cohort.assignment_id(),
-            cohort.decoder_id().clone(),
-            cohort.binding.child_request_ids().collect(),
-            cohort.binding.prefill_bootstrap_endpoint().clone(),
-            cohort.slot_generations().to_vec(),
-            cohort.bootstrap_rooms().to_vec(),
-            cohort.grant_digest(),
-            true,
+        issue_test_quarantine_receipt(receipt_binding(cohort), true)
+    }
+
+    fn retain_after_promotion(
+        pool: &DecoderPool,
+        cohort: &mut DecoderAssignmentCohort,
+    ) -> RetainedEngineGrant {
+        let mut promotion = pool.begin_promotion(cohort).unwrap();
+        promotion.assume_test_promoted().unwrap()
+    }
+
+    fn pin_abort_after_promotion(
+        pool: &DecoderPool,
+        cohort: &mut DecoderAssignmentCohort,
+    ) -> AbortReconciliationGrant {
+        let mut promotion = pool.begin_promotion(cohort).unwrap();
+        pool.pin_abort(
+            cohort,
+            &mut promotion,
+            "test_abort",
+            None,
+            RetryDisposition::Terminal,
         )
+        .unwrap()
+    }
+
+    fn pin_quarantine_after_promotion(
+        pool: &DecoderPool,
+        cohort: &mut DecoderAssignmentCohort,
+    ) -> QuarantineReconciliationGrant {
+        let mut promotion = pool.begin_promotion(cohort).unwrap();
+        pool.pin_quarantine(cohort, &mut promotion, "test_quarantine", None)
+            .unwrap()
     }
 
     fn release_before_activation(
@@ -1619,8 +2871,9 @@ mod tests {
         cohort: &mut DecoderAssignmentCohort,
         disposition: RetryDisposition,
     ) -> Result<(), DecoderPoolError> {
+        let _cancellation = pool.pin_cancellation(cohort, disposition)?;
         let receipt = release_receipt(cohort, EngineReleaseKind::PreparedCancelled);
-        pool.finish_before_activation(cohort, &receipt, disposition)
+        pool.apply_cancellation_receipt(cohort, &receipt, disposition)
     }
 
     fn release_after_abort(
@@ -1629,22 +2882,24 @@ mod tests {
         disposition: RetryDisposition,
     ) -> Result<(), DecoderPoolError> {
         let receipt = release_receipt(cohort, EngineReleaseKind::Aborted);
-        pool.confirm_quiesced(cohort, &receipt, disposition)
+        pool.apply_abort_release_receipt(cohort, &receipt, disposition)
     }
 
     fn release_after_completion(
         pool: &DecoderPool,
         cohort: &mut DecoderAssignmentCohort,
+        retained: &mut RetainedEngineGrant,
     ) -> Result<(), DecoderPoolError> {
+        let _completion = pool.pin_completion(cohort, retained)?;
         let receipt = release_receipt(cohort, EngineReleaseKind::Completed);
-        pool.complete(cohort, &receipt)
+        pool.apply_completion_receipt(cohort, &receipt)
     }
 
-    fn bind_next(
+    fn issue_next_grant(
         pool: &DecoderPool,
         owner: &LogicalRequestOwner,
         accounting: Vec<DecoderGrantChildAccounting>,
-    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+    ) -> Result<BoundPreparedGrant, DecoderPoolError> {
         let decoder_id = pool
             .admission_candidates(owner)?
             .into_iter()
@@ -1655,7 +2910,7 @@ mod tests {
         let rooms = (0..child_count)
             .map(|offset| first_room + offset as u64)
             .collect();
-        let grant = issue_grant(
+        Ok(issue_grant(
             pool,
             owner,
             decoder_id,
@@ -1665,8 +2920,16 @@ mod tests {
                 .collect(),
             rooms,
             accounting,
-        );
-        pool.bind_grant(owner, &grant)
+        ))
+    }
+
+    fn bind_next(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        accounting: Vec<DecoderGrantChildAccounting>,
+    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+        let mut grant = issue_next_grant(pool, owner, accounting)?;
+        pool.bind_grant(owner, &mut grant)
     }
 
     #[test]
@@ -1714,33 +2977,40 @@ mod tests {
     }
 
     #[test]
-    fn balances_arbitrary_replica_count_by_projected_decode_work() {
-        let pool = pool(2);
-        for index in 0..3 {
-            pool.register(replica(&format!("decode-{index}"), "packed-v1"))
-                .unwrap();
-        }
+    fn balances_tp2_and_tp4_across_arbitrary_replica_counts() {
+        for prefill_tp_size in [2, 4] {
+            for replica_count in [1, 2, 3, 5] {
+                let pool = pool(prefill_tp_size);
+                for index in 0..replica_count {
+                    pool.register(replica(&format!("decode-{index}"), "packed-v1"))
+                        .unwrap();
+                }
 
-        let mut requests = Vec::new();
-        let mut cohorts = Vec::new();
-        for index in 0..9 {
-            let request = pool.begin_request(format!("request-{index}")).unwrap();
-            let cohort = bind_next(&pool, &request, scalar_accounting()).unwrap();
-            requests.push(request);
-            cohorts.push(cohort);
-        }
-        assert_eq!(
-            pool.snapshot()
-                .replicas
-                .iter()
-                .map(|replica| replica.active_cohorts)
-                .collect::<Vec<_>>(),
-            vec![3, 3, 3]
-        );
+                let mut requests = Vec::new();
+                let mut cohorts = Vec::new();
+                for index in 0..(replica_count * 3) {
+                    let request = pool
+                        .begin_request(format!("tp{prefill_tp_size}-n{replica_count}-{index}"))
+                        .unwrap();
+                    let cohort = bind_next(&pool, &request, scalar_accounting()).unwrap();
+                    requests.push(request);
+                    cohorts.push(cohort);
+                }
+                assert_eq!(
+                    pool.snapshot()
+                        .replicas
+                        .iter()
+                        .map(|replica| replica.active_cohorts)
+                        .collect::<Vec<_>>(),
+                    vec![3; replica_count]
+                );
 
-        for (mut request, mut cohort) in requests.into_iter().zip(cohorts) {
-            release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
-            pool.finalize_request(&mut request).unwrap();
+                for (mut request, mut cohort) in requests.into_iter().zip(cohorts) {
+                    release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal)
+                        .unwrap();
+                    pool.finalize_request(&mut request).unwrap();
+                }
+            }
         }
     }
 
@@ -1755,7 +3025,7 @@ mod tests {
             DecoderGrantChildAccounting::new(300, 30),
         ];
         let decoder_id = pool.admission_candidates(&request).unwrap().remove(0);
-        let grant = issue_grant(
+        let mut grant = issue_grant(
             &pool,
             &request,
             decoder_id,
@@ -1766,7 +3036,7 @@ mod tests {
             vec![41, 43, 42],
             accounting,
         );
-        let mut cohort = pool.bind_grant(&request, &grant).unwrap();
+        let mut cohort = pool.bind_grant(&request, &mut grant).unwrap();
         assert_eq!(cohort.bootstrap_rooms(), &[41, 43, 42]);
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
@@ -1774,8 +3044,7 @@ mod tests {
         assert_eq!(snapshot.replicas[0].reserved_kv_tokens, 600);
         assert_eq!(snapshot.replicas[0].remaining_decode_tokens, 60);
 
-        pool.begin_activation(&mut cohort).unwrap();
-        pool.begin_quiescence(&mut cohort).unwrap();
+        let _abort = pin_abort_after_promotion(&pool, &mut cohort);
         assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 1);
         release_after_abort(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
         let snapshot = pool.snapshot();
@@ -1785,13 +3054,636 @@ mod tests {
     }
 
     #[test]
+    fn pool_binding_moves_only_the_exact_prepared_authority() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut mismatched_grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+
+        assert!(grant.begin_cancellation().is_err());
+        let _mismatched_cancellation = mismatched_grant.begin_cancellation().unwrap();
+
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        assert_eq!(
+            pool.begin_promotion(&mut cohort).unwrap_err(),
+            DecoderPoolError::InvalidTransition {
+                assignment_id: cohort.assignment_id(),
+                actual: "active",
+                requested: "active",
+            }
+        );
+        release_after_completion(&pool, &mut cohort, &mut retained).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_consumers_require_the_exact_pool_binding() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let mut first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
+        let mut second = bind_next(&pool, &second_owner, scalar_accounting()).unwrap();
+
+        let foreign_binding = DecoderGrantPoolBinding::new(&second.binding);
+        let first_prepared = first.prepared_grant.as_mut().unwrap();
+        assert_eq!(
+            first_prepared.begin_promotion(foreign_binding).unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool promotion binding does not match the exact prepared grant"
+                    .to_string(),
+            )
+        );
+
+        let mut promotion = pool.begin_promotion(&mut first).unwrap();
+        assert_eq!(
+            promotion
+                .begin_abort(
+                    DecoderGrantPoolBinding::new(&second.binding),
+                    "test_abort",
+                    None,
+                )
+                .unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool abort binding does not match the exact promotion grant".to_string(),
+            )
+        );
+        assert_eq!(
+            promotion
+                .begin_quarantine(
+                    DecoderGrantPoolBinding::new(&second.binding),
+                    "test_quarantine",
+                    None,
+                )
+                .unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool quarantine binding does not match the exact promotion grant"
+                    .to_string(),
+            )
+        );
+
+        let mut retained = promotion.assume_test_promoted().unwrap();
+        assert_eq!(
+            retained
+                .begin_completion(DecoderGrantPoolBinding::new(&second.binding))
+                .unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool completion binding does not match the exact retained grant"
+                    .to_string(),
+            )
+        );
+        assert_eq!(
+            retained
+                .begin_abort(
+                    DecoderGrantPoolBinding::new(&second.binding),
+                    "test_abort",
+                    None,
+                )
+                .unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool abort binding does not match the exact retained grant".to_string(),
+            )
+        );
+        assert_eq!(
+            retained
+                .begin_quarantine(
+                    DecoderGrantPoolBinding::new(&second.binding),
+                    "test_quarantine",
+                    None,
+                )
+                .unwrap_err(),
+            EngineGrantError::ProtocolViolation(
+                "decoder-pool quarantine binding does not match the exact retained grant"
+                    .to_string(),
+            )
+        );
+
+        release_after_completion(&pool, &mut first, &mut retained).unwrap();
+        release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn completion_cannot_consume_authority_from_another_active_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let mut first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
+        let mut second = bind_next(&pool, &second_owner, scalar_accounting()).unwrap();
+        let mut first_retained = retain_after_promotion(&pool, &mut first);
+        let mut second_retained = retain_after_promotion(&pool, &mut second);
+
+        assert_eq!(
+            pool.begin_completion(&mut second, &mut first_retained)
+                .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "completion grant does not exactly match the assignment".to_string(),
+            )
+        );
+        assert_eq!(first.phase, CohortPhase::Active);
+        assert_eq!(second.phase, CohortPhase::Active);
+
+        release_after_completion(&pool, &mut first, &mut first_retained).unwrap();
+        release_after_completion(&pool, &mut second, &mut second_retained).unwrap();
+    }
+
+    #[test]
+    fn abort_cannot_consume_authority_from_another_active_cohort() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let mut first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
+        let mut second = bind_next(&pool, &second_owner, scalar_accounting()).unwrap();
+        let mut first_promotion = pool.begin_promotion(&mut first).unwrap();
+        let mut second_promotion = pool.begin_promotion(&mut second).unwrap();
+
+        assert_eq!(
+            pool.begin_abort_from_promotion(
+                &mut second,
+                &mut first_promotion,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "abort grant does not exactly match the assignment".to_string(),
+            )
+        );
+        assert_eq!(first.phase, CohortPhase::Active);
+        assert_eq!(second.phase, CohortPhase::Active);
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 0);
+
+        let _first_abort = pool
+            .pin_abort(
+                &mut first,
+                &mut first_promotion,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap();
+        release_after_abort(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+        let _second_abort = pool
+            .pin_abort(
+                &mut second,
+                &mut second_promotion,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap();
+        release_after_abort(&pool, &mut second, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn quarantine_cannot_consume_authority_from_another_active_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let mut first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
+        let mut second = bind_next(&pool, &second_owner, scalar_accounting()).unwrap();
+        let mut first_promotion = pool.begin_promotion(&mut first).unwrap();
+        let mut second_promotion = pool.begin_promotion(&mut second).unwrap();
+
+        assert_eq!(
+            pool.begin_quarantine_from_promotion(
+                &mut second,
+                &mut first_promotion,
+                "test_quarantine",
+                None,
+            )
+            .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "quarantine grant does not exactly match the assignment".to_string(),
+            )
+        );
+        assert_eq!(first.phase, CohortPhase::Active);
+        assert_eq!(second.phase, CohortPhase::Active);
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 0);
+
+        let _first_quarantine = pool
+            .pin_quarantine(&mut first, &mut first_promotion, "test_quarantine", None)
+            .unwrap();
+        let first_receipt = quarantine_receipt(&first);
+        pool.apply_quarantine_receipt(&mut first, &first_receipt)
+            .unwrap();
+        let _second_quarantine = pool
+            .pin_quarantine(&mut second, &mut second_promotion, "test_quarantine", None)
+            .unwrap();
+        let second_receipt = quarantine_receipt(&second);
+        pool.apply_quarantine_receipt(&mut second, &second_receipt)
+            .unwrap();
+    }
+
+    #[test]
+    fn unavailable_completion_authority_does_not_change_the_active_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let mut consumed = retained.begin_test_completion().unwrap();
+
+        assert_eq!(
+            pool.begin_completion(&mut cohort, &mut retained)
+                .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "matching retained grant has no completion authority".to_string(),
+            )
+        );
+        assert_eq!(cohort.phase, CohortPhase::Active);
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 0);
+        consumed.assume_test_reconciled().unwrap();
+    }
+
+    #[test]
+    fn unavailable_abort_authority_does_not_change_the_active_cohort() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut promotion = pool.begin_promotion(&mut cohort).unwrap();
+        let mut consumed = promotion.begin_test_abort("test_abort", None).unwrap();
+
+        assert_eq!(
+            pool.begin_abort_from_promotion(
+                &mut cohort,
+                &mut promotion,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "matching engine grant could not pin abort authority".to_string(),
+            )
+        );
+        assert_eq!(cohort.phase, CohortPhase::Active);
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 0);
+        consumed.assume_test_reconciled().unwrap();
+    }
+
+    #[test]
+    fn unavailable_quarantine_authority_does_not_change_the_active_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let mut consumed = retained
+            .begin_test_quarantine("test_quarantine", None)
+            .unwrap();
+
+        assert_eq!(
+            pool.begin_quarantine_from_retained(
+                &mut cohort,
+                &mut retained,
+                "test_quarantine",
+                None,
+            )
+            .unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "matching engine grant could not pin quarantine authority".to_string(),
+            )
+        );
+        assert_eq!(cohort.phase, CohortPhase::Active);
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 0);
+        consumed.assume_test_reconciled().unwrap();
+    }
+
+    #[test]
+    fn promotion_preflights_the_complete_live_ledger_before_consuming_authority() {
+        #[derive(Clone, Copy, Debug)]
+        enum Corruption {
+            ActiveCohorts,
+            ActiveChildRequests,
+            ReservedKvTokens,
+            RemainingDecodeTokens,
+            MissingRoom,
+            MissingAllocation,
+            MissingReplica,
+            MissingChain,
+            WrongChainAssignment,
+            TerminalChain,
+            PrematureTerminalReconciliation,
+        }
+
+        impl Corruption {
+            fn expected_reason(self) -> &'static str {
+                match self {
+                    Self::ActiveCohorts
+                    | Self::ActiveChildRequests
+                    | Self::ReservedKvTokens
+                    | Self::RemainingDecodeTokens => {
+                        "decoder accounting is smaller than the assignment ledger"
+                    }
+                    Self::MissingRoom => "an assigned bootstrap room is not retained",
+                    Self::MissingAllocation => "an assigned slot generation is not retained",
+                    Self::MissingReplica => "assigned decoder is missing",
+                    Self::MissingChain => "request chain is missing",
+                    Self::WrongChainAssignment => "request chain does not own this assignment",
+                    Self::TerminalChain => "request chain became terminal before its assignment",
+                    Self::PrematureTerminalReconciliation => {
+                        "assignment phase differs from its terminal reconciliation ledger"
+                    }
+                }
+            }
+        }
+
+        for corruption in [
+            Corruption::ActiveCohorts,
+            Corruption::ActiveChildRequests,
+            Corruption::ReservedKvTokens,
+            Corruption::RemainingDecodeTokens,
+            Corruption::MissingRoom,
+            Corruption::MissingAllocation,
+            Corruption::MissingReplica,
+            Corruption::MissingChain,
+            Corruption::WrongChainAssignment,
+            Corruption::TerminalChain,
+            Corruption::PrematureTerminalReconciliation,
+        ] {
+            let pool = pool(4);
+            pool.register(replica("decode-0", "packed-v1")).unwrap();
+            let owner = pool
+                .begin_request(format!("request-{corruption:?}"))
+                .unwrap();
+            let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+            let decoder_id = cohort.decoder_id().clone();
+            let assignment_id = cohort.assignment_id();
+            let chain_id = owner.chain_id();
+            let room = cohort.bootstrap_rooms()[0];
+            let allocation = cohort
+                .binding
+                .allocation_keys()
+                .next()
+                .expect("scalar cohort must have one allocation");
+            let baseline = pool
+                .snapshot()
+                .replicas
+                .into_iter()
+                .next()
+                .expect("registered replica must be present");
+            let injected_receipt = quarantine_receipt(&cohort);
+            let mut removed_replica: Option<ReplicaState> = None;
+            let mut removed_chain: Option<RequestChainRecord> = None;
+
+            {
+                let mut state = pool.inner.state.lock();
+                match corruption {
+                    Corruption::ActiveCohorts => {
+                        state.replicas.get_mut(&decoder_id).unwrap().active_cohorts = 0;
+                    }
+                    Corruption::ActiveChildRequests => {
+                        state
+                            .replicas
+                            .get_mut(&decoder_id)
+                            .unwrap()
+                            .active_child_requests = 0;
+                    }
+                    Corruption::ReservedKvTokens => {
+                        state
+                            .replicas
+                            .get_mut(&decoder_id)
+                            .unwrap()
+                            .reserved_kv_tokens = 0;
+                    }
+                    Corruption::RemainingDecodeTokens => {
+                        state
+                            .replicas
+                            .get_mut(&decoder_id)
+                            .unwrap()
+                            .remaining_decode_tokens = 0;
+                    }
+                    Corruption::MissingRoom => {
+                        assert_eq!(
+                            state.room_owners.remove(&(decoder_id.clone(), room)),
+                            Some(assignment_id)
+                        );
+                    }
+                    Corruption::MissingAllocation => {
+                        assert_eq!(
+                            state.allocation_owners.remove(&allocation),
+                            Some(assignment_id)
+                        );
+                    }
+                    Corruption::MissingReplica => {
+                        removed_replica = state.replicas.remove(&decoder_id);
+                    }
+                    Corruption::MissingChain => {
+                        removed_chain = state.request_chains.remove(&chain_id);
+                    }
+                    Corruption::WrongChainAssignment => {
+                        state
+                            .request_chains
+                            .get_mut(&chain_id)
+                            .unwrap()
+                            .active_assignment = Some(Uuid::new_v4());
+                    }
+                    Corruption::TerminalChain => {
+                        state.request_chains.get_mut(&chain_id).unwrap().phase =
+                            RequestChainPhase::Terminal;
+                    }
+                    Corruption::PrematureTerminalReconciliation => {
+                        state
+                            .assignments
+                            .get_mut(&assignment_id)
+                            .unwrap()
+                            .terminal_reconciliation =
+                            Some(TerminalReconciliationRecord::Quarantine {
+                                proof: Some(injected_receipt.clone()),
+                            });
+                    }
+                }
+            }
+
+            assert_eq!(
+                pool.begin_promotion(&mut cohort).unwrap_err(),
+                DecoderPoolError::InconsistentAssignment {
+                    assignment_id,
+                    reason: corruption.expected_reason(),
+                },
+                "{corruption:?}"
+            );
+            assert_eq!(cohort.phase, CohortPhase::Reserved, "{corruption:?}");
+            assert_eq!(
+                pool.inner
+                    .state
+                    .lock()
+                    .assignments
+                    .get(&assignment_id)
+                    .unwrap()
+                    .phase,
+                CohortPhase::Reserved,
+                "{corruption:?}"
+            );
+
+            {
+                let mut state = pool.inner.state.lock();
+                match corruption {
+                    Corruption::ActiveCohorts
+                    | Corruption::ActiveChildRequests
+                    | Corruption::ReservedKvTokens
+                    | Corruption::RemainingDecodeTokens => {
+                        let replica = state.replicas.get_mut(&decoder_id).unwrap();
+                        replica.active_cohorts = baseline.active_cohorts;
+                        replica.active_child_requests = baseline.active_child_requests;
+                        replica.reserved_kv_tokens = baseline.reserved_kv_tokens;
+                        replica.remaining_decode_tokens = baseline.remaining_decode_tokens;
+                    }
+                    Corruption::MissingRoom => {
+                        assert!(state
+                            .room_owners
+                            .insert((decoder_id.clone(), room), assignment_id)
+                            .is_none());
+                    }
+                    Corruption::MissingAllocation => {
+                        assert!(state
+                            .allocation_owners
+                            .insert(allocation.clone(), assignment_id)
+                            .is_none());
+                    }
+                    Corruption::MissingReplica => {
+                        assert!(state
+                            .replicas
+                            .insert(decoder_id.clone(), removed_replica.take().unwrap())
+                            .is_none());
+                    }
+                    Corruption::MissingChain => {
+                        assert!(state
+                            .request_chains
+                            .insert(chain_id, removed_chain.take().unwrap())
+                            .is_none());
+                    }
+                    Corruption::WrongChainAssignment => {
+                        state
+                            .request_chains
+                            .get_mut(&chain_id)
+                            .unwrap()
+                            .active_assignment = Some(assignment_id);
+                    }
+                    Corruption::TerminalChain => {
+                        state.request_chains.get_mut(&chain_id).unwrap().phase =
+                            RequestChainPhase::Open;
+                    }
+                    Corruption::PrematureTerminalReconciliation => {
+                        state
+                            .assignments
+                            .get_mut(&assignment_id)
+                            .unwrap()
+                            .terminal_reconciliation = None;
+                    }
+                }
+            }
+
+            let mut retained = retain_after_promotion(&pool, &mut cohort);
+            release_after_completion(&pool, &mut cohort, &mut retained).unwrap();
+        }
+    }
+
+    #[test]
+    fn promotion_rejects_cross_cohort_aggregate_drift_before_consuming_authority() {
+        let pool = pool(4);
+        let decoder_id = decoder_id("decode-0");
+        pool.register(replica_with_id(decoder_id.clone(), "packed-v1"))
+            .unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let mut first_grant = issue_grant(
+            &pool,
+            &first_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        let mut second_grant = issue_grant(
+            &pool,
+            &second_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![701],
+            scalar_accounting(),
+        );
+        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
+        let baseline = pool
+            .snapshot()
+            .replicas
+            .into_iter()
+            .next()
+            .expect("registered replica must be present");
+        {
+            let mut state = pool.inner.state.lock();
+            let replica = state.replicas.get_mut(&decoder_id).unwrap();
+            replica.active_cohorts = 1;
+            replica.active_child_requests = 1;
+            replica.reserved_kv_tokens = child_accounting().reserved_kv_tokens();
+            replica.remaining_decode_tokens = child_accounting().remaining_decode_tokens();
+        }
+
+        assert_eq!(
+            pool.begin_promotion(&mut first).unwrap_err(),
+            DecoderPoolError::InconsistentAssignment {
+                assignment_id: first.assignment_id(),
+                reason: "decoder accounting differs from the assignment ledger",
+            }
+        );
+        assert_eq!(first.phase, CohortPhase::Reserved);
+        assert_eq!(second.phase, CohortPhase::Reserved);
+
+        {
+            let mut state = pool.inner.state.lock();
+            let replica = state.replicas.get_mut(&decoder_id).unwrap();
+            replica.active_cohorts = baseline.active_cohorts;
+            replica.active_child_requests = baseline.active_child_requests;
+            replica.reserved_kv_tokens = baseline.reserved_kv_tokens;
+            replica.remaining_decode_tokens = baseline.remaining_decode_tokens;
+        }
+        let mut retained = retain_after_promotion(&pool, &mut first);
+        release_after_completion(&pool, &mut first, &mut retained).unwrap();
+        release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn unavailable_promotion_authority_leaves_the_cohort_reserved() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+        let _cancellation = cohort
+            .prepared_grant
+            .as_mut()
+            .unwrap()
+            .begin_cancellation()
+            .unwrap();
+
+        assert_eq!(
+            pool.begin_promotion(&mut cohort).unwrap_err(),
+            DecoderPoolError::InvalidGrant(
+                "matching prepared grant has no promotion authority".to_string(),
+            )
+        );
+        assert_eq!(cohort.phase, CohortPhase::Reserved);
+        assert_eq!(pool.snapshot().replicas[0].active_cohorts, 1);
+    }
+
+    #[test]
     fn grant_cannot_cross_logical_request_owners() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
         let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
-        let grant = issue_grant(
+        let mut grant = issue_grant(
             &pool,
             &first_owner,
             decoder_id,
@@ -1802,13 +3694,13 @@ mod tests {
         );
 
         assert_eq!(
-            pool.bind_grant(&second_owner, &grant).unwrap_err(),
+            pool.bind_grant(&second_owner, &mut grant).unwrap_err(),
             DecoderPoolError::GrantRequestMismatch {
                 expected: second_owner.chain_id(),
                 actual: first_owner.chain_id(),
             }
         );
-        let mut cohort = pool.bind_grant(&first_owner, &grant).unwrap();
+        let mut cohort = pool.bind_grant(&first_owner, &mut grant).unwrap();
         release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
     }
 
@@ -1818,7 +3710,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let decoder_id = pool.admission_candidates(&owner).unwrap().remove(0);
-        let grant = issue_test_grant(
+        let mut grant = issue_test_grant(
             prefill_id("prefill-0@generation-1"),
             owner.chain_id(),
             2,
@@ -1831,7 +3723,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            pool.bind_grant(&owner, &grant).unwrap_err(),
+            pool.bind_grant(&owner, &mut grant).unwrap_err(),
             DecoderPoolError::GrantPrefillMismatch {
                 expected: prefill_id("prefill-0@generation-2"),
                 actual: prefill_id("prefill-0@generation-1"),
@@ -1857,7 +3749,7 @@ mod tests {
             pool.register(replica("decode-0", "packed-v1")).unwrap();
             let owner = pool.begin_request(format!("request-{mismatch}")).unwrap();
             let selected_decoder = pool.admission_candidates(&owner).unwrap().remove(0);
-            let grant = issue_grant(
+            let mut grant = issue_grant(
                 &pool,
                 &owner,
                 selected_decoder.clone(),
@@ -1866,7 +3758,7 @@ mod tests {
                 vec![11],
                 scalar_accounting(),
             );
-            let mut cohort = pool.bind_grant(&owner, &grant).unwrap();
+            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
             let alternate_grant = issue_grant(
                 &pool,
                 &owner,
@@ -1876,53 +3768,36 @@ mod tests {
                 vec![12],
                 scalar_accounting(),
             );
-            let receipt = issue_test_release_receipt(
-                if mismatch == 0 {
-                    Uuid::new_v4()
-                } else {
-                    cohort.assignment_id()
-                },
-                if mismatch == 1 {
-                    decoder_id("decode-other")
-                } else {
-                    selected_decoder.clone()
-                },
-                if mismatch == 2 {
-                    vec![Uuid::new_v4()]
-                } else {
-                    cohort.binding.child_request_ids().collect()
-                },
-                if mismatch == 3 {
-                    PrefillBootstrapEndpoint::new("other-prefill.test", 5001).unwrap()
-                } else {
-                    cohort.binding.prefill_bootstrap_endpoint().clone()
-                },
-                if mismatch == 4 {
-                    vec![DecoderSlotGeneration::new(Uuid::new_v4())]
-                } else {
-                    cohort.slot_generations().to_vec()
-                },
-                if mismatch == 5 {
-                    vec![12]
-                } else {
-                    cohort.bootstrap_rooms().to_vec()
-                },
-                if mismatch == 6 {
-                    alternate_grant.grant_digest()
-                } else {
-                    cohort.grant_digest()
-                },
-                if mismatch == 7 {
-                    EngineReleaseKind::Completed
-                } else {
-                    EngineReleaseKind::PreparedCancelled
-                },
-                mismatch != 8,
-            );
+            let mut binding = receipt_binding(&cohort);
+            match mismatch {
+                0 => binding.grant_id = Uuid::new_v4(),
+                1 => binding.decoder_id = decoder_id("decode-other"),
+                2 => binding.child_request_ids = vec![Uuid::new_v4()],
+                3 => {
+                    binding.prefill_bootstrap_endpoint =
+                        PrefillBootstrapEndpoint::new("other-prefill.test", 5001).unwrap();
+                }
+                4 => {
+                    binding.slot_generations = vec![DecoderSlotGeneration::new(Uuid::new_v4())];
+                }
+                5 => binding.bootstrap_rooms = vec![12],
+                6 => binding.grant_digest = alternate_grant.grant_digest(),
+                7 | 8 => {}
+                _ => unreachable!(),
+            }
+            let kind = if mismatch == 7 {
+                EngineReleaseKind::Completed
+            } else {
+                EngineReleaseKind::PreparedCancelled
+            };
+            let receipt = issue_test_release_receipt(binding, kind, mismatch != 8);
             let assignment_id = cohort.assignment_id();
+            let _cancellation = pool
+                .pin_cancellation(&mut cohort, RetryDisposition::Terminal)
+                .unwrap();
 
             assert_eq!(
-                pool.finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal,)
+                pool.apply_cancellation_receipt(&mut cohort, &receipt, RetryDisposition::Terminal,)
                     .unwrap_err(),
                 DecoderPoolError::InvalidEngineReleaseReceipt {
                     assignment_id,
@@ -1931,23 +3806,31 @@ mod tests {
             );
             assert_eq!(pool.snapshot().replicas[0].active_cohorts, 1);
 
-            release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
+            let valid_receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
+            pool.apply_cancellation_receipt(
+                &mut cohort,
+                &valid_receipt,
+                RetryDisposition::Terminal,
+            )
+            .unwrap();
             assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
         }
     }
 
     #[test]
-    fn active_completion_rejects_an_invalid_receipt_without_consuming_the_cohort() {
+    fn completing_cohort_rejects_an_invalid_receipt_without_consuming_the_cohort() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
-        pool.begin_activation(&mut cohort).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let _completion = pool.pin_completion(&mut cohort, &mut retained).unwrap();
         let invalid_receipt = release_receipt(&cohort, EngineReleaseKind::Aborted);
         let assignment_id = cohort.assignment_id();
 
         assert_eq!(
-            pool.complete(&mut cohort, &invalid_receipt).unwrap_err(),
+            pool.apply_completion_receipt(&mut cohort, &invalid_receipt)
+                .unwrap_err(),
             DecoderPoolError::InvalidEngineReleaseReceipt {
                 assignment_id,
                 reason: "release kind differs",
@@ -1955,24 +3838,29 @@ mod tests {
         );
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 1);
 
-        release_after_completion(&pool, &mut cohort).unwrap();
+        let valid_receipt = release_receipt(&cohort, EngineReleaseKind::Completed);
+        pool.apply_completion_receipt(&mut cohort, &valid_receipt)
+            .unwrap();
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
     }
 
     #[test]
-    fn quiesced_release_rejects_an_invalid_receipt_without_consuming_the_cohort() {
+    fn aborting_cohort_rejects_an_invalid_receipt_without_consuming_the_cohort() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
-        pool.begin_activation(&mut cohort).unwrap();
-        pool.begin_quiescence(&mut cohort).unwrap();
+        let _abort = pin_abort_after_promotion(&pool, &mut cohort);
         let invalid_receipt = release_receipt(&cohort, EngineReleaseKind::Completed);
         let assignment_id = cohort.assignment_id();
 
         assert_eq!(
-            pool.confirm_quiesced(&mut cohort, &invalid_receipt, RetryDisposition::Terminal,)
-                .unwrap_err(),
+            pool.apply_abort_release_receipt(
+                &mut cohort,
+                &invalid_receipt,
+                RetryDisposition::Terminal,
+            )
+            .unwrap_err(),
             DecoderPoolError::InvalidEngineReleaseReceipt {
                 assignment_id,
                 reason: "release kind differs",
@@ -1998,17 +3886,20 @@ mod tests {
         let assignment_id = cohort.assignment_id();
 
         assert_eq!(
-            pool.complete(&mut cohort, &receipt).unwrap_err(),
+            pool.apply_completion_receipt(&mut cohort, &receipt)
+                .unwrap_err(),
             DecoderPoolError::InvalidTransition {
                 assignment_id,
                 actual: "reserved",
-                requested: "terminal",
+                requested: "install completion proof",
             }
         );
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 1);
 
-        pool.begin_activation(&mut cohort).unwrap();
-        pool.complete(&mut cohort, &receipt).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let _completion = pool.pin_completion(&mut cohort, &mut retained).unwrap();
+        pool.apply_completion_receipt(&mut cohort, &receipt)
+            .unwrap();
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
     }
 
@@ -2021,18 +3912,21 @@ mod tests {
             .unwrap();
         let owner = issuing_pool.begin_request("request").unwrap();
         let mut cohort = bind_next(&issuing_pool, &owner, scalar_accounting()).unwrap();
+        let _cancellation = issuing_pool
+            .pin_cancellation(&mut cohort, RetryDisposition::Terminal)
+            .unwrap();
         let receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
 
         assert_eq!(
             foreign_pool
-                .finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal,)
+                .apply_cancellation_receipt(&mut cohort, &receipt, RetryDisposition::Terminal,)
                 .unwrap_err(),
             DecoderPoolError::ForeignAssignment
         );
         assert_eq!(issuing_pool.snapshot().replicas[0].active_cohorts, 1);
 
         issuing_pool
-            .finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal)
+            .apply_cancellation_receipt(&mut cohort, &receipt, RetryDisposition::Terminal)
             .unwrap();
         assert_eq!(issuing_pool.snapshot().replicas[0].active_cohorts, 0);
     }
@@ -2047,13 +3941,19 @@ mod tests {
         let decoder_id = cohort.decoder_id().clone();
         let room = cohort.bootstrap_rooms()[0];
         let assignment_id = cohort.assignment_id();
+        let _cancellation = pool
+            .pin_cancellation(&mut cohort, RetryDisposition::Terminal)
+            .unwrap();
         {
             let mut state = pool.inner.state.lock();
-            assert!(state.active_rooms.remove(&(decoder_id.clone(), room)));
+            assert_eq!(
+                state.room_owners.remove(&(decoder_id.clone(), room)),
+                Some(assignment_id)
+            );
         }
 
         assert_eq!(
-            pool.finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal,)
+            pool.apply_cancellation_receipt(&mut cohort, &receipt, RetryDisposition::Terminal,)
                 .unwrap_err(),
             DecoderPoolError::InconsistentAssignment {
                 assignment_id,
@@ -2065,12 +3965,246 @@ mod tests {
         assert_eq!(snapshot.replicas[0].active_child_requests, 1);
         {
             let mut state = pool.inner.state.lock();
-            assert!(state.active_rooms.insert((decoder_id, room)));
+            assert!(state
+                .room_owners
+                .insert((decoder_id, room), assignment_id)
+                .is_none());
         }
 
-        pool.finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal)
+        pool.apply_cancellation_receipt(&mut cohort, &receipt, RetryDisposition::Terminal)
             .unwrap();
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_cancellation_reuses_its_receipt_after_pool_preflight_failure() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
+        let decoder_id = cohort.decoder_id().clone();
+        let room = cohort.bootstrap_rooms()[0];
+        let assignment_id = cohort.assignment_id();
+        let mut reconciliation = pool
+            .begin_cancellation(&mut cohort, RetryDisposition::Terminal)
+            .unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_cancellation_proof(reconciliation.cohort, receipt)
+            .unwrap();
+        assert_eq!(
+            pool.inner
+                .state
+                .lock()
+                .room_owners
+                .remove(&(decoder_id.clone(), room)),
+            Some(assignment_id)
+        );
+
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::Pool(
+                DecoderPoolError::InconsistentAssignment {
+                    assignment_id: failed_assignment_id,
+                    reason: "an assigned bootstrap room is not retained",
+                }
+            )) if failed_assignment_id == assignment_id
+        ));
+        drop(reconciliation);
+        assert!(pool
+            .inner
+            .state
+            .lock()
+            .room_owners
+            .insert((decoder_id, room), assignment_id)
+            .is_none());
+
+        pool.resume_terminal_reconciliation(&mut cohort).unwrap();
+        pool.resume_terminal_reconciliation(&mut cohort).unwrap();
+        assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
+    }
+
+    #[test]
+    fn terminal_reconciliation_proof_install_is_exact_and_preserves_pinned_disposition() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        pool.register(replica("decode-1", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let failed_decoder = cohort.decoder_id().clone();
+        let assignment_id = cohort.assignment_id();
+        let first_receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
+        let conflicting_receipt = release_receipt(&cohort, EngineReleaseKind::PreparedCancelled);
+        let mut cancellation = pool
+            .pin_cancellation(&mut cohort, RetryDisposition::DecoderFailed)
+            .unwrap();
+
+        assert_eq!(
+            pool.resume_terminal_reconciliation(&mut cohort)
+                .unwrap_err(),
+            DecoderPoolError::TerminalProofPending(assignment_id)
+        );
+        assert_eq!(
+            pool.apply_cancellation_receipt(
+                &mut cohort,
+                &first_receipt,
+                RetryDisposition::Retryable,
+            )
+            .unwrap_err(),
+            DecoderPoolError::ConflictingTerminalProof(assignment_id)
+        );
+        cancellation.assume_test_reconciled().unwrap();
+        pool.install_cancellation_proof(&cohort, first_receipt.clone())
+            .unwrap();
+        pool.install_cancellation_proof(&cohort, first_receipt)
+            .unwrap();
+        assert_eq!(
+            pool.install_cancellation_proof(&cohort, conflicting_receipt)
+                .unwrap_err(),
+            DecoderPoolError::ConflictingTerminalProof(assignment_id)
+        );
+
+        pool.resume_terminal_reconciliation(&mut cohort).unwrap();
+        let candidates = pool.admission_candidates(&owner).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_ne!(candidates[0], failed_decoder);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_completion_terminalizes_only_its_borrowed_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let receipt = release_receipt(&cohort, EngineReleaseKind::Completed);
+        let mut reconciliation = pool.begin_completion(&mut cohort, &mut retained).unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_completion_proof(reconciliation.cohort, receipt)
+            .unwrap();
+
+        reconciliation.reconcile().await.unwrap();
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "completion"
+            ))
+        ));
+        drop(reconciliation);
+        assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_abort_applies_an_authoritative_release() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut promotion = pool.begin_promotion(&mut cohort).unwrap();
+        let receipt = release_receipt(&cohort, EngineReleaseKind::Aborted);
+        let mut reconciliation = pool
+            .begin_abort_from_promotion(
+                &mut cohort,
+                &mut promotion,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_abort_proof(reconciliation.cohort, EngineAbortOutcome::Aborted(receipt))
+            .unwrap();
+
+        reconciliation.reconcile().await.unwrap();
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "abort"
+            ))
+        ));
+        drop(reconciliation);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].active_cohorts, 0);
+        assert_eq!(snapshot.replicas[0].quiescing_cohorts, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_abort_applies_an_authoritative_quarantine_fallback() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let receipt = quarantine_receipt(&cohort);
+        let mut reconciliation = pool
+            .begin_abort_from_retained(
+                &mut cohort,
+                &mut retained,
+                "test_abort",
+                None,
+                RetryDisposition::Terminal,
+            )
+            .unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_abort_proof(
+                reconciliation.cohort,
+                EngineAbortOutcome::Quarantined(receipt.clone()),
+            )
+            .unwrap();
+
+        reconciliation.reconcile().await.unwrap();
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "abort"
+            ))
+        ));
+        drop(reconciliation);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].active_cohorts, 1);
+        assert_eq!(snapshot.replicas[0].quiescing_cohorts, 0);
+        assert_eq!(snapshot.replicas[0].quarantined_cohorts, 1);
+        assert_eq!(pool.quarantine_receipt(&cohort).unwrap(), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn pool_bound_quarantine_retains_only_its_borrowed_cohort() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let mut promotion = pool.begin_promotion(&mut cohort).unwrap();
+        let receipt = quarantine_receipt(&cohort);
+        let mut reconciliation = pool
+            .begin_quarantine_from_promotion(&mut cohort, &mut promotion, "test_quarantine", None)
+            .unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_quarantine_proof(reconciliation.cohort, receipt.clone())
+            .unwrap();
+
+        reconciliation.reconcile().await.unwrap();
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "quarantine"
+            ))
+        ));
+        drop(reconciliation);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].active_cohorts, 1);
+        assert_eq!(snapshot.replicas[0].quiescing_cohorts, 0);
+        assert_eq!(snapshot.replicas[0].quarantined_cohorts, 1);
+        assert_eq!(pool.quarantine_receipt(&cohort).unwrap(), Some(receipt));
     }
 
     #[test]
@@ -2083,7 +4217,7 @@ mod tests {
             DecoderSlotGeneration::new(Uuid::new_v4()),
             DecoderSlotGeneration::new(Uuid::new_v4()),
         ];
-        let original = issue_grant(
+        let mut original = issue_grant(
             &pool,
             &owner,
             decoder_id.clone(),
@@ -2092,11 +4226,11 @@ mod tests {
             vec![101, 102],
             vec![child_accounting(), child_accounting()],
         );
-        let mut first = pool.bind_grant(&owner, &original).unwrap();
+        let mut first = pool.bind_grant(&owner, &mut original).unwrap();
         release_before_activation(&pool, &mut first, RetryDisposition::Retryable).unwrap();
 
         assert_eq!(
-            pool.bind_grant(&owner, &original).unwrap_err(),
+            pool.bind_grant(&owner, &mut original).unwrap_err(),
             DecoderPoolError::GrantAlreadyBound {
                 child_index: 0,
                 decoder_id: decoder_id.clone(),
@@ -2104,7 +4238,7 @@ mod tests {
             }
         );
         for rooms in [vec![101, 103], vec![102, 101]] {
-            let altered = issue_grant(
+            let mut altered = issue_grant(
                 &pool,
                 &owner,
                 decoder_id.clone(),
@@ -2114,7 +4248,7 @@ mod tests {
                 vec![child_accounting(), child_accounting()],
             );
             assert_eq!(
-                pool.bind_grant(&owner, &altered).unwrap_err(),
+                pool.bind_grant(&owner, &mut altered).unwrap_err(),
                 DecoderPoolError::GrantGenerationRebound {
                     child_index: 0,
                     decoder_id: decoder_id.clone(),
@@ -2135,7 +4269,7 @@ mod tests {
             .unwrap();
         let owner = pool.begin_request("request").unwrap();
         let slot_generation = DecoderSlotGeneration::new(Uuid::new_v4());
-        let first_grant = issue_grant(
+        let mut first_grant = issue_grant(
             &pool,
             &owner,
             first_decoder,
@@ -2144,10 +4278,10 @@ mod tests {
             vec![101],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&owner, &first_grant).unwrap();
+        let mut first = pool.bind_grant(&owner, &mut first_grant).unwrap();
         release_before_activation(&pool, &mut first, RetryDisposition::DecoderFailed).unwrap();
 
-        let second_grant = issue_grant(
+        let mut second_grant = issue_grant(
             &pool,
             &owner,
             second_decoder.clone(),
@@ -2156,7 +4290,7 @@ mod tests {
             vec![101],
             scalar_accounting(),
         );
-        let mut second = pool.bind_grant(&owner, &second_grant).unwrap();
+        let mut second = pool.bind_grant(&owner, &mut second_grant).unwrap();
         assert_eq!(second.decoder_id(), &second_decoder);
         release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
@@ -2168,7 +4302,7 @@ mod tests {
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
         let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
-        let first_grant = issue_grant(
+        let mut first_grant = issue_grant(
             &pool,
             &first_owner,
             decoder_id.clone(),
@@ -2177,8 +4311,8 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&first_owner, &first_grant).unwrap();
-        let second_grant = issue_grant(
+        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut second_grant = issue_grant(
             &pool,
             &second_owner,
             decoder_id.clone(),
@@ -2188,13 +4322,56 @@ mod tests {
             scalar_accounting(),
         );
         assert_eq!(
-            pool.bind_grant(&second_owner, &second_grant).unwrap_err(),
+            pool.bind_grant(&second_owner, &mut second_grant)
+                .unwrap_err(),
             DecoderPoolError::GrantRoomInUse {
                 decoder_id,
                 room: 700,
             }
         );
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn active_slot_generation_cannot_be_owned_by_two_request_chains() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
+        let slot_generation = DecoderSlotGeneration::new(Uuid::new_v4());
+        let mut first_grant = issue_grant(
+            &pool,
+            &first_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![slot_generation],
+            vec![700],
+            scalar_accounting(),
+        );
+        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut second_grant = issue_grant(
+            &pool,
+            &second_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![slot_generation],
+            vec![701],
+            scalar_accounting(),
+        );
+
+        assert_eq!(
+            pool.bind_grant(&second_owner, &mut second_grant)
+                .unwrap_err(),
+            DecoderPoolError::GrantSlotGenerationInUse {
+                decoder_id,
+                slot_generation: slot_generation.as_uuid(),
+            }
+        );
+
+        release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
+        release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -2208,7 +4385,7 @@ mod tests {
             .unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
-        let first_grant = issue_grant(
+        let mut first_grant = issue_grant(
             &pool,
             &first_owner,
             first_decoder.clone(),
@@ -2217,7 +4394,7 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
-        let second_grant = issue_grant(
+        let mut second_grant = issue_grant(
             &pool,
             &second_owner,
             second_decoder.clone(),
@@ -2227,8 +4404,8 @@ mod tests {
             scalar_accounting(),
         );
 
-        let mut first = pool.bind_grant(&first_owner, &first_grant).unwrap();
-        let mut second = pool.bind_grant(&second_owner, &second_grant).unwrap();
+        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
         assert_eq!(first.decoder_id(), &first_decoder);
         assert_eq!(second.decoder_id(), &second_decoder);
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
@@ -2282,6 +4459,24 @@ mod tests {
         let mut replacement_cohort = bind_next(&pool, &replacement, scalar_accounting()).unwrap();
         release_before_activation(&pool, &mut replacement_cohort, RetryDisposition::Terminal)
             .unwrap();
+    }
+
+    #[test]
+    fn dropped_owner_cannot_cross_promotion_but_can_still_cancel() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let chain_id = owner.chain_id();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        drop(owner);
+
+        assert_eq!(
+            pool.begin_promotion(&mut cohort).unwrap_err(),
+            DecoderPoolError::RequestChainOwnerDropped(chain_id)
+        );
+        assert_eq!(cohort.phase, CohortPhase::Reserved);
+        release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
+        assert_eq!(pool.snapshot().active_logical_requests, 0);
     }
 
     #[test]
@@ -2357,13 +4552,12 @@ mod tests {
     }
 
     #[test]
-    fn quiescing_phase_and_counter_change_as_one_operation() {
+    fn abort_phase_and_quiescing_counter_change_as_one_operation() {
         let pool = pool(4);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
-        pool.begin_activation(&mut cohort).unwrap();
-        pool.begin_quiescence(&mut cohort).unwrap();
+        let _abort = pin_abort_after_promotion(&pool, &mut cohort);
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
         assert_eq!(snapshot.replicas[0].quiescing_cohorts, 1);
@@ -2387,7 +4581,7 @@ mod tests {
             pool.register(replica("decode-0", "packed-v1")).unwrap();
             let owner = pool.begin_request(format!("request-{mismatch}")).unwrap();
             let selected_decoder = pool.admission_candidates(&owner).unwrap().remove(0);
-            let grant = issue_grant(
+            let mut grant = issue_grant(
                 &pool,
                 &owner,
                 selected_decoder.clone(),
@@ -2396,9 +4590,8 @@ mod tests {
                 vec![11],
                 scalar_accounting(),
             );
-            let mut cohort = pool.bind_grant(&owner, &grant).unwrap();
-            pool.begin_activation(&mut cohort).unwrap();
-            pool.begin_quiescence(&mut cohort).unwrap();
+            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+            let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
             let alternate_grant = issue_grant(
                 &pool,
                 &owner,
@@ -2408,48 +4601,29 @@ mod tests {
                 vec![12],
                 scalar_accounting(),
             );
-            let receipt = issue_test_quarantine_receipt(
-                if mismatch == 0 {
-                    Uuid::new_v4()
-                } else {
-                    cohort.assignment_id()
-                },
-                if mismatch == 1 {
-                    decoder_id("decode-other")
-                } else {
-                    selected_decoder
-                },
-                if mismatch == 2 {
-                    vec![Uuid::new_v4()]
-                } else {
-                    cohort.binding.child_request_ids().collect()
-                },
-                if mismatch == 3 {
-                    PrefillBootstrapEndpoint::new("other-prefill.test", 5001).unwrap()
-                } else {
-                    cohort.binding.prefill_bootstrap_endpoint().clone()
-                },
-                if mismatch == 4 {
-                    vec![DecoderSlotGeneration::new(Uuid::new_v4())]
-                } else {
-                    cohort.slot_generations().to_vec()
-                },
-                if mismatch == 5 {
-                    vec![12]
-                } else {
-                    cohort.bootstrap_rooms().to_vec()
-                },
-                if mismatch == 6 {
-                    alternate_grant.grant_digest()
-                } else {
-                    cohort.grant_digest()
-                },
-                mismatch != 7,
-            );
+            let mut binding = receipt_binding(&cohort);
+            match mismatch {
+                0 => binding.grant_id = Uuid::new_v4(),
+                1 => binding.decoder_id = decoder_id("decode-other"),
+                2 => binding.child_request_ids = vec![Uuid::new_v4()],
+                3 => {
+                    binding.prefill_bootstrap_endpoint =
+                        PrefillBootstrapEndpoint::new("other-prefill.test", 5001).unwrap();
+                }
+                4 => {
+                    binding.slot_generations = vec![DecoderSlotGeneration::new(Uuid::new_v4())];
+                }
+                5 => binding.bootstrap_rooms = vec![12],
+                6 => binding.grant_digest = alternate_grant.grant_digest(),
+                7 => {}
+                _ => unreachable!(),
+            }
+            let receipt = issue_test_quarantine_receipt(binding, mismatch != 7);
             let assignment_id = cohort.assignment_id();
 
             assert_eq!(
-                pool.confirm_quarantined(&mut cohort, &receipt).unwrap_err(),
+                pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                    .unwrap_err(),
                 DecoderPoolError::InvalidEngineQuarantineReceipt {
                     assignment_id,
                     reason: expected_reason,
@@ -2460,7 +4634,7 @@ mod tests {
             assert_eq!(snapshot.replicas[0].quarantined_cohorts, 0);
 
             let valid_receipt = quarantine_receipt(&cohort);
-            pool.confirm_quarantined(&mut cohort, &valid_receipt)
+            pool.apply_quarantine_receipt(&mut cohort, &valid_receipt)
                 .unwrap();
             assert_eq!(
                 pool.quarantine_receipt(&cohort).unwrap(),
@@ -2470,13 +4644,197 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_rejects_missing_rooms_without_consuming_the_cohort() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
+        let receipt = quarantine_receipt(&cohort);
+        let room = cohort.bootstrap_rooms()[0];
+        let decoder_id = cohort.decoder_id().clone();
+        {
+            let mut state = pool.inner.state.lock();
+            assert_eq!(
+                state.room_owners.remove(&(decoder_id.clone(), room)),
+                Some(cohort.assignment_id())
+            );
+        }
+
+        assert_eq!(
+            pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                .unwrap_err(),
+            DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id(),
+                reason: "an assigned bootstrap room is not retained",
+            }
+        );
+        assert_eq!(pool.snapshot().replicas[0].quiescing_cohorts, 1);
+        assert_eq!(
+            pool.quarantine_receipt(&cohort).unwrap(),
+            Some(receipt.clone())
+        );
+
+        pool.inner
+            .state
+            .lock()
+            .room_owners
+            .insert((decoder_id, room), cohort.assignment_id());
+        pool.apply_quarantine_receipt(&mut cohort, &receipt)
+            .unwrap();
+    }
+
+    #[test]
+    fn quarantine_rejects_undersized_accounting_without_consuming_the_cohort() {
+        for field in [
+            "active_cohorts",
+            "active_child_requests",
+            "reserved_kv_tokens",
+            "remaining_decode_tokens",
+        ] {
+            let pool = pool(4);
+            pool.register(replica("decode-0", "packed-v1")).unwrap();
+            let owner = pool.begin_request(format!("request-{field}")).unwrap();
+            let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+            let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
+            let receipt = quarantine_receipt(&cohort);
+            let decoder_id = cohort.decoder_id().clone();
+            let baseline = pool
+                .snapshot()
+                .replicas
+                .into_iter()
+                .next()
+                .expect("registered replica must be present");
+            {
+                let mut state = pool.inner.state.lock();
+                let replica = state.replicas.get_mut(&decoder_id).unwrap();
+                match field {
+                    "active_cohorts" => replica.active_cohorts = 0,
+                    "active_child_requests" => replica.active_child_requests = 0,
+                    "reserved_kv_tokens" => replica.reserved_kv_tokens = 0,
+                    "remaining_decode_tokens" => replica.remaining_decode_tokens = 0,
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(
+                pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                    .unwrap_err(),
+                DecoderPoolError::InconsistentAssignment {
+                    assignment_id: cohort.assignment_id(),
+                    reason: "decoder accounting is smaller than the assignment ledger",
+                }
+            );
+            assert_eq!(
+                pool.quarantine_receipt(&cohort).unwrap(),
+                Some(receipt.clone())
+            );
+
+            {
+                let mut state = pool.inner.state.lock();
+                let replica = state.replicas.get_mut(&decoder_id).unwrap();
+                replica.active_cohorts = baseline.active_cohorts;
+                replica.active_child_requests = baseline.active_child_requests;
+                replica.reserved_kv_tokens = baseline.reserved_kv_tokens;
+                replica.remaining_decode_tokens = baseline.remaining_decode_tokens;
+            }
+            pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn quarantine_rejects_missing_quiescing_accounting_without_consuming_the_cohort() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
+        let receipt = quarantine_receipt(&cohort);
+        let decoder_id = cohort.decoder_id().clone();
+        {
+            let mut state = pool.inner.state.lock();
+            state
+                .replicas
+                .get_mut(&decoder_id)
+                .unwrap()
+                .quiescing_cohorts = 0;
+        }
+
+        assert_eq!(
+            pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                .unwrap_err(),
+            DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id(),
+                reason: "decoder has no quiescing cohort for this assignment",
+            }
+        );
+        assert_eq!(cohort.phase, CohortPhase::Quarantining);
+        assert_eq!(
+            pool.quarantine_receipt(&cohort).unwrap(),
+            Some(receipt.clone())
+        );
+
+        pool.inner
+            .state
+            .lock()
+            .replicas
+            .get_mut(&decoder_id)
+            .unwrap()
+            .quiescing_cohorts = 1;
+        pool.apply_quarantine_receipt(&mut cohort, &receipt)
+            .unwrap();
+    }
+
+    #[test]
+    fn quarantine_rejects_a_terminal_request_chain_without_consuming_the_cohort() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
+        let receipt = quarantine_receipt(&cohort);
+        {
+            let mut state = pool.inner.state.lock();
+            state
+                .request_chains
+                .get_mut(&owner.chain_id())
+                .unwrap()
+                .phase = RequestChainPhase::Terminal;
+        }
+
+        assert_eq!(
+            pool.apply_quarantine_receipt(&mut cohort, &receipt)
+                .unwrap_err(),
+            DecoderPoolError::InconsistentAssignment {
+                assignment_id: cohort.assignment_id(),
+                reason: "request chain became terminal before its assignment",
+            }
+        );
+        assert_eq!(
+            pool.quarantine_receipt(&cohort).unwrap(),
+            Some(receipt.clone())
+        );
+
+        pool.inner
+            .state
+            .lock()
+            .request_chains
+            .get_mut(&owner.chain_id())
+            .unwrap()
+            .phase = RequestChainPhase::Open;
+        pool.apply_quarantine_receipt(&mut cohort, &receipt)
+            .unwrap();
+    }
+
+    #[test]
     fn quarantine_retains_the_exact_receipt_and_every_owned_resource() {
         let pool = pool(4);
         let assigned_decoder = decoder_id("decode-0");
         pool.register(replica_with_id(assigned_decoder.clone(), "packed-v1"))
             .unwrap();
         let mut owner = pool.begin_request("request").unwrap();
-        let grant = issue_grant(
+        let mut grant = issue_grant(
             &pool,
             &owner,
             assigned_decoder.clone(),
@@ -2491,14 +4849,17 @@ mod tests {
                 DecoderGrantChildAccounting::new(200, 20),
             ],
         );
-        let mut cohort = pool.bind_grant(&owner, &grant).unwrap();
-        pool.begin_activation(&mut cohort).unwrap();
+        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+        let mut promotion = pool.begin_promotion(&mut cohort).unwrap();
         pool.observe_decode_progress(&cohort, 7).unwrap();
-        pool.begin_quiescence(&mut cohort).unwrap();
+        let _quarantine = pool
+            .pin_quarantine(&mut cohort, &mut promotion, "test_quarantine", None)
+            .unwrap();
         let receipt = quarantine_receipt(&cohort);
         let assignment_id = cohort.assignment_id();
 
-        pool.confirm_quarantined(&mut cohort, &receipt).unwrap();
+        pool.apply_quarantine_receipt(&mut cohort, &receipt)
+            .unwrap();
 
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
@@ -2527,7 +4888,7 @@ mod tests {
         );
 
         let second_owner = pool.begin_request("second").unwrap();
-        let colliding_grant = issue_grant(
+        let mut colliding_grant = issue_grant(
             &pool,
             &second_owner,
             assigned_decoder.clone(),
@@ -2537,7 +4898,7 @@ mod tests {
             scalar_accounting(),
         );
         assert_eq!(
-            pool.bind_grant(&second_owner, &colliding_grant)
+            pool.bind_grant(&second_owner, &mut colliding_grant)
                 .unwrap_err(),
             DecoderPoolError::GrantRoomInUse {
                 decoder_id: assigned_decoder.clone(),
@@ -2556,20 +4917,25 @@ mod tests {
         );
         let release_receipt = release_receipt(&cohort, EngineReleaseKind::Aborted);
         assert_eq!(
-            pool.confirm_quiesced(&mut cohort, &release_receipt, RetryDisposition::Terminal,)
+            pool.apply_abort_release_receipt(
+                &mut cohort,
+                &release_receipt,
+                RetryDisposition::Terminal,
+            )
+            .unwrap_err(),
+            DecoderPoolError::InvalidTransition {
+                assignment_id,
+                actual: "quarantined",
+                requested: "validate pinned retry disposition",
+            }
+        );
+        assert_eq!(
+            pool.apply_quarantine_receipt(&mut cohort, &receipt)
                 .unwrap_err(),
             DecoderPoolError::InvalidTransition {
                 assignment_id,
                 actual: "quarantined",
-                requested: "terminal",
-            }
-        );
-        assert_eq!(
-            pool.confirm_quarantined(&mut cohort, &receipt).unwrap_err(),
-            DecoderPoolError::InvalidTransition {
-                assignment_id,
-                actual: "quarantined",
-                requested: "quarantined",
+                requested: "install quarantine proof",
             }
         );
         assert_eq!(pool.quarantine_receipt(&cohort).unwrap(), Some(receipt));
@@ -2630,7 +4996,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
-        pool.begin_activation(&mut cohort).unwrap();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
         pool.observe_decode_progress(&cohort, 100).unwrap();
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].remaining_decode_tokens, 28);
@@ -2640,7 +5006,7 @@ mod tests {
             pool.observe_decode_progress(&cohort, 29),
             Err(DecoderPoolError::InvalidProgress { .. })
         ));
-        release_after_completion(&pool, &mut cohort).unwrap();
+        release_after_completion(&pool, &mut cohort, &mut retained).unwrap();
     }
 
     #[test]

@@ -1,8 +1,12 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use bytes::Bytes;
-use reqwest::{Client, StatusCode};
+use bytes::{Bytes, BytesMut};
+use reqwest::{
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+    redirect::Policy,
+    Client, ClientBuilder, RequestBuilder, Response, StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -11,9 +15,10 @@ use super::{
     digest_reserve_attempt, AuthorityDigest, DecoderGrantBinding, DecoderGrantChildAccounting,
     DecoderGrantChildBinding, DecoderGrantDigest, DecoderId, DecoderInferenceRoute,
     DecoderRequestShape, DecoderReservationDigest, DecoderReserveAttemptDigest,
-    DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt,
-    EngineReleaseKind, EngineReleaseReceipt, PrefillBootstrapEndpoint, PrefillId,
-    PreparedGrantCancellationReceipt, UnboundGrantBinding, UnboundPreparedGrant,
+    DecoderReserveRefusalDisposition, DecoderReserveRefusalReceipt, DecoderSlotGeneration,
+    EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt, EngineReleaseKind,
+    EngineReleaseReceipt, PrefillBootstrapEndpoint, PrefillId, PreparedGrantCancellationReceipt,
+    UnboundGrantBinding, UnboundPreparedGrant,
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -21,6 +26,8 @@ const CONTROL_PATH: &str = "/_internal/pd/v1/decode-reservations";
 const GRANT_TOKEN_BYTES: usize = 32;
 const MAX_REASON_CODE_BYTES: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
+const MAX_CONTROL_RESPONSE_BYTES: usize = 512 * 1024;
+const IDENTITY_CONTENT_ENCODING: &str = "identity";
 const RID_KEY: &str = "rid";
 const BOOTSTRAP_HOST_KEY: &str = "bootstrap_host";
 const BOOTSTRAP_PORT_KEY: &str = "bootstrap_port";
@@ -649,9 +656,30 @@ pub struct DecoderGrantControlClient {
 }
 
 impl DecoderGrantControlClient {
-    /// Bind lifecycle operations to the gateway's configured HTTP client.
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    #[cfg(test)]
+    /// Construct a dedicated control-plane client with safe test defaults.
+    fn new() -> Result<Self, EngineGrantError> {
+        Self::from_builder(Client::builder())
+    }
+
+    /// Construct a dedicated control-plane client from caller-supplied settings.
+    ///
+    /// Redirects and transparent response decompression are always disabled,
+    /// regardless of the supplied builder. Control requests carry bearer
+    /// authority and prompt-bearing transcripts, so these policies are
+    /// invariants rather than caller choices.
+    pub fn from_builder(builder: ClientBuilder) -> Result<Self, EngineGrantError> {
+        let client = builder
+            .redirect(Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .build()
+            .map_err(|_| {
+                EngineGrantError::InvalidGrant("decoder_control_client_build_failed".to_string())
+            })?;
+        Ok(Self { client })
     }
 
     /// Pin one exact reserve attempt before any allocator I/O.
@@ -688,38 +716,39 @@ impl DecoderGrantControlClient {
             base_request_body_json: reservation.base_request_body_json(),
             child_request_ids: reservation.child_request_ids(),
         };
-        let response = self
-            .client
-            .post(endpoint)
+        let response = control_post(&self.client, endpoint)
             .json(&request)
             .send()
             .await
-            .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
+            .map_err(|error| {
+                EngineGrantError::AmbiguousReserve(request_failure_reason(&error).to_string())
+            })?;
+        let response = read_control_response(response)
+            .await
+            .map_err(|error| EngineGrantError::AmbiguousReserve(error.code().to_string()))?;
         if response.status() == StatusCode::CONFLICT
             || response.status() == StatusCode::TOO_MANY_REQUESTS
         {
-            let receipt: WireReserveRefusalReceipt = response.json().await.map_err(|error| {
-                EngineGrantError::AmbiguousReserve(format!(
-                    "allocator refusal lacked an authoritative receipt: {error}"
-                ))
+            let receipt: WireReserveRefusalReceipt = serde_json::from_slice(response.body())
+                .map_err(|_| {
+                    EngineGrantError::AmbiguousReserve(
+                        "invalid_reserve_refusal_receipt".to_string(),
+                    )
+                })?;
+            let receipt = validate_reserve_refusal_receipt(receipt, reservation).map_err(|_| {
+                EngineGrantError::AmbiguousReserve("invalid_reserve_refusal_receipt".to_string())
             })?;
-            validate_reserve_refusal_receipt(&receipt, reservation)
-                .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
-            let message = match receipt.diagnostic {
-                Some(diagnostic) => format!("{}: {diagnostic}", receipt.reason_code),
-                None => receipt.reason_code,
-            };
-            return Err(EngineGrantError::AllocatorRefused(message));
+            return Err(EngineGrantError::AllocatorRefused(Box::new(receipt)));
         }
         if !response.status().is_success() {
-            return Err(EngineGrantError::AmbiguousReserve(
-                response_error_message(response).await,
-            ));
+            return Err(EngineGrantError::AmbiguousReserve(format!(
+                "http_status_{}_without_authoritative_receipt",
+                response.status().as_u16()
+            )));
         }
-        let response: ReserveResponse = response
-            .json()
-            .await
-            .map_err(|error| EngineGrantError::AmbiguousReserve(error.to_string()))?;
+        let response: ReserveResponse = serde_json::from_slice(response.body()).map_err(|_| {
+            EngineGrantError::AmbiguousReserve("invalid_prepared_receipt".to_string())
+        })?;
         self.validate_reserve_response(reservation, response)
     }
 
@@ -873,9 +902,9 @@ impl DecoderGrantControlClient {
 }
 
 fn validate_reserve_refusal_receipt(
-    receipt: &WireReserveRefusalReceipt,
+    receipt: WireReserveRefusalReceipt,
     reservation: &DecoderGrantReservation,
-) -> Result<(), EngineGrantError> {
+) -> Result<DecoderReserveRefusalReceipt, EngineGrantError> {
     validate_schema(receipt.schema_version)?;
     if receipt.operation != WireOperation::Reserve || receipt.state != WireGrantState::Refused {
         return Err(EngineGrantError::ProtocolViolation(format!(
@@ -929,13 +958,33 @@ fn validate_reserve_refusal_receipt(
             "allocator refusal receipt contains a nil identity".to_string(),
         ));
     }
-    AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?;
+    let receipt_digest = AuthorityDigest::from_hex("receipt digest", &receipt.receipt_digest)?;
     if !receipt.take_once {
         return Err(EngineGrantError::ProtocolViolation(
             "allocator refusal does not attest a take-once attempt tombstone".to_string(),
         ));
     }
-    Ok(())
+    let disposition = match receipt.disposition {
+        WireReserveRefusalDisposition::RetrySameDecoder => {
+            DecoderReserveRefusalDisposition::RetrySameDecoder
+        }
+        WireReserveRefusalDisposition::RetryAnotherDecoder => {
+            DecoderReserveRefusalDisposition::RetryAnotherDecoder
+        }
+        WireReserveRefusalDisposition::Terminal => DecoderReserveRefusalDisposition::Terminal,
+    };
+    Ok(DecoderReserveRefusalReceipt {
+        prefill_id: reservation.prefill_id.clone(),
+        decoder_id: reservation.decoder_id.clone(),
+        logical_request_chain_id: reservation.logical_request_chain_id,
+        reservation_attempt_id: reservation.reservation_attempt_id,
+        reserve_attempt_digest: reservation.reserve_attempt_digest,
+        reason_code: receipt.reason_code,
+        disposition,
+        receipt_id: receipt.receipt_id,
+        receipt_digest,
+        take_once: receipt.take_once,
+    })
 }
 
 /// Exact reserve attempt retained across every allocation-ambiguous outcome.
@@ -1006,7 +1055,6 @@ impl Drop for ReserveReconciliationGrant {
     }
 }
 
-#[derive(Clone)]
 struct SecretGrantToken(Arc<str>);
 
 impl SecretGrantToken {
@@ -1051,41 +1099,58 @@ impl fmt::Debug for SecretGrantToken {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct PreparedGrantControl {
     client: Client,
     grant_url: Arc<str>,
     token: SecretGrantToken,
 }
 
+#[cfg(test)]
+pub(super) fn test_prepared_grant_control(grant_id: Uuid) -> PreparedGrantControl {
+    let client = DecoderGrantControlClient::new()
+        .expect("test decoder control client must use a valid transport configuration")
+        .client;
+    let token = SecretGrantToken::new(URL_SAFE_NO_PAD.encode([0xA5; GRANT_TOKEN_BYTES]))
+        .expect("test decoder grant token must satisfy the production token contract");
+    PreparedGrantControl {
+        client,
+        grant_url: Arc::from(format!("http://127.0.0.1:9{CONTROL_PATH}/{grant_id}")),
+        token,
+    }
+}
+
 impl PreparedGrantControl {
     pub(super) async fn bind(&self, binding: &DecoderGrantBinding) -> Result<(), EngineGrantError> {
-        let response = self
-            .client
-            .post(format!("{}/bind", self.grant_url))
+        let response = control_post(&self.client, format!("{}/bind", self.grant_url))
             .bearer_auth(self.token.expose())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json")
             .body(binding.request_body())
             .send()
             .await
             .map_err(|error| EngineGrantError::AmbiguousControl {
                 operation: "bind",
-                message: error.to_string(),
+                message: request_failure_reason(&error).to_string(),
             })?;
+        let response = read_control_response(response).await.map_err(|error| {
+            EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                message: error.code().to_string(),
+            }
+        })?;
         if !response.status().is_success() {
             return Err(EngineGrantError::AmbiguousControl {
                 operation: "bind",
-                message: response_error_message(response).await,
+                message: http_status_reason(response.status()),
             });
         }
         let receipt: WireControlReceipt =
-            response
-                .json()
-                .await
-                .map_err(|error| EngineGrantError::AmbiguousControl {
+            serde_json::from_slice(response.body()).map_err(|_| {
+                EngineGrantError::AmbiguousControl {
                     operation: "bind",
-                    message: format!("engine returned an invalid receipt: {error}"),
-                })?;
+                    message: "invalid_control_receipt".to_string(),
+                }
+            })?;
         validate_control_receipt(
             &receipt,
             WireOperation::Bind,
@@ -1100,31 +1165,32 @@ impl PreparedGrantControl {
         attempted_binding: Option<&DecoderGrantBinding>,
     ) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
         let request = UnboundCancellationRequest::new(binding, attempted_binding);
-        let response = self
-            .client
-            .post(format!("{}/cancel", self.grant_url))
+        let response = control_post(&self.client, format!("{}/cancel", self.grant_url))
             .bearer_auth(self.token.expose())
             .json(&request)
             .send()
             .await
             .map_err(|error| EngineGrantError::AmbiguousControl {
                 operation: "cancel",
-                message: error.to_string(),
+                message: request_failure_reason(&error).to_string(),
             })?;
+        let response = read_control_response(response).await.map_err(|error| {
+            EngineGrantError::AmbiguousControl {
+                operation: "cancel",
+                message: error.code().to_string(),
+            }
+        })?;
         if !response.status().is_success() {
             return Err(EngineGrantError::AmbiguousControl {
                 operation: "cancel",
-                message: response_error_message(response).await,
+                message: http_status_reason(response.status()),
             });
         }
-        let receipt: WireUnboundCancellationReceipt =
-            response
-                .json()
-                .await
-                .map_err(|error| EngineGrantError::AmbiguousControl {
-                    operation: "cancel",
-                    message: format!("engine returned an invalid receipt: {error}"),
-                })?;
+        let receipt: WireUnboundCancellationReceipt = serde_json::from_slice(response.body())
+            .map_err(|_| EngineGrantError::AmbiguousControl {
+                operation: "cancel",
+                message: "invalid_control_receipt".to_string(),
+            })?;
         validate_unbound_cancellation_receipt(&receipt, binding, attempted_binding)?;
         Ok(PreparedGrantCancellationReceipt::from_control(
             binding.grant_id(),
@@ -1231,7 +1297,7 @@ impl PreparedGrantControl {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct RetainedGrantControl {
     client: Client,
     grant_url: Arc<str>,
@@ -1366,7 +1432,7 @@ async fn quarantine_control(
     quarantine_receipt(receipt, binding)
 }
 
-fn validate_failure_context(
+pub(super) fn validate_failure_context(
     reason_code: &str,
     diagnostic: Option<&str>,
 ) -> Result<(), EngineGrantError> {
@@ -1405,29 +1471,31 @@ async fn send_control<T: Serialize + ?Sized>(
     operation_path: &'static str,
     request: &T,
 ) -> Result<WireControlReceipt, EngineGrantError> {
-    let response = client
-        .post(format!("{grant_url}/{operation_path}"))
+    let response = control_post(client, format!("{grant_url}/{operation_path}"))
         .bearer_auth(token.expose())
         .json(request)
         .send()
         .await
         .map_err(|error| EngineGrantError::AmbiguousControl {
             operation: operation_path,
-            message: error.to_string(),
+            message: request_failure_reason(&error).to_string(),
         })?;
+    let response = read_control_response(response).await.map_err(|error| {
+        EngineGrantError::AmbiguousControl {
+            operation: operation_path,
+            message: error.code().to_string(),
+        }
+    })?;
     if !response.status().is_success() {
         return Err(EngineGrantError::AmbiguousControl {
             operation: operation_path,
-            message: response_error_message(response).await,
+            message: http_status_reason(response.status()),
         });
     }
-    response
-        .json()
-        .await
-        .map_err(|error| EngineGrantError::AmbiguousControl {
-            operation: operation_path,
-            message: format!("engine returned an invalid receipt: {error}"),
-        })
+    serde_json::from_slice(response.body()).map_err(|_| EngineGrantError::AmbiguousControl {
+        operation: operation_path,
+        message: "invalid_control_receipt".to_string(),
+    })
 }
 
 fn validate_control_receipt(
@@ -1693,16 +1761,109 @@ fn validate_bootstrap_endpoint(
     Ok(())
 }
 
-async fn response_error_message(response: reqwest::Response) -> String {
-    let status = response.status();
-    let body = match response.bytes().await {
-        Ok(bytes) => {
-            let limit = bytes.len().min(512);
-            String::from_utf8_lossy(&bytes[..limit]).into_owned()
+fn control_post(client: &Client, endpoint: String) -> RequestBuilder {
+    client
+        .post(endpoint)
+        .header(ACCEPT_ENCODING, IDENTITY_CONTENT_ENCODING)
+}
+
+fn request_failure_reason(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "request_timeout";
+    }
+    if error.is_connect() {
+        return "connection_failed";
+    }
+    if error.is_body() {
+        return "request_body_failed";
+    }
+    "request_failed"
+}
+
+fn http_status_reason(status: StatusCode) -> String {
+    format!("http_status_{}", status.as_u16())
+}
+
+struct ControlResponse {
+    status: StatusCode,
+    body: Bytes,
+}
+
+impl ControlResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlResponseError {
+    UnsupportedContentEncoding,
+    BodyTooLarge,
+    BodyReadFailed,
+}
+
+impl ControlResponseError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedContentEncoding => "unsupported_content_encoding",
+            Self::BodyTooLarge => "response_body_too_large",
+            Self::BodyReadFailed => "response_body_read_failed",
         }
-        Err(error) => format!("failed to read error response: {error}"),
+    }
+}
+
+async fn read_control_response(
+    mut response: Response,
+) -> Result<ControlResponse, ControlResponseError> {
+    validate_content_encoding(&response)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CONTROL_RESPONSE_BYTES as u64)
+    {
+        return Err(ControlResponseError::BodyTooLarge);
+    }
+
+    let status = response.status();
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_CONTROL_RESPONSE_BYTES as u64) as usize;
+    let mut body = BytesMut::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ControlResponseError::BodyReadFailed)?
+    {
+        if chunk.len() > MAX_CONTROL_RESPONSE_BYTES.saturating_sub(body.len()) {
+            return Err(ControlResponseError::BodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(ControlResponse {
+        status,
+        body: body.freeze(),
+    })
+}
+
+fn validate_content_encoding(response: &Response) -> Result<(), ControlResponseError> {
+    let mut values = response.headers().get_all(CONTENT_ENCODING).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
     };
-    format!("HTTP {status}: {body}")
+    if values.next().is_some() {
+        return Err(ControlResponseError::UnsupportedContentEncoding);
+    }
+    let encoding = value
+        .to_str()
+        .map_err(|_| ControlResponseError::UnsupportedContentEncoding)?;
+    if !encoding.eq_ignore_ascii_case(IDENTITY_CONTENT_ENCODING) {
+        return Err(ControlResponseError::UnsupportedContentEncoding);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1783,7 +1944,7 @@ struct ReserveResponse {
     prepared_expires_at_unix_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireReserveRefusalReceipt {
     schema_version: u32,
@@ -1801,9 +1962,18 @@ struct WireReserveRefusalReceipt {
     request_shape: String,
     reason_code: String,
     diagnostic: Option<String>,
+    disposition: WireReserveRefusalDisposition,
     receipt_id: Uuid,
     receipt_digest: String,
     take_once: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum WireReserveRefusalDisposition {
+    RetrySameDecoder,
+    RetryAnotherDecoder,
+    Terminal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1929,7 +2099,7 @@ impl<'a> UnboundCancellationRequest<'a> {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct FailureControlRequest<'a> {
     #[serde(flatten)]
     binding: BindingControlRequest<'a>,
@@ -2032,6 +2202,7 @@ mod tests {
     use std::{
         cell::{Ref, RefCell},
         collections::{HashMap, VecDeque},
+        convert::Infallible,
         sync::{Arc, Mutex},
     };
 
@@ -2046,15 +2217,59 @@ mod tests {
     const PROMPT_SECRET: &str = "prompt-secret-never-log-7d33f2";
 
     #[derive(Clone)]
+    enum PlannedBody {
+        Full(Bytes),
+        Chunked(Vec<Bytes>),
+    }
+
+    #[derive(Clone)]
     struct PlannedResponse {
         status: StatusCode,
-        body: Value,
+        headers: Vec<(String, String)>,
+        body: PlannedBody,
+    }
+
+    impl PlannedResponse {
+        fn json(body: Value) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: PlannedBody::Full(Bytes::from(body.to_string())),
+            }
+        }
+
+        fn raw(body: Bytes) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: Vec::new(),
+                body: PlannedBody::Full(body),
+            }
+        }
+
+        fn chunked(chunks: Vec<Bytes>) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: Vec::new(),
+                body: PlannedBody::Chunked(chunks),
+            }
+        }
+
+        fn with_status(mut self, status: StatusCode) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn with_header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_string(), value.to_string()));
+            self
+        }
     }
 
     #[derive(Debug)]
     struct CapturedRequest {
         path: String,
         authorization: Option<String>,
+        accept_encoding: Option<String>,
         body_bytes: Bytes,
         body: Value,
     }
@@ -2074,11 +2289,16 @@ mod tests {
             .headers()
             .get(reqwest::header::AUTHORIZATION)
             .map(|value| value.to_str().unwrap().to_string());
+        let accept_encoding = request
+            .headers()
+            .get(ACCEPT_ENCODING)
+            .map(|value| value.to_str().unwrap().to_string());
         let body_bytes = request.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
         state.requests.lock().unwrap().push(CapturedRequest {
             path: path.clone(),
             authorization,
+            accept_encoding,
             body_bytes: body_bytes.clone(),
             body: body.clone(),
         });
@@ -2089,11 +2309,17 @@ mod tests {
             .get_mut(&path)
             .and_then(VecDeque::pop_front)
             .expect("test server received an unplanned control request");
-        Response::builder()
-            .status(planned.status)
-            .header("content-type", "application/json")
-            .body(Body::from(planned.body.to_string()))
-            .unwrap()
+        let mut response = Response::builder().status(planned.status);
+        for (name, value) in &planned.headers {
+            response = response.header(name.as_str(), value.as_str());
+        }
+        let body = match planned.body {
+            PlannedBody::Full(body) => Body::from(body),
+            PlannedBody::Chunked(chunks) => Body::from_stream(tokio_stream::iter(
+                chunks.into_iter().map(Ok::<Bytes, Infallible>),
+            )),
+        };
+        response.body(body).unwrap()
     }
 
     async fn start_server() -> (String, TestServerState, JoinHandle<()>) {
@@ -2148,13 +2374,31 @@ mod tests {
         } else {
             DecoderRequestShape::Batch
         };
-        fixture_with_shape(decoder_url, child_count, request_shape)
+        fixture_with_shape_and_tp(decoder_url, child_count, request_shape, 2)
     }
 
     fn fixture_with_shape(
         decoder_url: &str,
         child_count: usize,
         request_shape: DecoderRequestShape,
+    ) -> Fixture {
+        fixture_with_shape_and_tp(decoder_url, child_count, request_shape, 2)
+    }
+
+    fn fixture_with_tp(decoder_url: &str, child_count: usize, source_tp_size: usize) -> Fixture {
+        let request_shape = if child_count == 1 {
+            DecoderRequestShape::Scalar
+        } else {
+            DecoderRequestShape::Batch
+        };
+        fixture_with_shape_and_tp(decoder_url, child_count, request_shape, source_tp_size)
+    }
+
+    fn fixture_with_shape_and_tp(
+        decoder_url: &str,
+        child_count: usize,
+        request_shape: DecoderRequestShape,
+        source_tp_size: usize,
     ) -> Fixture {
         let prefill_id = PrefillId::new(
             "http://prefill.test:30000",
@@ -2189,7 +2433,7 @@ mod tests {
                 bootstrap.clone(),
                 decoder_id.clone(),
                 chain_id,
-                2,
+                source_tp_size,
                 Duration::from_secs(2),
             )
             .unwrap();
@@ -2242,7 +2486,7 @@ mod tests {
             prefill_id.clone(),
             bootstrap.clone(),
             chain_id,
-            2,
+            source_tp_size,
             decoder_id.clone(),
             children,
         )
@@ -2261,7 +2505,7 @@ mod tests {
             "logical_request_chain_id": chain_id,
             "reservation_attempt_id": reservation_attempt_id,
             "reserve_attempt_digest": binding.reserve_attempt_digest().to_hex(),
-            "source_tp_size": 2,
+            "source_tp_size": source_tp_size,
             "prepared_ttl_ms": prepared_ttl_ms,
             "inference_route": DecoderInferenceRoute::Generate.as_str(),
             "request_shape": request_shape.as_str(),
@@ -2369,7 +2613,8 @@ mod tests {
             "inference_route": reservation.inference_route().as_str(),
             "request_shape": reservation.request_shape().as_str(),
             "reason_code": "capacity_exhausted",
-            "diagnostic": "decoder admission control refused the exact attempt",
+            "diagnostic": PROMPT_SECRET,
+            "disposition": WireReserveRefusalDisposition::RetryAnotherDecoder,
             "receipt_id": uuid("73000000-0000-4000-8000-000000000007"),
             "receipt_digest": hex_digest(AuthorityDigest([0x73; 32])),
             "take_once": true,
@@ -2377,9 +2622,22 @@ mod tests {
     }
 
     fn response(body: Value) -> PlannedResponse {
-        PlannedResponse {
-            status: StatusCode::OK,
-            body,
+        PlannedResponse::json(body)
+    }
+
+    fn assert_debug_redacted(value: &impl fmt::Debug, secrets: &[&str]) {
+        let debug = format!("{value:?}");
+        for secret in secrets {
+            assert!(!debug.contains(*secret));
+        }
+    }
+
+    fn assert_error_redacted(error: &EngineGrantError, secrets: &[&str]) {
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        for secret in secrets {
+            assert!(!debug.contains(*secret));
+            assert!(!display.contains(*secret));
         }
     }
 
@@ -2395,18 +2653,19 @@ mod tests {
 
     async fn reserve_bound(state: &TestServerState, fixture: &Fixture) -> BoundPreparedGrant {
         let bind_path = format!("{CONTROL_PATH}/{}/bind", fixture.binding.grant_id());
-        let mut responses = state.responses.lock().unwrap();
-        let bind_responses = responses.entry(bind_path).or_default();
-        if bind_responses.is_empty() {
-            bind_responses.push_back(response(receipt(
-                &fixture.binding,
-                WireOperation::Bind,
-                WireGrantState::Prepared,
-            )));
+        {
+            let mut responses = state.responses.lock().unwrap();
+            let bind_responses = responses.entry(bind_path).or_default();
+            if bind_responses.is_empty() {
+                bind_responses.push_back(response(receipt(
+                    &fixture.binding,
+                    WireOperation::Bind,
+                    WireGrantState::Prepared,
+                )));
+            }
         }
-        drop(responses);
 
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let mut reserve = client.begin_reserve(fixture.take_reservation());
         let mut unbound = reserve.reconcile_reserve().await.unwrap();
         let mut binding = unbound.begin_bind().unwrap();
@@ -2652,12 +2911,21 @@ mod tests {
         let (server_url, state, task) = start_server().await;
         let fixture = fixture(&server_url, 2);
         let grant_id = fixture.binding.grant_id();
+        let bind_path = format!("{CONTROL_PATH}/{grant_id}/bind");
         let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
         let complete_path = format!("{CONTROL_PATH}/{grant_id}/complete");
         let plans = plan([
             (
                 format!("{CONTROL_PATH}/reserve"),
                 response(fixture.reserve_response.clone()),
+            ),
+            (
+                bind_path.clone(),
+                response(receipt(
+                    &fixture.binding,
+                    WireOperation::Bind,
+                    WireGrantState::Prepared,
+                )),
             ),
             (
                 promote_path.clone(),
@@ -2678,25 +2946,40 @@ mod tests {
         ]);
         install_plans(&state, plans);
 
+        let template = DecoderRequestTemplate::new(
+            DecoderInferenceRoute::Generate,
+            Bytes::from(json!({"text": PROMPT_SECRET}).to_string()),
+        )
+        .unwrap();
+        assert_debug_redacted(&template, &[PROMPT_SECRET, &fixture.token]);
         let reservation_debug = format!("{:?}", fixture.reservation());
         assert!(!reservation_debug.contains(PROMPT_SECRET));
-        let grant = reserve_bound(&state, &fixture).await;
-        let debug = format!("{grant:?}");
-        assert!(!debug.contains(&fixture.token));
-        assert!(!debug.contains(PROMPT_SECRET));
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        assert_debug_redacted(&reserve, &[PROMPT_SECRET, &fixture.token]);
+        let mut unbound = reserve.reconcile_reserve().await.unwrap();
+        assert_debug_redacted(&unbound, &[PROMPT_SECRET, &fixture.token]);
+        let mut binding = unbound.begin_bind().unwrap();
+        assert_debug_redacted(&binding, &[PROMPT_SECRET, &fixture.token]);
+        let mut grant = binding.reconcile_bind().await.unwrap();
+        assert_debug_redacted(&grant, &[PROMPT_SECRET, &fixture.token]);
         let token_debug = format!(
             "{:?}",
             SecretGrantToken::new(fixture.token.clone()).unwrap()
         );
         assert_eq!(token_debug, "SecretGrantToken([REDACTED])");
-        let mut promotion = grant.begin_promotion();
+        let mut promotion = grant.begin_test_promotion().unwrap();
+        assert_debug_redacted(&promotion, &[PROMPT_SECRET, &fixture.token]);
         let mut retained = promotion.reconcile_promotion().await.unwrap();
-        let release = retained.complete().await.unwrap();
+        assert_debug_redacted(&retained, &[PROMPT_SECRET, &fixture.token]);
+        let mut completion = retained.begin_test_completion().unwrap();
+        assert_debug_redacted(&completion, &[PROMPT_SECRET, &fixture.token]);
+        let release = completion.reconcile_completion().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::Completed);
 
         let requests = state.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[1].path, format!("{CONTROL_PATH}/{grant_id}/bind"));
+        assert_eq!(requests[1].path, bind_path);
         assert_eq!(requests[1].body_bytes, fixture.final_request_body);
         assert_eq!(
             requests[1].body,
@@ -2706,6 +2989,12 @@ mod tests {
         assert!(requests[1].body.get("request_body_json").is_none());
         assert_eq!(requests[2].path, promote_path);
         assert_eq!(requests[3].path, complete_path);
+        for request in requests.iter() {
+            assert_eq!(
+                request.accept_encoding.as_deref(),
+                Some(IDENTITY_CONTENT_ENCODING)
+            );
+        }
         for request in &requests[1..] {
             assert_eq!(
                 request.authorization.as_deref(),
@@ -2727,10 +3016,8 @@ mod tests {
             plan([
                 (
                     format!("{CONTROL_PATH}/reserve"),
-                    PlannedResponse {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        body: json!({"error": "receipt delivery ambiguous"}),
-                    },
+                    response(json!({"error": "receipt delivery ambiguous"}))
+                        .with_status(StatusCode::SERVICE_UNAVAILABLE),
                 ),
                 (
                     format!("{CONTROL_PATH}/reserve"),
@@ -2739,7 +3026,7 @@ mod tests {
             ]),
         );
 
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let attempt_id = fixture.binding.reservation_attempt_id();
         let mut reserve = client.begin_reserve(fixture.take_reservation());
         assert!(matches!(
@@ -2774,10 +3061,8 @@ mod tests {
                 ),
                 (
                     bind_path.clone(),
-                    PlannedResponse {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        body: json!({"error": "bind receipt delivery ambiguous"}),
-                    },
+                    response(json!({"error": "bind receipt delivery ambiguous"}))
+                        .with_status(StatusCode::SERVICE_UNAVAILABLE),
                 ),
                 (
                     bind_path,
@@ -2790,7 +3075,7 @@ mod tests {
             ]),
         );
 
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let mut reserve = client.begin_reserve(fixture.take_reservation());
         let mut unbound = reserve.reconcile_reserve().await.unwrap();
         let mut binding = unbound.begin_bind().unwrap();
@@ -2812,6 +3097,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_responses_never_replay_prompt_or_bearer_authority() {
+        let redirect_statuses = [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ];
+        for status in redirect_statuses {
+            let (target_url, target_state, target_task) = start_server().await;
+            install_plans(
+                &target_state,
+                plan([(
+                    "/redirect-target".to_string(),
+                    response(json!({"unexpected": "redirect followed"})),
+                )]),
+            );
+            let (source_url, source_state, source_task) = start_server().await;
+            let fixture = fixture(&source_url, 1);
+            let bind_path = format!("{CONTROL_PATH}/{}/bind", fixture.binding.grant_id());
+            let location = format!("{target_url}/redirect-target");
+            install_plans(
+                &source_state,
+                plan([
+                    (
+                        format!("{CONTROL_PATH}/reserve"),
+                        response(fixture.reserve_response.clone()),
+                    ),
+                    (
+                        bind_path,
+                        response(json!({"redirect": true}))
+                            .with_status(status)
+                            .with_header("location", &location),
+                    ),
+                ]),
+            );
+
+            let client = DecoderGrantControlClient::from_builder(
+                Client::builder().redirect(Policy::limited(10)),
+            )
+            .unwrap();
+            let mut reserve = client.begin_reserve(fixture.take_reservation());
+            let mut unbound = reserve.reconcile_reserve().await.unwrap();
+            let mut binding = unbound.begin_bind().unwrap();
+            let error = match binding.reconcile_bind().await {
+                Ok(_) => panic!("redirect response unexpectedly produced a bound grant"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                &error,
+                EngineGrantError::AmbiguousControl {
+                    operation: "bind",
+                    message,
+                } if message == &http_status_reason(status)
+            ));
+            assert_error_redacted(&error, &[PROMPT_SECRET, &fixture.token]);
+
+            {
+                let requests = source_state.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[1].body_bytes, fixture.final_request_body);
+                assert_eq!(
+                    requests[1].authorization.as_deref(),
+                    Some(format!("Bearer {}", fixture.token).as_str())
+                );
+            }
+            assert!(target_state.requests.lock().unwrap().is_empty());
+            source_task.abort();
+            target_task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_control_response_is_rejected_without_exposing_its_body() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let oversized_body = Bytes::from(format!(
+            "{PROMPT_SECRET}:{}:{}",
+            fixture.token,
+            "x".repeat(MAX_CONTROL_RESPONSE_BYTES)
+        ));
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                PlannedResponse::raw(oversized_body),
+            )]),
+        );
+
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let error = match reserve.reconcile_reserve().await {
+            Ok(_) => panic!("oversized response unexpectedly produced a grant"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            EngineGrantError::AmbiguousReserve(message)
+                if message == ControlResponseError::BodyTooLarge.code()
+        ));
+        assert_error_redacted(&error, &[PROMPT_SECRET, &fixture.token]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_control_response_is_rejected_without_exposing_its_body() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let secret_chunk = Bytes::from(format!("{PROMPT_SECRET}:{}", fixture.token));
+        let oversized_chunk = Bytes::from(vec![b'x'; MAX_CONTROL_RESPONSE_BYTES]);
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                PlannedResponse::chunked(vec![secret_chunk, oversized_chunk]),
+            )]),
+        );
+
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let error = match reserve.reconcile_reserve().await {
+            Ok(_) => panic!("oversized response unexpectedly produced a grant"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            EngineGrantError::AmbiguousReserve(message)
+                if message == ControlResponseError::BodyTooLarge.code()
+        ));
+        assert_error_redacted(&error, &[PROMPT_SECRET, &fixture.token]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn encoded_control_response_is_rejected_before_json_parsing() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                response(fixture.reserve_response.clone()).with_header("content-encoding", "gzip"),
+            )]),
+        );
+
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let error = match reserve.reconcile_reserve().await {
+            Ok(_) => panic!("encoded response unexpectedly produced a grant"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            EngineGrantError::AmbiguousReserve(message)
+                if message == ControlResponseError::UnsupportedContentEncoding.code()
+        ));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_error_and_parse_bodies_are_never_returned_in_control_errors() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let bind_path = format!("{CONTROL_PATH}/{}/bind", fixture.binding.grant_id());
+        let peer_body = Bytes::from(format!("{PROMPT_SECRET}:{}", fixture.token));
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    bind_path.clone(),
+                    PlannedResponse::raw(peer_body.clone())
+                        .with_status(StatusCode::SERVICE_UNAVAILABLE),
+                ),
+                (bind_path, PlannedResponse::raw(peer_body)),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        let mut unbound = reserve.reconcile_reserve().await.unwrap();
+        let mut binding = unbound.begin_bind().unwrap();
+        let status_error = match binding.reconcile_bind().await {
+            Ok(_) => panic!("HTTP error unexpectedly produced a bound grant"),
+            Err(error) => error,
+        };
+        let parse_error = match binding.reconcile_bind().await {
+            Ok(_) => panic!("malformed receipt unexpectedly produced a bound grant"),
+            Err(error) => error,
+        };
+        for error in [&status_error, &parse_error] {
+            assert_error_redacted(error, &[PROMPT_SECRET, &fixture.token]);
+        }
+        assert!(matches!(
+            status_error,
+            EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                message,
+            } if message == http_status_reason(StatusCode::SERVICE_UNAVAILABLE)
+        ));
+        assert!(matches!(
+            parse_error,
+            EngineGrantError::AmbiguousControl {
+                operation: "bind",
+                message,
+            } if message == "invalid_control_receipt"
+        ));
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn bind_failure_cancels_prepared_with_exact_attempt_receipt() {
         let (server_url, state, task) = start_server().await;
         let fixture = fixture(&server_url, 1);
@@ -2825,10 +3324,8 @@ mod tests {
                 ),
                 (
                     format!("{CONTROL_PATH}/{grant_id}/bind"),
-                    PlannedResponse {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        body: json!({"error": "bind outcome ambiguous"}),
-                    },
+                    response(json!({"error": "bind outcome ambiguous"}))
+                        .with_status(StatusCode::SERVICE_UNAVAILABLE),
                 ),
                 (
                     format!("{CONTROL_PATH}/{grant_id}/cancel"),
@@ -2837,12 +3334,14 @@ mod tests {
             ]),
         );
 
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let mut reserve = client.begin_reserve(fixture.take_reservation());
         let mut unbound = reserve.reconcile_reserve().await.unwrap();
         let mut binding = unbound.begin_bind().unwrap();
         assert!(binding.reconcile_bind().await.is_err());
-        let cancellation = binding.cancel().await.unwrap();
+        let mut cancellation = binding.begin_cancellation().unwrap();
+        assert_debug_redacted(&cancellation, &[PROMPT_SECRET, &fixture.token]);
+        let cancellation = cancellation.reconcile_cancellation().await.unwrap();
         assert_eq!(
             cancellation.reservation_attempt_id(),
             fixture.binding.reservation_attempt_id()
@@ -2887,6 +3386,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tp2_and_tp4_control_lifecycles_preserve_exact_source_topology() {
+        for source_tp_size in [2, 4] {
+            for child_count in [1, 3] {
+                let (server_url, state, task) = start_server().await;
+                let fixture = fixture_with_tp(&server_url, child_count, source_tp_size);
+                let grant_id = fixture.binding.grant_id();
+                install_plans(
+                    &state,
+                    plan([
+                        (
+                            format!("{CONTROL_PATH}/reserve"),
+                            response(fixture.reserve_response.clone()),
+                        ),
+                        (
+                            format!("{CONTROL_PATH}/{grant_id}/cancel"),
+                            response(receipt(
+                                &fixture.binding,
+                                WireOperation::Cancel,
+                                WireGrantState::Cancelled,
+                            )),
+                        ),
+                    ]),
+                );
+
+                let mut grant = reserve_bound(&state, &fixture).await;
+                let mut cancellation = grant.begin_cancellation().unwrap();
+                cancellation.reconcile_cancellation().await.unwrap();
+
+                let requests = state.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0].body["source_tp_size"], source_tp_size);
+                assert_eq!(requests[2].body["source_tp_size"], source_tp_size);
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_cancel_returns_exact_release_receipt() {
         let (server_url, state, task) = start_server().await;
         let fixture = fixture(&server_url, 1);
@@ -2907,7 +3444,8 @@ mod tests {
         ]);
         install_plans(&state, plans);
         let mut grant = reserve_bound(&state, &fixture).await;
-        let release = grant.cancel().await.unwrap();
+        let mut cancellation = grant.begin_cancellation().unwrap();
+        let release = cancellation.reconcile_cancellation().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::PreparedCancelled);
         assert_eq!(
             release.child_request_ids(),
@@ -2949,15 +3487,16 @@ mod tests {
         );
 
         let mut grant = reserve_bound(&state, &fixture).await;
+        let mut cancellation = grant.begin_cancellation().unwrap();
         assert!(matches!(
-            grant.cancel().await,
+            cancellation.reconcile_cancellation().await,
             Err(EngineGrantError::AmbiguousControl {
                 operation: "cancel",
                 ..
             })
         ));
-        assert!(format!("{grant:?}").contains("has_control: true"));
-        let release = grant.cancel().await.unwrap();
+        assert!(format!("{cancellation:?}").contains("has_control: true"));
+        let release = cancellation.reconcile_cancellation().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::PreparedCancelled);
         assert_eq!(state.requests.lock().unwrap().len(), 4);
         task.abort();
@@ -2991,8 +3530,8 @@ mod tests {
             ]),
         );
 
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         assert!(matches!(
             promotion.reconcile_promotion().await,
             Err(EngineGrantError::AmbiguousControl {
@@ -3036,16 +3575,16 @@ mod tests {
             ]),
         );
 
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         assert!(promotion.reconcile_promotion().await.is_err());
-        let outcome = promotion
-            .abort(
+        let mut abort = promotion
+            .begin_test_abort(
                 "promotion_receipt_lost",
                 Some("promotion outcome requires quiescence"),
             )
-            .await
             .unwrap();
+        let outcome = abort.reconcile_abort().await.unwrap();
         assert!(matches!(outcome, EngineAbortOutcome::Aborted(_)));
         let paths: Vec<String> = state
             .requests
@@ -3089,13 +3628,13 @@ mod tests {
             ),
         ]);
         install_plans(&server_state, plans);
-        let grant = reserve_bound(&server_state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&server_state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
-        let outcome = retained
-            .abort("decoder_response_failed", Some("upstream body failed"))
-            .await
+        let mut abort = retained
+            .begin_test_abort("decoder_response_failed", Some("upstream body failed"))
             .unwrap();
+        let outcome = abort.reconcile_abort().await.unwrap();
         task.abort();
         outcome
     }
@@ -3138,13 +3677,13 @@ mod tests {
                 ),
             ]),
         );
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
-        let quarantine = retained
-            .quarantine("response_body_dropped", Some("client disconnected"))
-            .await
+        let mut quarantine = retained
+            .begin_test_quarantine("response_body_dropped", Some("client disconnected"))
             .unwrap();
+        let quarantine = quarantine.reconcile_quarantine().await.unwrap();
         assert_eq!(quarantine.grant_id(), fixture.binding.grant_id());
         assert_eq!(
             quarantine.child_request_ids(),
@@ -3194,12 +3733,13 @@ mod tests {
             ]),
         );
 
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
-        assert!(retained.complete().await.is_err());
-        assert!(format!("{retained:?}").contains("has_control: true"));
-        let release = retained.complete().await.unwrap();
+        let mut completion = retained.begin_test_completion().unwrap();
+        assert!(completion.reconcile_completion().await.is_err());
+        assert!(format!("{completion:?}").contains("has_control: true"));
+        let release = completion.reconcile_completion().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::Completed);
         assert_eq!(state.requests.lock().unwrap().len(), 5);
         task.abort();
@@ -3246,20 +3786,21 @@ mod tests {
             ]),
         );
 
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
-        assert!(retained
-            .abort("response_failed", Some("first receipt was invalid"))
-            .await
-            .is_err());
-        assert!(format!("{retained:?}").contains("has_control: true"));
-        let outcome = retained
-            .abort("response_failed", Some("retry exact abort"))
-            .await
+        let mut abort = retained
+            .begin_test_abort("response_failed", Some("pinned abort diagnostic"))
             .unwrap();
+        assert!(!format!("{abort:?}").contains("pinned abort diagnostic"));
+        assert!(abort.reconcile_abort().await.is_err());
+        assert!(format!("{abort:?}").contains("has_control: true"));
+        let outcome = abort.reconcile_abort().await.unwrap();
         assert!(matches!(outcome, EngineAbortOutcome::Aborted(_)));
-        assert_eq!(state.requests.lock().unwrap().len(), 5);
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[3].body_bytes, requests[4].body_bytes);
+        assert_eq!(requests[3].body["diagnostic"], "pinned abort diagnostic");
         task.abort();
     }
 
@@ -3287,10 +3828,8 @@ mod tests {
                 ),
                 (
                     quarantine_path.clone(),
-                    PlannedResponse {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        body: json!({"error": "receipt delivery failed"}),
-                    },
+                    response(json!({"error": "receipt delivery failed"}))
+                        .with_status(StatusCode::SERVICE_UNAVAILABLE),
                 ),
                 (
                     quarantine_path,
@@ -3303,25 +3842,30 @@ mod tests {
             ]),
         );
 
-        let grant = reserve_bound(&state, &fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let mut retained = promotion.reconcile_promotion().await.unwrap();
+        let mut quarantine = retained
+            .begin_test_quarantine("response_dropped", Some("pinned quarantine diagnostic"))
+            .unwrap();
+        assert!(!format!("{quarantine:?}").contains("pinned quarantine diagnostic"));
         assert!(matches!(
-            retained
-                .quarantine("response_dropped", Some("first response was ambiguous"))
-                .await,
+            quarantine.reconcile_quarantine().await,
             Err(EngineGrantError::AmbiguousControl {
                 operation: "quarantine",
                 ..
             })
         ));
-        assert!(format!("{retained:?}").contains("has_control: true"));
-        let quarantine = retained
-            .quarantine("response_dropped", Some("retry exact quarantine"))
-            .await
-            .unwrap();
-        assert_eq!(quarantine.grant_id(), fixture.binding.grant_id());
-        assert_eq!(state.requests.lock().unwrap().len(), 5);
+        assert!(format!("{quarantine:?}").contains("has_control: true"));
+        let quarantine_receipt = quarantine.reconcile_quarantine().await.unwrap();
+        assert_eq!(quarantine_receipt.grant_id(), fixture.binding.grant_id());
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[3].body_bytes, requests[4].body_bytes);
+        assert_eq!(
+            requests[3].body["diagnostic"],
+            "pinned quarantine diagnostic"
+        );
         task.abort();
     }
 
@@ -3351,8 +3895,8 @@ mod tests {
                 response(promotion_fixture.reserve_response.clone()),
             )]),
         );
-        let grant = reserve_bound(&state, &promotion_fixture).await;
-        drop(grant.begin_promotion());
+        let mut grant = reserve_bound(&state, &promotion_fixture).await;
+        drop(grant.begin_test_promotion().unwrap());
         tokio::task::yield_now().await;
         assert_eq!(state.requests.lock().unwrap().len(), 2);
         task.abort();
@@ -3377,8 +3921,8 @@ mod tests {
                 ),
             ]),
         );
-        let grant = reserve_bound(&state, &retained_fixture).await;
-        let mut promotion = grant.begin_promotion();
+        let mut grant = reserve_bound(&state, &retained_fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
         let retained = promotion.reconcile_promotion().await.unwrap();
         drop(retained);
         tokio::task::yield_now().await;
@@ -3396,21 +3940,21 @@ mod tests {
             plan([
                 (
                     format!("{CONTROL_PATH}/reserve"),
-                    PlannedResponse {
-                        status: StatusCode::CONFLICT,
-                        body: json!({"error": "capacity"}),
-                    },
+                    response(json!({"error": "capacity"}))
+                        .with_status(StatusCode::TOO_MANY_REQUESTS),
                 ),
                 (
                     format!("{CONTROL_PATH}/reserve"),
-                    PlannedResponse {
-                        status: StatusCode::CONFLICT,
-                        body: refusal_receipt,
-                    },
+                    response(json!({"schema_version": SCHEMA_VERSION}))
+                        .with_status(StatusCode::TOO_MANY_REQUESTS),
+                ),
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(refusal_receipt).with_status(StatusCode::CONFLICT),
                 ),
             ]),
         );
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let attempt_id = refused_fixture.binding.reservation_attempt_id();
         let mut reserve = client.begin_reserve(refused_fixture.take_reservation());
         assert!(matches!(
@@ -3418,11 +3962,41 @@ mod tests {
             Err(EngineGrantError::AmbiguousReserve(_))
         ));
         assert_eq!(reserve.reservation_attempt_id().unwrap(), attempt_id);
-        let refused = reserve.reconcile_reserve().await;
         assert!(matches!(
-            refused,
-            Err(EngineGrantError::AllocatorRefused(_))
+            reserve.reconcile_reserve().await,
+            Err(EngineGrantError::AmbiguousReserve(_))
         ));
+        assert_eq!(reserve.reservation_attempt_id().unwrap(), attempt_id);
+        let refused = reserve.reconcile_reserve().await;
+        let Err(error) = &refused else {
+            panic!("validated refusal unexpectedly produced a grant");
+        };
+        assert_error_redacted(error, &[PROMPT_SECRET, &refused_fixture.token]);
+        let Err(EngineGrantError::AllocatorRefused(receipt)) = refused else {
+            panic!("validated refusal must return its authoritative tombstone");
+        };
+        assert_eq!(receipt.prefill_id(), refused_fixture.binding.prefill_id());
+        assert_eq!(receipt.decoder_id(), refused_fixture.binding.decoder_id());
+        assert_eq!(
+            receipt.logical_request_chain_id(),
+            refused_fixture.binding.request_chain_id()
+        );
+        assert_eq!(receipt.reservation_attempt_id(), attempt_id);
+        assert_eq!(
+            receipt.reserve_attempt_digest(),
+            refused_fixture.binding.reserve_attempt_digest()
+        );
+        assert_eq!(receipt.reason_code(), "capacity_exhausted");
+        assert_eq!(
+            receipt.disposition(),
+            DecoderReserveRefusalDisposition::RetryAnotherDecoder
+        );
+        assert_eq!(
+            receipt.receipt_id(),
+            uuid("73000000-0000-4000-8000-000000000007")
+        );
+        assert_eq!(receipt.receipt_digest(), AuthorityDigest([0x73; 32]));
+        assert!(receipt.take_once());
         assert!(reserve.reservation_attempt_id().is_err());
         task.abort();
 
@@ -3437,13 +4011,63 @@ mod tests {
                 response(mismatch_fixture.reserve_response.clone()),
             )]),
         );
-        let client = DecoderGrantControlClient::new(Client::new());
+        let client = DecoderGrantControlClient::new().unwrap();
         let mut reserve = client.begin_reserve(mismatch_fixture.take_reservation());
         let mismatch = reserve.reconcile_reserve().await;
         assert!(matches!(
             mismatch,
             Err(EngineGrantError::AmbiguousReserve(_))
         ));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn authoritative_refusal_requires_a_fresh_reserve_attempt() {
+        let (server_url, state, task) = start_server().await;
+        let first_fixture = fixture(&server_url, 1);
+        let second_fixture = fixture(&server_url, 1);
+        let first_attempt_id = first_fixture.binding.reservation_attempt_id();
+        let second_attempt_id = second_fixture.binding.reservation_attempt_id();
+        assert_ne!(first_attempt_id, second_attempt_id);
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(reserve_refusal_receipt(&first_fixture.reservation()))
+                        .with_status(StatusCode::TOO_MANY_REQUESTS),
+                ),
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(second_fixture.reserve_response.clone()),
+                ),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::new().unwrap();
+        let mut first = client.begin_reserve(first_fixture.take_reservation());
+        let Err(EngineGrantError::AllocatorRefused(refusal)) = first.reconcile_reserve().await
+        else {
+            panic!("first attempt must return its authoritative refusal tombstone");
+        };
+        assert_eq!(refusal.reservation_attempt_id(), first_attempt_id);
+        assert!(first.reservation_attempt_id().is_err());
+
+        let mut second = client.begin_reserve(second_fixture.take_reservation());
+        let unbound = second.reconcile_reserve().await.unwrap();
+        assert_eq!(unbound.reservation_attempt_id(), second_attempt_id);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].body["reservation_attempt_id"],
+            first_attempt_id.to_string()
+        );
+        assert_eq!(
+            requests[1].body["reservation_attempt_id"],
+            second_attempt_id.to_string()
+        );
+        assert_ne!(requests[0].body_bytes, requests[1].body_bytes);
         task.abort();
     }
 
@@ -3458,6 +4082,14 @@ mod tests {
             validate_failure_context("failed", Some(&"x".repeat(MAX_DIAGNOSTIC_BYTES + 1)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reserve_refusal_disposition_is_a_closed_wire_enum() {
+        let fixture = fixture("http://decoder.test:30001", 1);
+        let mut refusal = reserve_refusal_receipt(&fixture.reservation());
+        refusal["disposition"] = json!("retry_somewhere_new");
+        assert!(serde_json::from_value::<WireReserveRefusalReceipt>(refusal).is_err());
     }
 
     #[test]

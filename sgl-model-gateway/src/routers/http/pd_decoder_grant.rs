@@ -13,6 +13,8 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::pd_decoder_pool::DecoderGrantPoolBinding;
+
 mod control;
 
 pub use control::{
@@ -246,6 +248,12 @@ impl DecoderSlotGeneration {
 pub(crate) struct DecoderAllocationKey {
     decoder_id: DecoderId,
     slot_generation: DecoderSlotGeneration,
+}
+
+impl DecoderAllocationKey {
+    pub(crate) fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
 }
 
 /// BLAKE3 digest of the exact gateway-issued reserve-attempt transcript.
@@ -1235,20 +1243,23 @@ impl UnboundPreparedGrant {
         })
     }
 
-    /// Cancel an unbound PREPARED reservation and prove allocator release.
+    /// Pin cancellation of an unbound PREPARED reservation.
     ///
-    /// No decoder-pool accounting exists before a bind succeeds.
-    pub async fn cancel(&mut self) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
-        let receipt = self.control()?.cancel_unbound(&self.binding, None).await?;
-        self.control = None;
-        Ok(receipt)
-    }
-
-    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
-        self.control.as_ref().ok_or_else(|| {
+    /// No decoder-pool accounting exists before a bind succeeds. Once this
+    /// transition returns, the exact cancellation is the only operation that
+    /// can be polled with the retained engine authority.
+    pub fn begin_cancellation(
+        &mut self,
+    ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
             EngineGrantError::ProtocolViolation(
                 "unbound prepared grant has no concrete control capability".to_string(),
             )
+        })?;
+        Ok(UnboundCancellationReconciliationGrant {
+            unbound_binding: self.binding.clone(),
+            attempted_binding: None,
+            control: Some(control),
         })
     }
 }
@@ -1262,6 +1273,60 @@ impl Drop for UnboundPreparedGrant {
             grant_id = %self.binding.grant_id(),
             decoder_id = %self.binding.decoder_id(),
             "Unbound PREPARED grant capability was dropped; engine-owned expiry remains authoritative"
+        );
+    }
+}
+
+/// One exact unbound PREPARED cancellation pinned before its first poll.
+pub struct UnboundCancellationReconciliationGrant {
+    unbound_binding: UnboundGrantBinding,
+    attempted_binding: Option<DecoderGrantBinding>,
+    control: Option<control::PreparedGrantControl>,
+}
+
+impl fmt::Debug for UnboundCancellationReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnboundCancellationReconciliationGrant")
+            .field("unbound_binding", &self.unbound_binding)
+            .field("attempted_binding", &self.attempted_binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl UnboundCancellationReconciliationGrant {
+    /// Reconcile the same cancellation without surrendering authority on error.
+    pub async fn reconcile_cancellation(
+        &mut self,
+    ) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
+        let receipt = self
+            .control()?
+            .cancel_unbound(&self.unbound_binding, self.attempted_binding.as_ref())
+            .await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "unbound cancellation reconciliation has no concrete control capability"
+                    .to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for UnboundCancellationReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.unbound_binding.grant_id(),
+            decoder_id = %self.unbound_binding.decoder_id(),
+            "Unbound cancellation reconciliation capability was dropped; PREPARED engine allocation remains authoritative"
         );
     }
 }
@@ -1337,14 +1402,20 @@ impl BindReconciliationGrant {
         ))
     }
 
-    /// Cancel the PREPARED allocation after a failed or ambiguous bind.
-    pub async fn cancel(&mut self) -> Result<PreparedGrantCancellationReceipt, EngineGrantError> {
-        let receipt = self
-            .control()?
-            .cancel_unbound(&self.unbound_binding, Some(&self.binding))
-            .await?;
-        self.control = None;
-        Ok(receipt)
+    /// Pin cancellation after a failed or ambiguous bind.
+    pub fn begin_cancellation(
+        &mut self,
+    ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "bind reconciliation grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(UnboundCancellationReconciliationGrant {
+            unbound_binding: self.unbound_binding.clone(),
+            attempted_binding: Some(self.binding.clone()),
+            control: Some(control),
+        })
     }
 
     fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
@@ -1462,35 +1533,68 @@ impl BoundPreparedGrant {
         self.binding.reservation_digest()
     }
 
-    /// Explicitly cancel a reservation that never crossed the activation boundary.
-    ///
-    /// A non-authoritative outcome leaves this capability intact so the caller
-    /// can retry reconciliation with the same grant token.
-    pub async fn cancel(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
-        let receipt = self.control()?.cancel(&self.binding).await?;
-        self.control = None;
-        Ok(receipt)
-    }
-
-    /// Cross into post-promotion reconciliation before polling a promote request.
-    ///
-    /// The caller must first cross the matching decoder-pool activation boundary.
-    /// Once this method returns, prepared cancellation is deliberately no longer
-    /// available: any subsequent ambiguity must be reconciled as potentially
-    /// promoted ownership.
-    pub fn begin_promotion(mut self) -> PromotionReconciliationGrant {
-        PromotionReconciliationGrant {
-            binding: self.binding.clone(),
-            control: self.control.take(),
+    pub(super) fn take_for_pool_binding(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+    ) -> Result<Self, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool binding does not match the exact prepared grant".to_string(),
+            ));
         }
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "pool binding has no concrete prepared control capability".to_string(),
+            )
+        })?;
+        Ok(Self::from_control(self.binding.clone(), control))
     }
 
-    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
-        self.control.as_ref().ok_or_else(|| {
+    /// Pin cancellation before crossing the activation boundary.
+    pub fn begin_cancellation(
+        &mut self,
+    ) -> Result<PreparedCancellationReconciliationGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
             EngineGrantError::ProtocolViolation(
-                "engine decoder grant has no concrete control capability".to_string(),
+                "prepared cancellation has no concrete control capability".to_string(),
             )
+        })?;
+        Ok(PreparedCancellationReconciliationGrant {
+            binding: self.binding.clone(),
+            control: Some(control),
         })
+    }
+
+    pub(super) fn begin_promotion(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+    ) -> Result<PromotionReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool promotion binding does not match the exact prepared grant"
+                    .to_string(),
+            ));
+        }
+        self.take_for_promotion()
+    }
+
+    fn take_for_promotion(&mut self) -> Result<PromotionReconciliationGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "promotion has no concrete prepared control capability".to_string(),
+            )
+        })?;
+        Ok(PromotionReconciliationGrant {
+            binding: self.binding.clone(),
+            control: Some(control),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_promotion(
+        &mut self,
+    ) -> Result<PromotionReconciliationGrant, EngineGrantError> {
+        self.take_for_promotion()
     }
 }
 
@@ -1503,6 +1607,65 @@ impl Drop for BoundPreparedGrant {
             grant_id = %self.binding.grant_id(),
             decoder_id = %self.binding.decoder_id(),
             "Prepared decoder grant capability was dropped; engine-owned expiry remains authoritative"
+        );
+    }
+}
+
+/// One exact bound PREPARED cancellation pinned before its first poll.
+pub struct PreparedCancellationReconciliationGrant {
+    binding: DecoderGrantBinding,
+    control: Option<control::PreparedGrantControl>,
+}
+
+impl fmt::Debug for PreparedCancellationReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedCancellationReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl PreparedCancellationReconciliationGrant {
+    /// Reconcile the same prepared cancellation without changing operation.
+    pub async fn reconcile_cancellation(
+        &mut self,
+    ) -> Result<EngineReleaseReceipt, EngineGrantError> {
+        let receipt = self.control()?.cancel(&self.binding).await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_test_reconciled(&mut self) -> Result<(), EngineGrantError> {
+        self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test prepared cancellation has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "prepared cancellation reconciliation has no concrete control capability"
+                    .to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for PreparedCancellationReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Prepared cancellation reconciliation capability was dropped; PREPARED engine allocation remains authoritative"
         );
     }
 }
@@ -1576,32 +1739,93 @@ impl PromotionReconciliationGrant {
         })
     }
 
-    /// Abort a potentially promoted grant and prove terminal quiescence.
-    pub async fn abort(
-        &mut self,
-        reason_code: &str,
-        diagnostic: Option<&str>,
-    ) -> Result<EngineAbortOutcome, EngineGrantError> {
-        let receipt = self
-            .control()?
-            .abort(&self.binding, reason_code, diagnostic)
-            .await?;
-        self.control = None;
-        Ok(receipt)
+    #[cfg(test)]
+    pub(crate) fn assume_test_promoted(&mut self) -> Result<RetainedEngineGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test promotion has no concrete prepared control capability".to_string(),
+            )
+        })?;
+        Ok(RetainedEngineGrant {
+            binding: self.binding.clone(),
+            control: Some(control.into_retained()),
+        })
     }
 
-    /// Monotonically quarantine a potentially promoted grant without release.
-    pub async fn quarantine(
+    /// Pin an abort of a potentially promoted grant.
+    pub(super) fn begin_abort(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool abort binding does not match the exact promotion grant".to_string(),
+            ));
+        }
+        self.take_for_abort(reason_code, diagnostic)
+    }
+
+    fn take_for_abort(
         &mut self,
         reason_code: &str,
         diagnostic: Option<&str>,
-    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
-        let receipt = self
-            .control()?
-            .quarantine(&self.binding, reason_code, diagnostic)
-            .await?;
-        self.control = None;
-        Ok(receipt)
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        let context = FailureContext::new(reason_code, diagnostic)?;
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "promotion reconciliation grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(AbortReconciliationGrant {
+            binding: self.binding.clone(),
+            context,
+            control: Some(TerminalGrantControl::Prepared(control)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_abort(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        self.take_for_abort(reason_code, diagnostic)
+    }
+
+    /// Pin quarantine of a potentially promoted grant.
+    pub(super) fn begin_quarantine(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool quarantine binding does not match the exact promotion grant"
+                    .to_string(),
+            ));
+        }
+        self.take_for_quarantine(reason_code, diagnostic)
+    }
+
+    fn take_for_quarantine(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        let context = FailureContext::new(reason_code, diagnostic)?;
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "promotion reconciliation grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(QuarantineReconciliationGrant {
+            binding: self.binding.clone(),
+            context,
+            control: Some(TerminalGrantControl::Prepared(control)),
+        })
     }
 
     fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
@@ -1678,51 +1902,126 @@ impl RetainedEngineGrant {
         self.binding.digest()
     }
 
-    /// Release after authoritative successful completion and teardown.
-    pub async fn complete(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
-        let receipt = self.control()?.complete(&self.binding).await?;
-        self.control = None;
-        Ok(receipt)
+    /// Pin successful completion before polling its terminal receipt.
+    pub(super) fn begin_completion(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+    ) -> Result<CompletionReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool completion binding does not match the exact retained grant"
+                    .to_string(),
+            ));
+        }
+        self.take_for_completion()
     }
 
-    /// Ask the engine to abort every child and prove terminal quiescence.
+    fn take_for_completion(&mut self) -> Result<CompletionReconciliationGrant, EngineGrantError> {
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "retained engine grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(CompletionReconciliationGrant {
+            binding: self.binding.clone(),
+            control: Some(control),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_completion(
+        &mut self,
+    ) -> Result<CompletionReconciliationGrant, EngineGrantError> {
+        self.take_for_completion()
+    }
+
+    /// Pin an abort of every retained child.
     ///
     /// The engine releases its allocations only when it can prove an exact
     /// all-child no-submit or terminal outcome. Otherwise the grant remains
     /// monotonically quarantined.
-    pub async fn abort(
+    pub(super) fn begin_abort(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool abort binding does not match the exact retained grant".to_string(),
+            ));
+        }
+        self.take_for_abort(reason_code, diagnostic)
+    }
+
+    fn take_for_abort(
         &mut self,
         reason_code: &str,
         diagnostic: Option<&str>,
-    ) -> Result<EngineAbortOutcome, EngineGrantError> {
-        let receipt = self
-            .control()?
-            .abort(&self.binding, reason_code, diagnostic)
-            .await?;
-        self.control = None;
-        Ok(receipt)
-    }
-
-    /// Monotonically quarantine an ambiguous promoted reservation without release.
-    pub async fn quarantine(
-        &mut self,
-        reason_code: &str,
-        diagnostic: Option<&str>,
-    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
-        let receipt = self
-            .control()?
-            .quarantine(&self.binding, reason_code, diagnostic)
-            .await?;
-        self.control = None;
-        Ok(receipt)
-    }
-
-    fn control(&self) -> Result<&control::RetainedGrantControl, EngineGrantError> {
-        self.control.as_ref().ok_or_else(|| {
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        let context = FailureContext::new(reason_code, diagnostic)?;
+        let control = self.control.take().ok_or_else(|| {
             EngineGrantError::ProtocolViolation(
                 "retained engine grant has no concrete control capability".to_string(),
             )
+        })?;
+        Ok(AbortReconciliationGrant {
+            binding: self.binding.clone(),
+            context,
+            control: Some(TerminalGrantControl::Retained(control)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_abort(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<AbortReconciliationGrant, EngineGrantError> {
+        self.take_for_abort(reason_code, diagnostic)
+    }
+
+    /// Pin quarantine of an ambiguous retained reservation.
+    pub(super) fn begin_quarantine(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool quarantine binding does not match the exact retained grant"
+                    .to_string(),
+            ));
+        }
+        self.take_for_quarantine(reason_code, diagnostic)
+    }
+
+    fn take_for_quarantine(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        let context = FailureContext::new(reason_code, diagnostic)?;
+        let control = self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "retained engine grant has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(QuarantineReconciliationGrant {
+            binding: self.binding.clone(),
+            context,
+            control: Some(TerminalGrantControl::Retained(control)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_quarantine(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<QuarantineReconciliationGrant, EngineGrantError> {
+        self.take_for_quarantine(reason_code, diagnostic)
     }
 }
 
@@ -1735,6 +2034,253 @@ impl Drop for RetainedEngineGrant {
             grant_id = %self.binding.grant_id(),
             decoder_id = %self.binding.decoder_id(),
             "Retained decoder grant capability was dropped; engine ownership remains retained"
+        );
+    }
+}
+
+struct FailureContext {
+    reason_code: Arc<str>,
+    diagnostic: Option<Arc<str>>,
+}
+
+impl FailureContext {
+    fn new(reason_code: &str, diagnostic: Option<&str>) -> Result<Self, EngineGrantError> {
+        control::validate_failure_context(reason_code, diagnostic)?;
+        Ok(Self {
+            reason_code: Arc::from(reason_code),
+            diagnostic: diagnostic.map(Arc::from),
+        })
+    }
+}
+
+impl fmt::Debug for FailureContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailureContext")
+            .field("reason_code", &self.reason_code)
+            .field("has_diagnostic", &self.diagnostic.is_some())
+            .finish()
+    }
+}
+
+enum TerminalGrantControl {
+    Prepared(control::PreparedGrantControl),
+    Retained(control::RetainedGrantControl),
+}
+
+impl TerminalGrantControl {
+    async fn abort(
+        &self,
+        binding: &DecoderGrantBinding,
+        context: &FailureContext,
+    ) -> Result<EngineAbortOutcome, EngineGrantError> {
+        match self {
+            Self::Prepared(control) => {
+                control
+                    .abort(binding, &context.reason_code, context.diagnostic.as_deref())
+                    .await
+            }
+            Self::Retained(control) => {
+                control
+                    .abort(binding, &context.reason_code, context.diagnostic.as_deref())
+                    .await
+            }
+        }
+    }
+
+    async fn quarantine(
+        &self,
+        binding: &DecoderGrantBinding,
+        context: &FailureContext,
+    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
+        match self {
+            Self::Prepared(control) => {
+                control
+                    .quarantine(binding, &context.reason_code, context.diagnostic.as_deref())
+                    .await
+            }
+            Self::Retained(control) => {
+                control
+                    .quarantine(binding, &context.reason_code, context.diagnostic.as_deref())
+                    .await
+            }
+        }
+    }
+}
+
+/// One exact completion pinned before its first control poll.
+pub struct CompletionReconciliationGrant {
+    binding: DecoderGrantBinding,
+    control: Option<control::RetainedGrantControl>,
+}
+
+impl fmt::Debug for CompletionReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl CompletionReconciliationGrant {
+    /// Reconcile only the pinned completion operation.
+    pub async fn reconcile_completion(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
+        let receipt = self.control()?.complete(&self.binding).await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_test_reconciled(&mut self) -> Result<(), EngineGrantError> {
+        self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test completion has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn control(&self) -> Result<&control::RetainedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "completion reconciliation has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for CompletionReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Completion reconciliation capability was dropped; engine ownership remains retained"
+        );
+    }
+}
+
+/// One exact abort and failure context pinned before its first control poll.
+pub struct AbortReconciliationGrant {
+    binding: DecoderGrantBinding,
+    context: FailureContext,
+    control: Option<TerminalGrantControl>,
+}
+
+impl fmt::Debug for AbortReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AbortReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("context", &self.context)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl AbortReconciliationGrant {
+    /// Reconcile only the pinned abort operation and exact failure context.
+    pub async fn reconcile_abort(&mut self) -> Result<EngineAbortOutcome, EngineGrantError> {
+        let outcome = self.control()?.abort(&self.binding, &self.context).await?;
+        self.control = None;
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_test_reconciled(&mut self) -> Result<(), EngineGrantError> {
+        self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test abort has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn control(&self) -> Result<&TerminalGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "abort reconciliation has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for AbortReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Abort reconciliation capability was dropped; engine ownership remains retained"
+        );
+    }
+}
+
+/// One exact quarantine and failure context pinned before its first control poll.
+pub struct QuarantineReconciliationGrant {
+    binding: DecoderGrantBinding,
+    context: FailureContext,
+    control: Option<TerminalGrantControl>,
+}
+
+impl fmt::Debug for QuarantineReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuarantineReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("context", &self.context)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl QuarantineReconciliationGrant {
+    /// Reconcile only the pinned quarantine operation and exact failure context.
+    pub async fn reconcile_quarantine(
+        &mut self,
+    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
+        let receipt = self
+            .control()?
+            .quarantine(&self.binding, &self.context)
+            .await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_test_reconciled(&mut self) -> Result<(), EngineGrantError> {
+        self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test quarantine has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn control(&self) -> Result<&TerminalGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "quarantine reconciliation has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for QuarantineReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Quarantine reconciliation capability was dropped; engine ownership remains retained"
         );
     }
 }
@@ -2078,6 +2624,106 @@ impl EngineReleaseReceipt {
     }
 }
 
+/// Authoritative retry policy attached to one refused reserve attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DecoderReserveRefusalDisposition {
+    /// Retry a fresh exact attempt against this decoder generation.
+    RetrySameDecoder,
+    /// Preserve the tombstone and select a different decoder generation.
+    RetryAnotherDecoder,
+    /// Finish admission without another decoder reservation attempt.
+    Terminal,
+}
+
+impl DecoderReserveRefusalDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RetrySameDecoder => "retry_same_decoder",
+            Self::RetryAnotherDecoder => "retry_another_decoder",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl fmt::Display for DecoderReserveRefusalDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Engine tombstone proving that one exact reserve attempt allocated nothing.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DecoderReserveRefusalReceipt {
+    prefill_id: PrefillId,
+    decoder_id: DecoderId,
+    logical_request_chain_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    reason_code: String,
+    disposition: DecoderReserveRefusalDisposition,
+    receipt_id: Uuid,
+    receipt_digest: AuthorityDigest,
+    take_once: bool,
+}
+
+impl fmt::Display for DecoderReserveRefusalReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} ({})", self.reason_code, self.disposition)
+    }
+}
+
+impl DecoderReserveRefusalReceipt {
+    /// Exact selected prefill process generation.
+    pub fn prefill_id(&self) -> &PrefillId {
+        &self.prefill_id
+    }
+
+    /// Logical request chain whose pending admission was refused.
+    pub fn logical_request_chain_id(&self) -> Uuid {
+        self.logical_request_chain_id
+    }
+
+    /// Gateway-issued identity of the tombstoned reserve attempt.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    /// Digest of the exact reserve transcript that allocated nothing.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
+    /// Exact decoder process generation that refused the attempt.
+    pub fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
+
+    /// Bounded machine-readable allocator reason code.
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
+    }
+
+    /// Authoritative retry policy, independent of status and reason text.
+    pub fn disposition(&self) -> DecoderReserveRefusalDisposition {
+        self.disposition
+    }
+
+    /// Immutable engine receipt identity.
+    pub fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+
+    /// Immutable engine receipt digest.
+    pub fn receipt_digest(&self) -> AuthorityDigest {
+        self.receipt_digest
+    }
+
+    /// Whether refusal reconciliation is take-once and retry-observable.
+    pub fn take_once(&self) -> bool {
+        self.take_once
+    }
+}
+
 /// Concrete decoder reservation and lifecycle failures.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum EngineGrantError {
@@ -2086,7 +2732,7 @@ pub enum EngineGrantError {
     #[error("invalid engine decoder grant: {0}")]
     InvalidGrant(String),
     #[error("decoder allocator refused the reservation: {0}")]
-    AllocatorRefused(String),
+    AllocatorRefused(Box<DecoderReserveRefusalReceipt>),
     #[error("decoder reserve outcome is allocation-ambiguous: {0}")]
     AmbiguousReserve(String),
     #[error("decoder control outcome is ambiguous during {operation}: {message}")]
@@ -2156,32 +2802,38 @@ pub(crate) fn issue_test_grant(
         decoder_id,
         children,
     )?;
+    let control = control::test_prepared_grant_control(binding.grant_id());
     Ok(BoundPreparedGrant {
         binding,
-        control: None,
+        control: Some(control),
     })
 }
 
 #[cfg(test)]
+pub(crate) struct TestEngineReceiptBinding {
+    pub(crate) grant_id: Uuid,
+    pub(crate) decoder_id: DecoderId,
+    pub(crate) child_request_ids: Vec<Uuid>,
+    pub(crate) prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+    pub(crate) slot_generations: Vec<DecoderSlotGeneration>,
+    pub(crate) bootstrap_rooms: Vec<u64>,
+    pub(crate) grant_digest: DecoderGrantDigest,
+}
+
+#[cfg(test)]
 pub(crate) fn issue_test_release_receipt(
-    grant_id: Uuid,
-    decoder_id: DecoderId,
-    child_request_ids: Vec<Uuid>,
-    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
-    slot_generations: Vec<DecoderSlotGeneration>,
-    bootstrap_rooms: Vec<u64>,
-    grant_digest: DecoderGrantDigest,
+    binding: TestEngineReceiptBinding,
     kind: EngineReleaseKind,
     take_once: bool,
 ) -> EngineReleaseReceipt {
     EngineReleaseReceipt::from_control(
-        grant_id,
-        decoder_id,
-        child_request_ids,
-        prefill_bootstrap_endpoint,
-        slot_generations,
-        bootstrap_rooms,
-        grant_digest,
+        binding.grant_id,
+        binding.decoder_id,
+        binding.child_request_ids,
+        binding.prefill_bootstrap_endpoint,
+        binding.slot_generations,
+        binding.bootstrap_rooms,
+        binding.grant_digest,
         kind,
         Uuid::new_v4(),
         AuthorityDigest([7; 32]),
@@ -2191,23 +2843,17 @@ pub(crate) fn issue_test_release_receipt(
 
 #[cfg(test)]
 pub(crate) fn issue_test_quarantine_receipt(
-    grant_id: Uuid,
-    decoder_id: DecoderId,
-    child_request_ids: Vec<Uuid>,
-    prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
-    slot_generations: Vec<DecoderSlotGeneration>,
-    bootstrap_rooms: Vec<u64>,
-    grant_digest: DecoderGrantDigest,
+    binding: TestEngineReceiptBinding,
     take_once: bool,
 ) -> EngineQuarantineReceipt {
     EngineQuarantineReceipt::from_control(
-        grant_id,
-        decoder_id,
-        child_request_ids,
-        prefill_bootstrap_endpoint,
-        slot_generations,
-        bootstrap_rooms,
-        grant_digest,
+        binding.grant_id,
+        binding.decoder_id,
+        binding.child_request_ids,
+        binding.prefill_bootstrap_endpoint,
+        binding.slot_generations,
+        binding.bootstrap_rooms,
+        binding.grant_digest,
         Uuid::new_v4(),
         AuthorityDigest([8; 32]),
         take_once,
@@ -2591,7 +3237,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_test_grant_has_no_forgeable_production_control() {
+    fn prepared_test_grant_carries_test_only_control_capability() {
         let (prefill_id, decoder_id) = process_ids();
         let grant = issue_test_grant(
             prefill_id,
@@ -2604,6 +3250,6 @@ mod tests {
             vec![DecoderGrantChildAccounting::new(100, 10)],
         )
         .unwrap();
-        assert!(grant.control.is_none());
+        assert!(grant.control.is_some());
     }
 }
