@@ -9,6 +9,7 @@ use std::{collections::HashSet, fmt, sync::Arc};
 
 use reqwest::Url;
 use thiserror::Error;
+use tracing::warn;
 use uuid::Uuid;
 
 mod control;
@@ -747,33 +748,27 @@ impl EngineDecoderGrant {
         self.binding.digest()
     }
 
-    /// Explicitly cancel a reservation that never crossed the dispatch boundary.
-    pub async fn cancel(mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
+    /// Explicitly cancel a reservation that never crossed the activation boundary.
+    ///
+    /// A non-authoritative outcome leaves this capability intact so the caller
+    /// can retry reconciliation with the same grant token.
+    pub async fn cancel(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
         let receipt = self.control()?.cancel(&self.binding).await?;
         self.control = None;
         Ok(receipt)
     }
 
-    /// Irreversibly promote the reservation before any inference send is pollable.
-    pub async fn promote(mut self) -> Result<RetainedEngineGrant, EngineGrantError> {
-        if let Err(error) = self.control()?.promote(&self.binding).await {
-            if let Some(control) = self.control.take() {
-                control.best_effort_quarantine(
-                    self.binding.clone(),
-                    "promotion_ambiguous",
-                    Some(error.to_string()),
-                );
-            }
-            return Err(error);
-        }
-        let control = self
-            .control
-            .take()
-            .expect("prepared engine grant lost its concrete control capability");
-        Ok(RetainedEngineGrant {
+    /// Cross into post-promotion reconciliation before polling a promote request.
+    ///
+    /// The caller must first cross the matching decoder-pool activation boundary.
+    /// Once this method returns, prepared cancellation is deliberately no longer
+    /// available: any subsequent ambiguity must be reconciled as potentially
+    /// promoted ownership.
+    pub fn begin_promotion(mut self) -> PromotionReconciliationGrant {
+        PromotionReconciliationGrant {
             binding: self.binding.clone(),
-            control: Some(control.into_retained()),
-        })
+            control: self.control.take(),
+        }
     }
 
     fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
@@ -787,10 +782,128 @@ impl EngineDecoderGrant {
 
 impl Drop for EngineDecoderGrant {
     fn drop(&mut self) {
-        let Some(control) = self.control.take() else {
+        if self.control.is_none() {
             return;
-        };
-        control.best_effort_cancel(self.binding.clone());
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Prepared decoder grant capability was dropped; engine-owned expiry remains authoritative"
+        );
+    }
+}
+
+/// Capability for a grant whose promotion may already have reached the engine.
+///
+/// This type intentionally has no prepared-cancel operation. Promotion retry,
+/// abort, and quarantine all preserve the concrete capability until the engine
+/// returns a validated authoritative receipt.
+pub struct PromotionReconciliationGrant {
+    binding: DecoderGrantBinding,
+    control: Option<control::PreparedGrantControl>,
+}
+
+impl fmt::Debug for PromotionReconciliationGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromotionReconciliationGrant")
+            .field("binding", &self.binding)
+            .field("has_control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl PromotionReconciliationGrant {
+    /// Engine grant identity, also used as the pool assignment identity.
+    pub fn grant_id(&self) -> Uuid {
+        self.binding.grant_id
+    }
+
+    /// Selected decoder process generation.
+    pub fn decoder_id(&self) -> &DecoderId {
+        self.binding.decoder_id()
+    }
+
+    /// Exact generation-scoped prefill endpoint consumed by decoder bootstrap.
+    pub fn prefill_bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
+        self.binding.prefill_bootstrap_endpoint()
+    }
+
+    /// Exact ordered decoder slot generations.
+    pub fn slot_generations(&self) -> &[DecoderSlotGeneration] {
+        self.binding.slot_generations()
+    }
+
+    /// Exact ordered decoder-local bootstrap rooms.
+    pub fn bootstrap_rooms(&self) -> &[u64] {
+        self.binding.bootstrap_rooms()
+    }
+
+    /// Digest covering the request and every ordered child allocation.
+    pub fn grant_digest(&self) -> DecoderGrantDigest {
+        self.binding.digest()
+    }
+
+    /// Retry promotion reconciliation without surrendering ownership on error.
+    pub async fn reconcile_promotion(&mut self) -> Result<RetainedEngineGrant, EngineGrantError> {
+        self.control()?.promote(&self.binding).await?;
+        let control = self
+            .control
+            .take()
+            .expect("promotion reconciliation lost its concrete control capability");
+        Ok(RetainedEngineGrant {
+            binding: self.binding.clone(),
+            control: Some(control.into_retained()),
+        })
+    }
+
+    /// Abort a potentially promoted grant and prove terminal quiescence.
+    pub async fn abort(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<EngineAbortOutcome, EngineGrantError> {
+        let receipt = self
+            .control()?
+            .abort(&self.binding, reason_code, diagnostic)
+            .await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    /// Monotonically quarantine a potentially promoted grant without release.
+    pub async fn quarantine(
+        &mut self,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
+        let receipt = self
+            .control()?
+            .quarantine(&self.binding, reason_code, diagnostic)
+            .await?;
+        self.control = None;
+        Ok(receipt)
+    }
+
+    fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
+        self.control.as_ref().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "promotion reconciliation grant has no concrete control capability".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for PromotionReconciliationGrant {
+    fn drop(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Promotion reconciliation capability was dropped; engine ownership remains retained"
+        );
     }
 }
 
@@ -842,7 +955,7 @@ impl RetainedEngineGrant {
     }
 
     /// Release after authoritative successful completion and teardown.
-    pub async fn complete(mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
+    pub async fn complete(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
         let receipt = self.control()?.complete(&self.binding).await?;
         self.control = None;
         Ok(receipt)
@@ -854,7 +967,7 @@ impl RetainedEngineGrant {
     /// all-child no-submit or terminal outcome. Otherwise the grant remains
     /// monotonically quarantined.
     pub async fn abort(
-        mut self,
+        &mut self,
         reason_code: &str,
         diagnostic: Option<&str>,
     ) -> Result<EngineAbortOutcome, EngineGrantError> {
@@ -868,7 +981,7 @@ impl RetainedEngineGrant {
 
     /// Monotonically quarantine an ambiguous promoted reservation without release.
     pub async fn quarantine(
-        mut self,
+        &mut self,
         reason_code: &str,
         diagnostic: Option<&str>,
     ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
@@ -891,10 +1004,14 @@ impl RetainedEngineGrant {
 
 impl Drop for RetainedEngineGrant {
     fn drop(&mut self) {
-        let Some(control) = self.control.take() else {
+        if self.control.is_none() {
             return;
-        };
-        control.best_effort_quarantine(self.binding.clone(), "retained_grant_dropped", None);
+        }
+        warn!(
+            grant_id = %self.binding.grant_id(),
+            decoder_id = %self.binding.decoder_id(),
+            "Retained decoder grant capability was dropped; engine ownership remains retained"
+        );
     }
 }
 

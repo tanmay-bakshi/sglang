@@ -4,7 +4,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 use uuid::Uuid;
 
 use super::{
@@ -310,7 +309,7 @@ impl DecoderGrantControlClient {
                 "reserve response contains no prepared expiry".to_string(),
             ));
         }
-        let token = SecretGrantToken::new(response.grant_token)?;
+        let token = response.grant_token;
         if response.allocations.len() != reservation.child_request_ids.len() {
             return Err(EngineGrantError::ProtocolViolation(format!(
                 "reserve returned {} allocations for {} gateway child identities",
@@ -418,6 +417,16 @@ impl SecretGrantToken {
     }
 }
 
+impl<'de> Deserialize<'de> for SecretGrantToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Debug for SecretGrantToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SecretGrantToken([REDACTED])")
@@ -476,33 +485,46 @@ impl PreparedGrantControl {
         release_receipt(receipt, binding, EngineReleaseKind::PreparedCancelled)
     }
 
+    pub(super) async fn abort(
+        &self,
+        binding: &DecoderGrantBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<EngineAbortOutcome, EngineGrantError> {
+        abort_control(
+            &self.client,
+            &self.grant_url,
+            &self.token,
+            binding,
+            reason_code,
+            diagnostic,
+        )
+        .await
+    }
+
+    pub(super) async fn quarantine(
+        &self,
+        binding: &DecoderGrantBinding,
+        reason_code: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
+        quarantine_control(
+            &self.client,
+            &self.grant_url,
+            &self.token,
+            binding,
+            reason_code,
+            diagnostic,
+        )
+        .await
+    }
+
     pub(super) fn into_retained(self) -> RetainedGrantControl {
         RetainedGrantControl {
             client: self.client,
             grant_url: self.grant_url,
             token: self.token,
         }
-    }
-
-    pub(super) fn best_effort_cancel(self, binding: DecoderGrantBinding) {
-        spawn_best_effort("cancel", async move {
-            let _ = self.cancel(&binding).await;
-        });
-    }
-
-    pub(super) fn best_effort_quarantine(
-        self,
-        binding: DecoderGrantBinding,
-        reason_code: &'static str,
-        diagnostic: Option<String>,
-    ) {
-        spawn_best_effort("quarantine", async move {
-            let retained = self.into_retained();
-            let diagnostic = diagnostic
-                .as_deref()
-                .filter(|value| validate_diagnostic(value).is_ok());
-            let _ = retained.quarantine(&binding, reason_code, diagnostic).await;
-        });
     }
 }
 
@@ -542,49 +564,15 @@ impl RetainedGrantControl {
         reason_code: &str,
         diagnostic: Option<&str>,
     ) -> Result<EngineAbortOutcome, EngineGrantError> {
-        validate_failure_context(reason_code, diagnostic)?;
-        let request = FailureControlRequest {
-            binding: BindingControlRequest::new(binding),
-            reason_code,
-            diagnostic,
-        };
-        let receipt = send_control(
+        abort_control(
             &self.client,
             &self.grant_url,
             &self.token,
-            "abort",
-            &request,
+            binding,
+            reason_code,
+            diagnostic,
         )
-        .await?;
-        match receipt.state {
-            WireGrantState::Aborted => {
-                validate_control_receipt(
-                    &receipt,
-                    WireOperation::Abort,
-                    WireGrantState::Aborted,
-                    binding,
-                )?;
-                Ok(EngineAbortOutcome::Aborted(release_receipt(
-                    receipt,
-                    binding,
-                    EngineReleaseKind::Aborted,
-                )?))
-            }
-            WireGrantState::Quarantined => {
-                validate_control_receipt(
-                    &receipt,
-                    WireOperation::Abort,
-                    WireGrantState::Quarantined,
-                    binding,
-                )?;
-                Ok(EngineAbortOutcome::Quarantined(quarantine_receipt(
-                    receipt, binding,
-                )?))
-            }
-            state => Err(EngineGrantError::ProtocolViolation(format!(
-                "abort returned state {state:?}, expected aborted or quarantined"
-            ))),
-        }
+        .await
     }
 
     pub(super) async fn quarantine(
@@ -593,42 +581,86 @@ impl RetainedGrantControl {
         reason_code: &str,
         diagnostic: Option<&str>,
     ) -> Result<EngineQuarantineReceipt, EngineGrantError> {
-        validate_failure_context(reason_code, diagnostic)?;
-        let request = FailureControlRequest {
-            binding: BindingControlRequest::new(binding),
-            reason_code,
-            diagnostic,
-        };
-        let receipt = send_control(
+        quarantine_control(
             &self.client,
             &self.grant_url,
             &self.token,
-            "quarantine",
-            &request,
-        )
-        .await?;
-        validate_control_receipt(
-            &receipt,
-            WireOperation::Quarantine,
-            WireGrantState::Quarantined,
             binding,
-        )?;
-        quarantine_receipt(receipt, binding)
+            reason_code,
+            diagnostic,
+        )
+        .await
     }
+}
 
-    pub(super) fn best_effort_quarantine(
-        self,
-        binding: DecoderGrantBinding,
-        reason_code: &'static str,
-        diagnostic: Option<String>,
-    ) {
-        spawn_best_effort("quarantine", async move {
-            let diagnostic = diagnostic
-                .as_deref()
-                .filter(|value| validate_diagnostic(value).is_ok());
-            let _ = self.quarantine(&binding, reason_code, diagnostic).await;
-        });
+async fn abort_control(
+    client: &Client,
+    grant_url: &str,
+    token: &SecretGrantToken,
+    binding: &DecoderGrantBinding,
+    reason_code: &str,
+    diagnostic: Option<&str>,
+) -> Result<EngineAbortOutcome, EngineGrantError> {
+    validate_failure_context(reason_code, diagnostic)?;
+    let request = FailureControlRequest {
+        binding: BindingControlRequest::new(binding),
+        reason_code,
+        diagnostic,
+    };
+    let receipt = send_control(client, grant_url, token, "abort", &request).await?;
+    match receipt.state {
+        WireGrantState::Aborted => {
+            validate_control_receipt(
+                &receipt,
+                WireOperation::Abort,
+                WireGrantState::Aborted,
+                binding,
+            )?;
+            Ok(EngineAbortOutcome::Aborted(release_receipt(
+                receipt,
+                binding,
+                EngineReleaseKind::Aborted,
+            )?))
+        }
+        WireGrantState::Quarantined => {
+            validate_control_receipt(
+                &receipt,
+                WireOperation::Abort,
+                WireGrantState::Quarantined,
+                binding,
+            )?;
+            Ok(EngineAbortOutcome::Quarantined(quarantine_receipt(
+                receipt, binding,
+            )?))
+        }
+        state => Err(EngineGrantError::ProtocolViolation(format!(
+            "abort returned state {state:?}, expected aborted or quarantined"
+        ))),
     }
+}
+
+async fn quarantine_control(
+    client: &Client,
+    grant_url: &str,
+    token: &SecretGrantToken,
+    binding: &DecoderGrantBinding,
+    reason_code: &str,
+    diagnostic: Option<&str>,
+) -> Result<EngineQuarantineReceipt, EngineGrantError> {
+    validate_failure_context(reason_code, diagnostic)?;
+    let request = FailureControlRequest {
+        binding: BindingControlRequest::new(binding),
+        reason_code,
+        diagnostic,
+    };
+    let receipt = send_control(client, grant_url, token, "quarantine", &request).await?;
+    validate_control_receipt(
+        &receipt,
+        WireOperation::Quarantine,
+        WireGrantState::Quarantined,
+        binding,
+    )?;
+    quarantine_receipt(receipt, binding)
 }
 
 fn validate_failure_context(
@@ -807,20 +839,6 @@ fn quarantine_receipt(
     ))
 }
 
-fn spawn_best_effort(
-    operation: &'static str,
-    task: impl std::future::Future<Output = ()> + Send + 'static,
-) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        warn!(
-            operation,
-            "No Tokio runtime is available for best-effort decoder grant cleanup"
-        );
-        return;
-    };
-    runtime.spawn(task);
-}
-
 fn validate_schema(schema_version: u32) -> Result<(), EngineGrantError> {
     if schema_version != SCHEMA_VERSION {
         return Err(EngineGrantError::ProtocolViolation(format!(
@@ -927,7 +945,7 @@ struct ReserveResponse {
     schema_version: u32,
     state: WireGrantState,
     grant_id: Uuid,
-    grant_token: String,
+    grant_token: SecretGrantToken,
     prefill_process: WireProcessIdentity,
     prefill_bootstrap_endpoint: WireBootstrapEndpoint,
     decoder_process: WireProcessIdentity,
@@ -1376,7 +1394,8 @@ mod tests {
             SecretGrantToken::new(fixture.token.clone()).unwrap()
         );
         assert_eq!(token_debug, "SecretGrantToken([REDACTED])");
-        let retained = grant.promote().await.unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
         let release = retained.complete().await.unwrap();
         assert_eq!(release.kind(), EngineReleaseKind::Completed);
 
@@ -1416,7 +1435,7 @@ mod tests {
             ),
         ]);
         install_plans(&state, plans);
-        let grant = DecoderGrantControlClient::new(Client::new())
+        let mut grant = DecoderGrantControlClient::new(Client::new())
             .reserve(&fixture.reservation)
             .await
             .unwrap();
@@ -1425,6 +1444,156 @@ mod tests {
         assert_eq!(
             release.child_request_ids(),
             fixture.reservation.child_request_ids()
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_cancel_retries_after_malformed_receipt() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let cancel_path = format!("{CONTROL_PATH}/{grant_id}/cancel");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    cancel_path.clone(),
+                    response(json!({"schema_version": SCHEMA_VERSION})),
+                ),
+                (
+                    cancel_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Cancel,
+                        WireGrantState::Cancelled,
+                    )),
+                ),
+            ]),
+        );
+
+        let mut grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        assert!(matches!(
+            grant.cancel().await,
+            Err(EngineGrantError::AmbiguousControl {
+                operation: "cancel",
+                ..
+            })
+        ));
+        assert!(format!("{grant:?}").contains("has_control: true"));
+        let release = grant.cancel().await.unwrap();
+        assert_eq!(release.kind(), EngineReleaseKind::PreparedCancelled);
+        assert_eq!(state.requests.lock().unwrap().len(), 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn promotion_retries_after_malformed_receipt() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    promote_path.clone(),
+                    response(json!({"schema_version": SCHEMA_VERSION})),
+                ),
+                (
+                    promote_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+            ]),
+        );
+
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        assert!(matches!(
+            promotion.reconcile_promotion().await,
+            Err(EngineGrantError::AmbiguousControl {
+                operation: "promote",
+                ..
+            })
+        ));
+        assert!(format!("{promotion:?}").contains("has_control: true"));
+        let retained = promotion.reconcile_promotion().await.unwrap();
+        assert_eq!(retained.grant_id(), fixture.binding.grant_id());
+        assert_eq!(state.requests.lock().unwrap().len(), 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn promotion_ambiguity_can_abort_but_cannot_cancel() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
+        let abort_path = format!("{CONTROL_PATH}/{grant_id}/abort");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    promote_path.clone(),
+                    response(json!({"schema_version": SCHEMA_VERSION})),
+                ),
+                (
+                    abort_path.clone(),
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Abort,
+                        WireGrantState::Aborted,
+                    )),
+                ),
+            ]),
+        );
+
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        assert!(promotion.reconcile_promotion().await.is_err());
+        let outcome = promotion
+            .abort(
+                "promotion_receipt_lost",
+                Some("promotion outcome requires quiescence"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EngineAbortOutcome::Aborted(_)));
+        let paths: Vec<String> = state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![format!("{CONTROL_PATH}/reserve"), promote_path, abort_path,]
         );
         task.abort();
     }
@@ -1456,7 +1625,8 @@ mod tests {
             .reserve(&fixture.reservation)
             .await
             .unwrap();
-        let retained = grant.promote().await.unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
         let outcome = retained
             .abort("decoder_response_failed", Some("upstream body failed"))
             .await
@@ -1507,7 +1677,8 @@ mod tests {
             .reserve(&fixture.reservation)
             .await
             .unwrap();
-        let retained = grant.promote().await.unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
         let quarantine = retained
             .quarantine("response_body_dropped", Some("client disconnected"))
             .await
@@ -1517,6 +1688,253 @@ mod tests {
             quarantine.child_request_ids(),
             fixture.reservation.child_request_ids()
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_complete_retries_after_malformed_receipt() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
+        let complete_path = format!("{CONTROL_PATH}/{grant_id}/complete");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    promote_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+                (
+                    complete_path.clone(),
+                    response(json!({"schema_version": SCHEMA_VERSION})),
+                ),
+                (
+                    complete_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Complete,
+                        WireGrantState::Completed,
+                    )),
+                ),
+            ]),
+        );
+
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
+        assert!(retained.complete().await.is_err());
+        assert!(format!("{retained:?}").contains("has_control: true"));
+        let release = retained.complete().await.unwrap();
+        assert_eq!(release.kind(), EngineReleaseKind::Completed);
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_abort_retries_after_invalid_receipt() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
+        let abort_path = format!("{CONTROL_PATH}/{grant_id}/abort");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    promote_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+                (
+                    abort_path.clone(),
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Complete,
+                        WireGrantState::Completed,
+                    )),
+                ),
+                (
+                    abort_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Abort,
+                        WireGrantState::Aborted,
+                    )),
+                ),
+            ]),
+        );
+
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
+        assert!(retained
+            .abort("response_failed", Some("first receipt was invalid"))
+            .await
+            .is_err());
+        assert!(format!("{retained:?}").contains("has_control: true"));
+        let outcome = retained
+            .abort("response_failed", Some("retry exact abort"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EngineAbortOutcome::Aborted(_)));
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn retained_quarantine_retries_after_http_ambiguity() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        let promote_path = format!("{CONTROL_PATH}/{grant_id}/promote");
+        let quarantine_path = format!("{CONTROL_PATH}/{grant_id}/quarantine");
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    promote_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+                (
+                    quarantine_path.clone(),
+                    PlannedResponse {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: json!({"error": "receipt delivery failed"}),
+                    },
+                ),
+                (
+                    quarantine_path,
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Quarantine,
+                        WireGrantState::Quarantined,
+                    )),
+                ),
+            ]),
+        );
+
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
+        assert!(matches!(
+            retained
+                .quarantine("response_dropped", Some("first response was ambiguous"))
+                .await,
+            Err(EngineGrantError::AmbiguousControl {
+                operation: "quarantine",
+                ..
+            })
+        ));
+        assert!(format!("{retained:?}").contains("has_control: true"));
+        let quarantine = retained
+            .quarantine("response_dropped", Some("retry exact quarantine"))
+            .await
+            .unwrap();
+        assert_eq!(quarantine.grant_id(), fixture.binding.grant_id());
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn dropping_grant_capabilities_emits_no_control_request() {
+        let (server_url, state, task) = start_server().await;
+        let prepared_fixture = fixture(&server_url, 1);
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                response(prepared_fixture.reserve_response.clone()),
+            )]),
+        );
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&prepared_fixture.reservation)
+            .await
+            .unwrap();
+        drop(grant);
+        tokio::task::yield_now().await;
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        task.abort();
+
+        let (server_url, state, task) = start_server().await;
+        let promotion_fixture = fixture(&server_url, 1);
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/reserve"),
+                response(promotion_fixture.reserve_response.clone()),
+            )]),
+        );
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&promotion_fixture.reservation)
+            .await
+            .unwrap();
+        drop(grant.begin_promotion());
+        tokio::task::yield_now().await;
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
+        task.abort();
+
+        let (server_url, state, task) = start_server().await;
+        let retained_fixture = fixture(&server_url, 1);
+        let grant_id = retained_fixture.binding.grant_id();
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(retained_fixture.reserve_response.clone()),
+                ),
+                (
+                    format!("{CONTROL_PATH}/{grant_id}/promote"),
+                    response(receipt(
+                        &retained_fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+            ]),
+        );
+        let grant = DecoderGrantControlClient::new(Client::new())
+            .reserve(&retained_fixture.reservation)
+            .await
+            .unwrap();
+        let mut promotion = grant.begin_promotion();
+        let retained = promotion.reconcile_promotion().await.unwrap();
+        drop(retained);
+        tokio::task::yield_now().await;
+        assert_eq!(state.requests.lock().unwrap().len(), 2);
         task.abort();
     }
 
