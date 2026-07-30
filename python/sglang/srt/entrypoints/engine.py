@@ -49,6 +49,10 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.disaggregation.runtime_capabilities import (
+    runtime_capabilities_from_scheduler_info,
+    validate_scheduler_runtime_capabilities,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -1106,6 +1110,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Wait for the model to finish loading
         scheduler_init_result.wait_for_ready()
+        if server_args.tokenizer_worker_num == 1:
+            tokenizer_manager.wait_for_disaggregation_ready(timeout_s=5.0)
 
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][
@@ -1232,12 +1238,21 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
+        scheduler_info = self._scheduler_init_result.scheduler_infos[0]
+        runtime_capabilities = runtime_capabilities_from_scheduler_info(
+            scheduler_info
+        )
         return msgspec_to_builtins(
             {
                 **dataclasses.asdict(self.tokenizer_manager.server_args),
-                **self._scheduler_init_result.scheduler_infos[0],
+                **scheduler_info,
                 "internal_states": internal_states,
                 "version": __version__,
+                "pd_process": (
+                    self.tokenizer_manager.server_args.pd_process_advertisement(
+                        runtime_capabilities
+                    )
+                ),
             }
         )
 
@@ -1636,6 +1651,7 @@ def _wait_for_scheduler_ready(
                 if not scheduler_procs[j].is_alive():
                     raise _scheduler_died_error(j, scheduler_procs[j])
 
+    validate_scheduler_runtime_capabilities(scheduler_infos)
     return scheduler_infos
 
 

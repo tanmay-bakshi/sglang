@@ -63,6 +63,9 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PdProcessRuntimeCapabilities,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
@@ -571,6 +574,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_pd_runtime_capabilities()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1307,6 +1311,29 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def init_pd_runtime_capabilities(self) -> None:
+        """Capture PD capabilities from initialized runtime-owned objects."""
+
+        self.pd_runtime_capabilities: PdProcessRuntimeCapabilities | None = None
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            return
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.disagg_prefill_bootstrap_queue is None:
+                raise RuntimeError("prefill KV manager was not initialized")
+            kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        else:
+            if self.disagg_decode_prealloc_queue is None:
+                raise RuntimeError("decode KV manager was not initialized")
+            kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+
+        self.pd_runtime_capabilities = PdProcessRuntimeCapabilities(
+            kv_dtype=self.tp_worker.model_runner.kv_cache_dtype_str,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            kv_transfer_protocol=kv_manager.kv_transfer_protocol(),
+            prepared_grant_protocol=None,
+        )
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -1513,6 +1540,11 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "pd_runtime_capabilities": (
+                self.pd_runtime_capabilities.to_dict()
+                if self.pd_runtime_capabilities is not None
+                else None
+            ),
         }
 
         return result_dict

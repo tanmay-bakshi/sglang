@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.disaggregation.runtime_capabilities import KvTransferProtocol
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -109,6 +110,14 @@ class BaseKVManager(ABC):
     def register_to_bootstrap(self):
         """Register prefill server info to the bootstrap server."""
         ...
+
+    def kv_transfer_protocol(self) -> KvTransferProtocol | None:
+        """Return the initialized transfer protocol implemented by this manager.
+
+        :returns: A closed transfer protocol, otherwise ``None``.
+        """
+
+        return None
 
 
 class BaseKVSender(ABC):
@@ -241,3 +250,13 @@ class BaseKVReceiver(ABC):
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
     def __init__(self, host: str, port: int): ...
+
+    @abstractmethod
+    def wait_until_ready(self, timeout_s: float) -> None:
+        """Wait until every transfer rank has registered.
+
+        :param timeout_s: Maximum wait in seconds.
+        :raises RuntimeError: If registration is incomplete at the deadline.
+        """
+
+        ...

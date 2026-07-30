@@ -26,6 +26,10 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PD_RUNTIME_CAPABILITIES_FIELD,
+    validate_scheduler_runtime_capabilities,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -728,6 +732,9 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
+        self.pd_runtime_capabilities = validate_scheduler_runtime_capabilities(
+            scheduler_info
+        )
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
@@ -841,6 +848,7 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                PD_RUNTIME_CAPABILITIES_FIELD: controller.pd_runtime_capabilities,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )

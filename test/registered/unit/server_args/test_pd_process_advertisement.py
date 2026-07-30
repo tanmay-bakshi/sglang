@@ -5,8 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.pd_disaggregation_hook import (
-    PdProcessRuntimeCapabilities,
     build_pd_process_advertisement,
+)
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PdProcessRuntimeCapabilities,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -147,6 +149,20 @@ class TestPdProcessAdvertisement(CustomTestCase):
         self.assertIsNone(
             build_pd_process_advertisement(_pd_args(), runtime_capabilities=None)
         )
+
+    def test_partial_runtime_has_no_advertisement(self) -> None:
+        """A process stays undiscoverable until both protocols are live."""
+
+        for capabilities in (
+            dataclasses.replace(_CAPABILITIES, kv_transfer_protocol=None),
+            dataclasses.replace(_CAPABILITIES, prepared_grant_protocol=None),
+        ):
+            with self.subTest(capabilities=capabilities):
+                self.assertIsNone(
+                    build_pd_process_advertisement(
+                        _pd_args(), runtime_capabilities=capabilities
+                    )
+                )
 
     def test_missing_api_key_is_rejected(self) -> None:
         """PD metadata is unavailable without authenticated engine access."""

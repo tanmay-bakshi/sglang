@@ -604,6 +604,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 encode_urls=self.encoder_urls,
             )
 
+    def wait_for_disaggregation_ready(self, timeout_s: float) -> None:
+        """Gate process readiness on complete prefill bootstrap registration.
+
+        :param timeout_s: Maximum wait in seconds.
+        """
+
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+        if self.bootstrap_server is None:
+            raise RuntimeError("prefill bootstrap service was not initialized")
+        self.bootstrap_server.wait_until_ready(timeout_s)
+
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:

@@ -42,12 +42,14 @@ from sglang.srt.arg_groups.argparse_actions import (
     LoRAPathAction,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import (
-    PdProcessRuntimeCapabilities,
     build_pd_process_advertisement,
     handle_pd_disaggregation,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PdProcessRuntimeCapabilities,
+)
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )

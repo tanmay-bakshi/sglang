@@ -62,6 +62,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.runtime_capabilities import (
+    runtime_capabilities_from_scheduler_info,
+)
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -749,6 +752,9 @@ async def server_info():
     )
 
     server_args = _global_state.tokenizer_manager.server_args
+    runtime_capabilities = runtime_capabilities_from_scheduler_info(
+        _global_state.scheduler_info
+    )
 
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
@@ -763,7 +769,7 @@ async def server_info():
             "kv_events": server_args.describe_kv_events_publisher(),
             # Capability presence is implementation-owned; configuration cannot
             # synthesize transfer or control protocols.
-            "pd_process": server_args.pd_process_advertisement(None),
+            "pd_process": server_args.pd_process_advertisement(runtime_capabilities),
         }
     )
 

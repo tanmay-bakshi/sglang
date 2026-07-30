@@ -26,6 +26,9 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PdProcessRuntimeCapabilities,
+)
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.server_args import ServerArgs
@@ -36,7 +39,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _call_server_info_with(
-    server_args: ServerArgs, internal_states: list[dict] | None = None
+    server_args: ServerArgs,
+    internal_states: list[dict] | None = None,
+    scheduler_info: dict[str, object] | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -50,12 +55,20 @@ def _call_server_info_with(
     async def _fake_internal_state():
         return internal_states or [{"max_req_input_len": 1024}]
 
+    resolved_scheduler_info = (
+        scheduler_info
+        if scheduler_info is not None
+        else {
+            "max_req_input_len": 1024,
+            "pd_runtime_capabilities": None,
+        }
+    )
     stub_state = SimpleNamespace(
         tokenizer_manager=SimpleNamespace(
             server_args=server_args,
             get_internal_state=_fake_internal_state,
         ),
-        scheduler_info={"max_req_input_len": 1024},
+        scheduler_info=resolved_scheduler_info,
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
@@ -231,6 +244,70 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 )
                 info = _call_server_info_with(args)
                 self.assertIsNone(info["kv_events"])
+
+
+class TestServerInfoPdRuntimeCapabilities(CustomTestCase):
+    """Runtime-owned PD metadata flows through the scheduler handshake."""
+
+    def test_partial_runtime_is_visible_but_not_advertised(self) -> None:
+        """Missing protocol implementations keep the process undiscoverable."""
+
+        args = ServerArgs(model_path="dummy")
+        args.disaggregation_mode = "decode"
+        capabilities = PdProcessRuntimeCapabilities(
+            kv_dtype="bfloat16",
+            page_size=64,
+            kv_transfer_protocol=None,
+            prepared_grant_protocol=None,
+        )
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "pd_runtime_capabilities": capabilities.to_dict(),
+            },
+        )
+
+        self.assertEqual(
+            info["pd_runtime_capabilities"],
+            capabilities.to_dict(),
+        )
+        self.assertIsNone(info["pd_process"])
+
+    def test_attested_runtime_builds_pd_process_document(self) -> None:
+        """Both live protocols unlock the typed process advertisement."""
+
+        args = ServerArgs(model_path="dummy")
+        args.api_key = "secret"
+        args.disaggregation_mode = "prefill"
+        args.tp_size = 4
+        args.dp_size = 1
+        args.pd_model_fingerprint = "a" * 64
+        args.pd_logical_kv_layout_fingerprint = "b" * 64
+        args.pd_prefill_bootstrap_advertise_host = "10.20.30.40"
+        args.disaggregation_bootstrap_port = 8998
+        capabilities = PdProcessRuntimeCapabilities(
+            kv_dtype="bfloat16",
+            page_size=64,
+            kv_transfer_protocol="packed-v4",
+            prepared_grant_protocol="control-v1",
+        )
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "max_req_input_len": 1024,
+                "pd_runtime_capabilities": capabilities.to_dict(),
+            },
+        )
+
+        self.assertEqual(info["pd_process"]["kv_dtype"], "bf16")
+        self.assertEqual(info["pd_process"]["kv_transfer_protocol"], "packed-v4")
+        self.assertEqual(
+            info["pd_process"]["prepared_grant_protocol"],
+            "control-v1",
+        )
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):

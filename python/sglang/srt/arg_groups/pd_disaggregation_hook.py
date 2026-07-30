@@ -2,9 +2,11 @@ import ipaddress
 import logging
 import os
 import re
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from sglang.srt.disaggregation.runtime_capabilities import (
+    PdProcessRuntimeCapabilities,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -13,22 +15,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CANONICAL_DIGEST = re.compile(r"[0-9a-f]{64}")
-
-
-@dataclass(frozen=True)
-class PdProcessRuntimeCapabilities:
-    """Implementation-owned PD transfer and control capabilities.
-
-    :ivar kv_dtype: Canonical runtime KV storage dtype.
-    :ivar page_size: Runtime KV page size.
-    :ivar kv_transfer_protocol: Implemented KV-transfer wire protocol.
-    :ivar prepared_grant_protocol: Implemented decoder-grant control protocol.
-    """
-
-    kv_dtype: str
-    page_size: int
-    kv_transfer_protocol: str
-    prepared_grant_protocol: str
 
 
 def _validate_fingerprint(value: str | None, flag: str) -> str:
@@ -106,6 +92,8 @@ def build_pd_process_advertisement(
         return None
     if runtime_capabilities is None:
         return None
+    if not runtime_capabilities.advertises_pd_process:
+        return None
     if server_args.api_key is None or len(server_args.api_key) == 0:
         raise ValueError("PD process advertisement requires --api-key")
     if server_args.tokenizer_worker_num != 1:
@@ -118,33 +106,8 @@ def build_pd_process_advertisement(
         server_args.pd_logical_kv_layout_fingerprint,
         "--pd-logical-kv-layout-fingerprint",
     )
-    if runtime_capabilities.kv_transfer_protocol != "packed-v4":
-        raise ValueError(
-            "PD process advertisement requires implemented packed-v4 transfer"
-        )
-    if runtime_capabilities.prepared_grant_protocol != "control-v1":
-        raise ValueError(
-            "PD process advertisement requires implemented control-v1 grants"
-        )
     kv_dtype = runtime_capabilities.kv_dtype
-    if (
-        len(kv_dtype) == 0
-        or kv_dtype == "auto"
-        or not kv_dtype.replace("_", "").isalnum()
-        or kv_dtype.lower() != kv_dtype
-    ):
-        raise ValueError(
-            "PD process advertisement requires a canonical runtime KV dtype"
-        )
-    canonical_kv_dtype = {
-        "bfloat16": "bf16",
-        "fp4_mx_block16": "nvfp4",
-    }.get(kv_dtype, kv_dtype)
     page_size = runtime_capabilities.page_size
-    if not isinstance(page_size, int) or page_size <= 0:
-        raise ValueError(
-            "PD process advertisement requires a resolved positive page_size"
-        )
     if server_args.tp_size <= 0:
         raise ValueError("PD process advertisement requires a positive tp_size")
     if server_args.dp_size != 1:
@@ -179,7 +142,7 @@ def build_pd_process_advertisement(
         "data_parallel_size": server_args.dp_size,
         "model_fingerprint": model_fingerprint,
         "logical_kv_layout_fingerprint": logical_kv_layout_fingerprint,
-        "kv_dtype": canonical_kv_dtype,
+        "kv_dtype": kv_dtype,
         "page_size": page_size,
         "kv_transfer_protocol": runtime_capabilities.kv_transfer_protocol,
         "prepared_grant_protocol": runtime_capabilities.prepared_grant_protocol,

@@ -662,22 +662,28 @@ class CommonKVManager(BaseKVManager):
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        last_failure = "bootstrap registration was not attempted"
         for attempt in range(max_retries):
             try:
                 response = requests.put(url, json=payload, timeout=5)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
+                last_failure = f"HTTP {response.status_code}: {response.text[:256]}"
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
+                    "Prefill register attempt %d/%d failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    last_failure,
                 )
-            except Exception as e:
-                # Walk to root cause to skip misleading urllib3 wrapper messages
-                cause = e
-                while cause.__cause__ is not None:
-                    cause = cause.__cause__
+            except requests.RequestException as error:
+                last_failure = f"{type(error).__name__}: {error}"
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
+                    "Prefill register attempt %d/%d failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    last_failure,
+                    exc_info=True,
                 )
             if attempt == max_retries - 1:
                 break
@@ -685,8 +691,9 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
-        logger.error(
-            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        raise RuntimeError(
+            "Prefill instance failed to register to bootstrap server after "
+            f"{max_retries} attempts: {last_failure}"
         )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
@@ -1464,6 +1471,66 @@ class CommonKVReceiver(BaseKVReceiver):
                 )
 
 
+def _resolve_bootstrap_int(
+    current: int | None,
+    candidate: int,
+    field: str,
+) -> int:
+    """Resolve one immutable integer bootstrap attribute.
+
+    :param current: Previously registered value.
+    :param candidate: Value supplied by the current rank.
+    :param field: Attribute name for diagnostics.
+    :returns: The process-wide value.
+    """
+
+    if current is not None and current != candidate:
+        raise ValueError(
+            f"inconsistent bootstrap {field}: {candidate} != {current}"
+        )
+    return candidate
+
+
+def _resolve_bootstrap_str(
+    current: str | None,
+    candidate: str,
+    field: str,
+) -> str:
+    """Resolve one immutable string bootstrap attribute.
+
+    :param current: Previously registered value.
+    :param candidate: Value supplied by the current rank.
+    :param field: Attribute name for diagnostics.
+    :returns: The process-wide value.
+    """
+
+    if current is not None and current != candidate:
+        raise ValueError(
+            f"inconsistent bootstrap {field}: {candidate!r} != {current!r}"
+        )
+    return candidate
+
+
+def _resolve_bootstrap_bool(
+    current: bool | None,
+    candidate: bool,
+    field: str,
+) -> bool:
+    """Resolve one immutable boolean bootstrap attribute.
+
+    :param current: Previously registered value.
+    :param candidate: Value supplied by the current rank.
+    :param field: Attribute name for diagnostics.
+    :returns: The process-wide value.
+    """
+
+    if current is not None and current != candidate:
+        raise ValueError(
+            f"inconsistent bootstrap {field}: {candidate} != {current}"
+        )
+    return candidate
+
+
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
@@ -1485,7 +1552,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
-        self._registered_count = 0
+        self._registered_ranks: set[tuple[int, int, int, int]] = set()
+        self._ready_event = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._runner: web.AppRunner | None = None
+        self._cleanup_task: asyncio.Task | None = None
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -1497,28 +1568,79 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def run(self):
         self.thread.start()
 
-    def _is_ready(self) -> bool:
+    @property
+    def registered_count(self) -> int:
+        """Return the number of unique registered transfer ranks.
+
+        :returns: Unique rank count.
+        """
+
+        return len(self._registered_ranks)
+
+    def _expected_rank_count(self) -> int | None:
+        """Return the complete topology size once its dimensions are known.
+
+        :returns: Expected unique rank count, otherwise ``None``.
+        """
+
         if (
             self.attn_tp_size is None
             or self.attn_cp_size is None
             or self.pp_size is None
             or self.dp_size is None
         ):
+            return None
+        return self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+
+    def _is_ready(self) -> bool:
+        expected = self._expected_rank_count()
+        if expected is None:
             return False
-        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
-            f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
+            "Expected %d prefill servers to be registered, %d registered so far",
+            expected,
+            self.registered_count,
         )
-        return self._registered_count >= expected
+        return self.registered_count == expected
+
+    def wait_until_ready(self, timeout_s: float) -> None:
+        """Wait until every expected prefill transfer rank has registered.
+
+        :param timeout_s: Maximum wait in seconds.
+        :raises RuntimeError: If the bootstrap topology remains incomplete.
+        """
+
+        if timeout_s <= 0:
+            raise ValueError("bootstrap readiness timeout must be positive")
+        if self._ready_event.wait(timeout_s):
+            return
+
+        expected = self._expected_rank_count()
+        raise RuntimeError(
+            "Prefill bootstrap did not become ready: "
+            f"{self.registered_count}/{expected} ranks registered"
+        )
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_get("/ready", self._handle_readiness_check)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
+
+    async def _handle_readiness_check(self, request: web.Request) -> web.Response:
+        if self._is_ready():
+            return web.Response(text="READY", status=200)
+        return web.Response(
+            text=(
+                "Prefill bootstrap is not ready "
+                f"({self.registered_count}/{self._expected_rank_count()} ranks)"
+            ),
+            status=503,
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1533,61 +1655,135 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
-        attn_tp_size = data["attn_tp_size"]
-        attn_tp_rank = data["attn_tp_rank"]
-        attn_cp_size = data["attn_cp_size"]
-        attn_cp_rank = data["attn_cp_rank"]
-        attn_dp_size = data["attn_dp_size"]
-        attn_dp_rank = data["attn_dp_rank"]
-        pp_size = data["pp_size"]
-        pp_rank = data["pp_rank"]
-        system_dp_size = data["system_dp_size"]
-        system_dp_rank = data["system_dp_rank"]
-        rank_ip = data["rank_ip"]
-        rank_port = int(data["rank_port"])
-        page_size = int(data["page_size"])
-        kv_cache_dtype = data["kv_cache_dtype"]
-        prefill_http_port = data.get("prefill_http_port")
-
-        if self.attn_tp_size is None:
-            self.attn_tp_size = attn_tp_size
-
-        if self.attn_cp_size is None:
-            self.attn_cp_size = attn_cp_size
-
-        if self.dp_size is None:
-            self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
-
-        if self.pp_size is None:
-            self.pp_size = pp_size
-
-        if self.page_size is None and page_size is not None:
-            self.page_size = page_size
-
-        if self.kv_cache_dtype is None and kv_cache_dtype is not None:
-            self.kv_cache_dtype = kv_cache_dtype
-
-        if self.prefill_http_port is None and prefill_http_port is not None:
-            self.prefill_http_port = int(prefill_http_port)
-
-        if self.follow_bootstrap_room is None:
-            load_balance_method = data.get(
-                "load_balance_method", "follow_bootstrap_room"
-            )
-            self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
-
-        if self.enable_dsa_cache_layer_split is None:
-            self.enable_dsa_cache_layer_split = bool(
-                data.get("enable_dsa_cache_layer_split", False)
+        try:
+            attn_tp_size = int(data["attn_tp_size"])
+            attn_tp_rank = int(data["attn_tp_rank"])
+            attn_cp_size = int(data["attn_cp_size"])
+            attn_cp_rank = int(data["attn_cp_rank"])
+            attn_dp_size = int(data["attn_dp_size"])
+            attn_dp_rank = int(data["attn_dp_rank"])
+            pp_size = int(data["pp_size"])
+            pp_rank = int(data["pp_rank"])
+            system_dp_size = int(data["system_dp_size"])
+            system_dp_rank = int(data["system_dp_rank"])
+            rank_port = int(data["rank_port"])
+            page_size = int(data["page_size"])
+            prefill_http_port = int(data["prefill_http_port"])
+        except (KeyError, TypeError, ValueError) as error:
+            return web.Response(
+                text=f"Invalid bootstrap registration: {error}",
+                status=400,
             )
 
-        if system_dp_size == 1:
-            dp_group = attn_dp_rank
-        else:
-            dp_group = system_dp_rank
+        rank_ip = data.get("rank_ip")
+        kv_cache_dtype = data.get("kv_cache_dtype")
+        load_balance_method = data.get(
+            "load_balance_method", "follow_bootstrap_room"
+        )
+        enable_dsa_cache_layer_split = data.get(
+            "enable_dsa_cache_layer_split", False
+        )
+        if type(rank_ip) is not str or len(rank_ip) == 0:
+            return web.Response(text="Invalid bootstrap rank_ip", status=400)
+        if type(kv_cache_dtype) is not str or len(kv_cache_dtype) == 0:
+            return web.Response(text="Invalid bootstrap kv_cache_dtype", status=400)
+        if type(load_balance_method) is not str:
+            return web.Response(
+                text="Invalid bootstrap load_balance_method",
+                status=400,
+            )
+        if type(enable_dsa_cache_layer_split) is not bool:
+            return web.Response(
+                text="Invalid bootstrap enable_dsa_cache_layer_split",
+                status=400,
+            )
 
-        # Add lock to make sure thread-safe
+        parallel_sizes = (
+            attn_tp_size,
+            attn_cp_size,
+            attn_dp_size,
+            pp_size,
+            system_dp_size,
+        )
+        if any(size <= 0 for size in parallel_sizes):
+            return web.Response(
+                text="Bootstrap parallel sizes must be positive",
+                status=400,
+            )
+        ranks_and_sizes = (
+            (attn_tp_rank, attn_tp_size),
+            (attn_cp_rank, attn_cp_size),
+            (attn_dp_rank, attn_dp_size),
+            (pp_rank, pp_size),
+            (system_dp_rank, system_dp_size),
+        )
+        if any(rank < 0 or rank >= size for rank, size in ranks_and_sizes):
+            return web.Response(
+                text="Bootstrap rank is outside its parallel dimension",
+                status=400,
+            )
+        if (
+            not 1 <= rank_port <= 65535
+            or not 1 <= prefill_http_port <= 65535
+            or page_size <= 0
+        ):
+            return web.Response(
+                text="Bootstrap ports and page_size must be positive and valid",
+                status=400,
+            )
+
+        dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
+        dp_group = attn_dp_rank if system_dp_size == 1 else system_dp_rank
+        follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+
         async with self.lock:
+            try:
+                resolved_attn_tp_size = _resolve_bootstrap_int(
+                    self.attn_tp_size, attn_tp_size, "attn_tp_size"
+                )
+                resolved_attn_cp_size = _resolve_bootstrap_int(
+                    self.attn_cp_size, attn_cp_size, "attn_cp_size"
+                )
+                resolved_dp_size = _resolve_bootstrap_int(
+                    self.dp_size, dp_size, "dp_size"
+                )
+                resolved_pp_size = _resolve_bootstrap_int(
+                    self.pp_size, pp_size, "pp_size"
+                )
+                resolved_page_size = _resolve_bootstrap_int(
+                    self.page_size, page_size, "page_size"
+                )
+                resolved_kv_cache_dtype = _resolve_bootstrap_str(
+                    self.kv_cache_dtype, kv_cache_dtype, "kv_cache_dtype"
+                )
+                resolved_prefill_http_port = _resolve_bootstrap_int(
+                    self.prefill_http_port,
+                    prefill_http_port,
+                    "prefill_http_port",
+                )
+                resolved_follow_bootstrap_room = _resolve_bootstrap_bool(
+                    self.follow_bootstrap_room,
+                    follow_bootstrap_room,
+                    "follow_bootstrap_room",
+                )
+                resolved_dsa_cache_layer_split = _resolve_bootstrap_bool(
+                    self.enable_dsa_cache_layer_split,
+                    enable_dsa_cache_layer_split,
+                    "enable_dsa_cache_layer_split",
+                )
+            except ValueError as error:
+                return web.Response(text=str(error), status=409)
+
+            self.attn_tp_size = resolved_attn_tp_size
+            self.attn_cp_size = resolved_attn_cp_size
+            self.dp_size = resolved_dp_size
+            self.pp_size = resolved_pp_size
+            self.page_size = resolved_page_size
+            self.kv_cache_dtype = resolved_kv_cache_dtype
+            self.prefill_http_port = resolved_prefill_http_port
+            self.follow_bootstrap_room = resolved_follow_bootstrap_room
+            self.enable_dsa_cache_layer_split = resolved_dsa_cache_layer_split
+
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
@@ -1596,13 +1792,24 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
+            self._registered_ranks.add(
+                (dp_group, attn_cp_rank, attn_tp_rank, pp_rank)
+            )
+            if self._is_ready():
+                self._ready_event.set()
 
-            self._registered_count += 1
-
-        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        expected = self._expected_rank_count()
         logger.debug(
-            f"Register prefill bootstrap: DP{dp_group} CP{attn_cp_rank} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
-            f" ({self._registered_count}/{expected} registered)"
+            "Register prefill bootstrap: DP%d CP%d TP%d PP%d at %s:%d "
+            "(%d/%s registered)",
+            dp_group,
+            attn_cp_rank,
+            attn_tp_rank,
+            pp_rank,
+            rank_ip,
+            rank_port,
+            self.registered_count,
+            expected,
         )
 
         return web.Response(text="OK", status=200)
@@ -1629,7 +1836,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             if not self._is_ready():
                 return web.Response(
                     text=f"Prefill server not fully registered yet"
-                    f" ({self._registered_count} workers registered).",
+                    f" ({self.registered_count} workers registered).",
                     status=503,
                 )
             info = PrefillServerInfo(
@@ -1652,7 +1859,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if not self._is_ready():
             return web.Response(
                 text=f"Prefill server not fully registered yet"
-                f" ({self._registered_count} workers registered).",
+                f" ({self.registered_count} workers registered).",
                 status=503,
             )
 
@@ -1718,7 +1925,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._loop.create_task(self._cleanup_expired_entries())
+            self._cleanup_task = self._loop.create_task(
+                self._cleanup_expired_entries()
+            )
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
@@ -1736,8 +1945,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
-            # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
+            if self._loop is None:
+                return
+            if self._cleanup_task is not None:
+                self._cleanup_task.cancel()
+                try:
+                    self._loop.run_until_complete(self._cleanup_task)
+                except asyncio.CancelledError:
+                    pass
+            if self._runner is not None:
+                self._loop.run_until_complete(self._runner.cleanup())
             self._loop.close()
 
     def close(self):
