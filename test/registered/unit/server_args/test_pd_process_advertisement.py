@@ -48,7 +48,11 @@ def _pd_args(**overrides: object) -> SimpleNamespace:
 
 
 class TestLaunchInstanceId(CustomTestCase):
-    def test_launch_uuid_is_stable_and_unique(self):
+    """Tests process-generation identity ownership."""
+
+    def test_launch_uuid_is_stable_and_unique(self) -> None:
+        """Each server configuration owns one stable, unique generation UUID."""
+
         first = ServerArgs(model_path="dummy")
         second = ServerArgs(model_path="dummy")
 
@@ -58,7 +62,9 @@ class TestLaunchInstanceId(CustomTestCase):
             str(uuid.UUID(first.launch_instance_id)), first.launch_instance_id
         )
 
-    def test_port_args_reuse_server_generation(self):
+    def test_port_args_reuse_server_generation(self) -> None:
+        """Child port configuration retains the server generation identity."""
+
         server_args = ServerArgs(model_path="dummy")
 
         with patch("sglang.srt.server_args.tempfile.NamedTemporaryFile") as temporary:
@@ -67,7 +73,9 @@ class TestLaunchInstanceId(CustomTestCase):
 
         self.assertEqual(ports.instance_id, server_args.launch_instance_id)
 
-    def test_launch_uuid_has_no_cli_surface(self):
+    def test_launch_uuid_has_no_cli_surface(self) -> None:
+        """Operators cannot override the implementation-owned generation UUID."""
+
         field = next(
             field
             for field in dataclasses.fields(ServerArgs)
@@ -78,7 +86,11 @@ class TestLaunchInstanceId(CustomTestCase):
 
 
 class TestPdProcessAdvertisement(CustomTestCase):
-    def test_prefill_advertisement_shape(self):
+    """Tests typed PD process capability advertisements."""
+
+    def test_prefill_advertisement_shape(self) -> None:
+        """A TP4 prefill publishes the complete validated capability contract."""
+
         advertisement = build_pd_process_advertisement(
             _pd_args(), runtime_capabilities=_CAPABILITIES
         )
@@ -104,7 +116,9 @@ class TestPdProcessAdvertisement(CustomTestCase):
             },
         )
 
-    def test_decode_advertisement_has_no_bootstrap_endpoint(self):
+    def test_decode_advertisement_has_no_bootstrap_endpoint(self) -> None:
+        """A TP1 decode advertisement cannot claim a prefill endpoint."""
+
         advertisement = build_pd_process_advertisement(
             _pd_args(
                 disaggregation_mode="decode",
@@ -117,7 +131,9 @@ class TestPdProcessAdvertisement(CustomTestCase):
         self.assertEqual(advertisement["role"], "decode")
         self.assertIsNone(advertisement["prefill_bootstrap_endpoint"])
 
-    def test_non_pd_server_has_no_advertisement(self):
+    def test_non_pd_server_has_no_advertisement(self) -> None:
+        """A regular server does not publish PD metadata."""
+
         self.assertIsNone(
             build_pd_process_advertisement(
                 _pd_args(disaggregation_mode="null"),
@@ -125,50 +141,68 @@ class TestPdProcessAdvertisement(CustomTestCase):
             )
         )
 
-    def test_pd_server_has_no_advertisement_without_runtime_capabilities(self):
+    def test_pd_server_has_no_advertisement_without_runtime_capabilities(self) -> None:
+        """Configuration alone cannot synthesize implementation capabilities."""
+
         self.assertIsNone(
             build_pd_process_advertisement(_pd_args(), runtime_capabilities=None)
         )
 
-    def test_missing_api_key_is_rejected(self):
+    def test_missing_api_key_is_rejected(self) -> None:
+        """PD metadata is unavailable without authenticated engine access."""
+
         with self.assertRaisesRegex(ValueError, "--api-key"):
             build_pd_process_advertisement(
                 _pd_args(api_key=None), runtime_capabilities=_CAPABILITIES
             )
 
-    def test_multiple_tokenizers_are_rejected(self):
+    def test_multiple_tokenizers_are_rejected(self) -> None:
+        """The current PD control contract requires one tokenizer process."""
+
         with self.assertRaisesRegex(ValueError, "--tokenizer-worker-num 1"):
             build_pd_process_advertisement(
                 _pd_args(tokenizer_worker_num=2),
                 runtime_capabilities=_CAPABILITIES,
             )
 
-    def test_invalid_fingerprints_are_rejected(self):
+    def test_invalid_fingerprints_are_rejected(self) -> None:
+        """Compatibility fingerprints must use canonical SHA-256 text."""
+
         for fingerprint in (None, "A" * 64, "a" * 63, "g" * 64):
-            with self.subTest(fingerprint=fingerprint):
-                with self.assertRaisesRegex(ValueError, "canonical lowercase"):
-                    build_pd_process_advertisement(
-                        _pd_args(pd_model_fingerprint=fingerprint),
-                        runtime_capabilities=_CAPABILITIES,
-                    )
+            with (
+                self.subTest(fingerprint=fingerprint),
+                self.assertRaisesRegex(ValueError, "canonical lowercase"),
+            ):
+                build_pd_process_advertisement(
+                    _pd_args(pd_model_fingerprint=fingerprint),
+                    runtime_capabilities=_CAPABILITIES,
+                )
 
-    def test_local_prefill_hosts_are_rejected(self):
+    def test_local_prefill_hosts_are_rejected(self) -> None:
+        """Prefill transfer authority must be reachable outside the process."""
+
         for host in ("localhost", "api.localhost", "127.0.0.1", "[::1]"):
-            with self.subTest(host=host):
-                with self.assertRaisesRegex(ValueError, "non-local|localhost"):
-                    build_pd_process_advertisement(
-                        _pd_args(pd_prefill_bootstrap_advertise_host=host),
-                        runtime_capabilities=_CAPABILITIES,
-                    )
+            with (
+                self.subTest(host=host),
+                self.assertRaisesRegex(ValueError, "non-local|localhost"),
+            ):
+                build_pd_process_advertisement(
+                    _pd_args(pd_prefill_bootstrap_advertise_host=host),
+                    runtime_capabilities=_CAPABILITIES,
+                )
 
-    def test_decode_bootstrap_host_is_rejected(self):
+    def test_decode_bootstrap_host_is_rejected(self) -> None:
+        """Decode processes cannot advertise prefill bootstrap authority."""
+
         with self.assertRaisesRegex(ValueError, "decode processes"):
             build_pd_process_advertisement(
                 _pd_args(disaggregation_mode="decode"),
                 runtime_capabilities=_CAPABILITIES,
             )
 
-    def test_runtime_kv_dtype_is_required(self):
+    def test_runtime_kv_dtype_is_required(self) -> None:
+        """An unresolved KV dtype cannot enter compatibility metadata."""
+
         with self.assertRaisesRegex(ValueError, "runtime KV dtype"):
             build_pd_process_advertisement(
                 _pd_args(),
@@ -177,7 +211,9 @@ class TestPdProcessAdvertisement(CustomTestCase):
                 ),
             )
 
-    def test_resolved_page_size_is_required(self):
+    def test_resolved_page_size_is_required(self) -> None:
+        """An unresolved page size cannot enter compatibility metadata."""
+
         with self.assertRaisesRegex(ValueError, "resolved positive page_size"):
             build_pd_process_advertisement(
                 _pd_args(),

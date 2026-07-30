@@ -3613,7 +3613,7 @@ class ServerArgs:
 
         materialize_declarations(self)
 
-    def _handle_launch_instance_id(self):
+    def _handle_launch_instance_id(self) -> None:
         """Validate the process-generation UUID shared by all engine processes."""
         try:
             launch_instance_id = uuid.UUID(self.launch_instance_id)
@@ -3761,8 +3761,12 @@ class ServerArgs:
 
     def pd_process_advertisement(
         self, runtime_capabilities: PdProcessRuntimeCapabilities | None
-    ) -> Optional[dict[str, Any]]:
-        """Return the validated PD process-generation advertisement."""
+    ) -> dict[str, Any] | None:
+        """Return the validated PD process-generation advertisement.
+
+        :param runtime_capabilities: Runtime-proven transfer and control capabilities.
+        :returns: The advertisement for a PD process, otherwise ``None``.
+        """
         return build_pd_process_advertisement(
             self, runtime_capabilities=runtime_capabilities
         )

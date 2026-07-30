@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import ipaddress
 import logging
 import os
@@ -94,13 +92,14 @@ def _validate_bootstrap_host(value: str | None) -> str:
 
 
 def build_pd_process_advertisement(
-    server_args: ServerArgs,
+    server_args: "ServerArgs",
     *,
     runtime_capabilities: PdProcessRuntimeCapabilities | None,
 ) -> dict[str, object] | None:
     """Build the versioned PD process-generation capability contract.
 
     :param server_args: Fully resolved server configuration.
+    :param runtime_capabilities: Runtime-proven transfer and control capabilities.
     :returns: The advertisement for a PD process, otherwise ``None``.
     """
     if server_args.disaggregation_mode not in ("prefill", "decode"):
@@ -150,7 +149,8 @@ def build_pd_process_advertisement(
         raise ValueError("PD process advertisement requires a positive tp_size")
     if server_args.dp_size != 1:
         raise ValueError(
-            f"PD process advertisement supports only DP1, received DP{server_args.dp_size}"
+            "PD process advertisement supports only DP1, "
+            f"received DP{server_args.dp_size}"
         )
 
     bootstrap_endpoint = None
@@ -187,8 +187,11 @@ def build_pd_process_advertisement(
     }
 
 
-def handle_pd_disaggregation(server_args: ServerArgs) -> None:
-    """Validate and normalize PD-disaggregation server args."""
+def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
+    """Validate and normalize PD-disaggregation server args.
+
+    :param server_args: Fully resolved server configuration.
+    """
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -251,13 +254,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             server_args.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
-    if server_args.disaggregation_mode in ("prefill", "decode"):
-        if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
-        ):
-            raise ValueError(
-                f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                f"disaggregation_transfer_backend='mooncake' or 'nixl', "
-                f"got '{server_args.disaggregation_transfer_backend}'."
-            )
+    if (
+        server_args.disaggregation_mode in ("prefill", "decode")
+        and envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
+    ):
+        raise ValueError(
+            f"SGLANG_DISAGG_STAGING_BUFFER requires "
+            f"disaggregation_transfer_backend='mooncake' or 'nixl', "
+            f"got '{server_args.disaggregation_transfer_backend}'."
+        )
