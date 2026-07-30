@@ -293,7 +293,10 @@ pub enum DecoderAvailability {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDisposition {
     Terminal,
+    /// Retry without changing the selected decoder's eligibility.
     Retryable,
+    /// Retry after excluding the selected decoder from this request chain.
+    DecoderFailed,
 }
 
 /// Current lifecycle of an issued cohort.
@@ -1085,6 +1088,9 @@ impl DecoderPool {
                     chain.failed_decoders.clear();
                 }
                 RetryDisposition::Retryable => {
+                    debug_assert_eq!(chain.phase, RequestChainPhase::Open);
+                }
+                RetryDisposition::DecoderFailed => {
                     chain.failed_decoders.insert(record.decoder_id);
                 }
             }
@@ -1392,7 +1398,7 @@ mod tests {
         let mut first_owner = pool.begin_request("reused-id").unwrap();
         let first = pool.reserve(&first_owner, scalar_demand()).unwrap();
         let failed_decoder = first.decoder_id().clone();
-        pool.finish_before_dispatch(first, RetryDisposition::Retryable)
+        pool.finish_before_dispatch(first, RetryDisposition::DecoderFailed)
             .unwrap();
         pool.finalize_request(&mut first_owner).unwrap();
 
@@ -1427,7 +1433,7 @@ mod tests {
         let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
         drop(owner);
         assert_eq!(pool.snapshot().active_logical_requests, 1);
-        pool.finish_before_dispatch(cohort, RetryDisposition::Retryable)
+        pool.finish_before_dispatch(cohort, RetryDisposition::DecoderFailed)
             .unwrap();
         assert_eq!(pool.snapshot().active_logical_requests, 0);
         let replacement = pool.begin_request("request").unwrap();
@@ -1437,12 +1443,28 @@ mod tests {
     }
 
     #[test]
+    fn retryable_non_decoder_failure_preserves_destination_eligibility() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let first = pool.reserve(&owner, scalar_demand()).unwrap();
+        let decoder_id = first.decoder_id().clone();
+        pool.finish_before_dispatch(first, RetryDisposition::Retryable)
+            .unwrap();
+
+        let retry = pool.reserve(&owner, scalar_demand()).unwrap();
+        assert_eq!(retry.decoder_id(), &decoder_id);
+        pool.finish_before_dispatch(retry, RetryDisposition::Terminal)
+            .unwrap();
+    }
+
+    #[test]
     fn exhausted_retry_chain_is_explicit_and_finalizable() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let mut owner = pool.begin_request("request").unwrap();
         let cohort = pool.reserve(&owner, scalar_demand()).unwrap();
-        pool.finish_before_dispatch(cohort, RetryDisposition::Retryable)
+        pool.finish_before_dispatch(cohort, RetryDisposition::DecoderFailed)
             .unwrap();
         assert_eq!(
             pool.reserve(&owner, scalar_demand()).unwrap_err(),
@@ -1476,7 +1498,7 @@ mod tests {
         let retry_owner = pool.begin_request("retry").unwrap();
         let failed = pool.reserve(&retry_owner, scalar_demand()).unwrap();
         let failed_decoder = failed.decoder_id().clone();
-        pool.finish_before_dispatch(failed, RetryDisposition::Retryable)
+        pool.finish_before_dispatch(failed, RetryDisposition::DecoderFailed)
             .unwrap();
         pool.set_availability(&failed_decoder, DecoderAvailability::Draining)
             .unwrap();
