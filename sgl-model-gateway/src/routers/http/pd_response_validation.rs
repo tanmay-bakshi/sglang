@@ -12,9 +12,14 @@ pub(crate) enum GenerateResponseExpectation<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct OpenAiResponseExpectation<'a> {
+pub(crate) struct ChatResponseExpectation<'a> {
     pub(crate) request_id: &'a str,
     pub(crate) choice_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompletionResponseExpectation<'a> {
+    pub(crate) child_ids: &'a [String],
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -85,9 +90,18 @@ pub(crate) fn validate_generate_response(
 pub(crate) fn validate_chat_completion_response(
     body: &[u8],
     max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
+    expectation: ChatResponseExpectation<'_>,
 ) -> Result<(), ResponseValidationError> {
-    validate_openai_response(body, max_response_bytes, expectation, "chat.completion")
+    if expectation.choice_count == 0 {
+        return Err(ResponseValidationError::InvalidExpectation);
+    }
+    let value = parse_bounded_json(body, max_response_bytes)?;
+    let (object, response_id) = validate_openai_identity(&value)?;
+    if response_id != expectation.request_id {
+        return Err(ResponseValidationError::WrongRequestId);
+    }
+    let choices = validate_openai_shape(object, "chat.completion")?;
+    validate_canonical_choices(choices, expectation.choice_count, "chat.completion")
 }
 
 pub(crate) fn validate_generate_stream_event(
@@ -129,50 +143,93 @@ pub(crate) fn validate_generate_stream_event(
 pub(crate) fn validate_chat_completion_stream_event(
     payload: &[u8],
     max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
+    expectation: ChatResponseExpectation<'_>,
 ) -> Result<(), ResponseValidationError> {
-    validate_openai_stream_event(
-        payload,
-        max_response_bytes,
-        expectation,
-        "chat.completion.chunk",
-    )
+    if expectation.choice_count == 0 {
+        return Err(ResponseValidationError::InvalidExpectation);
+    }
+    let value = parse_bounded_json(payload, max_response_bytes)?;
+    let (object, response_id) = validate_openai_identity(&value)?;
+    if response_id != expectation.request_id {
+        return Err(ResponseValidationError::WrongRequestId);
+    }
+    let choices = validate_openai_shape(object, "chat.completion.chunk")?;
+    validate_stream_choices(choices, expectation.choice_count, "chat.completion.chunk")?;
+    Ok(())
 }
 
 pub(crate) fn validate_completion_stream_event(
     payload: &[u8],
     max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
+    expectation: CompletionResponseExpectation<'_>,
 ) -> Result<(), ResponseValidationError> {
-    validate_openai_stream_event(payload, max_response_bytes, expectation, "text_completion")
+    validate_expected_child_ids(expectation.child_ids)?;
+    let value = parse_bounded_json(payload, max_response_bytes)?;
+    let (object, response_id) = validate_openai_identity(&value)?;
+    let choices = validate_openai_shape(object, "text_completion")?;
+    if choices.is_empty() {
+        if !expectation
+            .child_ids
+            .iter()
+            .any(|child_id| child_id == response_id)
+        {
+            return Err(ResponseValidationError::WrongChildIds);
+        }
+        return Ok(());
+    }
+
+    let mut previous_index = None;
+    for choice in choices {
+        let choice = choice
+            .as_object()
+            .ok_or(ResponseValidationError::WrongFieldType("choices[]"))?;
+        let index = required_index(choice, "index", "choices[].index")?;
+        if previous_index.is_some_and(|previous| index <= previous) {
+            return Err(ResponseValidationError::InvalidChoiceIndices);
+        }
+        let expected_id = expectation
+            .child_ids
+            .get(index)
+            .ok_or(ResponseValidationError::InvalidChoiceIndices)?;
+        if response_id != expected_id {
+            return Err(ResponseValidationError::WrongChildIds);
+        }
+        validate_openai_choice_shape(choice, "text_completion", true)?;
+        previous_index = Some(index);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_completion_response(
     body: &[u8],
     max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
+    expectation: CompletionResponseExpectation<'_>,
 ) -> Result<(), ResponseValidationError> {
-    validate_openai_response(body, max_response_bytes, expectation, "text_completion")
+    validate_expected_child_ids(expectation.child_ids)?;
+    let value = parse_bounded_json(body, max_response_bytes)?;
+    let (object, response_id) = validate_openai_identity(&value)?;
+    if response_id != expectation.child_ids[0] {
+        return Err(ResponseValidationError::WrongChildIds);
+    }
+    let choices = validate_openai_shape(object, "text_completion")?;
+    validate_canonical_choices(choices, expectation.child_ids.len(), "text_completion")
 }
 
-fn validate_openai_stream_event(
-    payload: &[u8],
-    max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
-    expected_object: &'static str,
-) -> Result<(), ResponseValidationError> {
-    if expectation.choice_count == 0 {
-        return Err(ResponseValidationError::InvalidExpectation);
-    }
-
-    let value = parse_bounded_json(payload, max_response_bytes)?;
+fn validate_openai_identity(
+    value: &Value,
+) -> Result<(&Map<String, Value>, &str), ResponseValidationError> {
     let object = value
         .as_object()
         .ok_or(ResponseValidationError::WrongTopLevelShape)?;
     reject_error_envelope(object)?;
-    if required_string(object, "id")? != expectation.request_id {
-        return Err(ResponseValidationError::WrongRequestId);
-    }
+    let response_id = required_string(object, "id")?;
+    Ok((object, response_id))
+}
+
+fn validate_openai_shape<'a>(
+    object: &'a Map<String, Value>,
+    expected_object: &'static str,
+) -> Result<&'a [Value], ResponseValidationError> {
     if required_string(object, "object")? != expected_object {
         return Err(ResponseValidationError::WrongFieldType("object"));
     }
@@ -184,15 +241,21 @@ fn validate_openai_stream_event(
         .ok_or(ResponseValidationError::MissingField("choices"))?
         .as_array()
         .ok_or(ResponseValidationError::WrongFieldType("choices"))?;
+    Ok(choices)
+}
+
+fn validate_stream_choices(
+    choices: &[Value],
+    choice_count: usize,
+    expected_object: &'static str,
+) -> Result<(), ResponseValidationError> {
     let mut previous_index = None;
     for choice in choices {
         let choice = choice
             .as_object()
             .ok_or(ResponseValidationError::WrongFieldType("choices[]"))?;
         let index = required_index(choice, "index", "choices[].index")?;
-        if index >= expectation.choice_count
-            || previous_index.is_some_and(|previous| index <= previous)
-        {
+        if index >= choice_count || previous_index.is_some_and(|previous| index <= previous) {
             return Err(ResponseValidationError::InvalidChoiceIndices);
         }
         validate_openai_choice_shape(choice, expected_object, true)?;
@@ -201,38 +264,12 @@ fn validate_openai_stream_event(
     Ok(())
 }
 
-fn validate_openai_response(
-    body: &[u8],
-    max_response_bytes: usize,
-    expectation: OpenAiResponseExpectation<'_>,
+fn validate_canonical_choices(
+    choices: &[Value],
+    choice_count: usize,
     expected_object: &'static str,
 ) -> Result<(), ResponseValidationError> {
-    if expectation.choice_count == 0 {
-        return Err(ResponseValidationError::InvalidExpectation);
-    }
-
-    let value = parse_bounded_json(body, max_response_bytes)?;
-    let object = value
-        .as_object()
-        .ok_or(ResponseValidationError::WrongTopLevelShape)?;
-    reject_error_envelope(object)?;
-
-    let request_id = required_string(object, "id")?;
-    if request_id != expectation.request_id {
-        return Err(ResponseValidationError::WrongRequestId);
-    }
-    if required_string(object, "object")? != expected_object {
-        return Err(ResponseValidationError::WrongFieldType("object"));
-    }
-    required_u64(object, "created")?;
-    required_string(object, "model")?;
-
-    let choices = object
-        .get("choices")
-        .ok_or(ResponseValidationError::MissingField("choices"))?
-        .as_array()
-        .ok_or(ResponseValidationError::WrongFieldType("choices"))?;
-    if choices.len() != expectation.choice_count {
+    if choices.len() != choice_count {
         return Err(ResponseValidationError::WrongChoiceCount);
     }
 
@@ -254,7 +291,7 @@ fn validate_openai_response(
 }
 
 fn validate_expected_child_ids(child_ids: &[String]) -> Result<(), ResponseValidationError> {
-    if child_ids.is_empty() {
+    if child_ids.is_empty() || child_ids.iter().any(|child_id| child_id.is_empty()) {
         return Err(ResponseValidationError::InvalidExpectation);
     }
     let mut unique = std::collections::HashSet::with_capacity(child_ids.len());
@@ -491,8 +528,8 @@ mod tests {
     use super::{
         validate_chat_completion_response, validate_chat_completion_stream_event,
         validate_completion_response, validate_completion_stream_event, validate_generate_response,
-        validate_generate_stream_event, GenerateResponseExpectation, OpenAiResponseExpectation,
-        ResponseValidationError,
+        validate_generate_stream_event, ChatResponseExpectation, CompletionResponseExpectation,
+        GenerateResponseExpectation, ResponseValidationError,
     };
 
     const LIMIT: usize = 4_096;
@@ -503,14 +540,18 @@ mod tests {
         )
     }
 
-    fn openai_expectation<'a>(
+    fn chat_expectation<'a>(
         request_id: &'a str,
         choice_count: usize,
-    ) -> OpenAiResponseExpectation<'a> {
-        OpenAiResponseExpectation {
+    ) -> ChatResponseExpectation<'a> {
+        ChatResponseExpectation {
             request_id,
             choice_count,
         }
+    }
+
+    fn completion_expectation(child_ids: &[String]) -> CompletionResponseExpectation<'_> {
+        CompletionResponseExpectation { child_ids }
     }
 
     #[test]
@@ -649,7 +690,7 @@ mod tests {
             ],
             "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
         }"#;
-        validate_chat_completion_response(chat, LIMIT, openai_expectation("chat-id", 2)).unwrap();
+        validate_chat_completion_response(chat, LIMIT, chat_expectation("chat-id", 2)).unwrap();
 
         let completion = br#"{
             "id":"completion-id",
@@ -658,7 +699,8 @@ mod tests {
             "model":"model",
             "choices":[{"index":0,"text":"ok","finish_reason":"stop"}]
         }"#;
-        validate_completion_response(completion, LIMIT, openai_expectation("completion-id", 1))
+        let completion_ids = vec!["completion-id".to_owned()];
+        validate_completion_response(completion, LIMIT, completion_expectation(&completion_ids))
             .unwrap();
     }
 
@@ -691,9 +733,9 @@ mod tests {
             "model":"model",
             "choices":[{"index":1,"delta":{"content":"ok"}}]
         }"#;
-        validate_chat_completion_stream_event(chat, LIMIT, openai_expectation("chat-id", 2))
-            .unwrap();
+        validate_chat_completion_stream_event(chat, LIMIT, chat_expectation("chat-id", 2)).unwrap();
 
+        let completion_ids = vec!["completion-a".to_owned(), "completion-id".to_owned()];
         let completion = br#"{
             "id":"completion-id",
             "object":"text_completion",
@@ -702,8 +744,136 @@ mod tests {
             "choices":[],
             "usage":{}
         }"#;
-        validate_completion_stream_event(completion, LIMIT, openai_expectation("completion-id", 2))
+        validate_completion_stream_event(
+            completion,
+            LIMIT,
+            completion_expectation(&completion_ids),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validates_ordered_completion_child_ids_for_non_stream_responses() {
+        let child_ids = vec!["child-a".to_owned(), "child-b".to_owned()];
+        let response = br#"{
+            "id":"child-a",
+            "object":"text_completion",
+            "created":1,
+            "model":"model",
+            "choices":[
+                {"index":0,"text":"first","finish_reason":"stop"},
+                {"index":1,"text":"second","finish_reason":"stop"}
+            ]
+        }"#;
+        validate_completion_response(response, LIMIT, completion_expectation(&child_ids)).unwrap();
+
+        let wrong_response_id = br#"{
+            "id":"child-b",
+            "object":"text_completion",
+            "created":1,
+            "model":"model",
+            "choices":[
+                {"index":0,"text":"first"},
+                {"index":1,"text":"second"}
+            ]
+        }"#;
+        assert_eq!(
+            validate_completion_response(
+                wrong_response_id,
+                LIMIT,
+                completion_expectation(&child_ids),
+            ),
+            Err(ResponseValidationError::WrongChildIds)
+        );
+
+        let wrong_choice_count = br#"{
+            "id":"child-a",
+            "object":"text_completion",
+            "created":1,
+            "model":"model",
+            "choices":[{"index":0,"text":"first"}]
+        }"#;
+        assert_eq!(
+            validate_completion_response(
+                wrong_choice_count,
+                LIMIT,
+                completion_expectation(&child_ids),
+            ),
+            Err(ResponseValidationError::WrongChoiceCount)
+        );
+
+        let noncanonical_indices = br#"{
+            "id":"child-a",
+            "object":"text_completion",
+            "created":1,
+            "model":"model",
+            "choices":[
+                {"index":0,"text":"first"},
+                {"index":2,"text":"second"}
+            ]
+        }"#;
+        assert_eq!(
+            validate_completion_response(
+                noncanonical_indices,
+                LIMIT,
+                completion_expectation(&child_ids),
+            ),
+            Err(ResponseValidationError::InvalidChoiceIndices)
+        );
+    }
+
+    #[test]
+    fn validates_per_child_completion_stream_ids_and_response_level_events() {
+        let child_ids = vec!["child-a".to_owned(), "child-b".to_owned()];
+        for event in [
+            br#"{"id":"child-a","object":"text_completion","created":1,"model":"model","choices":[{"index":0,"text":"a"}]}"#.as_slice(),
+            br#"{"id":"child-b","object":"text_completion","created":1,"model":"model","choices":[{"index":1,"text":"b"}]}"#,
+            br#"{"id":"child-a","object":"text_completion","created":1,"model":"model","choices":[],"usage":{"prompt_tokens":2}}"#,
+            br#"{"id":"child-b","object":"text_completion","created":1,"model":"model","choices":[],"usage":{"prompt_tokens":2}}"#,
+        ] {
+            validate_completion_stream_event(
+                event,
+                LIMIT,
+                completion_expectation(&child_ids),
+            )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_completion_stream_ids_that_do_not_match_choice_indices() {
+        let child_ids = vec!["child-a".to_owned(), "child-b".to_owned()];
+        for event in [
+            br#"{"id":"child-a","object":"text_completion","created":1,"model":"model","choices":[{"index":1,"text":"wrong child"}]}"#.as_slice(),
+            br#"{"id":"child-a","object":"text_completion","created":1,"model":"model","choices":[{"index":0,"text":"a"},{"index":1,"text":"b"}]}"#,
+            br#"{"id":"unknown","object":"text_completion","created":1,"model":"model","choices":[]}"#,
+            br#"{"id":"child-b","object":"text_completion","created":1,"model":"model","choices":[{"index":2,"text":"out of range"}]}"#,
+        ] {
+            assert!(validate_completion_stream_event(
+                event,
+                LIMIT,
+                completion_expectation(&child_ids),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_empty_or_duplicate_completion_expectations() {
+        for child_ids in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["child".to_owned(), "child".to_owned()],
+        ] {
+            assert_eq!(
+                validate_completion_response(b"{}", LIMIT, completion_expectation(&child_ids),),
+                Err(ResponseValidationError::InvalidExpectation)
+            );
+            assert_eq!(
+                validate_completion_stream_event(b"{}", LIMIT, completion_expectation(&child_ids),),
+                Err(ResponseValidationError::InvalidExpectation)
+            );
+        }
     }
 
     #[test]
@@ -743,37 +913,34 @@ mod tests {
             br#"{"id":"id","object":"chat.completion.chunk","choices":[{"index":1},{"index":0}]}"#,
             br#"{"error":{"message":"failed"}}"#,
         ] {
-            assert!(validate_chat_completion_stream_event(
-                body,
-                LIMIT,
-                openai_expectation("id", 2)
-            )
-            .is_err());
+            assert!(
+                validate_chat_completion_stream_event(body, LIMIT, chat_expectation("id", 2))
+                    .is_err()
+            );
         }
 
         let chat_chunk = br#"{"id":"id","object":"chat.completion.chunk","choices":[{"index":0}]}"#;
-        assert!(
-            validate_completion_stream_event(chat_chunk, LIMIT, openai_expectation("id", 1))
-                .is_err()
-        );
+        let completion_ids = vec!["id".to_owned()];
+        assert!(validate_completion_stream_event(
+            chat_chunk,
+            LIMIT,
+            completion_expectation(&completion_ids),
+        )
+        .is_err());
     }
 
     #[test]
     fn rejects_wrong_openai_object_and_request_id() {
         let wrong_id = br#"{"id":"wrong","object":"chat.completion","choices":[{"index":0}]}"#;
         assert_eq!(
-            validate_chat_completion_response(wrong_id, LIMIT, openai_expectation("expected", 1)),
+            validate_chat_completion_response(wrong_id, LIMIT, chat_expectation("expected", 1)),
             Err(ResponseValidationError::WrongRequestId)
         );
 
         let wrong_object =
             br#"{"id":"expected","object":"text_completion","choices":[{"index":0}]}"#;
         assert_eq!(
-            validate_chat_completion_response(
-                wrong_object,
-                LIMIT,
-                openai_expectation("expected", 1)
-            ),
+            validate_chat_completion_response(wrong_object, LIMIT, chat_expectation("expected", 1)),
             Err(ResponseValidationError::WrongFieldType("object"))
         );
     }
@@ -786,7 +953,7 @@ mod tests {
             br#"{"id":"id","object":"chat.completion","created":1,"model":"model","choices":[{"index":0},{"index":1},{"index":2}]}"#,
         ] {
             assert_eq!(
-                validate_chat_completion_response(body, LIMIT, openai_expectation("id", 2)),
+                validate_chat_completion_response(body, LIMIT, chat_expectation("id", 2)),
                 Err(ResponseValidationError::WrongChoiceCount)
             );
         }
@@ -798,7 +965,7 @@ mod tests {
             br#"{"id":"id","object":"chat.completion","created":1,"model":"model","choices":[{"index":0},{"index":2}]}"#,
         ] {
             assert!(
-                validate_chat_completion_response(body, LIMIT, openai_expectation("id", 2))
+                validate_chat_completion_response(body, LIMIT, chat_expectation("id", 2))
                     .is_err()
             );
         }
@@ -806,7 +973,7 @@ mod tests {
         let body =
             br#"{"id":"id","object":"chat.completion","created":1,"model":"model","choices":[]}"#;
         assert_eq!(
-            validate_chat_completion_response(body, LIMIT, openai_expectation("id", 0)),
+            validate_chat_completion_response(body, LIMIT, chat_expectation("id", 0)),
             Err(ResponseValidationError::InvalidExpectation)
         );
     }
@@ -823,11 +990,12 @@ mod tests {
             Err(ResponseValidationError::StructuredError)
         );
         assert_eq!(
-            validate_chat_completion_response(error, LIMIT, openai_expectation("id", 1)),
+            validate_chat_completion_response(error, LIMIT, chat_expectation("id", 1)),
             Err(ResponseValidationError::StructuredError)
         );
+        let completion_ids = vec!["id".to_owned()];
         assert_eq!(
-            validate_completion_response(error, LIMIT, openai_expectation("id", 1)),
+            validate_completion_response(error, LIMIT, completion_expectation(&completion_ids)),
             Err(ResponseValidationError::StructuredError)
         );
     }
