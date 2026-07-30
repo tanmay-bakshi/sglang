@@ -25,13 +25,18 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+from collections.abc import Set as AbstractSet
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
-from torch.profiler import record_function
-
 from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPin,
+    AllocationPinnedError,
+    AllocationPinRegistry,
+    AllocationPinSnapshot,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
@@ -40,6 +45,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
+from torch.profiler import record_function
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +130,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         )
         self.unified_buffer = unified_buffer
         self.sub_pool_name = sub_pool_name
+        self._allocation_pin_registry = AllocationPinRegistry(
+            f"{type(self).__name__}({sub_pool_name})"
+        )
+        self._physical_pages_by_pin: dict[AllocationPin, tuple[int, ...]] = {}
+        self._pinned_physical_pages: frozenset[int] = frozenset()
         self.spec = spec
         self.max_slots = max_slots
         self.grow_direction = spec.grow_direction
@@ -255,6 +266,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def clear(self) -> None:
         """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        self._assert_allocation_resettable("clear")
         if self.grow_direction == "up":
             self.watermark_physical = self.min_page_index
         else:
@@ -295,6 +307,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def restore_state(self, state):
+        self._assert_allocation_resettable("restore allocator state")
         watermark, n_free_virtual, n_inverse = state
         self.watermark_physical = watermark
         if self.is_id_owner and n_free_virtual is not None:
@@ -324,15 +337,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return max(0, self.num_pages - 1 - self.watermark_physical)
 
     def allocated_count(self) -> int:
-        """LIVE allocated TOKENS (excludes lazy holes / pending).
+        """LIVE allocated TOKENS (excludes holes and pending reuse).
 
         TOKENS, not pages — the leak checker's invariant is in tokens. Lazy mode
         uses `live_page_count` (invariant under compaction); the watermark span
-        over-counts because holes/pending sit inside it but aren't live.
+        over-counts because holes/pending sit inside it but aren't live. Eager
+        mode can temporarily retain holes when a pinned survivor prevents
+        physical compaction, so those holes are subtracted from its span.
         """
         if self.lazy_compaction:
             return self.live_page_count * self.page_size
-        return self._allocated_pages() * self.page_size
+        live_pages = self._allocated_pages() - int(
+            self._free_phys_pages.shape[0]
+        )
+        return live_pages * self.page_size
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
@@ -390,8 +408,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.num_pages - self.min_page_index - self._allocated_pages()
         )
         pages_extend = min(pages_by_bytes, pages_by_index_space)
-        # Lazy: drainable holes don't consume new bytes.
-        pages_drain = len(self._free_phys_pages) if self.lazy_compaction else 0
+        # Drainable holes do not consume new bytes. Eager mode normally has no
+        # holes, but pinned survivors can force temporary frontier retention.
+        pages_drain = len(self._free_phys_pages)
         return (pages_extend + pages_drain) * self.page_size
 
     def available_size(self) -> int:
@@ -407,7 +426,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         count — NOT `_pending_reuse` (awaiting an event) — so the credit is realizable.
         """
         peer = self._peer
-        if peer is None or not peer.lazy_compaction:
+        if peer is None:
+            return 0
+        if peer._allocation_pin_registry.has_live_pins():
             return 0
         return len(peer._free_phys_pages) * peer.entry_bytes_per_page
 
@@ -421,9 +442,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """One urgent peer-flush on alloc shortfall; returns whether THIS side now
         has enough. Only PEER compaction releases gap bytes (own compaction is net 0).
         """
-        if not (self.lazy_compaction and self._peer is not None):
+        if self._peer is None:
             return False
-        self._peer._flush(urgent=True)
+        if self._peer.lazy_compaction:
+            self._peer._flush(urgent=True)
+        elif self._peer._free_phys_pages.numel() > 0:
+            self._peer._compact_pending_impl(
+                torch.empty(
+                    0,
+                    dtype=torch.int64,
+                    device=self._peer.device,
+                )
+            )
         return need_tokens <= self.available_size()
 
     # -- physical-slot / physical-page primitives --
@@ -432,7 +462,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Reserve `need_size` TOKENS (multiple of page_size), returning backing
         physical PAGE ids, or `None` on shortfall.
 
-        Eager: pure watermark advance. Lazy: drain `_free_phys_pages` holes first,
+        Eager normally advances the watermark directly. Both modes drain
+        `_free_phys_pages` first when pin-aware compaction has retained holes,
         then extend the watermark (extend first so state is untouched on failure).
         """
         with record_function("MultiEndedAlloc.take_physical"):
@@ -444,11 +475,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
             num_pages = need_size // self.page_size
 
-            if not self.lazy_compaction:
+            if (
+                not self.lazy_compaction
+                and self._free_phys_pages.numel() == 0
+            ):
                 return self._take_physical_eager(num_pages)
 
-            # Lazy: slice the GPU free list (no D2H). sort ON: take deepest-in-band
-            # per direction (greedy clustering). sort OFF: take from front.
+            # Slice the GPU free list (no D2H). sort ON: take deepest-in-band per
+            # direction (greedy clustering). sort OFF: take from front.
             n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
             need_more = num_pages - n_drain
 
@@ -471,7 +505,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             else:
                 drained_t = None
 
-            self.live_page_count += num_pages
+            if self.lazy_compaction:
+                self.live_page_count += num_pages
 
             if drained_t is None:
                 return self._take_physical_arange(num_pages)
@@ -601,8 +636,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
 
-            # FAST PATH: eager, or lazy with no current holes.
-            if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
+            # FAST PATH: no current holes. Eager mode can retain holes only while
+            # pinned survivors prevent frontier compaction, and must drain them
+            # through the slow path just like lazy mode.
+            if self._free_phys_pages.numel() == 0:
                 start_wm = self.watermark_physical  # kernel's `start_phys`
 
                 # Lazy uses `_extend_watermark` (index + peer checks); eager
@@ -921,6 +958,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
+            self._assert_allocation_indices_reusable(free_index)
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
                 return
@@ -946,6 +984,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         free_v=free_v_pages, freed_p=freed_p_pages
                     )
             self.virtual_to_physical[free_v_pages] = -1
+            self.physical_to_virtual[freed_p_pages] = -1
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
@@ -1007,90 +1046,113 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        freed_set = set(int(x) for x in freed_physical_pages.tolist())
-        if not freed_set:
+        freed_list = [
+            int(page) for page in freed_physical_pages.tolist()
+        ]
+        existing_hole_list = [
+            int(page) for page in self._free_phys_pages.tolist()
+        ]
+        freed = set(freed_list)
+        existing_holes = set(existing_hole_list)
+        if len(freed) == 0 and len(existing_holes) == 0:
             return
-        K = len(freed_set)
+        if len(freed) != len(freed_list):
+            raise AssertionError("eager compaction received duplicate freed pages")
+        if len(existing_holes) != len(existing_hole_list):
+            raise AssertionError("eager compaction free-page list contains duplicates")
+        if len(freed & existing_holes) > 0:
+            raise AssertionError("eager compaction received an already-free page")
         if self.grow_direction == "up":
-            # allocated == [min_page_index, old_wm); after the free == [min_page_index, new_wm)
-            old_wm = self.watermark_physical
-            new_wm = old_wm - K
-            assert new_wm >= self.min_page_index, (
-                f"_compact_pending({self.sub_pool_name!r}): freeing {K} pages "
-                f"would push the watermark below min_page_index "
-                f"({new_wm} < {self.min_page_index})"
+            in_active_band = all(
+                self.min_page_index <= page < self.watermark_physical
+                for page in freed | existing_holes
             )
-            assert all(self.min_page_index <= h < old_wm for h in freed_set), (
-                f"_compact_pending({self.sub_pool_name!r}): freed physical pages "
-                f"{sorted(freed_set)} not all within allocated range "
-                f"[{self.min_page_index}, {old_wm})"
-            )
-            # vacated band = [new_wm, old_wm); kept band = [min_page_index, new_wm)
-            src_list = [s for s in range(new_wm, old_wm) if s not in freed_set]
-            dst_list = sorted(h for h in freed_set if h < new_wm)
-            self.watermark_physical = new_wm
-            vacated_lo, vacated_hi = new_wm, old_wm
         else:
-            # allocated == (old_wm, num_pages); after the free == (new_wm, num_pages)
-            old_wm = self.watermark_physical
-            new_wm = old_wm + K
-            assert new_wm <= self.num_pages - 1, (
-                f"_compact_pending({self.sub_pool_name!r}): freeing {K} pages "
-                f"would push the watermark above num_pages "
-                f"({new_wm} > {self.num_pages - 1})"
+            in_active_band = all(
+                self.watermark_physical < page < self.num_pages
+                for page in freed | existing_holes
             )
-            assert all(old_wm < h < self.num_pages for h in freed_set), (
-                f"_compact_pending({self.sub_pool_name!r}): freed physical pages "
-                f"{sorted(freed_set)} not all within allocated range "
-                f"({old_wm}, {self.num_pages})"
+        if not in_active_band:
+            raise AssertionError(
+                "eager compaction free pages fall outside the retained frontier"
             )
-            # vacated band = (old_wm, new_wm] = [old_wm+1, new_wm+1); kept band = (new_wm, num_pages)
-            src_list = [s for s in range(old_wm + 1, new_wm + 1) if s not in freed_set]
-            dst_list = sorted(h for h in freed_set if h > new_wm)
-            self.watermark_physical = new_wm
-            vacated_lo, vacated_hi = old_wm + 1, new_wm + 1
+        holes = sorted(existing_holes | freed)
+        self._free_phys_pages = torch.tensor(
+            holes,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        _, interior_holes = self._absorb_boundary_holes(holes)
+        pinned_physical = self._pinned_physical_page_ids()
+        hole_set = set(interior_holes)
 
-        assert len(src_list) == len(dst_list), (
-            f"_compact_pending({self.sub_pool_name!r}): {len(src_list)} survivors vs "
-            f"{len(dst_list)} holes — corrupt allocator state"
+        srcs: List[int] = []
+        dsts: List[int] = []
+        moved_virtuals: List[int] = []
+        if self.grow_direction == "up":
+            candidate = self.watermark_physical - 1
+            destinations = interior_holes
+            step = -1
+        else:
+            candidate = self.watermark_physical + 1
+            destinations = list(reversed(interior_holes))
+            step = 1
+
+        for destination in destinations:
+            while (
+                self.min_page_index <= candidate < self.num_pages
+                and (
+                    candidate in hole_set
+                    or candidate in pinned_physical
+                )
+            ):
+                candidate += step
+            if not self.min_page_index <= candidate < self.num_pages:
+                break
+            crossed = (
+                self.grow_direction == "up" and candidate <= destination
+            ) or (
+                self.grow_direction == "down" and candidate >= destination
+            )
+            if crossed:
+                break
+            moved_virtual = int(
+                self.physical_to_virtual[candidate].item()
+            )
+            if moved_virtual < 0:
+                raise AssertionError(
+                    "pin-aware eager compaction selected a non-live source page"
+                )
+            srcs.append(candidate)
+            dsts.append(destination)
+            moved_virtuals.append(moved_virtual)
+            candidate += step
+
+        released_sources: List[torch.Tensor] = []
+        self._commit_move_batch(
+            srcs,
+            dsts,
+            moved_virtuals,
+            None,
+            released_sources,
         )
 
-        if src_list:
-            src_pages = torch.tensor(src_list, dtype=torch.int64, device=self.device)
-            dst_pages = torch.tensor(dst_list, dtype=torch.int64, device=self.device)
-            v_moved = self.physical_to_virtual[
-                src_pages
-            ].clone()  # read before clearing
+        remaining_holes = (hole_set - set(dsts)) | set(srcs)
+        sorted_remaining = sorted(remaining_holes)
+        self._free_phys_pages = torch.tensor(
+            sorted_remaining,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._absorb_boundary_holes(sorted_remaining)
 
-            # Expand page ids to token ids for the token-granular move kernel.
-            if self.page_size == 1:
-                src_t, dst_t = src_pages, dst_pages
-            else:
-                offsets = torch.arange(
-                    self.page_size, dtype=torch.int64, device=self.device
-                )
-                src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
-                dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
+    def _pinned_physical_page_ids(self) -> AbstractSet[int]:
+        """Return the cached physical identities compaction must preserve.
 
-            # Un-translated copy: the public copy_from translates virtual ids,
-            # which we must NOT do here.
-            move_fn = getattr(self._kvcache, "move_kv_cache", None)
-            if move_fn is not None:
-                move_fn(dst_t, src_t)
-            else:
-                copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
-                assert copy_phys is not None, (
-                    f"sub-pool {self.sub_pool_name!r} supports neither move_kv_cache "
-                    "nor _copy_from_physical"
-                )
-                copy_phys(src_t, dst_t)
-            # Clear the vacated band, then re-bind the relocated dst pages.
-            self.physical_to_virtual[vacated_lo:vacated_hi] = -1
-            self.virtual_to_physical[v_moved] = dst_pages
-            self.physical_to_virtual[dst_pages] = v_moved
-            self._inverse_history.append((src_pages, dst_pages, v_moved))
-        else:
-            self.physical_to_virtual[vacated_lo:vacated_hi] = -1
+        :returns: Physical pages compaction must not move or reclaim.
+        """
+
+        return self._pinned_physical_pages
 
     # -- lazy compaction primitives --
 
@@ -1276,6 +1338,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         *,
         holes_cpu: Optional[List[int]] = None,
         j_in: Optional[int] = None,
+        excluded_physical: Optional[AbstractSet[int]] = None,
     ) -> Tuple[Optional[int], Optional[int]]:
         """Topmost live PAGE in the allocated band (largest `p < watermark` for
         grow-up / smallest `p > watermark` for grow-down), excluding holes
@@ -1301,7 +1364,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 while j >= 0 and holes_cpu[j] > p:
                     j -= 1
                 is_hole = j >= 0 and holes_cpu[j] == p
-                if is_hole or p in self._pending_reuse_pages_cpu:
+                is_excluded = (
+                    excluded_physical is not None
+                    and p in excluded_physical
+                )
+                if (
+                    is_hole
+                    or p in self._pending_reuse_pages_cpu
+                    or is_excluded
+                ):
                     if is_hole:
                         j -= 1
                     p -= 1
@@ -1318,7 +1389,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 while j < len(holes_cpu) and holes_cpu[j] < p:
                     j += 1
                 is_hole = j < len(holes_cpu) and holes_cpu[j] == p
-                if is_hole or p in self._pending_reuse_pages_cpu:
+                is_excluded = (
+                    excluded_physical is not None
+                    and p in excluded_physical
+                )
+                if (
+                    is_hole
+                    or p in self._pending_reuse_pages_cpu
+                    or is_excluded
+                ):
                     if is_hole:
                         j += 1
                     p += 1
@@ -1401,6 +1480,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             # `holes_cpu` = interior holes; `_free_phys_pages == holes_cpu` after.
             new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
+            pinned_physical = self._pinned_physical_page_ids()
 
             latest_event = self._latest_forward_done_event
 
@@ -1410,8 +1490,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # `_latest_forward_done_event` is recorded after the WHOLE forward, so
             # waiting it once settles BOTH hazards; then every src is event-fired
             # and the walk runs race-free (empty write_set, no `_pending_reuse`).
-            single_pass_absorb = urgent and len(holes_cpu) > 0
-            if single_pass_absorb:
+            settle_for_urgent = urgent and len(holes_cpu) > 0
+            single_pass_absorb = (
+                settle_for_urgent and len(pinned_physical) == 0
+            )
+            if settle_for_urgent:
                 self._settle_inflight_forward()
                 latest_event = None  # reads/writes settled → srcs are fired
 
@@ -1453,6 +1536,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     start_hint=cursor,
                     holes_cpu=holes_cpu,
                     j_in=j_cursor,
+                    excluded_physical=pinned_physical,
                 )
                 if src is None:
                     break
@@ -1559,11 +1643,107 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         if len(released_fired) == 1
                         else torch.cat(released_fired)
                     )
+                if urgent and len(pinned_physical) > 0:
+                    if self._free_phys_pages.numel() > 1:
+                        self._free_phys_pages, _ = torch.sort(
+                            self._free_phys_pages
+                        )
+                    remaining_cpu = self._free_phys_pages.tolist()
+                    self._absorb_boundary_holes(remaining_cpu)
             if n_moves > 0:
                 self._stats_n_flush_did_work += 1
                 self._stats_n_flush_moves += n_moves
             self._maybe_emit_stats()
             return n_moves
+
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Pin virtual token IDs and prohibit physical remapping.
+
+        :param indices: Exact virtual token IDs.
+        :param owner: Exact authority allowed to release the pin.
+        :returns: Opaque allocator-owned pin.
+        :raises AllocationPinnedError: If grouped free ownership is ambiguous.
+        """
+
+        if not self.is_not_in_free_group:
+            raise AllocationPinnedError(
+                "cannot pin a unified allocation during a grouped free"
+            )
+        virtual_pages = self._allocation_page_ids(indices)
+        virtual_tensor = torch.tensor(
+            virtual_pages,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        physical_pages = tuple(
+            int(page_id)
+            for page_id in self.virtual_to_physical[virtual_tensor].cpu().tolist()
+        )
+        if any(page_id <= 0 for page_id in physical_pages):
+            raise AllocationPinnedError(
+                "cannot pin virtual pages without live physical storage"
+            )
+        physical_page_set = frozenset(physical_pages)
+        if len(physical_page_set) != len(physical_pages):
+            raise RuntimeError("virtual pages alias the same physical page")
+        if not physical_page_set.isdisjoint(self._pinned_physical_pages):
+            raise RuntimeError("distinct allocation pins alias physical storage")
+        pin = self._allocation_pin_registry.acquire(virtual_pages, owner)
+        self._physical_pages_by_pin[pin] = physical_pages
+        self._pinned_physical_pages = self._pinned_physical_pages.union(
+            physical_page_set
+        )
+        return pin
+
+    def allocation_pin_snapshot(
+        self,
+        pin: AllocationPin,
+    ) -> AllocationPinSnapshot:
+        """Resolve immutable virtual-to-physical page identities.
+
+        Pin-aware compaction skips these physical pages, so the mapping remains
+        stable until authority-mediated release or process-lifetime quarantine.
+
+        :param pin: Exact allocator-owned pin.
+        :returns: Immutable virtual and physical page identities.
+        """
+
+        virtual_pages = self._allocation_pin_registry.page_ids(pin)
+        physical_pages = self._physical_pages_by_pin.get(pin)
+        if physical_pages is None:
+            raise RuntimeError("allocation pin physical-page cache is corrupt")
+        return AllocationPinSnapshot(
+            allocator_label=f"{type(self).__name__}({self.sub_pool_name})",
+            page_size=self.page_size,
+            virtual_pages=virtual_pages,
+            physical_pages=physical_pages,
+            quarantined=self._allocation_pin_registry.is_quarantined(pin),
+        )
+
+    def release_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Release a pin and its cached physical compaction exclusions.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._allocation_pin_registry.page_ids(pin)
+        physical_pages = self._physical_pages_by_pin.get(pin)
+        if physical_pages is None:
+            raise RuntimeError("allocation pin physical-page cache is corrupt")
+        super().release_allocation_pin(pin, owner)
+        del self._physical_pages_by_pin[pin]
+        self._pinned_physical_pages = self._pinned_physical_pages.difference(
+            physical_pages
+        )
 
     def _commit_move_batch(
         self,
@@ -1622,7 +1802,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def flush_opportunistic(self) -> int:
         """Public, non-urgent flush at quiescent points; never blocks
-        `schedule_stream`. No-op if `lazy_compaction=False`.
+        `schedule_stream`.
 
         Empty-set fast-path: the scheduler triggers this very often and ~99% hit
         the empty state. Skip whenever there is no possible work — no holes AND no
@@ -1630,7 +1810,17 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         with record_function("MultiEndedAlloc.flush_opportunistic"):
             if not self.lazy_compaction:
-                return 0
+                before = int(self._free_phys_pages.shape[0])
+                if before == 0:
+                    return 0
+                self._compact_pending_impl(
+                    torch.empty(
+                        0,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
+                return before - int(self._free_phys_pages.shape[0])
             if self._free_phys_pages.numel() == 0 and not self._pending_reuse:
                 return 0
             return self._flush(urgent=False)
@@ -1808,6 +1998,26 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Reject ambiguous claims against the composite allocator façade.
+
+        FULL token pages and Mamba request slots have independent ownership.
+        Callers must pin the concrete child allocators represented by the claim.
+
+        :param indices: Candidate composite token indices.
+        :param owner: Candidate pin authority.
+        :returns: This method never returns.
+        :raises TypeError: Always, because the façade is not pinnable.
+        """
+
+        raise TypeError(
+            "pin the FULL and Mamba child allocators, not the composite allocator"
+        )
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
@@ -1898,11 +2108,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def restore_state(self, state):
         assert len(state) == 2
+        self.full_attn_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
+        self.mamba_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
         full_rollback = self.full_attn_allocator.restore_state(state[0])
         mamba_rollback = self.mamba_allocator.restore_state(state[1])
         return full_rollback + mamba_rollback
 
     def clear(self) -> None:
+        self.full_attn_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
+        self.mamba_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
         self.is_not_in_free_group = True
@@ -2364,6 +2586,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # `> 0` strict: -1 = tombstoned, 0 = padding-sink page; both skipped.
             live_token_mask = swa_v2p_pages > 0
             live_tokens = v[live_token_mask]
+            self.full_attn_allocator.assert_allocation_indices_reusable(v)
+            self.swa_attn_allocator.assert_allocation_indices_reusable(live_tokens)
             if live_tokens.numel() > 0:
                 self.swa_attn_allocator.free(live_tokens)
             self.full_attn_allocator.free(v)
@@ -2387,6 +2611,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         live = v[swa_v2p_pages > 0]
         if live.numel() == 0:
             return
+        self.swa_attn_allocator.assert_allocation_indices_reusable(live)
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
@@ -2422,11 +2647,23 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def restore_state(self, state):
         assert len(state) == 2
+        self.full_attn_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
+        self.swa_attn_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
         full_rollback = self.full_attn_allocator.restore_state(state[0])
         swa_rollback = self.swa_attn_allocator.restore_state(state[1])
         return full_rollback + swa_rollback
 
     def clear(self) -> None:
+        self.full_attn_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
+        self.swa_attn_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True

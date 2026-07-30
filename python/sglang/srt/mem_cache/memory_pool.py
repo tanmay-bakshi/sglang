@@ -59,6 +59,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.allocation_pin import RequestSlotPinOwner
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -248,7 +249,7 @@ def _set_kv_buffer_prefix_valid_impl(
     )
 
 
-class ReqToTokenPool:
+class ReqToTokenPool(RequestSlotPinOwner):
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
@@ -276,6 +277,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._initialize_request_slot_pins(type(self).__name__)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -313,10 +315,11 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.release_detached_request_slot(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        self._assert_request_slots_resettable()
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 

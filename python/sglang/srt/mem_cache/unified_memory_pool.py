@@ -30,10 +30,12 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import triton
-from torch.profiler import record_function
-
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPin,
+    AllocationPinSnapshot,
+)
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
@@ -47,6 +49,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from torch.profiler import record_function
 
 logger = logging.getLogger(__name__)
 
@@ -683,6 +686,77 @@ class UnifiedMambaSlotAllocator:
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
+
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Pin exact virtual Mamba slots in the underlying allocator.
+
+        :param indices: Exact virtual Mamba slot IDs.
+        :param owner: Exact authority allowed to release the pin.
+        :returns: Opaque allocator-owned pin.
+        """
+
+        return self._multi_ended_allocator.acquire_allocation_pin(indices, owner)
+
+    def allocation_pin_snapshot(
+        self,
+        pin: AllocationPin,
+    ) -> AllocationPinSnapshot:
+        """Resolve immutable virtual-to-physical Mamba slots.
+
+        :param pin: Exact allocator-owned pin.
+        :returns: Immutable slot mapping.
+        """
+
+        return self._multi_ended_allocator.allocation_pin_snapshot(pin)
+
+    def release_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Release one exact Mamba allocation pin.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._multi_ended_allocator.release_allocation_pin(pin, owner)
+
+    def quarantine_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Permanently retain one ambiguous Mamba allocation.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._multi_ended_allocator.quarantine_allocation_pin(pin, owner)
+
+    def assert_allocation_resettable(self, operation: str) -> None:
+        """Reject allocator-wide mutation while any Mamba slot is pinned.
+
+        :param operation: Reader-facing allocator operation.
+        """
+
+        self._multi_ended_allocator.assert_allocation_resettable(operation)
+
+    def assert_allocation_indices_reusable(
+        self,
+        indices: torch.Tensor,
+    ) -> None:
+        """Reject mutation of exact pinned virtual Mamba slots.
+
+        :param indices: Allocator-visible Mamba slot IDs about to be mutated.
+        """
+
+        self._multi_ended_allocator.assert_allocation_indices_reusable(indices)
 
     def clear(self):
         self._alloc_iter = None

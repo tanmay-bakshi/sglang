@@ -40,6 +40,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def clear(self):
+        self._assert_allocation_resettable("clear")
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
@@ -66,6 +67,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self._assert_allocation_indices_reusable(free_index)
 
         if self.is_not_in_free_group:
             if self.need_sort:

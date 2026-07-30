@@ -19,6 +19,11 @@ import abc
 from typing import TYPE_CHECKING
 
 import torch
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPin,
+    AllocationPinRegistry,
+    AllocationPinSnapshot,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -46,6 +51,138 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._allocation_pin_registry = AllocationPinRegistry(type(self).__name__)
+
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Pin exact allocator-visible token indices.
+
+        :param indices: Allocator-visible token indices.
+        :param owner: Exact authority allowed to release the pin.
+        :returns: Opaque allocator-owned pin.
+        """
+
+        return self._allocation_pin_registry.acquire(
+            self._allocation_page_ids(indices),
+            owner,
+        )
+
+    def allocation_pin_snapshot(
+        self,
+        pin: AllocationPin,
+    ) -> AllocationPinSnapshot:
+        """Resolve immutable virtual and physical page identities.
+
+        Static allocators use identity virtual-to-physical mappings.
+
+        :param pin: Exact allocator-owned pin.
+        :returns: Immutable allocation mapping.
+        """
+
+        page_ids = self._allocation_pin_registry.page_ids(pin)
+        return AllocationPinSnapshot(
+            allocator_label=type(self).__name__,
+            page_size=self.page_size,
+            virtual_pages=page_ids,
+            physical_pages=page_ids,
+            quarantined=self._allocation_pin_registry.is_quarantined(pin),
+        )
+
+    def release_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Release one exact allocation pin.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._allocation_pin_registry.release(pin, owner)
+
+    def quarantine_allocation_pin(
+        self,
+        pin: AllocationPin,
+        owner: object,
+    ) -> None:
+        """Permanently retain one ambiguous allocation pin.
+
+        :param pin: Exact allocator-owned pin.
+        :param owner: Exact acquisition authority.
+        """
+
+        self._allocation_pin_registry.quarantine(pin, owner)
+
+    def _assert_allocation_indices_reusable(
+        self,
+        indices: torch.Tensor,
+    ) -> None:
+        """Reject mutation of pinned token indices.
+
+        :param indices: Allocator-visible token indices about to be mutated.
+        """
+
+        self.assert_allocation_indices_reusable(indices)
+
+    def assert_allocation_indices_reusable(
+        self,
+        indices: torch.Tensor,
+    ) -> None:
+        """Reject mutation of exact pinned token indices.
+
+        Composite allocators use this preflight before mutating either child
+        allocator, so a pin on the second child cannot leave the first child
+        partially freed.
+
+        :param indices: Allocator-visible token indices about to be mutated.
+        """
+
+        if indices.numel() == 0:
+            return
+        self._allocation_pin_registry.assert_pages_reusable(
+            self._allocation_page_ids(indices)
+        )
+
+    def _assert_allocation_resettable(self, operation: str) -> None:
+        """Reject allocator-wide mutation while any page is pinned.
+
+        :param operation: Reader-facing allocator operation.
+        """
+
+        self.assert_allocation_resettable(operation)
+
+    def assert_allocation_resettable(self, operation: str) -> None:
+        """Reject allocator-wide mutation while any page is pinned.
+
+        :param operation: Reader-facing allocator operation.
+        """
+
+        self._allocation_pin_registry.assert_resettable(operation)
+
+    def _allocation_page_ids(self, indices: torch.Tensor) -> tuple[int, ...]:
+        """Canonicalize token indices to positive page IDs.
+
+        :param indices: Allocator-visible token indices.
+        :returns: Sorted unique allocator page IDs.
+        """
+
+        if not isinstance(indices, torch.Tensor):
+            raise TypeError("allocation pin indices must be a torch.Tensor")
+        if indices.ndim != 1:
+            raise ValueError("allocation pin indices must be one-dimensional")
+        if indices.numel() == 0:
+            raise ValueError("allocation pin indices must not be empty")
+        pages = torch.unique(
+            indices.detach().to(dtype=torch.int64) // self.page_size
+        )
+        page_ids = tuple(sorted(int(page_id) for page_id in pages.cpu().tolist()))
+        if page_ids[0] <= 0:
+            raise ValueError("allocation pin indices include reserved page zero")
+        return page_ids
 
     @property
     def size_full(self):
@@ -61,6 +198,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def restore_state(self, state):
+        self._assert_allocation_resettable("restore allocator state")
         self.free_pages, self.release_pages = state
 
     def backup_state(self):

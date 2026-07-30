@@ -22,20 +22,27 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.decode_allocation_lease import (
+    DecodeAllocationComponent,
+    DecodeAllocationComponentClaim,
+    DecodeAllocationLease,
+    DecodeAllocationLeaseAuthority,
+    DecodeAllocationLeaseError,
+    DecodeWriterManifest,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -68,7 +75,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation_pin import RequestSlotPinOwner
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
@@ -81,6 +90,9 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -91,6 +103,7 @@ from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +121,7 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
-class DecodeReqToTokenPool:
+class DecodeReqToTokenPool(RequestSlotPinOwner):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
     DecodeReqToTokenPool subscribes memory for pre-allocated requests.
@@ -150,6 +163,7 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._initialize_request_slot_pins(type(self).__name__)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -184,10 +198,11 @@ class DecodeReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.release_detached_request_slot(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        self._assert_request_slots_resettable()
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
 
@@ -255,6 +270,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
+        self.assert_request_slots_resettable("clear hybrid decode request pool")
+        self.mamba_allocator.assert_allocation_resettable(
+            "clear hybrid decode request pool"
+        )
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_allocator.clear()
 
@@ -266,6 +285,7 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    allocation_lease: DecodeAllocationLease | None = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -281,6 +301,38 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+@dataclass(frozen=True)
+class _DecodeMetadataSubmission:
+    """Metadata submission held until the whole allocation cohort is prepared."""
+
+    decode_req: DecodeRequest
+    page_indices: np.ndarray
+    state_indices: list[Any] | None
+    decode_prefix_len: int
+
+
+@dataclass
+class _DecodeAllocationPreparation:
+    """Pre-publication transaction state for one scheduler cohort.
+
+    :ivar prepared_decode_reqs: Children whose migration leases are prepared.
+    :ivar publication_started: Whether staging or metadata may be externally visible.
+    """
+
+    prepared_decode_reqs: list[DecodeRequest] = field(default_factory=list)
+    publication_started: bool = False
+
+    def record_prepared(self, decode_req: DecodeRequest) -> None:
+        """Record one child immediately after its lease is acquired.
+
+        :param decode_req: Child whose live allocation may now be pinned.
+        """
+
+        if decode_req.allocation_lease is None:
+            return
+        self.prepared_decode_reqs.append(decode_req)
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -329,6 +381,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.allocation_lease_authority = DecodeAllocationLeaseAuthority()
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -866,12 +919,68 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Prepare and publish one preallocation cohort transactionally.
+
+        :param rids_to_check: Optional request IDs eligible for this pass.
+        :returns: Preallocated and failed decode requests.
+        """
+
+        preparation = _DecodeAllocationPreparation()
+        try:
+            return self._prepare_and_publish_preallocated(
+                rids_to_check,
+                preparation,
+            )
+        except Exception:
+            preparation_traceback = traceback.format_exc()
+            prepared_count = len(preparation.prepared_decode_reqs)
+            if preparation.publication_started:
+                logger.critical(
+                    "Decode preallocation failed after external publication began; "
+                    "retaining %d prepared allocation leases:\n%s",
+                    prepared_count,
+                    preparation_traceback,
+                )
+                raise
+
+            logger.error(
+                "Decode preallocation failed before metadata publication; "
+                "rolling back %d prepared allocation leases:\n%s",
+                prepared_count,
+                preparation_traceback,
+            )
+            try:
+                self._rollback_decode_allocation_leases(
+                    preparation.prepared_decode_reqs
+                )
+            except Exception:
+                logger.critical(
+                    "Decode allocation rollback failed. Preparation traceback:\n"
+                    "%s\nRollback traceback:\n%s",
+                    preparation_traceback,
+                    traceback.format_exc(),
+                )
+                raise
+            raise
+
+    def _prepare_and_publish_preallocated(
+        self,
+        rids_to_check: Optional[List[str]],
+        preparation: _DecodeAllocationPreparation,
+    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+        """Execute one cohort through the first metadata publication.
+
+        :param rids_to_check: Optional request IDs eligible for this pass.
+        :param preparation: Transaction state shared with the exception boundary.
+        :returns: Preallocated and failed decode requests.
+        """
+
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
         preallocated_reqs = []
+        metadata_submissions: list[_DecodeMetadataSubmission] = []
         indices_to_remove = set()
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
@@ -1065,7 +1174,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
+                decode_req=decode_req,
+                migration_end=origin_input_len,
             )
+            preparation.record_prepared(decode_req)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1210,29 +1322,39 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            metadata_submissions.append(
+                _DecodeMetadataSubmission(
+                    decode_req=decode_req,
+                    page_indices=page_indices,
+                    state_indices=state_indices,
+                    decode_prefix_len=total_prefix_len,
+                )
+            )
+            preallocated_reqs.append(decode_req)
+            indices_to_remove.add(i)
+
+        for submission in metadata_submissions:
+            decode_req = submission.decode_req
+            # Registration exposes the room to the background staging thread.
+            preparation.publication_started = True
             if (
                 self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
                 and decode_req.kv_receiver.require_staging
             ):
-                # Register before send_metadata, which triggers the STAGING_REQ
-                # prefetch (dropped for an unregistered room); tiny race, correct order.
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
             decode_req.kv_receiver.send_metadata(
-                page_indices,
+                submission.page_indices,
                 decode_req.metadata_buffer_index,
-                state_indices,
-                decode_prefix_len=total_prefix_len,
+                submission.state_indices,
+                decode_prefix_len=submission.decode_prefix_len,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
                 )
-            preallocated_reqs.append(decode_req)
-            indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         self.queue = [
@@ -1434,12 +1556,201 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _migration_component_claims(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        prefix_len: int,
+        migration_end: int,
+    ) -> tuple[DecodeAllocationComponentClaim, ...]:
+        """Build exact FULL, SWA, and Mamba claims from live request mappings.
+
+        :param decode_req: Request whose allocation is final.
+        :param prefix_len: L1-resident prefix boundary.
+        :param migration_end: End of the transferred prompt.
+        :returns: Canonically ordered component claims.
+        """
+
+        req = decode_req.req
+        request_slot = req.req_pool_idx
+        if request_slot is None:
+            raise DecodeAllocationLeaseError(
+                "decode request has no request-pool allocation"
+            )
+        if prefix_len < 0 or migration_end < prefix_len:
+            raise DecodeAllocationLeaseError(
+                "invalid migration-owned logical range"
+            )
+
+        full_indices = self.req_to_token_pool.req_to_token[
+            request_slot, prefix_len:migration_end
+        ]
+        if full_indices.numel() > 0 and bool((full_indices <= 0).any().item()):
+            raise DecodeAllocationLeaseError(
+                "migration-owned FULL mapping is incomplete; HiCache restore "
+                "destinations must be final before lease issuance"
+            )
+
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, SWATokenToKVPoolAllocator):
+            full_allocator = allocator.full_attn_allocator
+            window_size = self.scheduler.sliding_window_size
+            if window_size is None or window_size <= 0:
+                swa_start = prefix_len
+            else:
+                swa_start = max(prefix_len, migration_end - window_size)
+            swa_full_indices = self.req_to_token_pool.req_to_token[
+                request_slot, swa_start:migration_end
+            ]
+            if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+                swa_indices = swa_full_indices
+            else:
+                swa_indices = allocator.translate_loc_from_full_to_swa(
+                    swa_full_indices
+                )
+            if swa_indices.numel() > 0 and bool((swa_indices <= 0).any().item()):
+                raise DecodeAllocationLeaseError(
+                    "migration-owned SWA mapping is incomplete"
+                )
+            swa_claim = DecodeAllocationComponentClaim(
+                component=DecodeAllocationComponent.SWA,
+                logical_start=swa_start,
+                logical_length=int(swa_indices.numel()),
+                allocator=(
+                    allocator.swa_attn_allocator
+                    if swa_indices.numel() > 0
+                    else None
+                ),
+                indices=swa_indices if swa_indices.numel() > 0 else None,
+            )
+        else:
+            full_allocator = allocator
+            swa_claim = DecodeAllocationComponentClaim(
+                component=DecodeAllocationComponent.SWA,
+                logical_start=prefix_len,
+                logical_length=0,
+                allocator=None,
+                indices=None,
+            )
+
+        model_type = self.scheduler.model_config.hf_config.model_type
+        if model_type in ("gemma4", "gemma4_unified"):
+            mamba_claim = DecodeAllocationComponentClaim(
+                component=DecodeAllocationComponent.MAMBA,
+                logical_start=0,
+                logical_length=0,
+                allocator=None,
+                indices=None,
+            )
+        elif isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            if req.mamba_pool_idx is None:
+                raise DecodeAllocationLeaseError(
+                    "hybrid decode request has no Mamba allocation"
+                )
+            mamba_indices = req.mamba_pool_idx.reshape(1)
+            mamba_claim = DecodeAllocationComponentClaim(
+                component=DecodeAllocationComponent.MAMBA,
+                logical_start=0,
+                logical_length=1,
+                allocator=self.req_to_token_pool.mamba_allocator,
+                indices=mamba_indices,
+            )
+        else:
+            mamba_claim = DecodeAllocationComponentClaim(
+                component=DecodeAllocationComponent.MAMBA,
+                logical_start=0,
+                logical_length=0,
+                allocator=None,
+                indices=None,
+            )
+
+        full_claim = DecodeAllocationComponentClaim(
+            component=DecodeAllocationComponent.FULL,
+            logical_start=prefix_len,
+            logical_length=int(full_indices.numel()),
+            allocator=full_allocator if full_indices.numel() > 0 else None,
+            indices=full_indices if full_indices.numel() > 0 else None,
+        )
+        return full_claim, swa_claim, mamba_claim
+
+    def _acquire_decode_allocation_lease(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        prefix_len: int,
+        migration_end: int,
+    ) -> None:
+        """Acquire the process-local lease for one asymmetric TP transfer.
+
+        :param decode_req: Exact live decode request.
+        :param prefix_len: L1-resident prefix boundary.
+        :param migration_end: End of the transferred prompt.
+        """
+
+        if not decode_req.kv_receiver.require_staging:
+            return
+        if decode_req.allocation_lease is not None:
+            raise DecodeAllocationLeaseError(
+                "decode request already owns an allocation lease"
+            )
+        if self.tp_size != 1:
+            raise DecodeAllocationLeaseError(
+                "asymmetric decode allocation leases require TP1 destination"
+            )
+
+        source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
+        if source_tp_size not in (2, 4):
+            raise DecodeAllocationLeaseError(
+                "asymmetric decode allocation leases require TP2 or TP4 source"
+            )
+        request_slot = decode_req.req.req_pool_idx
+        if request_slot is None:
+            raise DecodeAllocationLeaseError(
+                "decode request has no request-pool allocation"
+            )
+        request_generation = int(
+            self.req_to_token_pool.req_generation[request_slot].item()
+        )
+        decode_req.allocation_lease = self.allocation_lease_authority.acquire(
+            request_pool=self.req_to_token_pool,
+            request_slot=request_slot,
+            expected_request_generation=request_generation,
+            writer_manifest=DecodeWriterManifest.for_tensor_parallel(
+                source_tp_size
+            ),
+            component_claims=self._migration_component_claims(
+                decode_req,
+                prefix_len=prefix_len,
+                migration_end=migration_end,
+            ),
+        )
+
+    def _rollback_decode_allocation_leases(
+        self,
+        decode_reqs: list[DecodeRequest],
+    ) -> None:
+        """Rollback every still-prepared child lease in reverse order.
+
+        :param decode_reqs: Newly prepared cohort.
+        """
+
+        for decode_req in reversed(decode_reqs):
+            lease = decode_req.allocation_lease
+            if lease is None:
+                continue
+            self.allocation_lease_authority.rollback_to_request(lease)
+            self.allocation_lease_authority.retire_terminal(lease)
+            decode_req.allocation_lease = None
+
     def _pre_alloc(
         self,
         req: Req,
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        *,
+        decode_req: DecodeRequest | None = None,
+        migration_end: int | None = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -1568,6 +1879,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
+
+        if decode_req is not None:
+            if migration_end is None:
+                raise DecodeAllocationLeaseError(
+                    "migration_end is required for decode allocation issuance"
+                )
+            self._acquire_decode_allocation_lease(
+                decode_req,
+                prefix_len=prefix_len,
+                migration_end=migration_end,
+            )
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:

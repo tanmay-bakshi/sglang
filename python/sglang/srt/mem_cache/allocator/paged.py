@@ -261,6 +261,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self._assert_allocation_indices_reusable(free_index)
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
@@ -275,6 +276,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
+        self._assert_allocation_resettable("clear")
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device

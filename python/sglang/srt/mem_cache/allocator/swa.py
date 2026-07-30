@@ -1,5 +1,6 @@
 import torch
 
+from sglang.srt.mem_cache.allocation_pin import AllocationPin
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -99,6 +100,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    def acquire_allocation_pin(
+        self,
+        indices: torch.Tensor,
+        owner: object,
+    ) -> AllocationPin:
+        """Reject ambiguous claims against the composite allocator façade.
+
+        FULL and SWA have independent physical ownership. Callers must pin both
+        concrete child allocators so the receipt contains both mappings.
+
+        :param indices: Candidate composite token indices.
+        :param owner: Candidate pin authority.
+        :returns: This method never returns.
+        :raises TypeError: Always, because the façade is not pinnable.
+        """
+
+        raise TypeError(
+            "pin the FULL and SWA child allocators, not the composite allocator"
+        )
 
     def available_size(self):
         return min(
@@ -319,12 +340,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        # NOTE: the API is not idempotent.
-        if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
-        else:
+        if not self.is_not_in_free_group:
             self.free_group.append(free_index)
+            return
+
+        mapping_indices, swa_indices = self._swa_free_plan(free_index)
+        self.full_attn_allocator.assert_allocation_indices_reusable(free_index)
+        self.swa_attn_allocator.assert_allocation_indices_reusable(swa_indices)
+
+        self.full_attn_allocator.free(free_index)
+        self._apply_swa_free_plan(mapping_indices, swa_indices)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -348,6 +373,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        mapping_indices, swa_indices = self._swa_free_plan(free_index)
+        self.swa_attn_allocator.assert_allocation_indices_reusable(swa_indices)
+        self._apply_swa_free_plan(mapping_indices, swa_indices)
+
+    def _swa_free_plan(
+        self,
+        free_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve the exact SWA indices and mapping entries a free will mutate.
+
+        :param free_index: FULL allocator-visible token indices.
+        :returns: Mapping entries to clear and positive SWA indices to free.
+        """
+
         if self.page_size == 1:
             mapping_indices = free_index
         else:
@@ -355,7 +394,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        return mapping_indices, swa_indices
+
+    def _apply_swa_free_plan(
+        self,
+        mapping_indices: torch.Tensor,
+        swa_indices: torch.Tensor,
+    ) -> None:
+        """Apply a preflighted SWA free plan.
+
+        :param mapping_indices: FULL-to-SWA mapping entries to clear.
+        :param swa_indices: Exact positive SWA allocator indices to free.
+        """
+
+        if swa_indices.numel() > 0:
+            self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
@@ -373,10 +426,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def restore_state(self, state):
         assert len(state) == 2
+        self.full_attn_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
+        self.swa_attn_allocator.assert_allocation_resettable(
+            "restore composite allocator state"
+        )
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
 
     def resize(self, config) -> None:
+        self.full_attn_allocator.assert_allocation_resettable(
+            "resize composite allocator"
+        )
+        self.swa_attn_allocator.assert_allocation_resettable(
+            "resize composite allocator"
+        )
         size_full = int(config.full_max_total_num_tokens)
         size_swa = int(config.swa_max_total_num_tokens)
         self._size_full = size_full
@@ -391,6 +456,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def clear(self):
+        self.full_attn_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
+        self.swa_attn_allocator.assert_allocation_resettable(
+            "clear composite allocator"
+        )
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
