@@ -19,6 +19,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -27,11 +28,16 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::pd_decoder_grant::{
-    AbortReconciliationGrant, BoundPreparedGrant, CompletionReconciliationGrant,
-    DecoderAllocationKey, DecoderGrantBinding, DecoderGrantDigest, DecoderId,
-    DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt,
-    EngineReleaseKind, EngineReleaseReceipt, PrefillId, PreparedCancellationReconciliationGrant,
-    PromotionReconciliationGrant, QuarantineReconciliationGrant, RetainedEngineGrant,
+    AbortReconciliationGrant, BindReconciliationGrant, BoundPreparedGrant,
+    CompletionReconciliationGrant, DecoderAllocationKey, DecoderGrantBinding,
+    DecoderGrantControlClient, DecoderGrantDigest, DecoderGrantReservation, DecoderId,
+    DecoderRequestTemplate, DecoderReserveAttemptDigest, DecoderReserveRefusalDisposition,
+    DecoderReserveRefusalReceipt, DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError,
+    EngineQuarantineReceipt, EngineReleaseKind, EngineReleaseReceipt, PrefillBootstrapEndpoint,
+    PrefillId, PreparedCancellationReconciliationGrant, PreparedGrantCancellationReceipt,
+    PreparedGrantCancellationTarget, PromotionReconciliationGrant, QuarantineReconciliationGrant,
+    ReserveReconciliationGrant, RetainedEngineGrant, UnboundCancellationReconciliationGrant,
+    UnboundPreparedGrant,
 };
 
 /// Engine-declared fields used to reject obviously incompatible PD pairings.
@@ -192,10 +198,433 @@ enum CohortPhase {
     Terminal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RequestChainPhase {
-    Open,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AdmissionRetryConstraint {
+    AnyEligible,
+    SameDecoder(DecoderId),
+}
+
+#[derive(Debug)]
+enum RequestChainState {
+    IdleOpen(AdmissionRetryConstraint),
+    Reserving(Box<PendingAdmissionRecord>),
+    Assigned(Uuid),
+    Quarantined(Uuid),
     Terminal,
+}
+
+/// Advisory scheduling charge held while one engine reservation is unresolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingSchedulingCharge {
+    child_requests: NonZeroUsize,
+    reserved_kv_tokens: usize,
+    remaining_decode_tokens: usize,
+}
+
+impl PendingSchedulingCharge {
+    /// Construct the load estimate charged before allocator I/O.
+    pub fn new(
+        child_requests: usize,
+        reserved_kv_tokens: usize,
+        remaining_decode_tokens: usize,
+    ) -> Result<Self, DecoderPoolError> {
+        let child_requests = NonZeroUsize::new(child_requests).ok_or_else(|| {
+            DecoderPoolError::InvalidConfiguration(
+                "pending admission must describe at least one child request".to_string(),
+            )
+        })?;
+        Ok(Self {
+            child_requests,
+            reserved_kv_tokens,
+            remaining_decode_tokens,
+        })
+    }
+
+    /// Number of child requests included in the pending attempt.
+    pub fn child_requests(&self) -> usize {
+        self.child_requests.get()
+    }
+
+    /// Conservatively estimated KV tokens held while reserving.
+    pub fn reserved_kv_tokens(&self) -> usize {
+        self.reserved_kv_tokens
+    }
+
+    /// Estimated remaining decode tokens held while reserving.
+    pub fn remaining_decode_tokens(&self) -> usize {
+        self.remaining_decode_tokens
+    }
+}
+
+/// Authoritative next step after a pending reservation is released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingAdmissionDisposition {
+    RetrySameDecoder,
+    RetryAnotherDecoder,
+    Terminal,
+}
+
+/// Pool-bound reserve result after every authoritative refusal is applied.
+#[derive(Debug)]
+pub enum PendingReserveOutcome {
+    Prepared(Box<UnboundPreparedGrant>),
+    Refused(PendingAdmissionDisposition),
+}
+
+/// Failure while reconciling engine authority with pending pool ownership.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum PendingReconciliationError {
+    #[error(transparent)]
+    Engine(#[from] EngineGrantError),
+    #[error(transparent)]
+    Pool(#[from] DecoderPoolError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingCancellationProof {
+    Unbound(PreparedGrantCancellationReceipt),
+    Bound(EngineReleaseReceipt),
+}
+
+#[derive(Debug)]
+pub(super) struct PendingCancellationPin {
+    target: PreparedGrantCancellationTarget,
+}
+
+impl PendingCancellationPin {
+    fn new(target: PreparedGrantCancellationTarget) -> Self {
+        Self { target }
+    }
+
+    pub(super) fn matches(&self, target: &PreparedGrantCancellationTarget) -> bool {
+        &self.target == target
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingCancellationKind {
+    Unbound,
+    Bound,
+}
+
+#[derive(Debug)]
+enum PendingCancellationEngine {
+    Unbound(Box<UnboundCancellationReconciliationGrant>),
+    Bound(Box<PreparedCancellationReconciliationGrant>),
+}
+
+#[derive(Debug)]
+enum PendingAdmissionAuthority {
+    ReserveReady,
+    ReserveCheckedOut {
+        operation_id: Uuid,
+    },
+    ReserveRetry(Box<ReserveReconciliationGrant>),
+    PreparedIssued,
+    CancellationCheckedOut {
+        operation_id: Uuid,
+        kind: PendingCancellationKind,
+    },
+    CancellationRetry(PendingCancellationEngine),
+    ReserveProof(Box<DecoderReserveRefusalReceipt>),
+    CancellationProof(Box<PendingCancellationProof>),
+}
+
+/// Exclusive lease over one exact pending reservation owned by the pool.
+#[must_use = "pending admission ownership must be reserved, bound, or explicitly released"]
+pub struct PendingAdmission {
+    inner: Arc<DecoderPoolInner>,
+    chain_id: Uuid,
+    claim_id: Uuid,
+    decoder_id: DecoderId,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    charge: PendingSchedulingCharge,
+    retry_constraint: AdmissionRetryConstraint,
+    resolved: bool,
+}
+
+impl fmt::Debug for PendingAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingAdmission")
+            .field("chain_id", &self.chain_id)
+            .field("claim_id", &self.claim_id)
+            .field("decoder_id", &self.decoder_id)
+            .field("reservation_attempt_id", &self.reservation_attempt_id)
+            .field("reserve_attempt_digest", &self.reserve_attempt_digest)
+            .field("charge", &self.charge)
+            .field("retry_constraint", &self.retry_constraint)
+            .field("resolved", &self.resolved)
+            .finish()
+    }
+}
+
+impl PendingAdmission {
+    /// Exact decoder process generation selected for this attempt.
+    pub fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
+
+    /// Stable idempotency identity for every reserve retry.
+    pub fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    /// Digest of the exact reserve transcript pinned before allocator I/O.
+    pub fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
+    /// Move the exact reservation transcript into pool-bound reconciliation.
+    pub fn begin_reserve(
+        &mut self,
+        client: &DecoderGrantControlClient,
+    ) -> Result<PendingReserveReconciliation<'_>, DecoderPoolError> {
+        let operation_id = Uuid::new_v4();
+        let engine = self
+            .inner
+            .checkout_initial_reserve(self, operation_id, client)?;
+        Ok(PendingReserveReconciliation {
+            pending: self,
+            operation_id,
+            engine: Some(engine),
+            polled: false,
+            complete: false,
+        })
+    }
+
+    /// Resume the exact reserve authority recovered from a dropped poll.
+    pub fn resume_reserve(&mut self) -> Result<PendingReserveReconciliation<'_>, DecoderPoolError> {
+        let operation_id = Uuid::new_v4();
+        let engine = self.inner.checkout_reserve_retry(self, operation_id)?;
+        Ok(PendingReserveReconciliation {
+            pending: self,
+            operation_id,
+            engine: Some(engine),
+            polled: true,
+            complete: false,
+        })
+    }
+}
+
+/// Pool-bound reserve retry whose authority returns to the pool on cancellation.
+#[must_use = "reserve reconciliation must be polled or dropped to release an unstarted attempt"]
+pub struct PendingReserveReconciliation<'a> {
+    pending: &'a mut PendingAdmission,
+    operation_id: Uuid,
+    engine: Option<ReserveReconciliationGrant>,
+    polled: bool,
+    complete: bool,
+}
+
+impl fmt::Debug for PendingReserveReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingReserveReconciliation")
+            .field(
+                "reservation_attempt_id",
+                &self.pending.reservation_attempt_id,
+            )
+            .field("decoder_id", &self.pending.decoder_id)
+            .field("operation_id", &self.operation_id)
+            .field("polled", &self.polled)
+            .field("complete", &self.complete)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingReserveReconciliation<'_> {
+    /// Reconcile the same exact attempt and apply any allocator refusal in-pool.
+    pub async fn reconcile_reserve(
+        &mut self,
+    ) -> Result<PendingReserveOutcome, PendingReconciliationError> {
+        self.polled = true;
+        let result = self
+            .engine
+            .as_mut()
+            .expect("live reserve checkout must retain engine authority")
+            .reconcile_reserve()
+            .await;
+        match result {
+            Ok(grant) => {
+                self.engine = None;
+                self.pending.inner.complete_reserve_checkout(
+                    self.pending,
+                    self.operation_id,
+                    PendingAdmissionAuthority::PreparedIssued,
+                );
+                self.complete = true;
+                Ok(PendingReserveOutcome::Prepared(Box::new(grant)))
+            }
+            Err(EngineGrantError::AllocatorRefused(receipt)) => {
+                self.engine = None;
+                let inner = Arc::clone(&self.pending.inner);
+                let disposition = inner.install_reserve_refusal_and_apply(
+                    self.pending,
+                    self.operation_id,
+                    *receipt,
+                );
+                self.complete = true;
+                match disposition {
+                    Ok(disposition) => {
+                        self.pending.resolved = true;
+                        Ok(PendingReserveOutcome::Refused(disposition))
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Gateway-issued idempotency identity reused by every reserve retry.
+    pub fn reservation_attempt_id(&self) -> Result<Uuid, EngineGrantError> {
+        self.engine
+            .as_ref()
+            .ok_or_else(|| {
+                EngineGrantError::ProtocolViolation(
+                    "reserve reconciliation is already complete".to_string(),
+                )
+            })?
+            .reservation_attempt_id()
+    }
+
+    #[cfg(test)]
+    fn mark_test_polled(&mut self) {
+        self.polled = true;
+    }
+}
+
+impl Drop for PendingReserveReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let engine = self
+            .engine
+            .take()
+            .expect("incomplete reserve checkout must retain engine authority");
+        let inner = Arc::clone(&self.pending.inner);
+        if self.polled {
+            inner.restore_reserve_checkout(self.pending, self.operation_id, engine);
+            return;
+        }
+        inner.rollback_checked_out_reserve(self.pending, self.operation_id);
+        self.pending.resolved = true;
+    }
+}
+
+/// Pool-bound pending cancellation whose raw authority never escapes the pool.
+#[must_use = "pending cancellation must be reconciled or dropped for exact retry"]
+pub struct PendingCancellationReconciliation<'a> {
+    pending: &'a mut PendingAdmission,
+    operation_id: Uuid,
+    engine: Option<PendingCancellationEngine>,
+    complete: bool,
+}
+
+impl fmt::Debug for PendingCancellationReconciliation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingCancellationReconciliation")
+            .field(
+                "reservation_attempt_id",
+                &self.pending.reservation_attempt_id,
+            )
+            .field("decoder_id", &self.pending.decoder_id)
+            .field("operation_id", &self.operation_id)
+            .field("complete", &self.complete)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingCancellationReconciliation<'_> {
+    /// Reconcile the exact cancellation and apply its proof before returning.
+    pub async fn reconcile_cancellation(
+        &mut self,
+    ) -> Result<PendingAdmissionDisposition, PendingReconciliationError> {
+        let result = match self
+            .engine
+            .as_mut()
+            .expect("live cancellation checkout must retain engine authority")
+        {
+            PendingCancellationEngine::Unbound(engine) => engine
+                .reconcile_cancellation()
+                .await
+                .map(PendingCancellationProof::Unbound),
+            PendingCancellationEngine::Bound(engine) => engine
+                .reconcile_cancellation()
+                .await
+                .map(PendingCancellationProof::Bound),
+        };
+        match result {
+            Ok(proof) => self.install_proof(proof),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn install_proof(
+        &mut self,
+        proof: PendingCancellationProof,
+    ) -> Result<PendingAdmissionDisposition, PendingReconciliationError> {
+        self.engine = None;
+        let inner = Arc::clone(&self.pending.inner);
+        let disposition =
+            inner.install_pending_cancellation_and_apply(self.pending, self.operation_id, proof);
+        self.complete = true;
+        match disposition {
+            Ok(disposition) => {
+                self.pending.resolved = true;
+                Ok(disposition)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(test)]
+    fn install_test_proof(
+        &mut self,
+        proof: PendingCancellationProof,
+    ) -> Result<PendingAdmissionDisposition, PendingReconciliationError> {
+        match self
+            .engine
+            .as_mut()
+            .expect("test cancellation checkout must retain engine authority")
+        {
+            PendingCancellationEngine::Unbound(engine) => {
+                engine.assume_test_reconciled()?;
+            }
+            PendingCancellationEngine::Bound(engine) => {
+                engine.assume_test_reconciled()?;
+            }
+        }
+        self.install_proof(proof)
+    }
+}
+
+impl Drop for PendingCancellationReconciliation<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let engine = self
+            .engine
+            .take()
+            .expect("incomplete cancellation checkout must retain engine authority");
+        let inner = Arc::clone(&self.pending.inner);
+        inner.restore_cancellation_checkout(self.pending, self.operation_id, engine);
+    }
+}
+
+impl Drop for PendingAdmission {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        inner.release_pending_claim(self);
+    }
 }
 
 /// One-owner logical request chain spanning zero or more retry cohorts.
@@ -294,6 +723,10 @@ impl DecoderAssignmentCohort {
 pub struct DecoderReplicaSnapshot {
     pub id: DecoderId,
     pub availability: DecoderAvailability,
+    pub pending_admissions: usize,
+    pub pending_child_requests: usize,
+    pub pending_reserved_kv_tokens: usize,
+    pub pending_remaining_decode_tokens: usize,
     pub active_cohorts: usize,
     pub active_child_requests: usize,
     pub quiescing_cohorts: usize,
@@ -330,10 +763,13 @@ pub enum DecoderPoolError {
         decoder_id: DecoderId,
         availability: DecoderAvailability,
     },
-    #[error("decoder {decoder_id} owns {active_cohorts} active cohorts")]
+    #[error(
+        "decoder {decoder_id} owns {active_cohorts} active cohorts and {pending_admissions} pending admissions"
+    )]
     DecoderInUse {
         decoder_id: DecoderId,
         active_cohorts: usize,
+        pending_admissions: usize,
     },
     #[error("decoder {decoder_id} metadata is ineligible for this prefill pool: {reason}")]
     IneligibleDecoderMetadata {
@@ -355,12 +791,56 @@ pub enum DecoderPoolError {
         request_id: String,
         assignment_id: Uuid,
     },
+    #[error("logical request {request_id} still owns pending attempt {reservation_attempt_id}")]
+    RequestHasPendingAdmission {
+        request_id: String,
+        reservation_attempt_id: Uuid,
+    },
     #[error("logical request {0} is terminal")]
     RequestChainTerminal(String),
     #[error("no ready decoder replica is registered")]
     NoReadyDecoder,
     #[error("the logical request has exhausted every registered retry alternative")]
     RetryAlternativesExhausted,
+    #[error("retry requires decoder generation {0}, which is not ready")]
+    RetryDecoderUnavailable(DecoderId),
+    #[error("pending reservation attempt {0} has already started")]
+    PendingReservationAlreadyStarted(Uuid),
+    #[error("pending reservation attempt {0} already has a live recovery claim")]
+    PendingAdmissionAlreadyClaimed(Uuid),
+    #[error("pending reservation attempt {0} still has a live request owner")]
+    PendingAdmissionOwnerStillAlive(Uuid),
+    #[error("pending admission capability was not issued by this decoder pool")]
+    ForeignPendingAdmission,
+    #[error("pending reservation attempt {0} is unknown or already bound")]
+    UnknownPendingAdmission(Uuid),
+    #[error("pending reservation attempt {0} has no authoritative release proof")]
+    PendingAdmissionProofPending(Uuid),
+    #[error("pending reservation attempt {0} has no pinned cancellation intent")]
+    PendingCancellationNotPinned(Uuid),
+    #[error("pending reservation attempt {0} already retains a conflicting release proof")]
+    ConflictingPendingAdmissionProof(Uuid),
+    #[error(
+        "pending reservation attempt {reservation_attempt_id} received an invalid cancellation proof: {reason}"
+    )]
+    InvalidPendingCancellationProof {
+        reservation_attempt_id: Uuid,
+        reason: &'static str,
+    },
+    #[error(
+        "decoder-pool accounting for pending reservation {reservation_attempt_id} is inconsistent: {reason}"
+    )]
+    InconsistentPendingAdmission {
+        reservation_attempt_id: Uuid,
+        reason: &'static str,
+    },
+    #[error(
+        "pending reservation describes {pending_children} children but the request describes {request_children}"
+    )]
+    PendingChildCountMismatch {
+        pending_children: usize,
+        request_children: usize,
+    },
     #[error("allocator grant targets prefill {actual}, expected {expected}")]
     GrantPrefillMismatch {
         expected: PrefillId,
@@ -700,6 +1180,10 @@ impl Drop for PoolQuarantineReconciliation<'_> {
 struct ReplicaState {
     metadata: DecoderReplicaMetadata,
     availability: DecoderAvailability,
+    pending_admissions: usize,
+    pending_child_requests: usize,
+    pending_reserved_kv_tokens: usize,
+    pending_remaining_decode_tokens: usize,
     active_cohorts: usize,
     active_child_requests: usize,
     quiescing_cohorts: usize,
@@ -711,11 +1195,53 @@ struct ReplicaState {
 #[derive(Debug)]
 struct RequestChainRecord {
     request_id: Arc<str>,
-    phase: RequestChainPhase,
+    state: RequestChainState,
     owner_alive: bool,
-    active_assignment: Option<Uuid>,
     failed_decoders: HashSet<DecoderId>,
     used_grants: HashMap<DecoderAllocationKey, DecoderGrantDigest>,
+    resolved_admissions: HashMap<Uuid, PendingAdmissionReconciliationRecord>,
+}
+
+#[derive(Debug)]
+struct PendingAdmissionRecord {
+    decoder_id: DecoderId,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    charge: PendingSchedulingCharge,
+    retry_constraint: AdmissionRetryConstraint,
+    reservation: Option<Arc<DecoderGrantReservation>>,
+    claim_id: Option<Uuid>,
+    authority: PendingAdmissionAuthority,
+    reconciliation: Option<PendingAdmissionReconciliationRecord>,
+}
+
+enum PendingAuthorityProof {
+    Reserve(DecoderReserveRefusalReceipt),
+    Cancellation(PendingCancellationProof),
+}
+
+impl PendingAdmissionRecord {
+    fn authority_proof(&self) -> Option<PendingAuthorityProof> {
+        match &self.authority {
+            PendingAdmissionAuthority::ReserveProof(receipt) => {
+                Some(PendingAuthorityProof::Reserve(receipt.as_ref().clone()))
+            }
+            PendingAdmissionAuthority::CancellationProof(proof) => {
+                Some(PendingAuthorityProof::Cancellation(proof.as_ref().clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingAdmissionReconciliationRecord {
+    Refusal(DecoderReserveRefusalReceipt),
+    Cancellation {
+        disposition: PendingAdmissionDisposition,
+        target: PreparedGrantCancellationTarget,
+        proof: Option<Box<PendingCancellationProof>>,
+    },
 }
 
 #[derive(Debug)]
@@ -787,10 +1313,221 @@ struct DecoderPoolInner {
 }
 
 impl DecoderPoolInner {
+    fn checkout_initial_reserve(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        client: &DecoderGrantControlClient,
+    ) -> Result<ReserveReconciliationGrant, DecoderPoolError> {
+        let mut state = self.state.lock();
+        let record = pending_record_mut(&mut state, pending)?;
+        if !matches!(record.authority, PendingAdmissionAuthority::ReserveReady) {
+            return Err(DecoderPoolError::PendingReservationAlreadyStarted(
+                pending.reservation_attempt_id,
+            ));
+        }
+        let reservation = Arc::clone(record.reservation.as_ref().ok_or({
+            DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id: pending.reservation_attempt_id,
+                reason: "fresh pending attempt has no immutable reservation",
+            }
+        })?);
+        record.authority = PendingAdmissionAuthority::ReserveCheckedOut { operation_id };
+        Ok(client.begin_reserve(reservation))
+    }
+
+    fn checkout_reserve_retry(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+    ) -> Result<ReserveReconciliationGrant, DecoderPoolError> {
+        let mut state = self.state.lock();
+        let record = pending_record_mut(&mut state, pending)?;
+        if !matches!(record.authority, PendingAdmissionAuthority::ReserveRetry(_)) {
+            return Err(DecoderPoolError::PendingReservationAlreadyStarted(
+                pending.reservation_attempt_id,
+            ));
+        }
+        let authority = std::mem::replace(
+            &mut record.authority,
+            PendingAdmissionAuthority::ReserveCheckedOut { operation_id },
+        );
+        let PendingAdmissionAuthority::ReserveRetry(engine) = authority else {
+            unreachable!("reserve retry authority changed while the pool mutex was held");
+        };
+        Ok(*engine)
+    }
+
+    fn complete_reserve_checkout(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        authority: PendingAdmissionAuthority,
+    ) {
+        let mut state = self.state.lock();
+        let record = pending_record_mut(&mut state, pending)
+            .expect("live reserve wrapper must match its pending admission");
+        assert!(matches!(
+            record.authority,
+            PendingAdmissionAuthority::ReserveCheckedOut {
+                operation_id: checked_out_id
+            } if checked_out_id == operation_id
+        ));
+        record.authority = authority;
+    }
+
+    fn install_reserve_refusal_and_apply(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        receipt: DecoderReserveRefusalReceipt,
+    ) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+        let mut state = self.state.lock();
+        {
+            let record = pending_record_mut(&mut state, pending)
+                .expect("live reserve wrapper must match its pending admission");
+            assert!(matches!(
+                record.authority,
+                PendingAdmissionAuthority::ReserveCheckedOut {
+                    operation_id: checked_out_id
+                } if checked_out_id == operation_id
+            ));
+            record.authority = PendingAdmissionAuthority::ReserveProof(Box::new(receipt));
+        }
+        let receipt = match &pending_record(&state, pending)?.authority {
+            PendingAdmissionAuthority::ReserveProof(receipt) => receipt.as_ref().clone(),
+            _ => unreachable!("reserve proof changed while the pool mutex was held"),
+        };
+        validate_reserve_refusal_receipt(&state, pending, &receipt)?;
+        install_pending_reconciliation(
+            &mut state,
+            pending,
+            PendingAdmissionReconciliationRecord::Refusal(receipt),
+        )?;
+        apply_pending_reconciliation(&mut state, pending)
+    }
+
+    fn restore_reserve_checkout(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        engine: ReserveReconciliationGrant,
+    ) {
+        let mut state = self.state.lock();
+        let record = pending_record_mut(&mut state, pending)
+            .expect("live reserve wrapper must match its pending admission");
+        assert!(matches!(
+            record.authority,
+            PendingAdmissionAuthority::ReserveCheckedOut {
+                operation_id: checked_out_id
+            } if checked_out_id == operation_id
+        ));
+        record.authority = PendingAdmissionAuthority::ReserveRetry(Box::new(engine));
+    }
+
+    fn rollback_checked_out_reserve(&self, pending: &PendingAdmission, operation_id: Uuid) {
+        let mut state = self.state.lock();
+        {
+            let record = pending_record(&state, pending)
+                .expect("live reserve wrapper must match its pending admission");
+            assert!(matches!(
+                record.authority,
+                PendingAdmissionAuthority::ReserveCheckedOut {
+                    operation_id: checked_out_id
+                } if checked_out_id == operation_id
+            ));
+        }
+        rollback_pending_record(&mut state, pending);
+    }
+
+    fn restore_cancellation_checkout(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        engine: PendingCancellationEngine,
+    ) {
+        let mut state = self.state.lock();
+        let record = pending_record_mut(&mut state, pending)
+            .expect("live cancellation wrapper must match its pending admission");
+        assert!(matches!(
+            record.authority,
+            PendingAdmissionAuthority::CancellationCheckedOut {
+                operation_id: checked_out_id,
+                ..
+            } if checked_out_id == operation_id
+        ));
+        record.authority = PendingAdmissionAuthority::CancellationRetry(engine);
+    }
+
+    fn install_pending_cancellation_and_apply(
+        &self,
+        pending: &PendingAdmission,
+        operation_id: Uuid,
+        proof: PendingCancellationProof,
+    ) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+        let mut state = self.state.lock();
+        {
+            let record = pending_record_mut(&mut state, pending)
+                .expect("live cancellation wrapper must match its pending admission");
+            let expected_kind = match &proof {
+                PendingCancellationProof::Unbound(_) => PendingCancellationKind::Unbound,
+                PendingCancellationProof::Bound(_) => PendingCancellationKind::Bound,
+            };
+            assert!(matches!(
+                record.authority,
+                PendingAdmissionAuthority::CancellationCheckedOut {
+                    operation_id: checked_out_id,
+                    kind,
+                } if checked_out_id == operation_id && kind == expected_kind
+            ));
+            record.authority = PendingAdmissionAuthority::CancellationProof(Box::new(proof));
+        }
+        let proof = match &pending_record(&state, pending)?.authority {
+            PendingAdmissionAuthority::CancellationProof(proof) => proof.as_ref().clone(),
+            _ => unreachable!("cancellation proof changed while the pool mutex was held"),
+        };
+        install_pending_cancellation_proof(&mut state, pending, &proof)?;
+        apply_pending_reconciliation(&mut state, pending)
+    }
+
+    fn release_pending_claim(&self, pending: &PendingAdmission) {
+        let mut state = self.state.lock();
+        let Some(chain) = state.request_chains.get(&pending.chain_id) else {
+            return;
+        };
+        if chain
+            .resolved_admissions
+            .contains_key(&pending.reservation_attempt_id)
+        {
+            return;
+        }
+        let record = pending_record(&state, pending)
+            .expect("live pending lease must match its pool-owned record");
+        if matches!(record.authority, PendingAdmissionAuthority::ReserveReady) {
+            rollback_pending_record(&mut state, pending);
+            return;
+        }
+        assert!(!matches!(
+            record.authority,
+            PendingAdmissionAuthority::ReserveCheckedOut { .. }
+                | PendingAdmissionAuthority::CancellationCheckedOut { .. }
+        ));
+        pending_record_mut(&mut state, pending)
+            .expect("validated pending lease disappeared while the pool mutex was held")
+            .claim_id = None;
+    }
+
     fn drop_request_owner(&self, chain_id: Uuid) {
         let mut state = self.state.lock();
         let remove_now = match state.request_chains.get_mut(&chain_id) {
-            Some(chain) if chain.active_assignment.is_none() => true,
+            Some(chain)
+                if matches!(
+                    &chain.state,
+                    RequestChainState::IdleOpen(_) | RequestChainState::Terminal
+                ) =>
+            {
+                true
+            }
             Some(chain) => {
                 chain.owner_alive = false;
                 false
@@ -958,6 +1695,10 @@ impl DecoderPool {
             ReplicaState {
                 metadata,
                 availability: DecoderAvailability::Ready,
+                pending_admissions: 0,
+                pending_child_requests: 0,
+                pending_reserved_kv_tokens: 0,
+                pending_remaining_decode_tokens: 0,
                 active_cohorts: 0,
                 active_child_requests: 0,
                 quiescing_cohorts: 0,
@@ -992,11 +1733,11 @@ impl DecoderPool {
             chain_id,
             RequestChainRecord {
                 request_id: Arc::clone(&request_id),
-                phase: RequestChainPhase::Open,
+                state: RequestChainState::IdleOpen(AdmissionRetryConstraint::AnyEligible),
                 owner_alive: true,
-                active_assignment: None,
                 failed_decoders: HashSet::new(),
                 used_grants: HashMap::new(),
+                resolved_admissions: HashMap::new(),
             },
         );
         state
@@ -1021,11 +1762,21 @@ impl DecoderPool {
             .request_chains
             .get(&request.chain_id)
             .ok_or(DecoderPoolError::UnknownRequestChain(request.chain_id))?;
-        if let Some(assignment_id) = chain.active_assignment {
-            return Err(DecoderPoolError::RequestHasActiveCohort {
-                request_id: chain.request_id.to_string(),
-                assignment_id,
-            });
+        match &chain.state {
+            RequestChainState::Reserving(pending) => {
+                return Err(DecoderPoolError::RequestHasPendingAdmission {
+                    request_id: chain.request_id.to_string(),
+                    reservation_attempt_id: pending.reservation_attempt_id,
+                });
+            }
+            RequestChainState::Assigned(assignment_id)
+            | RequestChainState::Quarantined(assignment_id) => {
+                return Err(DecoderPoolError::RequestHasActiveCohort {
+                    request_id: chain.request_id.to_string(),
+                    assignment_id: *assignment_id,
+                });
+            }
+            RequestChainState::IdleOpen(_) | RequestChainState::Terminal => {}
         }
         remove_request_chain(&mut state, request.chain_id);
         request.finalized = true;
@@ -1075,51 +1826,420 @@ impl DecoderPool {
                 availability: replica.availability,
             });
         }
-        if replica.active_cohorts > 0 {
+        if replica.active_cohorts > 0 || replica.pending_admissions > 0 {
             return Err(DecoderPoolError::DecoderInUse {
                 decoder_id: decoder_id.clone(),
                 active_cohorts: replica.active_cohorts,
+                pending_admissions: replica.pending_admissions,
             });
         }
         state.replicas.remove(decoder_id);
         Ok(())
     }
 
-    /// Return ordered decoder candidates for an allocator reservation attempt.
-    pub fn admission_candidates(
+    /// Atomically select, construct, and charge one exact reservation attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_admission(
         &self,
         request: &LogicalRequestOwner,
-    ) -> Result<Vec<DecoderId>, DecoderPoolError> {
+        template: &DecoderRequestTemplate,
+        prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
+        prepared_ttl: Duration,
+        charge: PendingSchedulingCharge,
+    ) -> Result<PendingAdmission, DecoderPoolError> {
         self.validate_request_owner(request)?;
-        let state = self.inner.state.lock();
-        let failed_decoders = {
+        if charge.child_requests() != template.child_count() {
+            return Err(DecoderPoolError::PendingChildCountMismatch {
+                pending_children: charge.child_requests(),
+                request_children: template.child_count(),
+            });
+        }
+
+        let mut state = self.inner.state.lock();
+        let (retry_constraint, failed_decoders) = {
             let chain = state
                 .request_chains
                 .get(&request.chain_id)
                 .ok_or(DecoderPoolError::UnknownRequestChain(request.chain_id))?;
-            if let Some(assignment_id) = chain.active_assignment {
-                return Err(DecoderPoolError::RequestHasActiveCohort {
-                    request_id: chain.request_id.to_string(),
-                    assignment_id,
-                });
-            }
-            if chain.phase == RequestChainPhase::Terminal {
-                return Err(DecoderPoolError::RequestChainTerminal(
-                    chain.request_id.to_string(),
-                ));
-            }
-            chain.failed_decoders.clone()
+            let retry_constraint = match &chain.state {
+                RequestChainState::IdleOpen(retry_constraint) => retry_constraint.clone(),
+                RequestChainState::Reserving(pending) => {
+                    return Err(DecoderPoolError::RequestHasPendingAdmission {
+                        request_id: chain.request_id.to_string(),
+                        reservation_attempt_id: pending.reservation_attempt_id,
+                    });
+                }
+                RequestChainState::Assigned(assignment_id)
+                | RequestChainState::Quarantined(assignment_id) => {
+                    return Err(DecoderPoolError::RequestHasActiveCohort {
+                        request_id: chain.request_id.to_string(),
+                        assignment_id: *assignment_id,
+                    });
+                }
+                RequestChainState::Terminal => {
+                    return Err(DecoderPoolError::RequestChainTerminal(
+                        chain.request_id.to_string(),
+                    ));
+                }
+            };
+            (retry_constraint, chain.failed_decoders.clone())
         };
-        select_decoders(&state.replicas, &failed_decoders)
+
+        let decoder_id = match &retry_constraint {
+            AdmissionRetryConstraint::AnyEligible => {
+                select_decoders(&state.replicas, &failed_decoders)?
+                    .into_iter()
+                    .next()
+                    .expect("successful decoder selection cannot be empty")
+            }
+            AdmissionRetryConstraint::SameDecoder(decoder_id) => {
+                let ready = state.replicas.get(decoder_id).is_some_and(|replica| {
+                    replica.availability == DecoderAvailability::Ready
+                        && !failed_decoders.contains(decoder_id)
+                });
+                if !ready {
+                    return Err(DecoderPoolError::RetryDecoderUnavailable(
+                        decoder_id.clone(),
+                    ));
+                }
+                decoder_id.clone()
+            }
+        };
+
+        let reservation = template
+            .prepare_reservation(
+                state.prefill_id.clone(),
+                prefill_bootstrap_endpoint,
+                decoder_id.clone(),
+                request.chain_id,
+                state.declared_prefill_tp_size.get(),
+                prepared_ttl,
+            )
+            .map_err(|error| DecoderPoolError::InvalidGrant(error.to_string()))?;
+        let reservation_attempt_id = reservation.reservation_attempt_id();
+        let reserve_attempt_digest = reservation.reserve_attempt_digest();
+        let reservation = Arc::new(reservation);
+        let claim_id = Uuid::new_v4();
+
+        install_pending_attempt(
+            &mut state,
+            request.chain_id,
+            decoder_id.clone(),
+            reservation_attempt_id,
+            reserve_attempt_digest,
+            charge,
+            retry_constraint.clone(),
+            Some(Arc::clone(&reservation)),
+            claim_id,
+            PendingAdmissionAuthority::ReserveReady,
+        )?;
+
+        Ok(PendingAdmission {
+            inner: Arc::clone(&self.inner),
+            chain_id: request.chain_id,
+            claim_id,
+            decoder_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
+            charge,
+            retry_constraint,
+            resolved: false,
+        })
     }
 
-    /// Atomically bind an allocator-issued grant to this logical request.
-    pub fn bind_grant(
+    /// Reclaim an unowned pending attempt for its live logical request.
+    pub fn recover_pending_admission(
         &self,
         request: &LogicalRequestOwner,
+        reservation_attempt_id: Uuid,
+    ) -> Result<PendingAdmission, DecoderPoolError> {
+        self.validate_request_owner(request)?;
+        let mut state = self.inner.state.lock();
+        let chain = state
+            .request_chains
+            .get_mut(&request.chain_id)
+            .ok_or(DecoderPoolError::UnknownRequestChain(request.chain_id))?;
+        let record = match &mut chain.state {
+            RequestChainState::Reserving(record)
+                if record.reservation_attempt_id == reservation_attempt_id =>
+            {
+                record
+            }
+            _ => {
+                return Err(DecoderPoolError::UnknownPendingAdmission(
+                    reservation_attempt_id,
+                ));
+            }
+        };
+        issue_pending_claim(Arc::clone(&self.inner), request.chain_id, record)
+    }
+
+    /// Reclaim an unowned pending attempt after its request owner has gone away.
+    pub fn recover_orphaned_pending_admission(
+        &self,
+        reservation_attempt_id: Uuid,
+    ) -> Result<PendingAdmission, DecoderPoolError> {
+        let mut state = self.inner.state.lock();
+        let chain_id = state
+            .request_chains
+            .iter()
+            .find_map(|(chain_id, chain)| match &chain.state {
+                RequestChainState::Reserving(record)
+                    if record.reservation_attempt_id == reservation_attempt_id =>
+                {
+                    Some(*chain_id)
+                }
+                _ => None,
+            })
+            .ok_or(DecoderPoolError::UnknownPendingAdmission(
+                reservation_attempt_id,
+            ))?;
+        let chain = state
+            .request_chains
+            .get_mut(&chain_id)
+            .expect("located orphaned pending chain disappeared while the pool mutex was held");
+        if chain.owner_alive {
+            return Err(DecoderPoolError::PendingAdmissionOwnerStillAlive(
+                reservation_attempt_id,
+            ));
+        }
+        let RequestChainState::Reserving(record) = &mut chain.state else {
+            unreachable!("located pending attempt changed while the pool mutex was held");
+        };
+        issue_pending_claim(Arc::clone(&self.inner), chain_id, record)
+    }
+
+    #[cfg(test)]
+    fn install_reserve_refusal_proof(
+        &self,
+        pending: &mut PendingAdmission,
+        receipt: &DecoderReserveRefusalReceipt,
+    ) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+        self.validate_pending_pool(pending)?;
+        let mut state = self.inner.state.lock();
+        if !pending_is_resolved(&state, pending) {
+            pending_record_mut(&mut state, pending)?.authority =
+                PendingAdmissionAuthority::ReserveProof(Box::new(receipt.clone()));
+        }
+        validate_reserve_refusal_receipt(&state, pending, receipt)?;
+        let proof = PendingAdmissionReconciliationRecord::Refusal(receipt.clone());
+        install_pending_reconciliation(&mut state, pending, proof)?;
+        let disposition = apply_pending_reconciliation(&mut state, pending)?;
+        pending.resolved = true;
+        Ok(disposition)
+    }
+
+    #[cfg(test)]
+    fn pin_pending_cancellation(
+        &self,
+        pending: &PendingAdmission,
+        target: &PreparedGrantCancellationTarget,
+        disposition: PendingAdmissionDisposition,
+    ) -> Result<PendingCancellationPin, DecoderPoolError> {
+        self.validate_pending_pool(pending)?;
+        validate_pending_cancellation_target(pending, target)?;
+        let mut state = self.inner.state.lock();
+        install_pending_cancellation_intent(&mut state, pending, target, disposition)?;
+        Ok(PendingCancellationPin::new(target.clone()))
+    }
+
+    /// Atomically pin and begin cancellation of an unbound PREPARED grant.
+    pub fn begin_unbound_pending_cancellation<'a>(
+        &self,
+        pending: &'a mut PendingAdmission,
+        grant: &mut UnboundPreparedGrant,
+        disposition: PendingAdmissionDisposition,
+    ) -> Result<PendingCancellationReconciliation<'a>, DecoderPoolError> {
+        let target = grant
+            .cancellation_target()
+            .map_err(|error| DecoderPoolError::InvalidGrant(error.to_string()))?;
+        self.validate_pending_pool(pending)?;
+        validate_pending_cancellation_target(pending, &target)?;
+        let operation_id = Uuid::new_v4();
+        let mut state = self.inner.state.lock();
+        ensure_prepared_pending_authority(&state, pending)?;
+        install_pending_cancellation_intent(&mut state, pending, &target, disposition)?;
+        let pin = PendingCancellationPin::new(target);
+        let engine = grant
+            .begin_pending_cancellation(pin)
+            .expect("validated unbound cancellation target lost engine authority");
+        pending_record_mut(&mut state, pending)?.authority =
+            PendingAdmissionAuthority::CancellationCheckedOut {
+                operation_id,
+                kind: PendingCancellationKind::Unbound,
+            };
+        drop(state);
+        Ok(PendingCancellationReconciliation {
+            pending,
+            operation_id,
+            engine: Some(PendingCancellationEngine::Unbound(Box::new(engine))),
+            complete: false,
+        })
+    }
+
+    /// Atomically pin and begin cancellation after failed or ambiguous bind I/O.
+    pub fn begin_bind_pending_cancellation<'a>(
+        &self,
+        pending: &'a mut PendingAdmission,
+        grant: &mut BindReconciliationGrant,
+        disposition: PendingAdmissionDisposition,
+    ) -> Result<PendingCancellationReconciliation<'a>, DecoderPoolError> {
+        let target = grant
+            .cancellation_target()
+            .map_err(|error| DecoderPoolError::InvalidGrant(error.to_string()))?;
+        self.validate_pending_pool(pending)?;
+        validate_pending_cancellation_target(pending, &target)?;
+        let operation_id = Uuid::new_v4();
+        let mut state = self.inner.state.lock();
+        ensure_prepared_pending_authority(&state, pending)?;
+        install_pending_cancellation_intent(&mut state, pending, &target, disposition)?;
+        let pin = PendingCancellationPin::new(target);
+        let engine = grant
+            .begin_pending_cancellation(pin)
+            .expect("validated bind cancellation target lost engine authority");
+        pending_record_mut(&mut state, pending)?.authority =
+            PendingAdmissionAuthority::CancellationCheckedOut {
+                operation_id,
+                kind: PendingCancellationKind::Unbound,
+            };
+        drop(state);
+        Ok(PendingCancellationReconciliation {
+            pending,
+            operation_id,
+            engine: Some(PendingCancellationEngine::Unbound(Box::new(engine))),
+            complete: false,
+        })
+    }
+
+    /// Atomically pin and begin cancellation of a bound PREPARED grant.
+    pub fn begin_bound_pending_cancellation<'a>(
+        &self,
+        pending: &'a mut PendingAdmission,
+        grant: &mut BoundPreparedGrant,
+        disposition: PendingAdmissionDisposition,
+    ) -> Result<PendingCancellationReconciliation<'a>, DecoderPoolError> {
+        let target = grant
+            .cancellation_target()
+            .map_err(|error| DecoderPoolError::InvalidGrant(error.to_string()))?;
+        self.validate_pending_pool(pending)?;
+        validate_pending_cancellation_target(pending, &target)?;
+        let operation_id = Uuid::new_v4();
+        let mut state = self.inner.state.lock();
+        ensure_prepared_pending_authority(&state, pending)?;
+        install_pending_cancellation_intent(&mut state, pending, &target, disposition)?;
+        let pin = PendingCancellationPin::new(target);
+        let engine = grant
+            .begin_pending_cancellation(pin)
+            .expect("validated bound cancellation target lost engine authority");
+        pending_record_mut(&mut state, pending)?.authority =
+            PendingAdmissionAuthority::CancellationCheckedOut {
+                operation_id,
+                kind: PendingCancellationKind::Bound,
+            };
+        drop(state);
+        Ok(PendingCancellationReconciliation {
+            pending,
+            operation_id,
+            engine: Some(PendingCancellationEngine::Bound(Box::new(engine))),
+            complete: false,
+        })
+    }
+
+    /// Resume exact pending-cancellation authority recovered from a dropped task.
+    pub fn resume_pending_cancellation<'a>(
+        &self,
+        pending: &'a mut PendingAdmission,
+    ) -> Result<PendingCancellationReconciliation<'a>, DecoderPoolError> {
+        self.validate_pending_pool(pending)?;
+        let operation_id = Uuid::new_v4();
+        let mut state = self.inner.state.lock();
+        let record = pending_record_mut(&mut state, pending)?;
+        if !matches!(
+            record.authority,
+            PendingAdmissionAuthority::CancellationRetry(_)
+        ) {
+            return Err(DecoderPoolError::PendingReservationAlreadyStarted(
+                pending.reservation_attempt_id,
+            ));
+        }
+        let authority = std::mem::replace(
+            &mut record.authority,
+            PendingAdmissionAuthority::CancellationCheckedOut {
+                operation_id,
+                kind: PendingCancellationKind::Unbound,
+            },
+        );
+        let PendingAdmissionAuthority::CancellationRetry(engine) = authority else {
+            unreachable!("cancellation retry authority changed while the pool mutex was held");
+        };
+        let kind = match &engine {
+            PendingCancellationEngine::Unbound(_) => PendingCancellationKind::Unbound,
+            PendingCancellationEngine::Bound(_) => PendingCancellationKind::Bound,
+        };
+        record.authority = PendingAdmissionAuthority::CancellationCheckedOut { operation_id, kind };
+        drop(state);
+        Ok(PendingCancellationReconciliation {
+            pending,
+            operation_id,
+            engine: Some(engine),
+            complete: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn install_pending_cancellation_proof(
+        &self,
+        pending: &mut PendingAdmission,
+        proof: &PendingCancellationProof,
+    ) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+        self.validate_pending_pool(pending)?;
+        let mut state = self.inner.state.lock();
+        if !pending_is_resolved(&state, pending) {
+            pending_record_mut(&mut state, pending)?.authority =
+                PendingAdmissionAuthority::CancellationProof(Box::new(proof.clone()));
+        }
+        install_pending_cancellation_proof(&mut state, pending, proof)?;
+        let disposition = apply_pending_reconciliation(&mut state, pending)?;
+        pending.resolved = true;
+        Ok(disposition)
+    }
+
+    /// Retry pool application of an already installed authoritative proof.
+    pub fn resume_pending_admission(
+        &self,
+        pending: &mut PendingAdmission,
+    ) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+        self.validate_pending_pool(pending)?;
+        let mut state = self.inner.state.lock();
+        if !pending_is_resolved(&state, pending) {
+            let authority = pending_record(&state, pending)?.authority_proof();
+            match authority {
+                Some(PendingAuthorityProof::Reserve(receipt)) => {
+                    validate_reserve_refusal_receipt(&state, pending, &receipt)?;
+                    install_pending_reconciliation(
+                        &mut state,
+                        pending,
+                        PendingAdmissionReconciliationRecord::Refusal(receipt),
+                    )?;
+                }
+                Some(PendingAuthorityProof::Cancellation(proof)) => {
+                    install_pending_cancellation_proof(&mut state, pending, &proof)?;
+                }
+                None => {}
+            }
+        }
+        let disposition = apply_pending_reconciliation(&mut state, pending)?;
+        pending.resolved = true;
+        Ok(disposition)
+    }
+
+    /// Atomically convert an exact pending attempt into its allocator-issued grant.
+    pub fn bind_grant(
+        &self,
+        pending: &mut PendingAdmission,
         grant: &mut BoundPreparedGrant,
     ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
-        self.validate_request_owner(request)?;
+        self.validate_pending_pool(pending)?;
         let binding = grant.binding().clone();
         let accounting = binding.accounting();
         if binding.bootstrap_rooms().len() != accounting.child_count() {
@@ -1136,9 +2256,9 @@ impl DecoderPool {
                 actual: binding.prefill_id().clone(),
             });
         }
-        if binding.request_chain_id() != request.chain_id {
+        if binding.request_chain_id() != pending.chain_id {
             return Err(DecoderPoolError::GrantRequestMismatch {
-                expected: request.chain_id,
+                expected: pending.chain_id,
                 actual: binding.request_chain_id(),
             });
         }
@@ -1151,20 +2271,28 @@ impl DecoderPool {
         if state.assignments.contains_key(&binding.grant_id()) {
             return Err(DecoderPoolError::GrantAlreadyActive(binding.grant_id()));
         }
-        let failed_decoders = {
+        {
             let chain = state
                 .request_chains
-                .get(&request.chain_id)
-                .ok_or(DecoderPoolError::UnknownRequestChain(request.chain_id))?;
-            if let Some(assignment_id) = chain.active_assignment {
-                return Err(DecoderPoolError::RequestHasActiveCohort {
-                    request_id: chain.request_id.to_string(),
-                    assignment_id,
-                });
+                .get(&pending.chain_id)
+                .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+            let record = match &chain.state {
+                RequestChainState::Reserving(record) => record,
+                _ => {
+                    return Err(DecoderPoolError::UnknownPendingAdmission(
+                        pending.reservation_attempt_id,
+                    ));
+                }
+            };
+            validate_pending_record(record, pending)?;
+            if !matches!(record.authority, PendingAdmissionAuthority::PreparedIssued) {
+                return Err(DecoderPoolError::PendingAdmissionProofPending(
+                    pending.reservation_attempt_id,
+                ));
             }
-            if chain.phase == RequestChainPhase::Terminal {
-                return Err(DecoderPoolError::RequestChainTerminal(
-                    chain.request_id.to_string(),
+            if record.reconciliation.is_some() {
+                return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+                    pending.reservation_attempt_id,
                 ));
             }
             for (child_index, allocation_key) in binding.allocation_keys().enumerate() {
@@ -1184,24 +2312,31 @@ impl DecoderPool {
                     slot_generation: binding.slot_generations()[child_index].as_uuid(),
                 });
             }
-            chain.failed_decoders.clone()
-        };
+        }
 
-        let candidates = select_decoders(&state.replicas, &failed_decoders)?;
-        if !candidates.contains(binding.decoder_id()) {
+        if binding.decoder_id() != &pending.decoder_id
+            || binding.reservation_attempt_id() != pending.reservation_attempt_id
+            || binding.reserve_attempt_digest() != pending.reserve_attempt_digest
+        {
             return Err(DecoderPoolError::GrantDecoderIneligible(
                 binding.decoder_id().clone(),
             ));
         }
+        if accounting.child_count() != pending.charge.child_requests() {
+            return Err(DecoderPoolError::PendingChildCountMismatch {
+                pending_children: pending.charge.child_requests(),
+                request_children: accounting.child_count(),
+            });
+        }
+        validate_pending_decoder_ledger(
+            &state,
+            binding.decoder_id(),
+            pending.reservation_attempt_id,
+        )?;
         let replica = state
             .replicas
             .get(binding.decoder_id())
-            .expect("eligible grant decoder disappeared while pool lock was held");
-        if replica.availability != DecoderAvailability::Ready {
-            return Err(DecoderPoolError::GrantDecoderUnavailable(
-                binding.decoder_id().clone(),
-            ));
-        }
+            .ok_or_else(|| DecoderPoolError::UnknownDecoder(binding.decoder_id().clone()))?;
         if let Some(room) = binding.bootstrap_rooms().iter().find(|room| {
             state
                 .room_owners
@@ -1222,6 +2357,9 @@ impl DecoderPool {
             });
         }
 
+        let active_cohorts = replica.active_cohorts.checked_add(1).ok_or_else(|| {
+            DecoderPoolError::InvalidGrant("active cohort accounting overflows usize".to_string())
+        })?;
         let active_child_requests = replica
             .active_child_requests
             .checked_add(accounting.child_count())
@@ -1257,8 +2395,12 @@ impl DecoderPool {
         let replica = state
             .replicas
             .get_mut(binding.decoder_id())
-            .expect("eligible grant decoder disappeared while pool lock was held");
-        replica.active_cohorts += 1;
+            .expect("pending decoder disappeared while pool lock was held");
+        replica.pending_admissions -= 1;
+        replica.pending_child_requests -= pending.charge.child_requests();
+        replica.pending_reserved_kv_tokens -= pending.charge.reserved_kv_tokens();
+        replica.pending_remaining_decode_tokens -= pending.charge.remaining_decode_tokens();
+        replica.active_cohorts = active_cohorts;
         replica.active_child_requests = active_child_requests;
         replica.reserved_kv_tokens = reserved_kv_tokens;
         replica.remaining_decode_tokens = remaining_decode_tokens;
@@ -1276,7 +2418,7 @@ impl DecoderPool {
         state.assignments.insert(
             assignment_id,
             AssignmentRecord {
-                chain_id: request.chain_id,
+                chain_id: pending.chain_id,
                 binding: binding.clone(),
                 phase: CohortPhase::Reserved,
                 terminal_reconciliation: None,
@@ -1287,16 +2429,17 @@ impl DecoderPool {
         );
         let chain = state
             .request_chains
-            .get_mut(&request.chain_id)
+            .get_mut(&pending.chain_id)
             .expect("request chain disappeared while pool lock was held");
         for allocation_key in binding.allocation_keys() {
             chain.used_grants.insert(allocation_key, binding.digest());
         }
-        chain.active_assignment = Some(assignment_id);
+        chain.state = RequestChainState::Assigned(assignment_id);
+        pending.resolved = true;
 
         Ok(DecoderAssignmentCohort {
             pool_id: self.inner.pool_id,
-            chain_id: request.chain_id,
+            chain_id: pending.chain_id,
             assignment_id,
             binding: binding.clone(),
             phase: CohortPhase::Reserved,
@@ -1347,11 +2490,14 @@ impl DecoderPool {
             .prepared_grant
             .as_mut()
             .expect("prepared grant authority was validated immediately before mutation");
-        let cancellation = prepared_grant.begin_cancellation().map_err(|_| {
-            DecoderPoolError::InvalidGrant(
-                "matching prepared grant has no cancellation authority".to_string(),
-            )
-        })?;
+        let pool_binding = DecoderGrantPoolBinding::new(&cohort.binding);
+        let cancellation = prepared_grant
+            .begin_pool_cancellation(pool_binding)
+            .map_err(|_| {
+                DecoderPoolError::InvalidGrant(
+                    "matching prepared grant has no cancellation authority".to_string(),
+                )
+            })?;
         cohort.prepared_grant = None;
         let record = state
             .assignments
@@ -2031,6 +3177,10 @@ impl DecoderPool {
             .map(|replica| DecoderReplicaSnapshot {
                 id: replica.metadata.id.clone(),
                 availability: replica.availability,
+                pending_admissions: replica.pending_admissions,
+                pending_child_requests: replica.pending_child_requests,
+                pending_reserved_kv_tokens: replica.pending_reserved_kv_tokens,
+                pending_remaining_decode_tokens: replica.pending_remaining_decode_tokens,
                 active_cohorts: replica.active_cohorts,
                 active_child_requests: replica.active_child_requests,
                 quiescing_cohorts: replica.quiescing_cohorts,
@@ -2058,6 +3208,13 @@ impl DecoderPool {
         }
         if request.finalized {
             return Err(DecoderPoolError::RequestOwnerFinalized);
+        }
+        Ok(())
+    }
+
+    fn validate_pending_pool(&self, pending: &PendingAdmission) -> Result<(), DecoderPoolError> {
+        if !Arc::ptr_eq(&pending.inner, &self.inner) {
+            return Err(DecoderPoolError::ForeignPendingAdmission);
         }
         Ok(())
     }
@@ -2109,17 +3266,17 @@ fn release_assignment(
             .request_chains
             .get_mut(&ledger.chain_id)
             .expect("request chain was preflighted under the same pool lock");
-        chain.active_assignment = None;
         match disposition {
             RetryDisposition::Terminal => {
-                chain.phase = RequestChainPhase::Terminal;
+                chain.state = RequestChainState::Terminal;
                 chain.failed_decoders.clear();
             }
             RetryDisposition::Retryable => {
-                debug_assert_eq!(chain.phase, RequestChainPhase::Open);
+                chain.state = RequestChainState::IdleOpen(AdmissionRetryConstraint::AnyEligible);
             }
             RetryDisposition::DecoderFailed => {
                 chain.failed_decoders.insert(ledger.decoder_id);
+                chain.state = RequestChainState::IdleOpen(AdmissionRetryConstraint::AnyEligible);
             }
         }
         !chain.owner_alive
@@ -2151,7 +3308,7 @@ fn quarantine_assignment(
         .request_chains
         .get_mut(&ledger.chain_id)
         .expect("request chain was preflighted under the same pool lock");
-    chain.phase = RequestChainPhase::Terminal;
+    chain.state = RequestChainState::Quarantined(cohort.assignment_id);
     chain.failed_decoders.clear();
     cohort.phase = CohortPhase::Quarantined;
     Ok(())
@@ -2180,6 +3337,129 @@ fn select_decoders(
         .into_iter()
         .map(|replica| replica.metadata.id.clone())
         .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_pending_attempt(
+    state: &mut PoolState,
+    chain_id: Uuid,
+    decoder_id: DecoderId,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    charge: PendingSchedulingCharge,
+    retry_constraint: AdmissionRetryConstraint,
+    reservation: Option<Arc<DecoderGrantReservation>>,
+    claim_id: Uuid,
+    authority: PendingAdmissionAuthority,
+) -> Result<(), DecoderPoolError> {
+    let replica = state
+        .replicas
+        .get(&decoder_id)
+        .expect("selected decoder disappeared while pool lock was held");
+    let pending_admissions = replica.pending_admissions.checked_add(1).ok_or_else(|| {
+        DecoderPoolError::InvalidGrant("pending reservation accounting overflows usize".to_string())
+    })?;
+    let pending_child_requests = replica
+        .pending_child_requests
+        .checked_add(charge.child_requests())
+        .ok_or_else(|| {
+            DecoderPoolError::InvalidGrant(
+                "pending child-request accounting overflows usize".to_string(),
+            )
+        })?;
+    let pending_reserved_kv_tokens = replica
+        .pending_reserved_kv_tokens
+        .checked_add(charge.reserved_kv_tokens())
+        .ok_or_else(|| {
+            DecoderPoolError::InvalidGrant(
+                "pending KV-token accounting overflows usize".to_string(),
+            )
+        })?;
+    let pending_remaining_decode_tokens = replica
+        .pending_remaining_decode_tokens
+        .checked_add(charge.remaining_decode_tokens())
+        .ok_or_else(|| {
+            DecoderPoolError::InvalidGrant(
+                "pending decode-token accounting overflows usize".to_string(),
+            )
+        })?;
+
+    let replica = state
+        .replicas
+        .get_mut(&decoder_id)
+        .expect("selected decoder disappeared while pool lock was held");
+    replica.pending_admissions = pending_admissions;
+    replica.pending_child_requests = pending_child_requests;
+    replica.pending_reserved_kv_tokens = pending_reserved_kv_tokens;
+    replica.pending_remaining_decode_tokens = pending_remaining_decode_tokens;
+    state
+        .request_chains
+        .get_mut(&chain_id)
+        .expect("request chain disappeared while pool lock was held")
+        .state = RequestChainState::Reserving(Box::new(PendingAdmissionRecord {
+        decoder_id,
+        reservation_attempt_id,
+        reserve_attempt_digest,
+        charge,
+        retry_constraint,
+        reservation,
+        claim_id: Some(claim_id),
+        authority,
+        reconciliation: None,
+    }));
+    Ok(())
+}
+
+fn rollback_pending_record(state: &mut PoolState, pending: &PendingAdmission) {
+    let (decoder_id, charge, retry_constraint, owner_alive) = {
+        let chain = state
+            .request_chains
+            .get(&pending.chain_id)
+            .expect("pending lease chain must exist until its authority is resolved");
+        let record = match &chain.state {
+            RequestChainState::Reserving(record) => record,
+            _ => panic!("pending lease must still own a reserving request chain"),
+        };
+        validate_pending_record(record, pending)
+            .expect("pending lease must exactly match its pool-owned record");
+        (
+            record.decoder_id.clone(),
+            record.charge,
+            record.retry_constraint.clone(),
+            chain.owner_alive,
+        )
+    };
+
+    let replica = state
+        .replicas
+        .get_mut(&decoder_id)
+        .expect("pending decoder must exist until its charge is released");
+    replica.pending_admissions = replica
+        .pending_admissions
+        .checked_sub(1)
+        .expect("pending admission accounting must include the checked-out attempt");
+    replica.pending_child_requests = replica
+        .pending_child_requests
+        .checked_sub(charge.child_requests())
+        .expect("pending child accounting must include the checked-out attempt");
+    replica.pending_reserved_kv_tokens = replica
+        .pending_reserved_kv_tokens
+        .checked_sub(charge.reserved_kv_tokens())
+        .expect("pending KV accounting must include the checked-out attempt");
+    replica.pending_remaining_decode_tokens = replica
+        .pending_remaining_decode_tokens
+        .checked_sub(charge.remaining_decode_tokens())
+        .expect("pending decode accounting must include the checked-out attempt");
+
+    if owner_alive {
+        state
+            .request_chains
+            .get_mut(&pending.chain_id)
+            .expect("pending request chain disappeared while the pool mutex was held")
+            .state = RequestChainState::IdleOpen(retry_constraint);
+        return;
+    }
+    remove_request_chain(state, pending.chain_id);
 }
 
 fn remove_request_chain(state: &mut PoolState, chain_id: Uuid) {
@@ -2350,6 +3630,487 @@ fn validate_engine_grant_identity(
         return Err(DecoderPoolError::InvalidGrant(format!(
             "{operation} grant does not exactly match the assignment"
         )));
+    }
+    Ok(())
+}
+
+fn issue_pending_claim(
+    inner: Arc<DecoderPoolInner>,
+    chain_id: Uuid,
+    record: &mut PendingAdmissionRecord,
+) -> Result<PendingAdmission, DecoderPoolError> {
+    if record.claim_id.is_some() {
+        return Err(DecoderPoolError::PendingAdmissionAlreadyClaimed(
+            record.reservation_attempt_id,
+        ));
+    }
+    if matches!(
+        record.authority,
+        PendingAdmissionAuthority::ReserveCheckedOut { .. }
+            | PendingAdmissionAuthority::CancellationCheckedOut { .. }
+    ) {
+        return Err(DecoderPoolError::PendingReservationAlreadyStarted(
+            record.reservation_attempt_id,
+        ));
+    }
+    let claim_id = Uuid::new_v4();
+    record.claim_id = Some(claim_id);
+    Ok(PendingAdmission {
+        inner,
+        chain_id,
+        claim_id,
+        decoder_id: record.decoder_id.clone(),
+        reservation_attempt_id: record.reservation_attempt_id,
+        reserve_attempt_digest: record.reserve_attempt_digest,
+        charge: record.charge,
+        retry_constraint: record.retry_constraint.clone(),
+        resolved: false,
+    })
+}
+
+fn pending_record<'a>(
+    state: &'a PoolState,
+    pending: &PendingAdmission,
+) -> Result<&'a PendingAdmissionRecord, DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    let record = match &chain.state {
+        RequestChainState::Reserving(record) => record,
+        _ => {
+            return Err(DecoderPoolError::UnknownPendingAdmission(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_record(record, pending)?;
+    Ok(record)
+}
+
+fn pending_is_resolved(state: &PoolState, pending: &PendingAdmission) -> bool {
+    state
+        .request_chains
+        .get(&pending.chain_id)
+        .is_some_and(|chain| {
+            chain
+                .resolved_admissions
+                .contains_key(&pending.reservation_attempt_id)
+        })
+}
+
+fn pending_record_mut<'a>(
+    state: &'a mut PoolState,
+    pending: &PendingAdmission,
+) -> Result<&'a mut PendingAdmissionRecord, DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get_mut(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    let record = match &mut chain.state {
+        RequestChainState::Reserving(record) => record,
+        _ => {
+            return Err(DecoderPoolError::UnknownPendingAdmission(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_record(record, pending)?;
+    Ok(record)
+}
+
+fn ensure_prepared_pending_authority(
+    state: &PoolState,
+    pending: &PendingAdmission,
+) -> Result<(), DecoderPoolError> {
+    let record = pending_record(state, pending)?;
+    if matches!(record.authority, PendingAdmissionAuthority::PreparedIssued) {
+        return Ok(());
+    }
+    Err(DecoderPoolError::PendingReservationAlreadyStarted(
+        pending.reservation_attempt_id,
+    ))
+}
+
+fn validate_pending_record(
+    record: &PendingAdmissionRecord,
+    pending: &PendingAdmission,
+) -> Result<(), DecoderPoolError> {
+    if record.decoder_id != pending.decoder_id
+        || record.reservation_attempt_id != pending.reservation_attempt_id
+        || record.reserve_attempt_digest != pending.reserve_attempt_digest
+        || record.charge != pending.charge
+        || record.retry_constraint != pending.retry_constraint
+        || record.claim_id != Some(pending.claim_id)
+    {
+        return Err(DecoderPoolError::ForeignPendingAdmission);
+    }
+    Ok(())
+}
+
+fn validate_reserve_refusal_receipt(
+    state: &PoolState,
+    pending: &PendingAdmission,
+    receipt: &DecoderReserveRefusalReceipt,
+) -> Result<(), DecoderPoolError> {
+    if receipt.prefill_id() != &state.prefill_id
+        || receipt.logical_request_chain_id() != pending.chain_id
+        || receipt.decoder_id() != &pending.decoder_id
+        || receipt.reservation_attempt_id() != pending.reservation_attempt_id
+        || receipt.reserve_attempt_digest() != pending.reserve_attempt_digest
+        || !receipt.take_once()
+    {
+        return Err(DecoderPoolError::ForeignPendingAdmission);
+    }
+    Ok(())
+}
+
+fn validate_pending_cancellation_target(
+    pending: &PendingAdmission,
+    target: &PreparedGrantCancellationTarget,
+) -> Result<(), DecoderPoolError> {
+    if target.decoder_id() != &pending.decoder_id
+        || target.reservation_attempt_id() != pending.reservation_attempt_id
+        || target.reserve_attempt_digest() != pending.reserve_attempt_digest
+    {
+        return Err(DecoderPoolError::ForeignPendingAdmission);
+    }
+    Ok(())
+}
+
+fn validate_pending_cancellation_proof(
+    reservation_attempt_id: Uuid,
+    target: &PreparedGrantCancellationTarget,
+    proof: &PendingCancellationProof,
+) -> Result<(), DecoderPoolError> {
+    let valid = match proof {
+        PendingCancellationProof::Unbound(receipt) => target.matches_unbound_receipt(receipt),
+        PendingCancellationProof::Bound(receipt) => target.matches_bound_receipt(receipt),
+    };
+    if !valid {
+        return Err(DecoderPoolError::InvalidPendingCancellationProof {
+            reservation_attempt_id,
+            reason: "receipt does not match the pinned cancellation target",
+        });
+    }
+    Ok(())
+}
+
+fn install_pending_reconciliation(
+    state: &mut PoolState,
+    pending: &PendingAdmission,
+    proof: PendingAdmissionReconciliationRecord,
+) -> Result<(), DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get_mut(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    if let Some(existing) = chain
+        .resolved_admissions
+        .get(&pending.reservation_attempt_id)
+    {
+        if existing == &proof {
+            return Ok(());
+        }
+        return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+            pending.reservation_attempt_id,
+        ));
+    }
+    let record = match &mut chain.state {
+        RequestChainState::Reserving(record) => record,
+        _ => {
+            return Err(DecoderPoolError::UnknownPendingAdmission(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_record(record, pending)?;
+    if let Some(existing) = record.reconciliation.as_ref() {
+        if existing == &proof {
+            return Ok(());
+        }
+        return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+            pending.reservation_attempt_id,
+        ));
+    }
+    record.reconciliation = Some(proof);
+    Ok(())
+}
+
+fn install_pending_cancellation_intent(
+    state: &mut PoolState,
+    pending: &PendingAdmission,
+    target: &PreparedGrantCancellationTarget,
+    disposition: PendingAdmissionDisposition,
+) -> Result<(), DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get_mut(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    if let Some(existing) = chain
+        .resolved_admissions
+        .get(&pending.reservation_attempt_id)
+    {
+        if matches!(
+            existing,
+            PendingAdmissionReconciliationRecord::Cancellation {
+                disposition: existing_disposition,
+                target: existing_target,
+                ..
+            } if *existing_disposition == disposition && existing_target == target
+        ) {
+            return Ok(());
+        }
+        return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+            pending.reservation_attempt_id,
+        ));
+    }
+    let record = match &mut chain.state {
+        RequestChainState::Reserving(record) => record,
+        _ => {
+            return Err(DecoderPoolError::UnknownPendingAdmission(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_record(record, pending)?;
+    match record.reconciliation.as_ref() {
+        None => {
+            record.reconciliation = Some(PendingAdmissionReconciliationRecord::Cancellation {
+                disposition,
+                target: target.clone(),
+                proof: None,
+            });
+            Ok(())
+        }
+        Some(PendingAdmissionReconciliationRecord::Cancellation {
+            disposition: existing_disposition,
+            target: existing_target,
+            ..
+        }) if *existing_disposition == disposition && existing_target == target => Ok(()),
+        Some(_) => Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+            pending.reservation_attempt_id,
+        )),
+    }
+}
+
+fn install_pending_cancellation_proof(
+    state: &mut PoolState,
+    pending: &PendingAdmission,
+    proof: &PendingCancellationProof,
+) -> Result<(), DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get_mut(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    if let Some(existing) = chain
+        .resolved_admissions
+        .get(&pending.reservation_attempt_id)
+    {
+        return match existing {
+            PendingAdmissionReconciliationRecord::Cancellation {
+                proof: Some(existing_proof),
+                ..
+            } if existing_proof.as_ref() == proof => Ok(()),
+            _ => Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+                pending.reservation_attempt_id,
+            )),
+        };
+    }
+    let record = match &mut chain.state {
+        RequestChainState::Reserving(record) => record,
+        _ => {
+            return Err(DecoderPoolError::UnknownPendingAdmission(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_record(record, pending)?;
+    let (target, proof_slot) = match record.reconciliation.as_mut() {
+        Some(PendingAdmissionReconciliationRecord::Cancellation { target, proof, .. }) => {
+            (target, proof)
+        }
+        Some(PendingAdmissionReconciliationRecord::Refusal(_)) => {
+            return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+                pending.reservation_attempt_id,
+            ));
+        }
+        None => {
+            return Err(DecoderPoolError::PendingCancellationNotPinned(
+                pending.reservation_attempt_id,
+            ));
+        }
+    };
+    validate_pending_cancellation_proof(pending.reservation_attempt_id, target, proof)?;
+    if let Some(existing) = proof_slot.as_ref() {
+        if existing.as_ref() == proof {
+            return Ok(());
+        }
+        return Err(DecoderPoolError::ConflictingPendingAdmissionProof(
+            pending.reservation_attempt_id,
+        ));
+    }
+    *proof_slot = Some(Box::new(proof.clone()));
+    Ok(())
+}
+
+fn apply_pending_reconciliation(
+    state: &mut PoolState,
+    pending: &PendingAdmission,
+) -> Result<PendingAdmissionDisposition, DecoderPoolError> {
+    let chain = state
+        .request_chains
+        .get(&pending.chain_id)
+        .ok_or(DecoderPoolError::UnknownRequestChain(pending.chain_id))?;
+    if let Some(resolved) = chain
+        .resolved_admissions
+        .get(&pending.reservation_attempt_id)
+    {
+        return Ok(pending_reconciliation_disposition(resolved));
+    }
+    let (decoder_id, reservation_attempt_id, charge, reconciliation, owner_alive) = {
+        let record = match &chain.state {
+            RequestChainState::Reserving(record) => record,
+            _ => {
+                return Err(DecoderPoolError::UnknownPendingAdmission(
+                    pending.reservation_attempt_id,
+                ));
+            }
+        };
+        validate_pending_record(record, pending)?;
+        (
+            record.decoder_id.clone(),
+            record.reservation_attempt_id,
+            record.charge,
+            record.reconciliation.clone(),
+            chain.owner_alive,
+        )
+    };
+    let reconciliation = reconciliation.ok_or(DecoderPoolError::PendingAdmissionProofPending(
+        pending.reservation_attempt_id,
+    ))?;
+    if matches!(
+        &reconciliation,
+        PendingAdmissionReconciliationRecord::Cancellation { proof: None, .. }
+    ) {
+        return Err(DecoderPoolError::PendingAdmissionProofPending(
+            pending.reservation_attempt_id,
+        ));
+    }
+    validate_pending_decoder_ledger(state, &decoder_id, pending.reservation_attempt_id)?;
+    let disposition = pending_reconciliation_disposition(&reconciliation);
+
+    let replica = state
+        .replicas
+        .get_mut(&decoder_id)
+        .expect("pending decoder was validated under the same pool lock");
+    replica.pending_admissions -= 1;
+    replica.pending_child_requests -= charge.child_requests();
+    replica.pending_reserved_kv_tokens -= charge.reserved_kv_tokens();
+    replica.pending_remaining_decode_tokens -= charge.remaining_decode_tokens();
+
+    let chain = state
+        .request_chains
+        .get_mut(&pending.chain_id)
+        .expect("request chain was validated under the same pool lock");
+    let previous = chain
+        .resolved_admissions
+        .insert(reservation_attempt_id, reconciliation);
+    debug_assert!(previous.is_none());
+    match disposition {
+        PendingAdmissionDisposition::RetrySameDecoder => {
+            chain.state =
+                RequestChainState::IdleOpen(AdmissionRetryConstraint::SameDecoder(decoder_id));
+        }
+        PendingAdmissionDisposition::RetryAnotherDecoder => {
+            chain.failed_decoders.insert(decoder_id);
+            chain.state = RequestChainState::IdleOpen(AdmissionRetryConstraint::AnyEligible);
+        }
+        PendingAdmissionDisposition::Terminal => {
+            chain.failed_decoders.clear();
+            chain.state = RequestChainState::Terminal;
+        }
+    }
+    if !owner_alive {
+        remove_request_chain(state, pending.chain_id);
+    }
+    Ok(disposition)
+}
+
+fn pending_reconciliation_disposition(
+    reconciliation: &PendingAdmissionReconciliationRecord,
+) -> PendingAdmissionDisposition {
+    match reconciliation {
+        PendingAdmissionReconciliationRecord::Refusal(receipt) => match receipt.disposition() {
+            DecoderReserveRefusalDisposition::RetrySameDecoder => {
+                PendingAdmissionDisposition::RetrySameDecoder
+            }
+            DecoderReserveRefusalDisposition::RetryAnotherDecoder => {
+                PendingAdmissionDisposition::RetryAnotherDecoder
+            }
+            DecoderReserveRefusalDisposition::Terminal => PendingAdmissionDisposition::Terminal,
+        },
+        PendingAdmissionReconciliationRecord::Cancellation { disposition, .. } => *disposition,
+    }
+}
+
+fn validate_pending_decoder_ledger(
+    state: &PoolState,
+    decoder_id: &DecoderId,
+    reservation_attempt_id: Uuid,
+) -> Result<(), DecoderPoolError> {
+    let replica =
+        state
+            .replicas
+            .get(decoder_id)
+            .ok_or(DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id,
+                reason: "pending decoder generation is missing",
+            })?;
+    let mut pending_admissions = 0usize;
+    let mut pending_child_requests = 0usize;
+    let mut pending_reserved_kv_tokens = 0usize;
+    let mut pending_remaining_decode_tokens = 0usize;
+    for record in state.request_chains.values().filter_map(|chain| {
+        let RequestChainState::Reserving(record) = &chain.state else {
+            return None;
+        };
+        (record.decoder_id == *decoder_id).then_some(record)
+    }) {
+        pending_admissions = pending_admissions.checked_add(1).ok_or(
+            DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id,
+                reason: "pending reservation accounting overflows usize",
+            },
+        )?;
+        pending_child_requests = pending_child_requests
+            .checked_add(record.charge.child_requests())
+            .ok_or(DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id,
+                reason: "pending child-request accounting overflows usize",
+            })?;
+        pending_reserved_kv_tokens = pending_reserved_kv_tokens
+            .checked_add(record.charge.reserved_kv_tokens())
+            .ok_or(DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id,
+                reason: "pending KV-token accounting overflows usize",
+            })?;
+        pending_remaining_decode_tokens = pending_remaining_decode_tokens
+            .checked_add(record.charge.remaining_decode_tokens())
+            .ok_or(DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id,
+                reason: "pending decode-token accounting overflows usize",
+            })?;
+    }
+    if replica.pending_admissions != pending_admissions
+        || replica.pending_child_requests != pending_child_requests
+        || replica.pending_reserved_kv_tokens != pending_reserved_kv_tokens
+        || replica.pending_remaining_decode_tokens != pending_remaining_decode_tokens
+    {
+        return Err(DecoderPoolError::InconsistentPendingAdmission {
+            reservation_attempt_id,
+            reason: "decoder pending accounting differs from request-chain reservations",
+        });
     }
     Ok(())
 }
@@ -2554,16 +4315,17 @@ fn preflight_live_assignment(
             reason: "request chain is missing",
         },
     )?;
-    if chain.active_assignment != Some(cohort.assignment_id) {
+    let chain_assignment = match &chain.state {
+        RequestChainState::Assigned(assignment_id)
+        | RequestChainState::Quarantined(assignment_id) => Some(*assignment_id),
+        RequestChainState::IdleOpen(_)
+        | RequestChainState::Reserving(_)
+        | RequestChainState::Terminal => None,
+    };
+    if chain_assignment != Some(cohort.assignment_id) {
         return Err(DecoderPoolError::InconsistentAssignment {
             assignment_id: cohort.assignment_id,
             reason: "request chain does not own this assignment",
-        });
-    }
-    if chain.phase != RequestChainPhase::Open {
-        return Err(DecoderPoolError::InconsistentAssignment {
-            assignment_id: cohort.assignment_id,
-            reason: "request chain became terminal before its assignment",
         });
     }
     validate_decoder_ledger(state, &ledger.decoder_id, cohort.assignment_id)?;
@@ -2647,24 +4409,24 @@ fn validate_engine_quarantine_receipt(
 
 fn compare_current_load(left: &ReplicaState, right: &ReplicaState) -> Ordering {
     compare_ratio(
-        left.remaining_decode_tokens,
+        left.remaining_decode_tokens as u128 + left.pending_remaining_decode_tokens as u128,
         left.metadata.scheduling.service_weight.get(),
-        right.remaining_decode_tokens,
+        right.remaining_decode_tokens as u128 + right.pending_remaining_decode_tokens as u128,
         right.metadata.scheduling.service_weight.get(),
     )
     .then_with(|| {
         compare_ratio(
-            left.reserved_kv_tokens,
+            left.reserved_kv_tokens as u128 + left.pending_reserved_kv_tokens as u128,
             left.metadata.scheduling.kv_token_scale.get(),
-            right.reserved_kv_tokens,
+            right.reserved_kv_tokens as u128 + right.pending_reserved_kv_tokens as u128,
             right.metadata.scheduling.kv_token_scale.get(),
         )
     })
     .then_with(|| {
         compare_ratio(
-            left.active_child_requests,
+            left.active_child_requests as u128 + left.pending_child_requests as u128,
             left.metadata.scheduling.child_request_scale.get(),
-            right.active_child_requests,
+            right.active_child_requests as u128 + right.pending_child_requests as u128,
             right.metadata.scheduling.child_request_scale.get(),
         )
     })
@@ -2672,13 +4434,46 @@ fn compare_current_load(left: &ReplicaState, right: &ReplicaState) -> Ordering {
 }
 
 fn compare_ratio(
-    left_numerator: usize,
+    mut left_numerator: u128,
     left_denominator: usize,
-    right_numerator: usize,
+    mut right_numerator: u128,
     right_denominator: usize,
 ) -> Ordering {
-    ((left_numerator as u128) * (right_denominator as u128))
-        .cmp(&((right_numerator as u128) * (left_denominator as u128)))
+    let mut left_denominator = left_denominator as u128;
+    let mut right_denominator = right_denominator as u128;
+    let mut inverted = false;
+    loop {
+        let ordering =
+            (left_numerator / left_denominator).cmp(&(right_numerator / right_denominator));
+        if ordering != Ordering::Equal {
+            return if inverted {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+
+        let left_remainder = left_numerator % left_denominator;
+        let right_remainder = right_numerator % right_denominator;
+        let ordering = match (left_remainder == 0, right_remainder == 0) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => {
+                left_numerator = left_denominator;
+                left_denominator = left_remainder;
+                right_numerator = right_denominator;
+                right_denominator = right_remainder;
+                inverted = !inverted;
+                continue;
+            }
+        };
+        return if inverted {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+    }
 }
 
 fn invalid_transition(
@@ -2714,20 +4509,132 @@ fn phase_is_quiescing(phase: CohortPhase) -> bool {
 mod tests {
     use std::{
         collections::HashSet,
+        future,
         sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc,
+            atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex as StdMutex,
         },
         thread,
     };
 
+    use axum::{
+        extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
+    };
+    use serde_json::{json, Value};
+    use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+
     use super::*;
     use crate::routers::http::pd_decoder_grant::{
-        issue_test_grant, issue_test_quarantine_receipt, issue_test_release_receipt,
-        DecoderGrantChildAccounting, PrefillBootstrapEndpoint, TestEngineReceiptBinding,
+        issue_test_grant, issue_test_grant_at_control_url,
+        issue_test_prepared_cancellation_receipt, issue_test_quarantine_receipt,
+        issue_test_release_receipt, issue_test_reserve_refusal_receipt,
+        issue_test_unbound_cancellation_target, DecoderGrantChildAccounting, DecoderInferenceRoute,
+        PrefillBootstrapEndpoint, TestEngineReceiptBinding,
     };
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone, Default)]
+    struct ReserveRecoveryServerState {
+        calls: Arc<AtomicUsize>,
+        attempts: Arc<StdMutex<Vec<String>>>,
+        first_request_seen: Arc<Notify>,
+    }
+
+    async fn reserve_recovery_handler(
+        State(state): State<ReserveRecoveryServerState>,
+        Json(request): Json<Value>,
+    ) -> impl IntoResponse {
+        let call_index = state.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        state.attempts.lock().unwrap().push(
+            request["reservation_attempt_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        if call_index == 0 {
+            state.first_request_seen.notify_one();
+            future::pending::<()>().await;
+            unreachable!("the deliberately ambiguous first reserve request cannot complete");
+        }
+        let receipt = json!({
+            "schema_version": request["schema_version"],
+            "operation": "reserve",
+            "state": "refused",
+            "prefill_process": request["prefill_process"],
+            "prefill_bootstrap_endpoint": request["prefill_bootstrap_endpoint"],
+            "decoder_process": request["decoder_process"],
+            "logical_request_chain_id": request["logical_request_chain_id"],
+            "reservation_attempt_id": request["reservation_attempt_id"],
+            "reserve_attempt_digest": request["reserve_attempt_digest"],
+            "source_tp_size": request["source_tp_size"],
+            "prepared_ttl_ms": request["prepared_ttl_ms"],
+            "inference_route": request["inference_route"],
+            "request_shape": request["request_shape"],
+            "reason_code": "capacity_exhausted",
+            "diagnostic": null,
+            "disposition": "retry_another_decoder",
+            "receipt_id": Uuid::new_v4(),
+            "receipt_digest": "73".repeat(32),
+            "take_once": true,
+        });
+        (StatusCode::CONFLICT, Json(receipt))
+    }
+
+    async fn start_reserve_recovery_server() -> (String, ReserveRecoveryServerState, JoinHandle<()>)
+    {
+        let state = ReserveRecoveryServerState::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let application = Router::new()
+            .route(
+                "/_internal/pd/v1/decode-reservations/reserve",
+                post(reserve_recovery_handler),
+            )
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, application).await.unwrap();
+        });
+        (format!("http://{address}"), state, task)
+    }
+
+    #[derive(Clone, Default)]
+    struct CancellationRecoveryServerState {
+        calls: Arc<AtomicUsize>,
+    }
+
+    async fn cancellation_recovery_handler(
+        State(state): State<CancellationRecoveryServerState>,
+        Json(mut request): Json<Value>,
+    ) -> impl IntoResponse {
+        state.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let request = request
+            .as_object_mut()
+            .expect("cancellation request must be a JSON object");
+        request.insert("operation".to_string(), Value::String("cancel".to_string()));
+        request.insert("state".to_string(), Value::String("cancelled".to_string()));
+        request.insert(
+            "receipt_id".to_string(),
+            Value::String(Uuid::new_v4().to_string()),
+        );
+        request.insert("receipt_digest".to_string(), Value::String("74".repeat(32)));
+        request.insert("take_once".to_string(), Value::Bool(true));
+        (StatusCode::OK, Json(request.clone()))
+    }
+
+    async fn start_cancellation_recovery_server(
+    ) -> (String, CancellationRecoveryServerState, JoinHandle<()>) {
+        let state = CancellationRecoveryServerState::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let application = Router::new()
+            .fallback(post(cancellation_recovery_handler))
+            .with_state(state.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, application).await.unwrap();
+        });
+        (format!("http://{address}"), state, task)
+    }
 
     fn stable_instance_id(name: &str) -> Uuid {
         let digest = blake3::hash(name.as_bytes());
@@ -2788,6 +4695,144 @@ mod tests {
         vec![child_accounting()]
     }
 
+    fn pending_charge(accounting: &[DecoderGrantChildAccounting]) -> PendingSchedulingCharge {
+        PendingSchedulingCharge::new(
+            accounting.len(),
+            accounting
+                .iter()
+                .map(DecoderGrantChildAccounting::reserved_kv_tokens)
+                .sum(),
+            accounting
+                .iter()
+                .map(DecoderGrantChildAccounting::remaining_decode_tokens)
+                .sum(),
+        )
+        .unwrap()
+    }
+
+    fn scalar_template() -> DecoderRequestTemplate {
+        DecoderRequestTemplate::new(
+            DecoderInferenceRoute::Generate,
+            bytes::Bytes::from_static(br#"{"text":"test"}"#),
+        )
+        .unwrap()
+    }
+
+    fn begin_scalar_admission(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        accounting: DecoderGrantChildAccounting,
+    ) -> Result<PendingAdmission, DecoderPoolError> {
+        pool.begin_admission(
+            owner,
+            &scalar_template(),
+            PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000).unwrap(),
+            Duration::from_secs(2),
+            pending_charge(&[accounting]),
+        )
+    }
+
+    fn test_selected_decoder(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+    ) -> Result<DecoderId, DecoderPoolError> {
+        pool.validate_request_owner(owner)?;
+        let state = pool.inner.state.lock();
+        let chain = state
+            .request_chains
+            .get(&owner.chain_id)
+            .ok_or(DecoderPoolError::UnknownRequestChain(owner.chain_id))?;
+        let constraint = match &chain.state {
+            RequestChainState::IdleOpen(constraint) => constraint,
+            RequestChainState::Reserving(record) => {
+                return Err(DecoderPoolError::RequestHasPendingAdmission {
+                    request_id: chain.request_id.to_string(),
+                    reservation_attempt_id: record.reservation_attempt_id,
+                });
+            }
+            RequestChainState::Assigned(assignment_id)
+            | RequestChainState::Quarantined(assignment_id) => {
+                return Err(DecoderPoolError::RequestHasActiveCohort {
+                    request_id: chain.request_id.to_string(),
+                    assignment_id: *assignment_id,
+                });
+            }
+            RequestChainState::Terminal => {
+                return Err(DecoderPoolError::RequestChainTerminal(
+                    chain.request_id.to_string(),
+                ));
+            }
+        };
+        match constraint {
+            AdmissionRetryConstraint::AnyEligible => {
+                Ok(select_decoders(&state.replicas, &chain.failed_decoders)?.remove(0))
+            }
+            AdmissionRetryConstraint::SameDecoder(decoder_id) => Ok(decoder_id.clone()),
+        }
+    }
+
+    fn begin_test_pending_for_grant(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        grant: &BoundPreparedGrant,
+    ) -> Result<PendingAdmission, DecoderPoolError> {
+        pool.validate_request_owner(owner)?;
+        let binding = grant.binding();
+        let charge = PendingSchedulingCharge::new(
+            binding.accounting().child_count(),
+            binding.accounting().total_reserved_kv_tokens(),
+            binding.accounting().total_remaining_decode_tokens(),
+        )?;
+        let mut state = pool.inner.state.lock();
+        let (retry_constraint, failed_decoders) = {
+            let chain = state
+                .request_chains
+                .get(&owner.chain_id)
+                .ok_or(DecoderPoolError::UnknownRequestChain(owner.chain_id))?;
+            let RequestChainState::IdleOpen(retry_constraint) = &chain.state else {
+                return Err(DecoderPoolError::InvalidGrant(
+                    "test pending admission requires an idle request chain".to_string(),
+                ));
+            };
+            (retry_constraint.clone(), chain.failed_decoders.clone())
+        };
+        let selected = match &retry_constraint {
+            AdmissionRetryConstraint::AnyEligible => {
+                select_decoders(&state.replicas, &failed_decoders)?.remove(0)
+            }
+            AdmissionRetryConstraint::SameDecoder(decoder_id) => decoder_id.clone(),
+        };
+        if binding.decoder_id() != &selected {
+            return Err(DecoderPoolError::GrantDecoderIneligible(
+                binding.decoder_id().clone(),
+            ));
+        }
+        let claim_id = Uuid::new_v4();
+        install_pending_attempt(
+            &mut state,
+            owner.chain_id,
+            selected.clone(),
+            binding.reservation_attempt_id(),
+            binding.reserve_attempt_digest(),
+            charge,
+            retry_constraint.clone(),
+            None,
+            claim_id,
+            PendingAdmissionAuthority::PreparedIssued,
+        )?;
+        Ok(PendingAdmission {
+            inner: Arc::clone(&pool.inner),
+            chain_id: owner.chain_id,
+            claim_id,
+            decoder_id: selected,
+            reservation_attempt_id: binding.reservation_attempt_id(),
+            reserve_attempt_digest: binding.reserve_attempt_digest(),
+            charge,
+            retry_constraint,
+            resolved: false,
+        })
+    }
+
     fn issue_grant(
         pool: &DecoderPool,
         owner: &LogicalRequestOwner,
@@ -2821,6 +4866,34 @@ mod tests {
             bootstrap_rooms: cohort.bootstrap_rooms().to_vec(),
             grant_digest: cohort.grant_digest(),
         }
+    }
+
+    fn grant_receipt_binding(grant: &BoundPreparedGrant) -> TestEngineReceiptBinding {
+        TestEngineReceiptBinding {
+            grant_id: grant.grant_id(),
+            decoder_id: grant.decoder_id().clone(),
+            child_request_ids: grant.binding().child_request_ids().collect::<Vec<_>>(),
+            prefill_bootstrap_endpoint: grant.prefill_bootstrap_endpoint().clone(),
+            slot_generations: grant.slot_generations().to_vec(),
+            bootstrap_rooms: grant.bootstrap_rooms().to_vec(),
+            grant_digest: grant.grant_digest(),
+        }
+    }
+
+    fn refusal_receipt(
+        pool: &DecoderPool,
+        pending: &PendingAdmission,
+        disposition: DecoderReserveRefusalDisposition,
+    ) -> DecoderReserveRefusalReceipt {
+        issue_test_reserve_refusal_receipt(
+            pool.snapshot().prefill_id,
+            pending.decoder_id().clone(),
+            pending.chain_id,
+            pending.reservation_attempt_id(),
+            pending.reserve_attempt_digest(),
+            disposition,
+            true,
+        )
     }
 
     fn release_receipt(
@@ -2900,13 +4973,9 @@ mod tests {
         owner: &LogicalRequestOwner,
         accounting: Vec<DecoderGrantChildAccounting>,
     ) -> Result<BoundPreparedGrant, DecoderPoolError> {
-        let decoder_id = pool
-            .admission_candidates(owner)?
-            .into_iter()
-            .next()
-            .expect("candidate list cannot be empty");
+        let decoder_id = test_selected_decoder(pool, owner)?;
         let child_count = accounting.len();
-        let first_room = NEXT_ROOM.fetch_add(child_count as u64, Ordering::Relaxed);
+        let first_room = NEXT_ROOM.fetch_add(child_count as u64, AtomicOrdering::Relaxed);
         let rooms = (0..child_count)
             .map(|offset| first_room + offset as u64)
             .collect();
@@ -2929,7 +4998,17 @@ mod tests {
         accounting: Vec<DecoderGrantChildAccounting>,
     ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
         let mut grant = issue_next_grant(pool, owner, accounting)?;
-        pool.bind_grant(owner, &mut grant)
+        let mut pending = begin_test_pending_for_grant(pool, owner, &grant)?;
+        pool.bind_grant(&mut pending, &mut grant)
+    }
+
+    fn bind_issued_grant(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+        grant: &mut BoundPreparedGrant,
+    ) -> Result<DecoderAssignmentCohort, DecoderPoolError> {
+        let mut pending = begin_test_pending_for_grant(pool, owner, grant)?;
+        pool.bind_grant(&mut pending, grant)
     }
 
     #[test]
@@ -2954,6 +5033,21 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn ratio_comparison_is_exact_without_cross_multiplication_overflow() {
+        let maximum = usize::MAX as u128;
+        assert_eq!(
+            compare_ratio(maximum * 2, usize::MAX, maximum * 2 - 1, usize::MAX,),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_ratio(maximum * 2, usize::MAX, maximum * 2, usize::MAX),
+            Ordering::Equal
+        );
+        assert_eq!(compare_ratio(1, 3, 2, 5), Ordering::Less);
+        assert_eq!(compare_ratio(7, 3, 9, 4), Ordering::Greater);
     }
 
     #[test]
@@ -3015,6 +5109,908 @@ mod tests {
     }
 
     #[test]
+    fn balances_pending_tp2_and_tp4_bursts_across_arbitrary_replica_counts() {
+        for prefill_tp_size in [2, 4] {
+            for replica_count in [1, 2, 3, 5] {
+                let pool = pool(prefill_tp_size);
+                for index in 0..replica_count {
+                    pool.register(replica(&format!("decode-{index}"), "packed-v1"))
+                        .unwrap();
+                }
+
+                let mut owners = Vec::new();
+                let mut pending = Vec::new();
+                for index in 0..(replica_count * 3) {
+                    let owner = pool
+                        .begin_request(format!(
+                            "pending-tp{prefill_tp_size}-n{replica_count}-{index}"
+                        ))
+                        .unwrap();
+                    let admission =
+                        begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+                    owners.push(owner);
+                    pending.push(admission);
+                }
+
+                assert_eq!(
+                    pool.snapshot()
+                        .replicas
+                        .iter()
+                        .map(|replica| replica.pending_admissions)
+                        .collect::<Vec<_>>(),
+                    vec![3; replica_count]
+                );
+                drop(pending);
+                assert!(pool
+                    .snapshot()
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.pending_admissions == 0));
+                drop(owners);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_begin_admission_has_exactly_one_winner() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+
+        let results = thread::scope(|scope| {
+            let first = scope.spawn(|| begin_scalar_admission(&pool, &owner, child_accounting()));
+            let second = scope.spawn(|| begin_scalar_admission(&pool, &owner, child_accounting()));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        let mut winner = None;
+        let mut rejected = 0usize;
+        for result in results {
+            match result {
+                Ok(pending) => winner = Some(pending),
+                Err(DecoderPoolError::RequestHasPendingAdmission { .. }) => rejected += 1,
+                Err(error) => panic!("unexpected concurrent admission result: {error}"),
+            }
+        }
+        assert!(winner.is_some());
+        assert_eq!(rejected, 1);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 1);
+        drop(winner);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+    }
+
+    #[test]
+    fn pending_load_changes_the_next_decoder_selection() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        pool.register(replica("decode-1", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+
+        let first = begin_scalar_admission(&pool, &first_owner, child_accounting()).unwrap();
+        let second = begin_scalar_admission(&pool, &second_owner, child_accounting()).unwrap();
+        assert_ne!(first.decoder_id(), second.decoder_id());
+        assert_eq!(
+            pool.snapshot()
+                .replicas
+                .iter()
+                .map(|replica| replica.pending_admissions)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn dropping_an_unstarted_admission_rolls_back_exact_pending_load() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let pending =
+            begin_scalar_admission(&pool, &owner, DecoderGrantChildAccounting::new(123, 45))
+                .unwrap();
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].pending_admissions, 1);
+        assert_eq!(snapshot.replicas[0].pending_child_requests, 1);
+        assert_eq!(snapshot.replicas[0].pending_reserved_kv_tokens, 123);
+        assert_eq!(snapshot.replicas[0].pending_remaining_decode_tokens, 45);
+
+        drop(pending);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].pending_admissions, 0);
+        assert_eq!(snapshot.replicas[0].pending_child_requests, 0);
+        assert_eq!(snapshot.replicas[0].pending_reserved_kv_tokens, 0);
+        assert_eq!(snapshot.replicas[0].pending_remaining_decode_tokens, 0);
+        let retry = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        drop(retry);
+    }
+
+    #[test]
+    fn dropping_an_owner_then_its_unstarted_admission_reaps_the_chain() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        drop(owner);
+        assert_eq!(pool.snapshot().active_logical_requests, 1);
+
+        drop(pending);
+        assert_eq!(pool.snapshot().active_logical_requests, 0);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+    }
+
+    #[test]
+    fn dropping_an_unpolled_reserve_rolls_back_pending_ownership() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
+        let reconciliation = pending.begin_reserve(&client).unwrap();
+
+        drop(reconciliation);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+        let retry = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        drop(retry);
+    }
+
+    #[test]
+    fn dropping_a_polled_reserve_retains_pending_ownership() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
+        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        reconciliation.mark_test_polled();
+        drop(reconciliation);
+
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 1);
+        assert!(matches!(
+            test_selected_decoder(&pool, &owner),
+            Err(DecoderPoolError::RequestHasPendingAdmission { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_reserve_future_resumes_the_exact_engine_attempt() {
+        let (decoder_url, server, server_task) = start_reserve_recovery_server().await;
+        let pool = pool(2);
+        let decoder_id =
+            DecoderId::new(decoder_url, stable_instance_id("decode-0@generation-1")).unwrap();
+        pool.register(replica_with_id(decoder_id, "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        let reservation_attempt_id = pending.reservation_attempt_id();
+        let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
+        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        assert_eq!(
+            reconciliation.reservation_attempt_id().unwrap(),
+            reservation_attempt_id
+        );
+        assert_eq!(
+            pool.recover_pending_admission(&owner, reservation_attempt_id)
+                .unwrap_err(),
+            DecoderPoolError::PendingAdmissionAlreadyClaimed(reservation_attempt_id)
+        );
+
+        let first_request_seen = server.first_request_seen.notified();
+        let mut first_poll = Box::pin(reconciliation.reconcile_reserve());
+        tokio::select! {
+            _ = first_request_seen => {}
+            result = &mut first_poll => {
+                panic!("ambiguous reserve unexpectedly completed: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("first reserve request did not reach the control endpoint");
+            }
+        }
+        drop(first_poll);
+        drop(reconciliation);
+
+        let mut resumed = pending.resume_reserve().unwrap();
+        assert_eq!(
+            resumed.reservation_attempt_id().unwrap(),
+            reservation_attempt_id
+        );
+        assert!(matches!(
+            resumed.reconcile_reserve().await.unwrap(),
+            PendingReserveOutcome::Refused(PendingAdmissionDisposition::RetryAnotherDecoder)
+        ));
+        drop(resumed);
+
+        assert_eq!(server.calls.load(AtomicOrdering::SeqCst), 2);
+        let attempts = server.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], reservation_attempt_id.to_string());
+        assert_eq!(attempts[1], reservation_attempt_id.to_string());
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_cancellation_and_failed_pool_apply_reuse_one_engine_receipt() {
+        let (decoder_url, server, server_task) = start_cancellation_recovery_server().await;
+        let pool = pool(4);
+        let decoder_id = DecoderId::new(
+            decoder_url.clone(),
+            stable_instance_id("decode-0@generation-1"),
+        )
+        .unwrap();
+        pool.register(replica_with_id(decoder_id.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let snapshot = pool.snapshot();
+        let mut grant = issue_test_grant_at_control_url(
+            snapshot.prefill_id,
+            owner.chain_id(),
+            snapshot.declared_prefill_tp_size,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![NEXT_ROOM.fetch_add(1, AtomicOrdering::Relaxed)],
+            scalar_accounting(),
+            &decoder_url,
+        )
+        .unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+
+        let cancellation = pool
+            .begin_bound_pending_cancellation(
+                &mut pending,
+                &mut grant,
+                PendingAdmissionDisposition::Terminal,
+            )
+            .unwrap();
+        drop(cancellation);
+        assert_eq!(server.calls.load(AtomicOrdering::SeqCst), 0);
+
+        let mut resumed = pool.resume_pending_cancellation(&mut pending).unwrap();
+        pool.inner
+            .state
+            .lock()
+            .replicas
+            .get_mut(&decoder_id)
+            .unwrap()
+            .pending_child_requests = 0;
+        assert_eq!(
+            resumed.reconcile_cancellation().await.unwrap_err(),
+            PendingReconciliationError::Pool(DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id: resumed.pending.reservation_attempt_id(),
+                reason: "decoder pending accounting differs from request-chain reservations",
+            })
+        );
+        pool.inner
+            .state
+            .lock()
+            .replicas
+            .get_mut(&decoder_id)
+            .unwrap()
+            .pending_child_requests = 1;
+        drop(resumed);
+
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        assert_eq!(server.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+        server_task.abort();
+    }
+
+    #[test]
+    fn pending_claims_are_exclusive_and_recoverable_after_owner_drop() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let reservation_attempt_id = pending.reservation_attempt_id();
+
+        assert_eq!(
+            pool.recover_pending_admission(&owner, reservation_attempt_id)
+                .unwrap_err(),
+            DecoderPoolError::PendingAdmissionAlreadyClaimed(reservation_attempt_id)
+        );
+        drop(pending);
+
+        pending = pool
+            .recover_pending_admission(&owner, reservation_attempt_id)
+            .unwrap();
+        assert_eq!(pending.reservation_attempt_id(), reservation_attempt_id);
+        drop(owner);
+        drop(pending);
+
+        let mut orphaned = pool
+            .recover_orphaned_pending_admission(reservation_attempt_id)
+            .unwrap();
+        let proof = PendingCancellationProof::Bound(issue_test_release_receipt(
+            grant_receipt_binding(&grant),
+            EngineReleaseKind::PreparedCancelled,
+            true,
+        ));
+        let mut cancellation = pool
+            .begin_bound_pending_cancellation(
+                &mut orphaned,
+                &mut grant,
+                PendingAdmissionDisposition::Terminal,
+            )
+            .unwrap();
+        assert_eq!(
+            cancellation.install_test_proof(proof).unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        drop(cancellation);
+        assert_eq!(pool.snapshot().active_logical_requests, 0);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+    }
+
+    #[test]
+    fn reserve_refusal_proof_replays_exactly_and_rejects_an_altered_receipt() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(
+            &pool,
+            &pending,
+            DecoderReserveRefusalDisposition::RetrySameDecoder,
+        );
+
+        pool.install_reserve_refusal_proof(&mut pending, &receipt)
+            .unwrap();
+        pool.install_reserve_refusal_proof(&mut pending, &receipt)
+            .unwrap();
+        let altered = refusal_receipt(
+            &pool,
+            &pending,
+            DecoderReserveRefusalDisposition::RetrySameDecoder,
+        );
+        assert_eq!(
+            pool.install_reserve_refusal_proof(&mut pending, &altered)
+                .unwrap_err(),
+            DecoderPoolError::ConflictingPendingAdmissionProof(pending.reservation_attempt_id())
+        );
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::RetrySameDecoder
+        );
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::RetrySameDecoder
+        );
+    }
+
+    #[test]
+    fn resolved_admission_replays_while_a_new_attempt_is_reserving() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut resolved = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(
+            &pool,
+            &resolved,
+            DecoderReserveRefusalDisposition::RetrySameDecoder,
+        );
+        pool.install_reserve_refusal_proof(&mut resolved, &receipt)
+            .unwrap();
+        let current = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+
+        assert_eq!(
+            pool.resume_pending_admission(&mut resolved).unwrap(),
+            PendingAdmissionDisposition::RetrySameDecoder
+        );
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 1);
+        drop(current);
+    }
+
+    #[test]
+    fn retry_same_refusal_pins_the_exact_decoder_generation() {
+        let pool = pool(2);
+        let first_generation = decoder_id("decode@generation-1");
+        pool.register(replica_with_id(first_generation.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(
+            &pool,
+            &pending,
+            DecoderReserveRefusalDisposition::RetrySameDecoder,
+        );
+        assert_eq!(
+            pool.install_reserve_refusal_proof(&mut pending, &receipt)
+                .unwrap(),
+            PendingAdmissionDisposition::RetrySameDecoder
+        );
+
+        pool.set_availability(&first_generation, DecoderAvailability::Draining)
+            .unwrap();
+        pool.register(replica_with_id(
+            decoder_id("decode@generation-2"),
+            "packed-v1",
+        ))
+        .unwrap();
+        assert_eq!(
+            begin_scalar_admission(&pool, &owner, child_accounting()).unwrap_err(),
+            DecoderPoolError::RetryDecoderUnavailable(first_generation)
+        );
+    }
+
+    #[test]
+    fn retry_another_refusal_excludes_only_the_failed_generation() {
+        let pool = pool(4);
+        let first_generation = decoder_id("decode@generation-1");
+        let replacement_generation = decoder_id("decode@generation-2");
+        pool.register(replica_with_id(first_generation.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(
+            &pool,
+            &pending,
+            DecoderReserveRefusalDisposition::RetryAnotherDecoder,
+        );
+        pool.install_reserve_refusal_proof(&mut pending, &receipt)
+            .unwrap();
+        pool.resume_pending_admission(&mut pending).unwrap();
+
+        pool.set_availability(&first_generation, DecoderAvailability::Draining)
+            .unwrap();
+        pool.register(replica_with_id(replacement_generation.clone(), "packed-v1"))
+            .unwrap();
+        let retry = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        assert_eq!(retry.decoder_id(), &replacement_generation);
+    }
+
+    #[test]
+    fn terminal_reserve_refusal_closes_the_request_chain() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(&pool, &pending, DecoderReserveRefusalDisposition::Terminal);
+        pool.install_reserve_refusal_proof(&mut pending, &receipt)
+            .unwrap();
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        assert_eq!(
+            begin_scalar_admission(&pool, &owner, child_accounting()).unwrap_err(),
+            DecoderPoolError::RequestChainTerminal("request".to_string())
+        );
+    }
+
+    #[test]
+    fn decoder_removal_waits_for_pending_admission_ownership() {
+        let pool = pool(4);
+        let decoder_id = decoder_id("decode-0");
+        pool.register(replica_with_id(decoder_id.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+        pool.set_availability(&decoder_id, DecoderAvailability::Draining)
+            .unwrap();
+
+        assert_eq!(
+            pool.remove(&decoder_id).unwrap_err(),
+            DecoderPoolError::DecoderInUse {
+                decoder_id: decoder_id.clone(),
+                active_cohorts: 0,
+                pending_admissions: 1,
+            }
+        );
+        drop(pending);
+        pool.remove(&decoder_id).unwrap();
+    }
+
+    #[test]
+    fn dropped_owner_is_reaped_only_after_receipt_backed_pending_resolution() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(&pool, &pending, DecoderReserveRefusalDisposition::Terminal);
+        drop(owner);
+        assert_eq!(pool.snapshot().active_logical_requests, 1);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 1);
+
+        assert_eq!(
+            pool.install_reserve_refusal_proof(&mut pending, &receipt)
+                .unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        assert_eq!(pool.snapshot().active_logical_requests, 0);
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+    }
+
+    #[test]
+    fn pending_cancellation_requires_a_pinned_intent() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let proof = PendingCancellationProof::Bound(issue_test_release_receipt(
+            grant_receipt_binding(&grant),
+            EngineReleaseKind::PreparedCancelled,
+            true,
+        ));
+
+        assert_eq!(
+            pool.install_pending_cancellation_proof(&mut pending, &proof)
+                .unwrap_err(),
+            DecoderPoolError::PendingCancellationNotPinned(pending.reservation_attempt_id())
+        );
+    }
+
+    #[test]
+    fn pending_cancellation_intent_is_exact_and_idempotent() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let target = grant.cancellation_target().unwrap();
+
+        pool.pin_pending_cancellation(
+            &pending,
+            &target,
+            PendingAdmissionDisposition::RetrySameDecoder,
+        )
+        .unwrap();
+        pool.pin_pending_cancellation(
+            &pending,
+            &target,
+            PendingAdmissionDisposition::RetrySameDecoder,
+        )
+        .unwrap();
+        assert_eq!(
+            pool.pin_pending_cancellation(
+                &pending,
+                &target,
+                PendingAdmissionDisposition::Terminal,
+            )
+            .unwrap_err(),
+            DecoderPoolError::ConflictingPendingAdmissionProof(
+                pending.reservation_attempt_id()
+            )
+        );
+
+        let altered_grant = issue_grant(
+            &pool,
+            &owner,
+            pending.decoder_id().clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![999],
+            scalar_accounting(),
+        );
+        let altered_target = altered_grant.cancellation_target().unwrap();
+        assert_eq!(
+            pool.pin_pending_cancellation(
+                &pending,
+                &altered_target,
+                PendingAdmissionDisposition::RetrySameDecoder,
+            )
+            .unwrap_err(),
+            DecoderPoolError::ConflictingPendingAdmissionProof(pending.reservation_attempt_id())
+        );
+    }
+
+    #[test]
+    fn bound_pending_cancellation_proof_replays_and_rejects_conflicts() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt_binding = grant_receipt_binding(&grant);
+        let proof = PendingCancellationProof::Bound(issue_test_release_receipt(
+            receipt_binding.clone(),
+            EngineReleaseKind::PreparedCancelled,
+            true,
+        ));
+        let mut cancellation = pool
+            .begin_bound_pending_cancellation(
+                &mut pending,
+                &mut grant,
+                PendingAdmissionDisposition::Terminal,
+            )
+            .unwrap();
+        cancellation.install_test_proof(proof.clone()).unwrap();
+        drop(cancellation);
+        pool.install_pending_cancellation_proof(&mut pending, &proof)
+            .unwrap();
+        pool.install_pending_cancellation_proof(&mut pending, &proof)
+            .unwrap();
+
+        let altered = PendingCancellationProof::Bound(issue_test_release_receipt(
+            receipt_binding,
+            EngineReleaseKind::PreparedCancelled,
+            true,
+        ));
+        assert_eq!(
+            pool.install_pending_cancellation_proof(&mut pending, &altered)
+                .unwrap_err(),
+            DecoderPoolError::ConflictingPendingAdmissionProof(pending.reservation_attempt_id())
+        );
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
+    }
+
+    #[test]
+    fn bound_pending_cancellation_rejects_the_wrong_release_kind() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let target = grant.cancellation_target().unwrap();
+        pool.pin_pending_cancellation(&pending, &target, PendingAdmissionDisposition::Terminal)
+            .unwrap();
+        let proof = PendingCancellationProof::Bound(issue_test_release_receipt(
+            grant_receipt_binding(&grant),
+            EngineReleaseKind::Completed,
+            true,
+        ));
+
+        assert_eq!(
+            pool.install_pending_cancellation_proof(&mut pending, &proof)
+                .unwrap_err(),
+            DecoderPoolError::InvalidPendingCancellationProof {
+                reservation_attempt_id: pending.reservation_attempt_id(),
+                reason: "receipt does not match the pinned cancellation target",
+            }
+        );
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap_err(),
+            DecoderPoolError::InvalidPendingCancellationProof {
+                reservation_attempt_id: target.reservation_attempt_id(),
+                reason: "receipt does not match the pinned cancellation target",
+            }
+        );
+    }
+
+    #[test]
+    fn unbound_pending_cancellation_matches_the_exact_attempted_digest() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let first_grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &first_grant).unwrap();
+        let target =
+            issue_test_unbound_cancellation_target(&first_grant, Some(first_grant.grant_digest()));
+        pool.pin_pending_cancellation(
+            &pending,
+            &target,
+            PendingAdmissionDisposition::RetryAnotherDecoder,
+        )
+        .unwrap();
+
+        let second_grant = issue_grant(
+            &pool,
+            &owner,
+            pending.decoder_id().clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![987],
+            scalar_accounting(),
+        );
+        let altered_target = issue_test_unbound_cancellation_target(
+            &second_grant,
+            Some(second_grant.grant_digest()),
+        );
+        let altered = PendingCancellationProof::Unbound(issue_test_prepared_cancellation_receipt(
+            &altered_target,
+            true,
+        ));
+        assert!(matches!(
+            pool.install_pending_cancellation_proof(&mut pending, &altered),
+            Err(DecoderPoolError::InvalidPendingCancellationProof { .. })
+        ));
+
+        let proof = PendingCancellationProof::Unbound(issue_test_prepared_cancellation_receipt(
+            &target, true,
+        ));
+        pool.install_pending_cancellation_proof(&mut pending, &proof)
+            .unwrap();
+        assert_eq!(
+            pool.resume_pending_admission(&mut pending).unwrap(),
+            PendingAdmissionDisposition::RetryAnotherDecoder
+        );
+    }
+
+    #[test]
+    fn refusal_and_cancellation_intents_conflict_in_both_orders() {
+        for refusal_first in [false, true] {
+            let pool = pool(2);
+            pool.register(replica("decode-0", "packed-v1")).unwrap();
+            let owner = pool
+                .begin_request(format!("request-{refusal_first}"))
+                .unwrap();
+            let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+            let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+            let target = grant.cancellation_target().unwrap();
+            let refusal =
+                refusal_receipt(&pool, &pending, DecoderReserveRefusalDisposition::Terminal);
+
+            if refusal_first {
+                pool.install_reserve_refusal_proof(&mut pending, &refusal)
+                    .unwrap();
+                assert!(matches!(
+                    pool.pin_pending_cancellation(
+                        &pending,
+                        &target,
+                        PendingAdmissionDisposition::Terminal,
+                    ),
+                    Err(DecoderPoolError::ConflictingPendingAdmissionProof(_))
+                ));
+            } else {
+                pool.pin_pending_cancellation(
+                    &pending,
+                    &target,
+                    PendingAdmissionDisposition::Terminal,
+                )
+                .unwrap();
+                assert!(matches!(
+                    pool.install_reserve_refusal_proof(&mut pending, &refusal),
+                    Err(DecoderPoolError::ConflictingPendingAdmissionProof(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_bound_grant_can_release_pending_ownership_with_a_bound_proof() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let first_owner = pool.begin_request("first").unwrap();
+        let second_owner = pool.begin_request("second").unwrap();
+        let decoder_id = test_selected_decoder(&pool, &first_owner).unwrap();
+        let mut first_grant = issue_grant(
+            &pool,
+            &first_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
+        let mut rejected_grant = issue_grant(
+            &pool,
+            &second_owner,
+            decoder_id.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![700],
+            scalar_accounting(),
+        );
+        let mut pending =
+            begin_test_pending_for_grant(&pool, &second_owner, &rejected_grant).unwrap();
+        assert_eq!(
+            pool.bind_grant(&mut pending, &mut rejected_grant)
+                .unwrap_err(),
+            DecoderPoolError::GrantRoomInUse {
+                decoder_id,
+                room: 700,
+            }
+        );
+
+        let receipt_binding = grant_receipt_binding(&rejected_grant);
+        let proof = PendingCancellationProof::Bound(issue_test_release_receipt(
+            receipt_binding,
+            EngineReleaseKind::PreparedCancelled,
+            true,
+        ));
+        let mut cancellation = pool
+            .begin_bound_pending_cancellation(
+                &mut pending,
+                &mut rejected_grant,
+                PendingAdmissionDisposition::Terminal,
+            )
+            .unwrap();
+        cancellation.install_test_proof(proof).unwrap();
+        drop(cancellation);
+        pool.resume_pending_admission(&mut pending).unwrap();
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].pending_admissions, 0);
+        assert_eq!(snapshot.replicas[0].active_cohorts, 1);
+        release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn binding_atomically_converts_pending_load_into_active_accounting() {
+        let pool = pool(4);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let accounting = vec![
+            DecoderGrantChildAccounting::new(100, 10),
+            DecoderGrantChildAccounting::new(200, 20),
+        ];
+        let mut grant = issue_next_grant(&pool, &owner, accounting).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let before = pool.snapshot();
+        assert_eq!(before.replicas[0].pending_admissions, 1);
+        assert_eq!(before.replicas[0].pending_child_requests, 2);
+        assert_eq!(before.replicas[0].pending_reserved_kv_tokens, 300);
+        assert_eq!(before.replicas[0].pending_remaining_decode_tokens, 30);
+        assert_eq!(before.replicas[0].active_cohorts, 0);
+
+        let mut cohort = pool.bind_grant(&mut pending, &mut grant).unwrap();
+        let after = pool.snapshot();
+        assert_eq!(after.replicas[0].pending_admissions, 0);
+        assert_eq!(after.replicas[0].pending_child_requests, 0);
+        assert_eq!(after.replicas[0].pending_reserved_kv_tokens, 0);
+        assert_eq!(after.replicas[0].pending_remaining_decode_tokens, 0);
+        assert_eq!(after.replicas[0].active_cohorts, 1);
+        assert_eq!(after.replicas[0].active_child_requests, 2);
+        assert_eq!(after.replicas[0].reserved_kv_tokens, 300);
+        assert_eq!(after.replicas[0].remaining_decode_tokens, 30);
+        release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
+    }
+
+    #[test]
+    fn corrupted_pending_accounting_preserves_the_durable_release_proof() {
+        let pool = pool(2);
+        let decoder_id = decoder_id("decode-0");
+        pool.register(replica_with_id(decoder_id.clone(), "packed-v1"))
+            .unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
+        let receipt = refusal_receipt(&pool, &pending, DecoderReserveRefusalDisposition::Terminal);
+        pool.inner
+            .state
+            .lock()
+            .replicas
+            .get_mut(&decoder_id)
+            .unwrap()
+            .pending_child_requests = 0;
+
+        assert_eq!(
+            pool.install_reserve_refusal_proof(&mut pending, &receipt)
+                .unwrap_err(),
+            DecoderPoolError::InconsistentPendingAdmission {
+                reservation_attempt_id: pending.reservation_attempt_id(),
+                reason: "decoder pending accounting differs from request-chain reservations",
+            }
+        );
+        let retained = {
+            let state = pool.inner.state.lock();
+            let chain = state.request_chains.get(&owner.chain_id()).unwrap();
+            let RequestChainState::Reserving(record) = &chain.state else {
+                panic!("failed reconciliation must retain the pending attempt");
+            };
+            record.reconciliation.clone()
+        };
+        assert_eq!(
+            retained,
+            Some(PendingAdmissionReconciliationRecord::Refusal(
+                receipt.clone()
+            ))
+        );
+
+        pool.inner
+            .state
+            .lock()
+            .replicas
+            .get_mut(&decoder_id)
+            .unwrap()
+            .pending_child_requests = 1;
+        pool.resume_pending_admission(&mut pending).unwrap();
+    }
+
+    #[test]
     fn batch_cohort_preserves_room_order_and_releases_all_children_together() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
@@ -3024,7 +6020,7 @@ mod tests {
             DecoderGrantChildAccounting::new(200, 20),
             DecoderGrantChildAccounting::new(300, 30),
         ];
-        let decoder_id = pool.admission_candidates(&request).unwrap().remove(0);
+        let decoder_id = test_selected_decoder(&pool, &request).unwrap();
         let mut grant = issue_grant(
             &pool,
             &request,
@@ -3036,7 +6032,7 @@ mod tests {
             vec![41, 43, 42],
             accounting,
         );
-        let mut cohort = pool.bind_grant(&request, &mut grant).unwrap();
+        let mut cohort = bind_issued_grant(&pool, &request, &mut grant).unwrap();
         assert_eq!(cohort.bootstrap_rooms(), &[41, 43, 42]);
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.replicas[0].active_cohorts, 1);
@@ -3060,7 +6056,7 @@ mod tests {
         let owner = pool.begin_request("request").unwrap();
         let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
         let mut mismatched_grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
-        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+        let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
 
         assert!(grant.begin_cancellation().is_err());
         let _mismatched_cancellation = mismatched_grant.begin_cancellation().unwrap();
@@ -3386,7 +6382,7 @@ mod tests {
                     Self::MissingReplica => "assigned decoder is missing",
                     Self::MissingChain => "request chain is missing",
                     Self::WrongChainAssignment => "request chain does not own this assignment",
-                    Self::TerminalChain => "request chain became terminal before its assignment",
+                    Self::TerminalChain => "request chain does not own this assignment",
                     Self::PrematureTerminalReconciliation => {
                         "assignment phase differs from its terminal reconciliation ledger"
                     }
@@ -3413,7 +6409,7 @@ mod tests {
                 .begin_request(format!("request-{corruption:?}"))
                 .unwrap();
             let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
-            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+            let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
             let decoder_id = cohort.decoder_id().clone();
             let assignment_id = cohort.assignment_id();
             let chain_id = owner.chain_id();
@@ -3479,15 +6475,12 @@ mod tests {
                         removed_chain = state.request_chains.remove(&chain_id);
                     }
                     Corruption::WrongChainAssignment => {
-                        state
-                            .request_chains
-                            .get_mut(&chain_id)
-                            .unwrap()
-                            .active_assignment = Some(Uuid::new_v4());
+                        state.request_chains.get_mut(&chain_id).unwrap().state =
+                            RequestChainState::Assigned(Uuid::new_v4());
                     }
                     Corruption::TerminalChain => {
-                        state.request_chains.get_mut(&chain_id).unwrap().phase =
-                            RequestChainPhase::Terminal;
+                        state.request_chains.get_mut(&chain_id).unwrap().state =
+                            RequestChainState::Terminal;
                     }
                     Corruption::PrematureTerminalReconciliation => {
                         state
@@ -3561,15 +6554,12 @@ mod tests {
                             .is_none());
                     }
                     Corruption::WrongChainAssignment => {
-                        state
-                            .request_chains
-                            .get_mut(&chain_id)
-                            .unwrap()
-                            .active_assignment = Some(assignment_id);
+                        state.request_chains.get_mut(&chain_id).unwrap().state =
+                            RequestChainState::Assigned(assignment_id);
                     }
                     Corruption::TerminalChain => {
-                        state.request_chains.get_mut(&chain_id).unwrap().phase =
-                            RequestChainPhase::Open;
+                        state.request_chains.get_mut(&chain_id).unwrap().state =
+                            RequestChainState::Assigned(assignment_id);
                     }
                     Corruption::PrematureTerminalReconciliation => {
                         state
@@ -3612,8 +6602,8 @@ mod tests {
             vec![701],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
-        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
+        let mut second = bind_issued_grant(&pool, &second_owner, &mut second_grant).unwrap();
         let baseline = pool
             .snapshot()
             .replicas
@@ -3658,7 +6648,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut grant = issue_next_grant(&pool, &owner, scalar_accounting()).unwrap();
-        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+        let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
         let _cancellation = cohort
             .prepared_grant
             .as_mut()
@@ -3682,26 +6672,42 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
-        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
-        let mut grant = issue_grant(
+        let decoder_id = test_selected_decoder(&pool, &first_owner).unwrap();
+        let mut first_grant = issue_grant(
             &pool,
             &first_owner,
-            decoder_id,
+            decoder_id.clone(),
             Uuid::new_v4(),
             vec![DecoderSlotGeneration::new(Uuid::new_v4())],
             vec![11],
             scalar_accounting(),
         );
+        let mut second_grant = issue_grant(
+            &pool,
+            &second_owner,
+            decoder_id,
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![12],
+            scalar_accounting(),
+        );
+        let mut second_pending =
+            begin_test_pending_for_grant(&pool, &second_owner, &second_grant).unwrap();
 
         assert_eq!(
-            pool.bind_grant(&second_owner, &mut grant).unwrap_err(),
+            pool.bind_grant(&mut second_pending, &mut first_grant)
+                .unwrap_err(),
             DecoderPoolError::GrantRequestMismatch {
                 expected: second_owner.chain_id(),
                 actual: first_owner.chain_id(),
             }
         );
-        let mut cohort = pool.bind_grant(&first_owner, &mut grant).unwrap();
-        release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
+        let mut second = pool
+            .bind_grant(&mut second_pending, &mut second_grant)
+            .unwrap();
+        release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
+        release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -3709,7 +6715,7 @@ mod tests {
         let pool = pool_for_prefill("prefill-0@generation-2", 2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let decoder_id = pool.admission_candidates(&owner).unwrap().remove(0);
+        let decoder_id = test_selected_decoder(&pool, &owner).unwrap();
         let mut grant = issue_test_grant(
             prefill_id("prefill-0@generation-1"),
             owner.chain_id(),
@@ -3722,8 +6728,9 @@ mod tests {
         )
         .unwrap();
 
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &grant).unwrap();
         assert_eq!(
-            pool.bind_grant(&owner, &mut grant).unwrap_err(),
+            pool.bind_grant(&mut pending, &mut grant).unwrap_err(),
             DecoderPoolError::GrantPrefillMismatch {
                 expected: prefill_id("prefill-0@generation-2"),
                 actual: prefill_id("prefill-0@generation-1"),
@@ -3748,7 +6755,7 @@ mod tests {
             let pool = pool(2);
             pool.register(replica("decode-0", "packed-v1")).unwrap();
             let owner = pool.begin_request(format!("request-{mismatch}")).unwrap();
-            let selected_decoder = pool.admission_candidates(&owner).unwrap().remove(0);
+            let selected_decoder = test_selected_decoder(&pool, &owner).unwrap();
             let mut grant = issue_grant(
                 &pool,
                 &owner,
@@ -3758,7 +6765,7 @@ mod tests {
                 vec![11],
                 scalar_accounting(),
             );
-            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+            let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
             let alternate_grant = issue_grant(
                 &pool,
                 &owner,
@@ -4067,9 +7074,10 @@ mod tests {
         );
 
         pool.resume_terminal_reconciliation(&mut cohort).unwrap();
-        let candidates = pool.admission_candidates(&owner).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_ne!(candidates[0], failed_decoder);
+        assert_ne!(
+            test_selected_decoder(&pool, &owner).unwrap(),
+            failed_decoder
+        );
     }
 
     #[tokio::test]
@@ -4212,7 +7220,7 @@ mod tests {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let owner = pool.begin_request("request").unwrap();
-        let decoder_id = pool.admission_candidates(&owner).unwrap().remove(0);
+        let decoder_id = test_selected_decoder(&pool, &owner).unwrap();
         let slot_generations = vec![
             DecoderSlotGeneration::new(Uuid::new_v4()),
             DecoderSlotGeneration::new(Uuid::new_v4()),
@@ -4226,11 +7234,12 @@ mod tests {
             vec![101, 102],
             vec![child_accounting(), child_accounting()],
         );
-        let mut first = pool.bind_grant(&owner, &mut original).unwrap();
+        let mut first = bind_issued_grant(&pool, &owner, &mut original).unwrap();
         release_before_activation(&pool, &mut first, RetryDisposition::Retryable).unwrap();
+        let mut pending = begin_test_pending_for_grant(&pool, &owner, &original).unwrap();
 
         assert_eq!(
-            pool.bind_grant(&owner, &mut original).unwrap_err(),
+            pool.bind_grant(&mut pending, &mut original).unwrap_err(),
             DecoderPoolError::GrantAlreadyBound {
                 child_index: 0,
                 decoder_id: decoder_id.clone(),
@@ -4248,7 +7257,7 @@ mod tests {
                 vec![child_accounting(), child_accounting()],
             );
             assert_eq!(
-                pool.bind_grant(&owner, &mut altered).unwrap_err(),
+                pool.bind_grant(&mut pending, &mut altered).unwrap_err(),
                 DecoderPoolError::GrantGenerationRebound {
                     child_index: 0,
                     decoder_id: decoder_id.clone(),
@@ -4261,13 +7270,19 @@ mod tests {
     #[test]
     fn slot_generations_are_decoder_process_local() {
         let pool = pool(2);
-        let first_decoder = decoder_id("decode-0");
-        let second_decoder = decoder_id("decode-1");
-        pool.register(replica_with_id(first_decoder.clone(), "packed-v1"))
+        let registered_first = decoder_id("decode-0");
+        let registered_second = decoder_id("decode-1");
+        pool.register(replica_with_id(registered_first.clone(), "packed-v1"))
             .unwrap();
-        pool.register(replica_with_id(second_decoder.clone(), "packed-v1"))
+        pool.register(replica_with_id(registered_second.clone(), "packed-v1"))
             .unwrap();
         let owner = pool.begin_request("request").unwrap();
+        let first_decoder = test_selected_decoder(&pool, &owner).unwrap();
+        let second_decoder = if first_decoder == registered_first {
+            registered_second
+        } else {
+            registered_first
+        };
         let slot_generation = DecoderSlotGeneration::new(Uuid::new_v4());
         let mut first_grant = issue_grant(
             &pool,
@@ -4278,7 +7293,7 @@ mod tests {
             vec![101],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&owner, &mut first_grant).unwrap();
+        let mut first = bind_issued_grant(&pool, &owner, &mut first_grant).unwrap();
         release_before_activation(&pool, &mut first, RetryDisposition::DecoderFailed).unwrap();
 
         let mut second_grant = issue_grant(
@@ -4290,7 +7305,7 @@ mod tests {
             vec![101],
             scalar_accounting(),
         );
-        let mut second = pool.bind_grant(&owner, &mut second_grant).unwrap();
+        let mut second = bind_issued_grant(&pool, &owner, &mut second_grant).unwrap();
         assert_eq!(second.decoder_id(), &second_decoder);
         release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
@@ -4301,7 +7316,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
-        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
+        let decoder_id = test_selected_decoder(&pool, &first_owner).unwrap();
         let mut first_grant = issue_grant(
             &pool,
             &first_owner,
@@ -4311,7 +7326,7 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
         let mut second_grant = issue_grant(
             &pool,
             &second_owner,
@@ -4321,8 +7336,10 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
+        let mut second_pending =
+            begin_test_pending_for_grant(&pool, &second_owner, &second_grant).unwrap();
         assert_eq!(
-            pool.bind_grant(&second_owner, &mut second_grant)
+            pool.bind_grant(&mut second_pending, &mut second_grant)
                 .unwrap_err(),
             DecoderPoolError::GrantRoomInUse {
                 decoder_id,
@@ -4330,6 +7347,10 @@ mod tests {
             }
         );
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+        let mut second = pool
+            .bind_grant(&mut second_pending, &mut second_grant)
+            .unwrap();
+        release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
@@ -4338,7 +7359,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
-        let decoder_id = pool.admission_candidates(&first_owner).unwrap().remove(0);
+        let decoder_id = test_selected_decoder(&pool, &first_owner).unwrap();
         let slot_generation = DecoderSlotGeneration::new(Uuid::new_v4());
         let mut first_grant = issue_grant(
             &pool,
@@ -4349,7 +7370,7 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
-        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
         let mut second_grant = issue_grant(
             &pool,
             &second_owner,
@@ -4359,9 +7380,11 @@ mod tests {
             vec![701],
             scalar_accounting(),
         );
+        let mut second_pending =
+            begin_test_pending_for_grant(&pool, &second_owner, &second_grant).unwrap();
 
         assert_eq!(
-            pool.bind_grant(&second_owner, &mut second_grant)
+            pool.bind_grant(&mut second_pending, &mut second_grant)
                 .unwrap_err(),
             DecoderPoolError::GrantSlotGenerationInUse {
                 decoder_id,
@@ -4370,21 +7393,20 @@ mod tests {
         );
 
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
-        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
+        let mut second = pool
+            .bind_grant(&mut second_pending, &mut second_grant)
+            .unwrap();
         release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
 
     #[test]
     fn equal_active_room_numbers_are_valid_on_separate_decoders() {
         let pool = pool(2);
-        let first_decoder = decoder_id("decode-0");
-        let second_decoder = decoder_id("decode-1");
-        pool.register(replica_with_id(first_decoder.clone(), "packed-v1"))
-            .unwrap();
-        pool.register(replica_with_id(second_decoder.clone(), "packed-v1"))
-            .unwrap();
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        pool.register(replica("decode-1", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
+        let first_decoder = test_selected_decoder(&pool, &first_owner).unwrap();
         let mut first_grant = issue_grant(
             &pool,
             &first_owner,
@@ -4394,6 +7416,8 @@ mod tests {
             vec![700],
             scalar_accounting(),
         );
+        let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
+        let second_decoder = test_selected_decoder(&pool, &second_owner).unwrap();
         let mut second_grant = issue_grant(
             &pool,
             &second_owner,
@@ -4404,8 +7428,8 @@ mod tests {
             scalar_accounting(),
         );
 
-        let mut first = pool.bind_grant(&first_owner, &mut first_grant).unwrap();
-        let mut second = pool.bind_grant(&second_owner, &mut second_grant).unwrap();
+        let mut second = bind_issued_grant(&pool, &second_owner, &mut second_grant).unwrap();
+        assert_ne!(first_decoder, second_decoder);
         assert_eq!(first.decoder_id(), &first_decoder);
         assert_eq!(second.decoder_id(), &second_decoder);
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
@@ -4439,7 +7463,7 @@ mod tests {
         release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal).unwrap();
 
         assert_eq!(
-            pool.admission_candidates(&owner).unwrap_err(),
+            test_selected_decoder(&pool, &owner).unwrap_err(),
             DecoderPoolError::RequestChainTerminal("request".to_string())
         );
         pool.finalize_request(&mut owner).unwrap();
@@ -4501,7 +7525,7 @@ mod tests {
         let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
         release_before_activation(&pool, &mut cohort, RetryDisposition::DecoderFailed).unwrap();
         assert_eq!(
-            pool.admission_candidates(&owner).unwrap_err(),
+            test_selected_decoder(&pool, &owner).unwrap_err(),
             DecoderPoolError::RetryAlternativesExhausted
         );
         pool.finalize_request(&mut owner).unwrap();
@@ -4540,8 +7564,8 @@ mod tests {
         let mut blocker = bind_next(&pool, &blocker_owner, scalar_accounting()).unwrap();
         assert_ne!(blocker.decoder_id(), &failed_decoder);
         assert_eq!(
-            pool.admission_candidates(&retry_owner).unwrap(),
-            vec![blocker.decoder_id().clone()]
+            test_selected_decoder(&pool, &retry_owner).unwrap(),
+            blocker.decoder_id().clone()
         );
 
         let available_decoder = blocker.decoder_id().clone();
@@ -4580,7 +7604,7 @@ mod tests {
             let pool = pool(4);
             pool.register(replica("decode-0", "packed-v1")).unwrap();
             let owner = pool.begin_request(format!("request-{mismatch}")).unwrap();
-            let selected_decoder = pool.admission_candidates(&owner).unwrap().remove(0);
+            let selected_decoder = test_selected_decoder(&pool, &owner).unwrap();
             let mut grant = issue_grant(
                 &pool,
                 &owner,
@@ -4590,7 +7614,7 @@ mod tests {
                 vec![11],
                 scalar_accounting(),
             );
-            let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+            let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
             let _quarantine = pin_quarantine_after_promotion(&pool, &mut cohort);
             let alternate_grant = issue_grant(
                 &pool,
@@ -4800,7 +7824,7 @@ mod tests {
                 .request_chains
                 .get_mut(&owner.chain_id())
                 .unwrap()
-                .phase = RequestChainPhase::Terminal;
+                .state = RequestChainState::Terminal;
         }
 
         assert_eq!(
@@ -4808,7 +7832,7 @@ mod tests {
                 .unwrap_err(),
             DecoderPoolError::InconsistentAssignment {
                 assignment_id: cohort.assignment_id(),
-                reason: "request chain became terminal before its assignment",
+                reason: "request chain does not own this assignment",
             }
         );
         assert_eq!(
@@ -4822,7 +7846,7 @@ mod tests {
             .request_chains
             .get_mut(&owner.chain_id())
             .unwrap()
-            .phase = RequestChainPhase::Open;
+            .state = RequestChainState::Assigned(cohort.assignment_id());
         pool.apply_quarantine_receipt(&mut cohort, &receipt)
             .unwrap();
     }
@@ -4849,7 +7873,7 @@ mod tests {
                 DecoderGrantChildAccounting::new(200, 20),
             ],
         );
-        let mut cohort = pool.bind_grant(&owner, &mut grant).unwrap();
+        let mut cohort = bind_issued_grant(&pool, &owner, &mut grant).unwrap();
         let mut promotion = pool.begin_promotion(&mut cohort).unwrap();
         pool.observe_decode_progress(&cohort, 7).unwrap();
         let _quarantine = pool
@@ -4873,7 +7897,7 @@ mod tests {
             Some(receipt.clone())
         );
         assert_eq!(
-            pool.admission_candidates(&owner).unwrap_err(),
+            test_selected_decoder(&pool, &owner).unwrap_err(),
             DecoderPoolError::RequestHasActiveCohort {
                 request_id: "request".to_string(),
                 assignment_id,
@@ -4897,8 +7921,10 @@ mod tests {
             vec![41],
             scalar_accounting(),
         );
+        let mut colliding_pending =
+            begin_test_pending_for_grant(&pool, &second_owner, &colliding_grant).unwrap();
         assert_eq!(
-            pool.bind_grant(&second_owner, &mut colliding_grant)
+            pool.bind_grant(&mut colliding_pending, &mut colliding_grant)
                 .unwrap_err(),
             DecoderPoolError::GrantRoomInUse {
                 decoder_id: assigned_decoder.clone(),
@@ -4913,6 +7939,7 @@ mod tests {
             DecoderPoolError::DecoderInUse {
                 decoder_id: assigned_decoder,
                 active_cohorts: 1,
+                pending_admissions: 1,
             }
         );
         let release_receipt = release_receipt(&cohort, EngineReleaseKind::Aborted);

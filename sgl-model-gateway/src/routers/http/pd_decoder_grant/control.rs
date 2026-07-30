@@ -685,11 +685,11 @@ impl DecoderGrantControlClient {
     /// Pin one exact reserve attempt before any allocator I/O.
     pub fn begin_reserve(
         &self,
-        reservation: DecoderGrantReservation,
+        reservation: impl Into<Arc<DecoderGrantReservation>>,
     ) -> ReserveReconciliationGrant {
         ReserveReconciliationGrant {
             client: self.clone(),
-            reservation: Some(reservation),
+            reservation: Some(reservation.into()),
             polled: false,
         }
     }
@@ -990,7 +990,7 @@ fn validate_reserve_refusal_receipt(
 /// Exact reserve attempt retained across every allocation-ambiguous outcome.
 pub struct ReserveReconciliationGrant {
     client: DecoderGrantControlClient,
-    reservation: Option<DecoderGrantReservation>,
+    reservation: Option<Arc<DecoderGrantReservation>>,
     polled: bool,
 }
 
@@ -1030,7 +1030,7 @@ impl ReserveReconciliationGrant {
     }
 
     fn reservation(&self) -> Result<&DecoderGrantReservation, EngineGrantError> {
-        self.reservation.as_ref().ok_or_else(|| {
+        self.reservation.as_deref().ok_or_else(|| {
             EngineGrantError::ProtocolViolation(
                 "reserve reconciliation has no exact attempt capability".to_string(),
             )
@@ -1108,6 +1108,14 @@ pub(super) struct PreparedGrantControl {
 
 #[cfg(test)]
 pub(super) fn test_prepared_grant_control(grant_id: Uuid) -> PreparedGrantControl {
+    test_prepared_grant_control_at(grant_id, "http://127.0.0.1:9")
+}
+
+#[cfg(test)]
+pub(super) fn test_prepared_grant_control_at(
+    grant_id: Uuid,
+    decoder_url: &str,
+) -> PreparedGrantControl {
     let client = DecoderGrantControlClient::new()
         .expect("test decoder control client must use a valid transport configuration")
         .client;
@@ -1115,7 +1123,7 @@ pub(super) fn test_prepared_grant_control(grant_id: Uuid) -> PreparedGrantContro
         .expect("test decoder grant token must satisfy the production token contract");
     PreparedGrantControl {
         client,
-        grant_url: Arc::from(format!("http://127.0.0.1:9{CONTROL_PATH}/{grant_id}")),
+        grant_url: Arc::from(format!("{decoder_url}{CONTROL_PATH}/{grant_id}")),
         token,
     }
 }

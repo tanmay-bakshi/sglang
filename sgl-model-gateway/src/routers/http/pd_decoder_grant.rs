@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::pd_decoder_pool::DecoderGrantPoolBinding;
+use super::pd_decoder_pool::{DecoderGrantPoolBinding, PendingCancellationPin};
 
 mod control;
 
@@ -354,6 +354,103 @@ impl DecoderGrantDigest {
             ))
         })?;
         Ok(Self(*digest.as_bytes()))
+    }
+}
+
+/// Exact PREPARED allocation identity pinned before cancellation authority moves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedGrantCancellationTarget {
+    grant_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    decoder_id: DecoderId,
+    kind: PreparedGrantCancellationTargetKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedGrantCancellationTargetKind {
+    Unbound {
+        reservation_digest: DecoderReservationDigest,
+        attempted_grant_digest: Option<DecoderGrantDigest>,
+    },
+    Bound {
+        grant_digest: DecoderGrantDigest,
+    },
+}
+
+impl PreparedGrantCancellationTarget {
+    fn unbound(
+        binding: &UnboundGrantBinding,
+        attempted_grant_digest: Option<DecoderGrantDigest>,
+    ) -> Self {
+        Self {
+            grant_id: binding.grant_id(),
+            reservation_attempt_id: binding.reservation_attempt_id(),
+            reserve_attempt_digest: binding.reserve_attempt_digest(),
+            decoder_id: binding.decoder_id().clone(),
+            kind: PreparedGrantCancellationTargetKind::Unbound {
+                reservation_digest: binding.digest(),
+                attempted_grant_digest,
+            },
+        }
+    }
+
+    fn bound(binding: &DecoderGrantBinding) -> Self {
+        Self {
+            grant_id: binding.grant_id(),
+            reservation_attempt_id: binding.reservation_attempt_id(),
+            reserve_attempt_digest: binding.reserve_attempt_digest(),
+            decoder_id: binding.decoder_id().clone(),
+            kind: PreparedGrantCancellationTargetKind::Bound {
+                grant_digest: binding.digest(),
+            },
+        }
+    }
+
+    /// Gateway-issued idempotency identity for the owning reserve attempt.
+    pub(super) fn reservation_attempt_id(&self) -> Uuid {
+        self.reservation_attempt_id
+    }
+
+    /// Digest of the exact idempotent reserve-attempt request.
+    pub(super) fn reserve_attempt_digest(&self) -> DecoderReserveAttemptDigest {
+        self.reserve_attempt_digest
+    }
+
+    /// Decoder process generation retaining the PREPARED allocation.
+    pub(super) fn decoder_id(&self) -> &DecoderId {
+        &self.decoder_id
+    }
+
+    pub(super) fn matches_unbound_receipt(
+        &self,
+        receipt: &PreparedGrantCancellationReceipt,
+    ) -> bool {
+        let PreparedGrantCancellationTargetKind::Unbound {
+            reservation_digest,
+            attempted_grant_digest,
+        } = self.kind
+        else {
+            return false;
+        };
+        receipt.grant_id() == self.grant_id
+            && receipt.reservation_attempt_id() == self.reservation_attempt_id
+            && receipt.reserve_attempt_digest() == self.reserve_attempt_digest
+            && receipt.decoder_id() == &self.decoder_id
+            && receipt.reservation_digest() == reservation_digest
+            && receipt.attempted_grant_digest() == attempted_grant_digest
+            && receipt.take_once()
+    }
+
+    pub(super) fn matches_bound_receipt(&self, receipt: &EngineReleaseReceipt) -> bool {
+        let PreparedGrantCancellationTargetKind::Bound { grant_digest } = self.kind else {
+            return false;
+        };
+        receipt.grant_id() == self.grant_id
+            && receipt.decoder_id() == &self.decoder_id
+            && receipt.grant_digest() == grant_digest
+            && receipt.kind() == EngineReleaseKind::PreparedCancelled
+            && receipt.take_once()
     }
 }
 
@@ -1223,6 +1320,20 @@ impl UnboundPreparedGrant {
         self.binding.digest()
     }
 
+    pub(super) fn cancellation_target(
+        &self,
+    ) -> Result<PreparedGrantCancellationTarget, EngineGrantError> {
+        if self.control.is_none() {
+            return Err(EngineGrantError::ProtocolViolation(
+                "unbound prepared grant has no concrete cancellation capability".to_string(),
+            ));
+        }
+        Ok(PreparedGrantCancellationTarget::unbound(
+            &self.binding,
+            None,
+        ))
+    }
+
     /// Canonically enrich and pin the final inference body before any bind I/O.
     ///
     /// The returned reconciliation capability has no operation that accepts
@@ -1243,12 +1354,20 @@ impl UnboundPreparedGrant {
         })
     }
 
-    /// Pin cancellation of an unbound PREPARED reservation.
-    ///
-    /// No decoder-pool accounting exists before a bind succeeds. Once this
-    /// transition returns, the exact cancellation is the only operation that
-    /// can be polled with the retained engine authority.
-    pub fn begin_cancellation(
+    pub(super) fn begin_pending_cancellation(
+        &mut self,
+        pin: PendingCancellationPin,
+    ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
+        let target = self.cancellation_target()?;
+        if !pin.matches(&target) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "pending cancellation pin does not match the unbound grant".to_string(),
+            ));
+        }
+        self.take_cancellation()
+    }
+
+    fn take_cancellation(
         &mut self,
     ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
         let control = self.control.take().ok_or_else(|| {
@@ -1306,6 +1425,16 @@ impl UnboundCancellationReconciliationGrant {
             .await?;
         self.control = None;
         Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_test_reconciled(&mut self) -> Result<(), EngineGrantError> {
+        self.control.take().ok_or_else(|| {
+            EngineGrantError::ProtocolViolation(
+                "test unbound cancellation has no concrete control capability".to_string(),
+            )
+        })?;
+        Ok(())
     }
 
     fn control(&self) -> Result<&control::PreparedGrantControl, EngineGrantError> {
@@ -1389,6 +1518,20 @@ impl BindReconciliationGrant {
         self.binding.reservation_digest()
     }
 
+    pub(super) fn cancellation_target(
+        &self,
+    ) -> Result<PreparedGrantCancellationTarget, EngineGrantError> {
+        if self.control.is_none() {
+            return Err(EngineGrantError::ProtocolViolation(
+                "bind reconciliation grant has no concrete cancellation capability".to_string(),
+            ));
+        }
+        Ok(PreparedGrantCancellationTarget::unbound(
+            &self.unbound_binding,
+            Some(self.binding.digest()),
+        ))
+    }
+
     /// Bind or reconcile the same exact body without surrendering ownership on error.
     pub async fn reconcile_bind(&mut self) -> Result<BoundPreparedGrant, EngineGrantError> {
         self.control()?.bind(&self.binding).await?;
@@ -1402,8 +1545,27 @@ impl BindReconciliationGrant {
         ))
     }
 
-    /// Pin cancellation after a failed or ambiguous bind.
-    pub fn begin_cancellation(
+    pub(super) fn begin_pending_cancellation(
+        &mut self,
+        pin: PendingCancellationPin,
+    ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
+        let target = self.cancellation_target()?;
+        if !pin.matches(&target) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "pending cancellation pin does not match the attempted bind".to_string(),
+            ));
+        }
+        self.take_cancellation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_cancellation(
+        &mut self,
+    ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
+        self.take_cancellation()
+    }
+
+    fn take_cancellation(
         &mut self,
     ) -> Result<UnboundCancellationReconciliationGrant, EngineGrantError> {
         let control = self.control.take().ok_or_else(|| {
@@ -1533,6 +1695,17 @@ impl BoundPreparedGrant {
         self.binding.reservation_digest()
     }
 
+    pub(super) fn cancellation_target(
+        &self,
+    ) -> Result<PreparedGrantCancellationTarget, EngineGrantError> {
+        if self.control.is_none() {
+            return Err(EngineGrantError::ProtocolViolation(
+                "prepared grant has no concrete cancellation capability".to_string(),
+            ));
+        }
+        Ok(PreparedGrantCancellationTarget::bound(&self.binding))
+    }
+
     pub(super) fn take_for_pool_binding(
         &mut self,
         pool_binding: DecoderGrantPoolBinding,
@@ -1550,8 +1723,40 @@ impl BoundPreparedGrant {
         Ok(Self::from_control(self.binding.clone(), control))
     }
 
-    /// Pin cancellation before crossing the activation boundary.
-    pub fn begin_cancellation(
+    pub(super) fn begin_pending_cancellation(
+        &mut self,
+        pin: PendingCancellationPin,
+    ) -> Result<PreparedCancellationReconciliationGrant, EngineGrantError> {
+        let target = self.cancellation_target()?;
+        if !pin.matches(&target) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "pending cancellation pin does not match the bound grant".to_string(),
+            ));
+        }
+        self.take_cancellation()
+    }
+
+    pub(super) fn begin_pool_cancellation(
+        &mut self,
+        pool_binding: DecoderGrantPoolBinding,
+    ) -> Result<PreparedCancellationReconciliationGrant, EngineGrantError> {
+        if !pool_binding.matches(&self.binding) {
+            return Err(EngineGrantError::ProtocolViolation(
+                "decoder-pool cancellation binding does not match the exact prepared grant"
+                    .to_string(),
+            ));
+        }
+        self.take_cancellation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_cancellation(
+        &mut self,
+    ) -> Result<PreparedCancellationReconciliationGrant, EngineGrantError> {
+        self.take_cancellation()
+    }
+
+    fn take_cancellation(
         &mut self,
     ) -> Result<PreparedCancellationReconciliationGrant, EngineGrantError> {
         let control = self.control.take().ok_or_else(|| {
@@ -2652,7 +2857,7 @@ impl fmt::Display for DecoderReserveRefusalDisposition {
 }
 
 /// Engine tombstone proving that one exact reserve attempt allocated nothing.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecoderReserveRefusalReceipt {
     prefill_id: PrefillId,
     decoder_id: DecoderId,
@@ -2756,6 +2961,58 @@ pub(crate) fn issue_test_grant(
     bootstrap_rooms: Vec<u64>,
     accounting: Vec<DecoderGrantChildAccounting>,
 ) -> Result<BoundPreparedGrant, EngineGrantError> {
+    issue_test_grant_with_control_url(
+        prefill_id,
+        request_chain_id,
+        source_tp_size,
+        decoder_id,
+        grant_id,
+        slot_generations,
+        bootstrap_rooms,
+        accounting,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn issue_test_grant_at_control_url(
+    prefill_id: PrefillId,
+    request_chain_id: Uuid,
+    source_tp_size: usize,
+    decoder_id: DecoderId,
+    grant_id: Uuid,
+    slot_generations: Vec<DecoderSlotGeneration>,
+    bootstrap_rooms: Vec<u64>,
+    accounting: Vec<DecoderGrantChildAccounting>,
+    control_url: &str,
+) -> Result<BoundPreparedGrant, EngineGrantError> {
+    issue_test_grant_with_control_url(
+        prefill_id,
+        request_chain_id,
+        source_tp_size,
+        decoder_id,
+        grant_id,
+        slot_generations,
+        bootstrap_rooms,
+        accounting,
+        Some(control_url),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn issue_test_grant_with_control_url(
+    prefill_id: PrefillId,
+    request_chain_id: Uuid,
+    source_tp_size: usize,
+    decoder_id: DecoderId,
+    grant_id: Uuid,
+    slot_generations: Vec<DecoderSlotGeneration>,
+    bootstrap_rooms: Vec<u64>,
+    accounting: Vec<DecoderGrantChildAccounting>,
+    control_url: Option<&str>,
+) -> Result<BoundPreparedGrant, EngineGrantError> {
     if slot_generations.len() != bootstrap_rooms.len() || slot_generations.len() != accounting.len()
     {
         return Err(EngineGrantError::InvalidGrant(
@@ -2802,7 +3059,12 @@ pub(crate) fn issue_test_grant(
         decoder_id,
         children,
     )?;
-    let control = control::test_prepared_grant_control(binding.grant_id());
+    let control = match control_url {
+        Some(control_url) => {
+            control::test_prepared_grant_control_at(binding.grant_id(), control_url)
+        }
+        None => control::test_prepared_grant_control(binding.grant_id()),
+    };
     Ok(BoundPreparedGrant {
         binding,
         control: Some(control),
@@ -2810,6 +3072,79 @@ pub(crate) fn issue_test_grant(
 }
 
 #[cfg(test)]
+pub(super) fn issue_test_unbound_cancellation_target(
+    grant: &BoundPreparedGrant,
+    attempted_grant_digest: Option<DecoderGrantDigest>,
+) -> PreparedGrantCancellationTarget {
+    PreparedGrantCancellationTarget {
+        grant_id: grant.binding.grant_id(),
+        reservation_attempt_id: grant.binding.reservation_attempt_id(),
+        reserve_attempt_digest: grant.binding.reserve_attempt_digest(),
+        decoder_id: grant.binding.decoder_id().clone(),
+        kind: PreparedGrantCancellationTargetKind::Unbound {
+            reservation_digest: grant.binding.reservation_digest(),
+            attempted_grant_digest,
+        },
+    }
+}
+
+#[cfg(test)]
+pub(super) fn issue_test_prepared_cancellation_receipt(
+    target: &PreparedGrantCancellationTarget,
+    take_once: bool,
+) -> PreparedGrantCancellationReceipt {
+    let PreparedGrantCancellationTargetKind::Unbound {
+        reservation_digest,
+        attempted_grant_digest,
+    } = target.kind
+    else {
+        panic!("test unbound cancellation receipt requires an unbound target");
+    };
+    PreparedGrantCancellationReceipt::from_control(
+        target.grant_id,
+        target.reservation_attempt_id,
+        target.reserve_attempt_digest,
+        target.decoder_id.clone(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        1_000,
+        1_900_000_000_000,
+        reservation_digest,
+        attempted_grant_digest,
+        Uuid::new_v4(),
+        AuthorityDigest([9; 32]),
+        take_once,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn issue_test_reserve_refusal_receipt(
+    prefill_id: PrefillId,
+    decoder_id: DecoderId,
+    logical_request_chain_id: Uuid,
+    reservation_attempt_id: Uuid,
+    reserve_attempt_digest: DecoderReserveAttemptDigest,
+    disposition: DecoderReserveRefusalDisposition,
+    take_once: bool,
+) -> DecoderReserveRefusalReceipt {
+    DecoderReserveRefusalReceipt {
+        prefill_id,
+        decoder_id,
+        logical_request_chain_id,
+        reservation_attempt_id,
+        reserve_attempt_digest,
+        reason_code: "test_refusal".to_string(),
+        disposition,
+        receipt_id: Uuid::new_v4(),
+        receipt_digest: AuthorityDigest([10; 32]),
+        take_once,
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct TestEngineReceiptBinding {
     pub(crate) grant_id: Uuid,
     pub(crate) decoder_id: DecoderId,
