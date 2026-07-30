@@ -8,7 +8,7 @@ CUDA-graph capturable.
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,9 @@ _BLOCK_THREADS = 1024
 _NUMEL_PER_THREAD = 8
 _MIN_BLOCKS = 4
 _MAX_BLOCKS = 32
+_INPUT_DIMENSIONS = 2
+
+_ConsensusValue = TypeVar("_ConsensusValue")
 
 
 # ------------------------------------------------------------------------------
@@ -294,6 +297,18 @@ def _all_gather_kernel_inner(
 
 @dataclass
 class MultimemAllGatherState:
+    """Resources for one tensor-parallel multimem all-gather.
+
+    :ivar group: Device process group used by the symmetric-memory rendezvous.
+    :ivar rank_in_group: Local rank within the tensor-parallel group.
+    :ivar world_size: Tensor-parallel group size.
+    :ivar device: CUDA device owning the symmetric buffer.
+    :ivar max_token_num: Maximum token rows held by the symmetric buffer.
+    :ivar hidden_dim: Gathered hidden width.
+    :ivar comm_buff: Rank-local view of the symmetric communication buffer.
+    :ivar symm_mem_hdl: Stable symmetric-memory rendezvous handle.
+    """
+
     group: dist.ProcessGroup
     rank_in_group: int
     world_size: int
@@ -419,9 +434,15 @@ def all_gather_inner(
 
 
 def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
-    """Largest batch (tokens) to keep on the fast path; bigger falls back to
-    NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
-    chunk. Returns ``floor`` if server args are unavailable."""
+    """Return the largest token batch retained by the multimem buffer.
+
+    Larger replicated batches use NCCL without changing the committed
+    multimem mode.
+
+    :param include_prefill: Include configured prefill limits.
+    :param floor: Minimum returned capacity.
+    :returns: Recommended symmetric-buffer token capacity.
+    """
     try:
         from sglang.srt.runtime_context import get_server_args
 
@@ -437,112 +458,320 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
         if include_prefill:
             tokens = max(tokens, g("chunked_prefill_size"), g("max_prefill_tokens"))
         return max(tokens, floor)
-    except Exception:
+    except ValueError:
         return floor
 
 
-class MultimemAllGatherer:
-    """Guarded multimem all-gather (last dim) with NCCL fallback; the single
-    entry point for every caller. Owns one symmetric buffer built lazily on the
-    first eager call, and uses the kernel only when the input fits its
-    dtype/shape/alignment contract. Guards use TP-replicated quantities so all
-    ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+@dataclass(frozen=True)
+class _InitializationRecord:
+    """Replicated contract used to select one permanent dispatch mode.
 
-    _UNINIT = object()
+    :ivar caller_name: Stable call-site identity.
+    :ivar process_enabled: Whether the dedicated process-wide multimem policy is
+        enabled.
+    :ivar caller_enabled: Whether this call site can use tensor-parallel multimem.
+    :ivar max_tokens: Symmetric-buffer token capacity.
+    :ivar skip_entry_sync: Whether the reusable-buffer entry barrier is omitted.
+    :ivar world_size: Tensor-parallel group size.
+    :ivar nnodes: Deployment node count.
+    :ivar input_shape: First-call local tensor shape.
+    :ivar input_dtype: First-call tensor dtype.
+    :ivar device_type: First-call tensor device type.
+    :ivar device_capability: CUDA compute capability, when applicable.
+    :ivar stream_capturing: Whether initialization was attempted during capture.
+    """
+
+    caller_name: str
+    process_enabled: bool
+    caller_enabled: bool
+    max_tokens: int
+    skip_entry_sync: bool
+    world_size: int
+    nnodes: int
+    input_shape: tuple[int, ...]
+    input_dtype: str
+    device_type: str
+    device_capability: tuple[int, int] | None
+    stream_capturing: bool
+
+
+def _all_gather_consensus_values(
+    value: _ConsensusValue,
+    group: dist.ProcessGroup,
+    world_size: int,
+) -> list[_ConsensusValue]:
+    """Gather one initialization value from every tensor-parallel rank.
+
+    :param value: Rank-local value.
+    :param group: CPU process group for control-plane consensus.
+    :param world_size: Expected group size.
+    :returns: Values in process-group rank order.
+    """
+    gathered: list[_ConsensusValue | None] = [None] * world_size
+    dist.all_gather_object(gathered, value, group=group)
+    if any(item is None for item in gathered):
+        raise RuntimeError("multimem initialization consensus returned no value")
+    return cast(list[_ConsensusValue], gathered)
+
+
+def _require_identical_records(
+    records: list[_InitializationRecord],
+) -> _InitializationRecord:
+    """Validate that every rank entered with the same static contract.
+
+    :param records: Initialization records in rank order.
+    :returns: The common initialization record.
+    :raises RuntimeError: If the records are empty or differ across ranks.
+    """
+    if len(records) == 0:
+        raise RuntimeError("multimem initialization consensus returned no records")
+    expected = records[0]
+    if any(record != expected for record in records[1:]):
+        raise RuntimeError(
+            "multimem all-gather initialization contract differs across TP ranks: "
+            f"{records}"
+        )
+    return expected
+
+
+def _static_ineligibility_reason(record: _InitializationRecord) -> str | None:
+    """Return why a replicated initialization contract cannot use multimem.
+
+    :param record: Replicated first-call contract.
+    :returns: A reason for permanent NCCL dispatch, or ``None`` when eligible.
+    """
+    if not record.caller_enabled:
+        return "the caller does not use the tensor-parallel device group"
+    if record.world_size <= 1:
+        return "tensor parallelism has one rank"
+    if record.nnodes != 1:
+        return "the deployment spans multiple nodes"
+    if record.device_type != "cuda":
+        return f"device type {record.device_type!r} is not CUDA"
+    if record.input_dtype != str(torch.bfloat16):
+        return f"dtype {record.input_dtype} is not bfloat16"
+    if len(record.input_shape) != _INPUT_DIMENSIONS:
+        return f"input rank {len(record.input_shape)} is not two"
+    if record.input_shape[-1] % _NUMEL_PER_THREAD != 0:
+        return (
+            f"local hidden width {record.input_shape[-1]} is not divisible by "
+            f"{_NUMEL_PER_THREAD}"
+        )
+    return None
+
+
+class MultimemAllGatherer:
+    """Tensor-parallel all-gather with one-time replicated multimem selection.
+
+    The dedicated process flag is part of the first-call consensus and controls
+    whether symmetric-memory initialization is attempted. The first call
+    reaches TP consensus on the static input contract, then
+    permanently selects NCCL or builds one symmetric buffer. A rendezvous
+    failure after that consensus is fatal; it never becomes a rank-local NCCL
+    fallback. Committed multimem calls require the same dtype, device, and local
+    hidden width on every rank. Token count is a TP-replicated dynamic value, so
+    batches larger than the buffer safely use NCCL without another control
+    collective.
+
+    ``skip_entry_sync=True`` is valid only when another cross-rank
+    synchronization separates every pair of calls.
+    """
 
     def __init__(
         self,
         max_tokens: int,
         *,
+        name: str,
         enabled: bool = True,
         skip_entry_sync: bool = False,
-    ):
-        self._max_tokens = int(max_tokens)
-        self._skip_entry_sync = skip_entry_sync
-        # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
-        if self._state is self._UNINIT:
-            # Lazy import avoids a module-load dependency on the distributed facade.
-            from sglang.srt.distributed import get_tp_group
-            from sglang.srt.distributed.parallel_state import in_the_same_node_as
-            from sglang.srt.runtime_context import get_server_args
+    ) -> None:
+        """Initialize an uncommitted all-gather policy.
 
-            tp_group = get_tp_group()
-            # Only probe node topology when the deployment can actually span
-            # nodes. Check world_size first so a TP=1 gatherer short-circuits
-            # before reading server args (which may be unpublished on offline
-            # paths). On a single node every TP rank is co-located, so skip the
-            # in_the_same_node_as() all-reduce, which can segfault under some
-            # EP/mooncake setups, and keep multimem enabled.
-            if (
-                tp_group.world_size > 1
-                and get_server_args().nnodes > 1
-                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
-                logger.warning(
-                    "multimem all-gather disabled because the TP group spans "
-                    "across nodes."
-                )
-                self._state = None
+        :param max_tokens: Maximum token rows held by the symmetric buffer.
+        :param name: Stable identity shared by this call site on every TP rank.
+        :param enabled: Whether this caller can use the TP device group.
+        :param skip_entry_sync: Omit the reusable-buffer entry barrier.
+        """
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if len(name) == 0:
+            raise ValueError("name must not be empty")
+        self._max_tokens = max_tokens
+        self._name = name
+        self._caller_enabled = enabled
+        self._skip_entry_sync = skip_entry_sync
+        self._initialized = False
+        self._state: MultimemAllGatherState | None = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Gather one rank-local hidden shard.
+
+        :param x: Rank-local tensor with replicated leading dimensions.
+        :returns: Tensor gathered along the final dimension.
+        """
+        if not self._initialized:
+            self._state = self._initialize(x)
+            self._initialized = True
+
         state = self._state
-        if state is self._UNINIT:
-            state = self._build(x)
-            if state is not self._UNINIT:
-                self._state = state
-        if (
-            state is not None
-            and state is not self._UNINIT
-            and x.dtype == torch.bfloat16
-            and x.dim() == 2
-            and x.is_contiguous()
-            and 0 < x.shape[0] <= state.max_token_num
-            and x.data_ptr() % 16 == 0
-            and x.shape[-1] * state.world_size <= state.hidden_dim
-        ):
-            return all_gather_inner(
-                state,
-                x,
-                tp_hidden_dim=x.shape[-1] * state.world_size,
-                skip_entry_sync=self._skip_entry_sync,
-                safe=False,
-            )
-        # Lazy import avoids a module-load dependency on the distributed facade.
+        if state is None:
+            return self._nccl_all_gather(x)
+
+        self._validate_committed_input(state, x)
+        # Token rows are replicated within a TP collective, so every rank makes
+        # the same capacity decision without another control-plane collective.
+        if x.shape[0] > state.max_token_num:
+            return self._nccl_all_gather(x)
+
+        prepared_x = self._prepare_input(x)
+        return all_gather_inner(
+            state,
+            prepared_x,
+            tp_hidden_dim=state.hidden_dim,
+            skip_entry_sync=self._skip_entry_sync,
+            safe=False,
+        )
+
+    @staticmethod
+    def _nccl_all_gather(x: torch.Tensor) -> torch.Tensor:
+        """Use the ordinary tensor-parallel collective.
+
+        :param x: Rank-local tensor.
+        :returns: Tensor gathered along the final dimension.
+        """
         from sglang.srt.distributed import tensor_model_parallel_all_gather
 
         return tensor_model_parallel_all_gather(x, dim=-1)
 
-    def _build(self, x: torch.Tensor):
-        if x.dim() != 2 or x.dtype != torch.bfloat16:
-            return None
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            # Can't allocate under capture; retry later.
-            return self._UNINIT
-        if x.shape[-1] % _NUMEL_PER_THREAD != 0:
-            return None
-        try:
-            from sglang.srt.distributed import get_tp_group
+    def _initialize(self, x: torch.Tensor) -> MultimemAllGatherState | None:
+        """Select a permanent dispatch mode and optionally build multimem state.
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
-            state = create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
-                max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
-            )
-            if state.symm_mem_hdl.multicast_ptr == 0:
-                # No multicast for this world size / arch; multimem.st would
-                # write nowhere. Fall back to NCCL.
-                logger.warning(
-                    "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
-                )
-                return None
-            return state
-        except Exception as e:
-            logger.warning("multimem all-gather disabled (%s)", e)
+        :param x: First rank-local input.
+        :returns: Committed multimem state, or ``None`` for permanent NCCL.
+        """
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
             return None
+
+        device_capability = (
+            torch.cuda.get_device_capability(x.device) if x.is_cuda else None
+        )
+        stream_capturing = (
+            torch.cuda.is_current_stream_capturing() if x.is_cuda else False
+        )
+        local_record = _InitializationRecord(
+            caller_name=self._name,
+            process_enabled=server_args.enable_multimem_all_gather,
+            caller_enabled=self._caller_enabled,
+            max_tokens=self._max_tokens,
+            skip_entry_sync=self._skip_entry_sync,
+            world_size=tp_group.world_size,
+            nnodes=server_args.nnodes,
+            input_shape=tuple(x.shape),
+            input_dtype=str(x.dtype),
+            device_type=x.device.type,
+            device_capability=device_capability,
+            stream_capturing=stream_capturing,
+        )
+        records = _all_gather_consensus_values(
+            local_record,
+            tp_group.cpu_group,
+            tp_group.world_size,
+        )
+        record = _require_identical_records(records)
+        if not record.process_enabled:
+            return None
+        if record.stream_capturing:
+            raise RuntimeError(
+                f"{self._name} multimem initialization must run before CUDA "
+                "graph capture"
+            )
+
+        ineligibility_reason = _static_ineligibility_reason(record)
+        if ineligibility_reason is not None:
+            if tp_group.rank_in_group == 0:
+                logger.warning(
+                    "%s multimem all-gather disabled: %s",
+                    self._name,
+                    ineligibility_reason,
+                )
+            return None
+
+        state = create_state(
+            group=tp_group.device_group,
+            rank_in_group=tp_group.rank_in_group,
+            max_tokens=self._max_tokens,
+            hidden_size=x.shape[-1] * tp_group.world_size,
+            device=x.device,
+        )
+        multicast_available = state.symm_mem_hdl.multicast_ptr != 0
+        multicast_availability = _all_gather_consensus_values(
+            multicast_available,
+            tp_group.cpu_group,
+            tp_group.world_size,
+        )
+        if all(multicast_availability):
+            return state
+        if any(multicast_availability):
+            raise RuntimeError(
+                f"{self._name} multicast availability differs across TP ranks: "
+                f"{multicast_availability}"
+            )
+        if tp_group.rank_in_group == 0:
+            logger.warning(
+                "%s multimem all-gather disabled: CUDA multicast is unavailable "
+                "for TP%d on compute capability %s",
+                self._name,
+                tp_group.world_size,
+                record.device_capability,
+            )
+        return None
+
+    @staticmethod
+    def _validate_committed_input(
+        state: MultimemAllGatherState,
+        x: torch.Tensor,
+    ) -> None:
+        """Validate the static contract after multimem has been committed.
+
+        :param state: Committed multimem state.
+        :param x: Current rank-local input.
+        :raises RuntimeError: If a static input property changed.
+        """
+        if x.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"committed multimem dtype changed from bfloat16 to {x.dtype}"
+            )
+        if x.device != state.device:
+            raise RuntimeError(
+                f"committed multimem device changed from {state.device} to {x.device}"
+            )
+        if x.dim() != _INPUT_DIMENSIONS:
+            raise RuntimeError(
+                f"committed multimem input rank changed from 2 to {x.dim()}"
+            )
+        expected_local_hidden = state.hidden_dim // state.world_size
+        if x.shape[-1] != expected_local_hidden:
+            raise RuntimeError(
+                "committed multimem local hidden width changed from "
+                f"{expected_local_hidden} to {x.shape[-1]}"
+            )
+
+    @staticmethod
+    def _prepare_input(x: torch.Tensor) -> torch.Tensor:
+        """Repair rank-local layout without changing collective dispatch.
+
+        :param x: Valid rank-local multimem input.
+        :returns: Contiguous, 16-byte-aligned input.
+        :raises RuntimeError: If a fresh contiguous allocation is still unaligned.
+        """
+        prepared_x = x if x.is_contiguous() else x.contiguous()
+        if prepared_x.data_ptr() % 16 != 0:
+            prepared_x = prepared_x.clone()
+        if prepared_x.data_ptr() % 16 != 0:
+            raise RuntimeError("fresh multimem input allocation is not 16-byte aligned")
+        return prepared_x

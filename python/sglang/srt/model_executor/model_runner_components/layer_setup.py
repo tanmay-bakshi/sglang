@@ -216,17 +216,17 @@ def adjust_hybrid_swa_layer_ids(
     if model_config.is_deepseek_v4_arch:
         return
 
+    full_attention_layer_id_set = set(model_config.full_attention_layer_ids)
+    swa_attention_layer_id_set = set(model_config.swa_attention_layer_ids)
     full_attention_layer_ids = [
         layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "full_attention_layer_ids")
-        and layer_idx in model_config.full_attention_layer_ids
+        for layer_idx in range(start_layer, end_layer)
+        if layer_idx in full_attention_layer_id_set
     ]
     swa_attention_layer_ids = [
         layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "swa_attention_layer_ids")
-        and layer_idx in model_config.swa_attention_layer_ids
+        for layer_idx in range(start_layer, end_layer)
+        if layer_idx in swa_attention_layer_id_set
     ]
     model_config.swa_attention_layer_ids = swa_attention_layer_ids
     model_config.full_attention_layer_ids = full_attention_layer_ids

@@ -1879,6 +1879,11 @@ class ServerArgs:
     enable_symm_mem: A[
         bool, "Enable NCCL symmetric memory for fast collectives.", NS("exec.comm")
     ] = False
+    enable_multimem_all_gather: A[
+        bool,
+        "Enable the Triton multimem tensor-parallel all-gather.",
+        NS("exec.comm"),
+    ] = False
     triton_attention_reduce_in_fp32: A[
         bool,
         "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."

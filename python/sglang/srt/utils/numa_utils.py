@@ -4,10 +4,11 @@ import logging
 import math
 import multiprocessing
 import os
-import random
+import shlex
 import shutil
 import subprocess
-import time
+import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -56,30 +57,53 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     )
                     yield
                     return
-                executable, debug_str = _create_numactl_executable(
+                with _create_numactl_executable(
                     numactl_args=numactl_args
-                )
-                debug_str += (
-                    f", logical_gpu_id={gpu_id}, "
-                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-                )
-                with _mp_set_executable(executable=executable, debug_str=debug_str):
-                    yield
-                    return
+                ) as executable_info:
+                    executable, debug_str = executable_info
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        "CUDA_VISIBLE_DEVICES="
+                        f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                    )
+                    with _mp_set_executable(
+                        executable=executable,
+                        debug_str=debug_str,
+                    ):
+                        yield
+                        return
     yield
 
 
-def _create_numactl_executable(numactl_args: str):
+@contextmanager
+def _create_numactl_executable(
+    numactl_args: str,
+) -> Iterator[tuple[str, str]]:
+    """Create a private NUMA launcher for one multiprocessing spawn context.
+
+    :param numactl_args: Validated arguments inserted before the Python
+        executable.
+    :yields: Executable path and debug description.
+    """
+
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
+    quoted_executable = shlex.quote(old_executable)
     script = f'''#!/bin/sh
-exec numactl {numactl_args} {old_executable} "$@"'''
-    path = Path(
-        f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
+exec numactl {numactl_args} {quoted_executable} "$@"'''
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix="sglang-numactl-",
+        suffix=".sh",
+        dir=tempfile.gettempdir(),
     )
-    path.write_text(script)
-    path.chmod(0o777)
-    return str(path), f"{script=}"
+    path = Path(temporary_path)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            stream.write(script)
+        path.chmod(0o700)
+        yield str(path), f"{script=}"
+    finally:
+        path.unlink(missing_ok=True)
 
 
 @contextmanager

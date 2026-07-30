@@ -6,6 +6,7 @@ import logging
 import struct
 import threading
 import time
+import traceback
 import uuid
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -24,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    PrefillServerInfo,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -32,6 +34,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    compute_tensor_parallel_shard,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -336,23 +339,32 @@ class TransferStatus:
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
-    # PP ranks that have sent state data (state is layer-specific, each PP rank sends its portion).
-    received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
-    # Whether state data is expected (set based on state_type).
-    expects_state: bool = False
+    # State transfers are independently completed by source writer and component.
+    received_state_components: set[tuple[int, int]] = dataclasses.field(
+        default_factory=set
+    )
+    # Component positions in KVArgs.state_types which have a non-empty payload.
+    expected_state_indices: set[int] = dataclasses.field(default_factory=set)
     # KV part notifications for mixed-memory transfers. Keyed by
     # (pp_rank, chunk_id); normal homogeneous transfers bypass this.
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
     expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
 
-    def is_done(self):
+    @property
+    def expected_state_components(self) -> set[tuple[int, int]]:
+        """Return the state transfers required from the discovered KV writers.
+
+        :returns: Source-writer and state-component pairs required for completion.
+        """
+
+        return {
+            (source_rank, state_index)
+            for source_rank in self.expected_kvs_per_pp
+            for state_index in self.expected_state_indices
+        }
+
+    def is_done(self) -> bool:
         if self.num_pp_ranks_expected is None or not self.received_aux:
-            return False
-        # If state data is expected, check all PP ranks have sent it
-        if (
-            self.expects_state
-            and len(self.received_state_per_pp) < self.num_pp_ranks_expected
-        ):
             return False
         # All PP ranks must have reported their expected count
         if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
@@ -361,6 +373,8 @@ class TransferStatus:
         for pp_rank, expected in self.expected_kvs_per_pp.items():
             if len(self.received_kvs_per_pp[pp_rank]) != expected:
                 return False
+        if not self.expected_state_components.issubset(self.received_state_components):
+            return False
         return True
 
 
@@ -490,6 +504,34 @@ class NixlKVManager(CommonKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
+        """Validate NIXL state-transfer topology before resolving peer ranks.
+
+        :param info: Parallel topology advertised by the prefill server.
+        :raises RuntimeError: If asymmetric non-MLA SWA uses unsupported PP or CP.
+        """
+
+        state_types = self.kv_args.state_types
+        uses_asymmetric_swa = (
+            StateType.SWA in state_types
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and self.attn_tp_size != info.attn_tp_size
+        )
+        unsupported_pipeline_or_context_parallelism = (
+            self.pp_size != 1
+            or info.pp_size != 1
+            or self.attn_cp_size != 1
+            or info.attn_cp_size != 1
+        )
+        if uses_asymmetric_swa and unsupported_pipeline_or_context_parallelism:
+            raise RuntimeError(
+                "NIXL asymmetric-TP SWA transfer requires PP=1 and CP=1 on "
+                "both prefill and decode servers"
+            )
+
+        super()._resolve_rank_mapping(info)
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1038,6 +1080,27 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _notify_decode_transfer_failure(self, room: int) -> None:
+        """Best-effort notify every decode peer that a room has failed.
+
+        :param room: Bootstrap room whose transfer failed.
+        """
+
+        notification = f"{room}_failure_{self.transfer_source_rank}".encode("ascii")
+        transfer_infos = self.transfer_infos.get(room, {})
+        for transfer_info in transfer_infos.values():
+            if transfer_info.is_dummy():
+                continue
+            try:
+                self.agent.send_notif(transfer_info.agent_name, notification)
+            except Exception:
+                logger.error(
+                    "Failed to notify decode peer %s that room %s failed:\n%s",
+                    transfer_info.agent_name,
+                    room,
+                    traceback.format_exc(),
+                )
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1266,6 +1329,7 @@ class NixlKVManager(CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
+                self._notify_decode_transfer_failure(room)
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
@@ -1862,6 +1926,221 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def _send_tp_sharded_state(
+        self,
+        peer_name: str,
+        source_indices: list[int],
+        source_data_ptrs: list[int],
+        source_item_lens: list[int],
+        destination_indices: list[int],
+        destination_data_ptrs: list[int],
+        destination_item_lens: list[int],
+        destination_gpu_id: int,
+        destination_tp_size: int,
+        destination_engine_rank: int,
+        notification: str,
+        source_layer_ids: list[int] | None = None,
+        destination_layer_ids: list[int] | None = None,
+    ) -> Any | None:
+        """Transfer a page-indexed state whose token payload is TP-sharded.
+
+        :param peer_name: NIXL peer receiving the state.
+        :param source_indices: Source page indices.
+        :param source_data_ptrs: Source state-buffer base addresses.
+        :param source_item_lens: Source bytes per page for each state buffer.
+        :param destination_indices: Destination page indices.
+        :param destination_data_ptrs: Destination state-buffer base addresses.
+        :param destination_item_lens: Destination bytes per page for each buffer.
+        :param destination_gpu_id: Destination GPU identifier used by NIXL.
+        :param destination_tp_size: Destination attention TP width.
+        :param destination_engine_rank: Destination global engine rank.
+        :param notification: Transfer completion notification.
+        :param source_layer_ids: Optional source layer identifiers.
+        :param destination_layer_ids: Optional destination layer identifiers.
+        :returns: The NIXL transfer handle, or ``None`` when no buffers are paired.
+        :raises ValueError: If page indices or TP-sharded buffer geometries differ.
+        """
+
+        source_indices_signed = np.asarray(source_indices, dtype=np.int64).reshape(-1)
+        destination_indices_signed = np.asarray(
+            destination_indices, dtype=np.int64
+        ).reshape(-1)
+        if np.any(source_indices_signed < 0):
+            raise ValueError(
+                "Source TP-sharded state page indices must be non-negative"
+            )
+        if np.any(destination_indices_signed < 0):
+            raise ValueError(
+                "Destination TP-sharded state page indices must be non-negative"
+            )
+
+        source_indices_array = source_indices_signed.astype(np.uint64, copy=False)
+        destination_indices_array = destination_indices_signed.astype(
+            np.uint64, copy=False
+        )
+        if source_indices_array.size != destination_indices_array.size:
+            raise ValueError(
+                "TP-sharded state index count mismatch: "
+                f"source={source_indices_array.size}, "
+                f"destination={destination_indices_array.size}"
+            )
+        if source_indices_array.size == 0:
+            return None
+
+        if len(source_data_ptrs) != len(source_item_lens):
+            raise ValueError(
+                "Source state pointer/item-length count mismatch: "
+                f"{len(source_data_ptrs)} pointers and "
+                f"{len(source_item_lens)} item lengths"
+            )
+        if len(destination_data_ptrs) != len(destination_item_lens):
+            raise ValueError(
+                "Destination state pointer/item-length count mismatch: "
+                f"{len(destination_data_ptrs)} pointers and "
+                f"{len(destination_item_lens)} item lengths"
+            )
+
+        pairs = build_transfer_entry_pairs(
+            source_layer_ids if source_layer_ids is not None else [],
+            destination_layer_ids if destination_layer_ids is not None else [],
+            len(source_data_ptrs),
+            len(destination_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        if len(pairs) == 0:
+            return None
+
+        page_size = self.kv_args.page_size
+        if page_size <= 0:
+            raise ValueError(f"KV page size must be positive, got {page_size}")
+
+        source_tp_size = self.attn_tp_size
+        if source_tp_size <= 0:
+            raise ValueError(
+                f"Source attention TP size must be positive, got {source_tp_size}"
+            )
+        if destination_tp_size <= 0:
+            raise ValueError(
+                "Destination attention TP size must be positive, got "
+                f"{destination_tp_size}"
+            )
+        if self.kv_args.engine_rank < 0:
+            raise ValueError(
+                f"Source engine rank must be non-negative, got {self.kv_args.engine_rank}"
+            )
+        if destination_engine_rank < 0:
+            raise ValueError(
+                "Destination engine rank must be non-negative, got "
+                f"{destination_engine_rank}"
+            )
+
+        source_tp_rank = self.kv_args.engine_rank % source_tp_size
+        destination_tp_rank = destination_engine_rank % destination_tp_size
+        token_offsets = np.arange(page_size, dtype=np.uint64)
+        source_address_chunks: list[npt.NDArray[np.uint64]] = []
+        destination_address_chunks: list[npt.NDArray[np.uint64]] = []
+        length_chunks: list[npt.NDArray[np.uint64]] = []
+
+        for source_index, destination_index in pairs:
+            source_item_bytes = source_item_lens[source_index]
+            destination_item_bytes = destination_item_lens[destination_index]
+            if source_item_bytes <= 0 or destination_item_bytes <= 0:
+                raise ValueError(
+                    "TP-sharded state item lengths must be positive, got "
+                    f"{source_item_bytes} and {destination_item_bytes}"
+                )
+            if source_item_bytes % page_size != 0:
+                raise ValueError(
+                    f"Source item length {source_item_bytes} is not divisible by "
+                    f"page size {page_size}"
+                )
+            if destination_item_bytes % page_size != 0:
+                raise ValueError(
+                    f"Destination item length {destination_item_bytes} is not "
+                    f"divisible by page size {page_size}"
+                )
+
+            source_token_bytes = source_item_bytes // page_size
+            destination_token_bytes = destination_item_bytes // page_size
+            shard = compute_tensor_parallel_shard(
+                source_token_bytes=source_token_bytes,
+                destination_token_bytes=destination_token_bytes,
+                source_parallel_size=source_tp_size,
+                destination_parallel_size=destination_tp_size,
+                source_rank=source_tp_rank,
+                destination_rank=destination_tp_rank,
+            )
+
+            source_page_bases = np.uint64(
+                source_data_ptrs[source_index]
+            ) + source_indices_array[:, None] * np.uint64(source_item_bytes)
+            destination_page_bases = np.uint64(
+                destination_data_ptrs[destination_index]
+            ) + destination_indices_array[:, None] * np.uint64(destination_item_bytes)
+            source_addresses = (
+                source_page_bases
+                + token_offsets[None, :] * np.uint64(source_token_bytes)
+                + np.uint64(shard.source_offset_bytes)
+            ).reshape(-1)
+            destination_addresses = (
+                destination_page_bases
+                + token_offsets[None, :] * np.uint64(destination_token_bytes)
+                + np.uint64(shard.destination_offset_bytes)
+            ).reshape(-1)
+            source_address_chunks.append(source_addresses)
+            destination_address_chunks.append(destination_addresses)
+            length_chunks.append(
+                np.full(
+                    source_addresses.size,
+                    shard.length_bytes,
+                    dtype=np.uint64,
+                )
+            )
+
+        source_addresses = np.concatenate(source_address_chunks)
+        destination_addresses = np.concatenate(destination_address_chunks)
+        lengths = np.concatenate(length_chunks)
+        source_requests = np.column_stack(
+            (
+                source_addresses,
+                lengths,
+                np.full(
+                    source_addresses.size,
+                    self.kv_args.gpu_id,
+                    dtype=np.uint64,
+                ),
+            )
+        )
+        destination_requests = np.column_stack(
+            (
+                destination_addresses,
+                lengths,
+                np.full(
+                    destination_addresses.size,
+                    destination_gpu_id,
+                    dtype=np.uint64,
+                ),
+            )
+        )
+
+        source_descriptors = self.agent.get_xfer_descs(source_requests, "VRAM")
+        destination_descriptors = self.agent.get_xfer_descs(
+            destination_requests, "VRAM"
+        )
+        transfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            source_descriptors,
+            destination_descriptors,
+            peer_name,
+            notification.encode("ascii"),
+        )
+        if transfer_handle is None:
+            raise RuntimeError("Failed to create TP-sharded state transfer")
+        state = self.agent.transfer(transfer_handle)
+        if state == "ERR":
+            raise RuntimeError("Failed to post TP-sharded state transfer")
+        return transfer_handle
+
     def _send_mamba_state(
         self,
         peer_name: str,
@@ -2151,6 +2430,30 @@ class NixlKVManager(CommonKVManager):
                 StateType.SWA_RING,
                 StateType.C128_STATE,
             ):
+                if (
+                    st == StateType.SWA
+                    and not self.is_mla_backend
+                    and not self.is_hybrid_mla_backend
+                    and self.attn_tp_size != decode_tp_size
+                ):
+                    h = self._send_tp_sharded_state(
+                        peer_name=peer_name,
+                        source_indices=src_indices,
+                        source_data_ptrs=src_ptrs,
+                        source_item_lens=src_lens,
+                        destination_indices=dst_indices,
+                        destination_data_ptrs=dst_ptrs,
+                        destination_item_lens=dst_lens,
+                        destination_gpu_id=dst_gpu_id,
+                        destination_tp_size=decode_tp_size,
+                        destination_engine_rank=decode_tp_rank,
+                        notification=comp_notif,
+                        source_layer_ids=src_lids,
+                        destination_layer_ids=dst_lids,
+                    )
+                    if h is not None:
+                        handles.append(h)
+                    continue
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
@@ -2264,7 +2567,8 @@ class NixlKVManager(CommonKVManager):
                 #   stg:   {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}
                 #          _{page_start}_{num_pages}_{agent_name}               -> 9 fields
                 #   aux:   {room}_aux                                           -> 2 fields
-                #   state: {room}_state_{pp_rank}                               -> 3 fields
+                #   state: {room}_state_{source_rank}_{state_index}              -> 4 fields
+                #   failure: {room}_failure_{source_rank}                        -> 3 fields
                 # maxsplit=8 keeps everything past the 8th underscore in the
                 # last component, so agent_name (which may itself contain
                 # underscores) lands intact in components[8] for the stg path.
@@ -2293,8 +2597,24 @@ class NixlKVManager(CommonKVManager):
                     # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
                     self._handle_aux_notification(room, components)
                 elif tag == "state":
-                    pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                    if len(components) != 4:
+                        raise RuntimeError(
+                            f"Malformed NIXL state notification: {msg!r}"
+                        )
+                    source_rank = int(components[2])
+                    state_index = int(components[3])
+                    self.transfer_statuses[room].received_state_components.add(
+                        (source_rank, state_index)
+                    )
+                elif tag == "failure":
+                    if room not in self.request_status:
+                        continue
+                    source_rank = int(components[2])
+                    self.record_failure(
+                        room,
+                        f"Prefill source rank {source_rank} reported transfer failure",
+                    )
+                    self.update_status(room, KVPoll.Failed)
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2673,6 +2993,17 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        expected_state_indices: set[int] = set()
+        if state_indices is not None:
+            expected_state_indices = {
+                state_index
+                for state_index, component_indices in enumerate(state_indices)
+                if component_indices is not None and len(component_indices) > 0
+            }
+        self.kv_mgr.transfer_statuses[self.bootstrap_room].expected_state_indices = (
+            expected_state_indices
+        )
+
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
         if (
@@ -2724,13 +3055,6 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
 
-        # Mark that we expect state data if state_indices was provided.
-        # Match the prefill-side truthy check: an empty list means the
-        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
-        # won't send state notifs, so we must not expect them.
-        if state_indices:
-            self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
-
         self.started_transfer = True
         self.init_time = time.time()
 
@@ -2750,6 +3074,10 @@ class NixlKVReceiver(CommonKVReceiver):
         # update_transfer_status(); a completion queued by NIXL at/after the
         # deadline would otherwise lose to the timeout purely by poll ordering.
         self.kv_mgr.update_transfer_status()
+        if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
+            self.conclude_state = KVPoll.Failed
+            return self.conclude_state
+
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
@@ -2852,6 +3180,16 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
+
+    def clear(self) -> None:
+        """Release NIXL receiver bookkeeping for this room."""
+
+        bootstrap_room = self.bootstrap_room
+        super().clear()
+        if bootstrap_room is None:
+            return
+        self.kv_mgr.transfer_statuses.pop(bootstrap_room, None)
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(bootstrap_room)
 
     def failure_exception(self):
         with self.kv_mgr.failure_lock:

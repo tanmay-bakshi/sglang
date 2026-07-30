@@ -1007,10 +1007,14 @@ class UnifiedSWAKVPool(SWAKVPool):
     """Shared-buffer replacement for `SWAKVPool`.
 
     Composes two `UnifiedMHATokenToKVPool` instances (full + swa) aliasing the same
-    byte buffer. Inherits from `SWAKVPool` only for `isinstance`; does NOT call the
-    parent `__init__` (it would build static-partition pools). The per-sub-pool v2p
-    table IS the full->swa mapping, so `register_mapping` is a no-op.
+    byte buffer. It does not call the parent initializer because that would build
+    static-partition pools, so it owns initialization of the shared layer-identity
+    and mapping contract used by inherited registration methods. The per-sub-pool
+    v2p table is the full-to-SWA mapping, so ``register_mapping`` is a no-op.
     """
+
+    _full_attention_layer_ids: tuple[int, ...]
+    _swa_attention_layer_ids: tuple[int, ...]
 
     def __init__(
         self,
@@ -1022,11 +1026,13 @@ class UnifiedSWAKVPool(SWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_memory_saver: bool = False,
-    ):
+    ) -> None:
         # Do NOT call super().__init__ — it would allocate static-partition pools.
         self.unified_buffer = unified_buffer
-        self.swa_layer_nums = len(swa_attention_layer_ids)
-        self.full_layer_nums = len(full_attention_layer_ids)
+        self._swa_attention_layer_ids = tuple(swa_attention_layer_ids)
+        self._full_attention_layer_ids = tuple(full_attention_layer_ids)
+        self.swa_layer_nums = len(self._swa_attention_layer_ids)
+        self.full_layer_nums = len(self._full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = start_layer if start_layer is not None else 0
         self.page_size = page_size
@@ -1067,9 +1073,9 @@ class UnifiedSWAKVPool(SWAKVPool):
 
         # {global_layer_id: (per-pool index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
-        for idx, gid in enumerate(full_attention_layer_ids):
+        for idx, gid in enumerate(self._full_attention_layer_ids):
             self.layers_mapping[gid] = (idx, False)
-        for idx, gid in enumerate(swa_attention_layer_ids):
+        for idx, gid in enumerate(self._swa_attention_layer_ids):
             self.layers_mapping[gid] = (idx, True)
 
         # None so dispatch routes through our v2p-table overrides, not a registered mapping.
