@@ -1,13 +1,17 @@
 import msgspec
-
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
-    PackedCommit,
     PackedLayoutSpec,
     PackedPrepare,
     PackedReady,
     PackedTopology,
+    PackedTransportPath,
+    PackedWriterCompletionMechanism,
+    PackedWriterOutcome,
+    PackedWriterOutcomeStatus,
+    PackedWriterVisibilityAction,
+    PackedWriterVisibilityEvidence,
 )
 from sglang.srt.disaggregation.common.staging_layout import (
     StagingComponentGeometry,
@@ -16,7 +20,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
 )
 
-PACKED_WIRE_VERSION: int = 1
+PACKED_WIRE_VERSION: int = 3
 MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
 
 
@@ -33,6 +37,7 @@ class _WireChunkKey(
 
     room_id: int
     chunk_id: int
+    request_generation: bytes
 
 
 class _WireComponentId(
@@ -144,30 +149,48 @@ class _WireReady(
     key: _WireChunkKey
     writer_id: _WireWriterId
     digest: bytes
+    visibility_policy_digest: bytes
     lease_id: int
     lease_base_address: int
     projection_offset: int
     projection_length: int
 
 
-class _WireCommit(
+class _WireWriterVisibilityEvidence(
     msgspec.Struct,
-    tag="commit",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of source-side visibility evidence."""
+
+    policy_digest: bytes
+    transport_path: str
+    lane_identifier: str
+    completion_mechanism: str
+    writer_action: str
+
+
+class _WireWriterOutcome(
+    msgspec.Struct,
+    tag="writer_outcome",
     tag_field="kind",
     frozen=True,
     forbid_unknown_fields=True,
 ):
-    """Versioned COMMIT envelope."""
+    """Versioned terminal writer-outcome envelope."""
 
     version: int
     key: _WireChunkKey
     writer_id: _WireWriterId
     digest: bytes
     lease_id: int
+    status: str
+    visibility: _WireWriterVisibilityEvidence | None
+    reason: str | None
 
 
-PackedWireMessage = PackedPrepare | PackedReady | PackedCommit
-_WireMessage = _WirePrepare | _WireReady | _WireCommit
+PackedWireMessage = PackedPrepare | PackedReady | PackedWriterOutcome
+_WireMessage = _WirePrepare | _WireReady | _WireWriterOutcome
 _ENCODER = msgspec.msgpack.Encoder()
 _DECODER = msgspec.msgpack.Decoder(_WireMessage, strict=True)
 
@@ -179,7 +202,11 @@ def _encode_chunk_key(key: PackedChunkKey) -> _WireChunkKey:
     :returns: Immutable wire identity.
     """
 
-    return _WireChunkKey(room_id=key.room_id, chunk_id=key.chunk_id)
+    return _WireChunkKey(
+        room_id=key.room_id,
+        chunk_id=key.chunk_id,
+        request_generation=key.request_generation,
+    )
 
 
 def _decode_chunk_key(key: _WireChunkKey) -> PackedChunkKey:
@@ -189,7 +216,11 @@ def _decode_chunk_key(key: _WireChunkKey) -> PackedChunkKey:
     :returns: Validated domain identity.
     """
 
-    return PackedChunkKey(room_id=key.room_id, chunk_id=key.chunk_id)
+    return PackedChunkKey(
+        room_id=key.room_id,
+        chunk_id=key.chunk_id,
+        request_generation=key.request_generation,
+    )
 
 
 def _encode_component_id(component_id: StagingComponentId) -> _WireComponentId:
@@ -320,6 +351,44 @@ def _decode_writer_id(writer_id: _WireWriterId) -> StagingWriterId:
     )
 
 
+def _encode_visibility_evidence(
+    evidence: PackedWriterVisibilityEvidence,
+) -> _WireWriterVisibilityEvidence:
+    """Convert source visibility evidence into its wire shape.
+
+    :param evidence: Validated domain evidence.
+    :returns: Immutable wire evidence.
+    """
+
+    return _WireWriterVisibilityEvidence(
+        policy_digest=evidence.policy_digest,
+        transport_path=evidence.transport_path.value,
+        lane_identifier=evidence.lane_identifier,
+        completion_mechanism=evidence.completion_mechanism.value,
+        writer_action=evidence.writer_action.value,
+    )
+
+
+def _decode_visibility_evidence(
+    evidence: _WireWriterVisibilityEvidence,
+) -> PackedWriterVisibilityEvidence:
+    """Convert wire visibility evidence into its validated domain shape.
+
+    :param evidence: Untrusted wire evidence.
+    :returns: Validated domain evidence.
+    """
+
+    return PackedWriterVisibilityEvidence(
+        policy_digest=evidence.policy_digest,
+        transport_path=PackedTransportPath(evidence.transport_path),
+        lane_identifier=evidence.lane_identifier,
+        completion_mechanism=PackedWriterCompletionMechanism(
+            evidence.completion_mechanism
+        ),
+        writer_action=PackedWriterVisibilityAction(evidence.writer_action),
+    )
+
+
 def _encode_topology(topology: PackedTopology) -> _WireTopology:
     """Convert a domain topology into its wire shape.
 
@@ -400,7 +469,7 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
     ZMQ supplies message framing, so the returned bytes contain exactly one
     deterministic msgpack object and no delimiter protocol.
 
-    :param message: PREPARE, READY, or COMMIT domain payload.
+    :param message: PREPARE, READY, or terminal writer-outcome domain payload.
     :returns: Versioned msgpack frame.
     :raises TypeError: If the message type is unsupported.
     :raises PackedWireError: If the encoded frame exceeds the protocol bound.
@@ -421,18 +490,26 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
             key=_encode_chunk_key(message.key),
             writer_id=_encode_writer_id(message.writer_id),
             digest=message.digest,
+            visibility_policy_digest=message.visibility_policy_digest,
             lease_id=message.lease_id,
             lease_base_address=message.lease_base_address,
             projection_offset=message.projection_offset,
             projection_length=message.projection_length,
         )
-    elif type(message) is PackedCommit:
-        wire_message = _WireCommit(
+    elif type(message) is PackedWriterOutcome:
+        wire_message = _WireWriterOutcome(
             version=PACKED_WIRE_VERSION,
             key=_encode_chunk_key(message.key),
             writer_id=_encode_writer_id(message.writer_id),
             digest=message.digest,
             lease_id=message.lease_id,
+            status=message.status.value,
+            visibility=(
+                _encode_visibility_evidence(message.visibility)
+                if message.visibility is not None
+                else None
+            ),
+            reason=message.reason,
         )
     else:
         raise TypeError(f"unsupported packed wire message: {type(message)!r}")
@@ -449,7 +526,7 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
     """Decode and validate one versioned packed staging envelope.
 
     :param payload: Complete msgpack ZMQ frame.
-    :returns: PREPARE, READY, or COMMIT domain payload.
+    :returns: PREPARE, READY, or terminal writer-outcome domain payload.
     :raises PackedWireError: If framing, schema, version, or domain values fail.
     """
 
@@ -482,17 +559,25 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
                 key=_decode_chunk_key(wire_message.key),
                 writer_id=_decode_writer_id(wire_message.writer_id),
                 digest=wire_message.digest,
+                visibility_policy_digest=wire_message.visibility_policy_digest,
                 lease_id=wire_message.lease_id,
                 lease_base_address=wire_message.lease_base_address,
                 projection_offset=wire_message.projection_offset,
                 projection_length=wire_message.projection_length,
             )
-        if type(wire_message) is _WireCommit:
-            return PackedCommit(
+        if type(wire_message) is _WireWriterOutcome:
+            return PackedWriterOutcome(
                 key=_decode_chunk_key(wire_message.key),
                 writer_id=_decode_writer_id(wire_message.writer_id),
                 digest=wire_message.digest,
                 lease_id=wire_message.lease_id,
+                status=PackedWriterOutcomeStatus(wire_message.status),
+                visibility=(
+                    _decode_visibility_evidence(wire_message.visibility)
+                    if wire_message.visibility is not None
+                    else None
+                ),
+                reason=wire_message.reason,
             )
         raise PackedWireError(
             f"unsupported packed wire message: {type(wire_message)!r}"

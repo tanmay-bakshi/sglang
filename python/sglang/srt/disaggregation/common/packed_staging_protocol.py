@@ -23,6 +23,27 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 
 logger = logging.getLogger(__name__)
 
+PACKED_REQUEST_GENERATION_BYTES = 16
+PACKED_VISIBILITY_POLICY_DIGEST_BYTES = 32
+MAX_PACKED_WRITER_ERROR_BYTES = 4096
+MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES = 512
+
+
+def _validate_visibility_policy_digest(value: bytes, label: str) -> None:
+    """Validate one exact route-policy digest.
+
+    :param value: Candidate SHA-256 digest.
+    :param label: Reader-facing field label.
+    """
+
+    if type(value) is not bytes:
+        raise TypeError(f"{label} must be bytes")
+    if len(value) != PACKED_VISIBILITY_POLICY_DIGEST_BYTES:
+        raise ValueError(
+            f"{label} must contain {PACKED_VISIBILITY_POLICY_DIGEST_BYTES} "
+            f"bytes, got {len(value)}"
+        )
+
 
 @dataclasses.dataclass(frozen=True, order=True)
 class PackedChunkKey:
@@ -30,14 +51,18 @@ class PackedChunkKey:
 
     :ivar room_id: Bootstrap room identifying the request.
     :ivar chunk_id: Request-local monotonically increasing chunk identifier.
+    :ivar request_generation: Bootstrap generation preventing room-key replay.
     """
 
     room_id: int
     chunk_id: int
+    request_generation: bytes
 
     def __post_init__(self) -> None:
         """Validate the packed chunk identity."""
 
+        if type(self.request_generation) is not bytes:
+            raise TypeError("request_generation must be bytes")
         if type(self.room_id) is not int or self.room_id < 0:
             raise ValueError(
                 f"room_id must be a non-negative integer, got {self.room_id!r}"
@@ -45,6 +70,12 @@ class PackedChunkKey:
         if type(self.chunk_id) is not int or self.chunk_id < 0:
             raise ValueError(
                 f"chunk_id must be a non-negative integer, got {self.chunk_id!r}"
+            )
+        if len(self.request_generation) != PACKED_REQUEST_GENERATION_BYTES:
+            raise ValueError(
+                "request_generation must contain "
+                f"{PACKED_REQUEST_GENERATION_BYTES} bytes, got "
+                f"{len(self.request_generation)}"
             )
 
 
@@ -66,17 +97,17 @@ class PackedTopology:
     def __post_init__(self) -> None:
         """Validate topology values before layout construction."""
 
-        if self.source_tp_size <= 0:
+        if type(self.source_tp_size) is not int or self.source_tp_size <= 0:
             raise ValueError(
                 f"source_tp_size must be positive, got {self.source_tp_size}"
             )
-        if self.destination_tp_size <= 0:
+        if type(self.destination_tp_size) is not int or self.destination_tp_size <= 0:
             raise ValueError(
-                "destination_tp_size must be positive, got "
-                f"{self.destination_tp_size}"
+                f"destination_tp_size must be positive, got {self.destination_tp_size}"
             )
         if (
-            self.destination_tp_rank < 0
+            type(self.destination_tp_rank) is not int
+            or self.destination_tp_rank < 0
             or self.destination_tp_rank >= self.destination_tp_size
         ):
             raise ValueError(
@@ -84,7 +115,7 @@ class PackedTopology:
                 f"[0, {self.destination_tp_size}), got "
                 f"{self.destination_tp_rank}"
             )
-        if self.alignment_bytes <= 0:
+        if type(self.alignment_bytes) is not int or self.alignment_bytes <= 0:
             raise ValueError(
                 f"alignment_bytes must be positive, got {self.alignment_bytes}"
             )
@@ -118,6 +149,12 @@ class PackedLayoutSpec:
     def __post_init__(self) -> None:
         """Own immutable copies of every layout-bearing sequence."""
 
+        if type(self.chunk_id) is not int or self.chunk_id < 0:
+            raise ValueError("packed layout chunk_id must be a non-negative integer")
+        if type(self.is_last) is not bool:
+            raise TypeError("packed layout is_last must be bool")
+        if type(self.topology) is not PackedTopology:
+            raise TypeError("packed layout topology must be PackedTopology")
         object.__setattr__(self, "spans", tuple(self.spans))
         object.__setattr__(self, "source_components", tuple(self.source_components))
         object.__setattr__(
@@ -188,7 +225,8 @@ class PackedPrepare:
     def __post_init__(self) -> None:
         """Own and validate an immutable copy of the digest."""
 
-        object.__setattr__(self, "digest", bytes(self.digest))
+        if type(self.digest) is not bytes:
+            raise TypeError("PREPARE digest must be bytes")
         if len(self.digest) != 32:
             raise ValueError(
                 f"PREPARE digest must contain 32 bytes, got {len(self.digest)}"
@@ -202,6 +240,7 @@ class PackedReady:
     :ivar key: Request and chunk identity.
     :ivar writer_id: Writer owning the projection.
     :ivar digest: Canonical layout digest.
+    :ivar visibility_policy_digest: Decode-selected route-policy identity.
     :ivar lease_id: Decode allocation identity.
     :ivar lease_base_address: Base address of the one contiguous decode lease.
     :ivar projection_offset: Writer-local offset into the lease.
@@ -211,6 +250,7 @@ class PackedReady:
     key: PackedChunkKey
     writer_id: StagingWriterId
     digest: bytes
+    visibility_policy_digest: bytes
     lease_id: int
     lease_base_address: int
     projection_offset: int
@@ -219,11 +259,16 @@ class PackedReady:
     def __post_init__(self) -> None:
         """Own and validate READY lease metadata."""
 
-        object.__setattr__(self, "digest", bytes(self.digest))
+        if type(self.digest) is not bytes:
+            raise TypeError("READY digest must be bytes")
         if len(self.digest) != 32:
             raise ValueError(
                 f"READY digest must contain 32 bytes, got {len(self.digest)}"
             )
+        _validate_visibility_policy_digest(
+            self.visibility_policy_digest,
+            "READY visibility_policy_digest",
+        )
         if type(self.lease_id) is not int or self.lease_id < 0:
             raise ValueError(
                 f"READY lease_id must be non-negative, got {self.lease_id!r}"
@@ -245,37 +290,244 @@ class PackedReady:
             )
 
 
-@dataclasses.dataclass(frozen=True)
-class PackedCommit:
-    """Writer proof that its registered contiguous transfer completed.
+class PackedWriterOutcomeStatus(enum.StrEnum):
+    """Terminal status of one writer's exact registered transfer."""
 
-    A COMMIT is valid only after the transport reports terminal completion for
-    that writer's one registered DMA. Enqueue or submission alone is not
-    completion.
+    DONE = "done"
+    ERROR = "error"
+
+
+class PackedTransportPath(enum.StrEnum):
+    """One independently ordered data path into destination memory."""
+
+    CUDA_IPC = "cuda_ipc"
+    NIC_RDMA = "nic_rdma"
+
+
+class PackedWriterVisibilityAction(enum.StrEnum):
+    """Source-side action proven before a successful terminal outcome."""
+
+    CUDA_EVENT_RECORDED = "cuda_event_recorded"
+    TRANSPORT_HANDLE_TERMINAL = "transport_handle_terminal"
+
+
+class PackedWriterCompletionMechanism(enum.StrEnum):
+    """Concrete source primitive backing successful visibility evidence."""
+
+    EXPORTED_CUDA_EVENT_RECORDED = "exported_cuda_event_recorded"
+    NIXL_TRANSFER_HANDLE_TERMINAL = "nixl_transfer_handle_terminal"
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedWriterVisibilityEvidence:
+    """Bounded source evidence used to derive destination-local visibility.
+
+    :ivar policy_digest: Decode-selected route-policy identity from READY.
+    :ivar transport_path: Exact independently ordered transfer path.
+    :ivar lane_identifier: Bootstrap-pinned CUDA IPC or UCX lane identity.
+    :ivar completion_mechanism: Exact source completion primitive observed.
+    :ivar writer_action: Source-side action completed before the outcome.
+    """
+
+    policy_digest: bytes
+    transport_path: PackedTransportPath
+    lane_identifier: str
+    completion_mechanism: PackedWriterCompletionMechanism
+    writer_action: PackedWriterVisibilityAction
+
+    def __post_init__(self) -> None:
+        """Validate exact, bounded visibility evidence."""
+
+        _validate_visibility_policy_digest(
+            self.policy_digest,
+            "visibility policy_digest",
+        )
+        if type(self.transport_path) is not PackedTransportPath:
+            raise TypeError("visibility transport_path must be PackedTransportPath")
+        if type(self.writer_action) is not PackedWriterVisibilityAction:
+            raise TypeError(
+                "visibility writer_action must be PackedWriterVisibilityAction"
+            )
+        if type(self.completion_mechanism) is not PackedWriterCompletionMechanism:
+            raise TypeError(
+                "visibility completion_mechanism must be "
+                "PackedWriterCompletionMechanism"
+            )
+        self._validate_bounded_text(
+            self.lane_identifier,
+            "visibility lane_identifier",
+            MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
+        )
+        expected_action = (
+            PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
+            if self.transport_path is PackedTransportPath.CUDA_IPC
+            else PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
+        )
+        if self.writer_action is not expected_action:
+            raise ValueError(
+                "visibility writer_action does not match its transport path"
+            )
+        expected_mechanism = (
+            PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+            if self.transport_path is PackedTransportPath.CUDA_IPC
+            else PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+        )
+        if self.completion_mechanism is not expected_mechanism:
+            raise ValueError(
+                "visibility completion_mechanism does not match its transport path"
+            )
+
+    @staticmethod
+    def _validate_bounded_text(value: str, label: str, maximum_bytes: int) -> None:
+        """Validate one non-empty bounded UTF-8 evidence field.
+
+        :param value: Candidate text.
+        :param label: Reader-facing field label.
+        :param maximum_bytes: Maximum encoded length.
+        """
+
+        if type(value) is not str or len(value) == 0:
+            raise ValueError(f"{label} must be a non-empty string")
+        encoded_length = len(value.encode("utf-8"))
+        if encoded_length > maximum_bytes:
+            raise ValueError(f"{label} exceeds {maximum_bytes} UTF-8 bytes")
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedWriterOutcome:
+    """Authenticated terminal outcome of one exact writer transfer.
+
+    ``DONE`` is valid only after transport completion. ``ERROR`` is valid only
+    after the source has proven that no DMA was submitted or the submitted
+    transport handle reached terminal error. Ambiguous submission or connection
+    loss must not produce an outcome.
 
     :ivar key: Request and chunk identity.
     :ivar writer_id: Claimed writer identity.
     :ivar digest: Canonical layout digest.
     :ivar lease_id: Decode allocation identity received in READY.
+    :ivar status: Proven terminal transport status.
+    :ivar visibility: Successful writer-side visibility evidence.
+    :ivar reason: Bounded reader-facing failure reason for ``ERROR``.
     """
 
     key: PackedChunkKey
     writer_id: StagingWriterId
     digest: bytes
     lease_id: int
+    status: PackedWriterOutcomeStatus
+    visibility: PackedWriterVisibilityEvidence | None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
-        """Own and validate COMMIT identity metadata."""
+        """Own and validate terminal outcome metadata."""
 
-        object.__setattr__(self, "digest", bytes(self.digest))
+        if type(self.digest) is not bytes:
+            raise TypeError("writer outcome digest must be bytes")
         if len(self.digest) != 32:
             raise ValueError(
-                f"COMMIT digest must contain 32 bytes, got {len(self.digest)}"
+                f"writer outcome digest must contain 32 bytes, got {len(self.digest)}"
             )
         if type(self.lease_id) is not int or self.lease_id < 0:
             raise ValueError(
-                f"COMMIT lease_id must be non-negative, got {self.lease_id!r}"
+                f"writer outcome lease_id must be non-negative, got {self.lease_id!r}"
             )
+        if type(self.status) is not PackedWriterOutcomeStatus:
+            raise TypeError(
+                "writer outcome status must be PackedWriterOutcomeStatus, got "
+                f"{type(self.status)!r}"
+            )
+        if self.status is PackedWriterOutcomeStatus.DONE:
+            if self.reason is not None:
+                raise ValueError("DONE writer outcome must not contain a reason")
+            if type(self.visibility) is not PackedWriterVisibilityEvidence:
+                raise TypeError("DONE writer outcome must contain visibility evidence")
+            return
+        if self.visibility is not None:
+            raise ValueError(
+                "ERROR writer outcome must not contain visibility evidence"
+            )
+        if type(self.reason) is not str or len(self.reason) == 0:
+            raise ValueError("ERROR writer outcome must contain a non-empty reason")
+        if len(self.reason.encode("utf-8")) > MAX_PACKED_WRITER_ERROR_BYTES:
+            raise ValueError(
+                "writer outcome reason exceeds "
+                f"{MAX_PACKED_WRITER_ERROR_BYTES} UTF-8 bytes"
+            )
+
+
+_WRITER_OUTCOME_TICKET_ISSUER_RECEIPT = object()
+_WRITER_OUTCOME_TICKET_RECEIPT = object()
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _PackedWriterOutcomeTicket:
+    """Protocol-instance-bound admission for one exact successful outcome.
+
+    Tickets are issued only by the destination visibility coordinator after its
+    required CUDA action completes. They are intentionally identity-bearing and
+    single-use rather than wire-serializable values.
+
+    :ivar message: Exact successful writer outcome admitted by the coordinator.
+    :ivar authenticated_writer_id: Transport-authenticated writer identity.
+    """
+
+    message: PackedWriterOutcome
+    authenticated_writer_id: StagingWriterId
+    _protocol_nonce: object = dataclasses.field(repr=False, compare=False)
+    _ticket_identity: object = dataclasses.field(repr=False, compare=False)
+    _construction_receipt: object = dataclasses.field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Reject tickets not constructed by the claimed protocol issuer."""
+
+        if self._construction_receipt is not _WRITER_OUTCOME_TICKET_RECEIPT:
+            raise TypeError("writer outcome ticket requires a protocol issuer")
+        if type(self.message) is not PackedWriterOutcome:
+            raise TypeError("writer outcome ticket message must be PackedWriterOutcome")
+        if self.message.status is not PackedWriterOutcomeStatus.DONE:
+            raise ValueError("writer outcome tickets admit only DONE")
+        if self.message.writer_id != self.authenticated_writer_id:
+            raise ValueError(
+                "writer outcome ticket identity differs from its authenticated writer"
+            )
+
+
+class _PackedWriterOutcomeTicketIssuer:
+    """Single-coordinator authority to issue protocol-bound DONE tickets."""
+
+    _protocol_nonce: object
+
+    def __init__(self, protocol_nonce: object, construction_receipt: object) -> None:
+        """Construct one protocol-owned issuer.
+
+        :param protocol_nonce: Exact protocol-instance identity.
+        :param construction_receipt: Module-private construction authority.
+        """
+
+        if construction_receipt is not _WRITER_OUTCOME_TICKET_ISSUER_RECEIPT:
+            raise TypeError("writer outcome ticket issuer is protocol-owned")
+        self._protocol_nonce = protocol_nonce
+
+    def _issue(
+        self,
+        message: PackedWriterOutcome,
+        authenticated_writer_id: StagingWriterId,
+    ) -> _PackedWriterOutcomeTicket:
+        """Issue one single-use ticket bound to exact authenticated DONE.
+
+        :param message: Successful outcome whose destination action completed.
+        :param authenticated_writer_id: Writer authenticated by the transport.
+        :returns: Protocol-instance-bound admission ticket.
+        """
+
+        return _PackedWriterOutcomeTicket(
+            message=message,
+            authenticated_writer_id=authenticated_writer_id,
+            _protocol_nonce=self._protocol_nonce,
+            _ticket_identity=object(),
+            _construction_receipt=_WRITER_OUTCOME_TICKET_RECEIPT,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -398,7 +650,7 @@ class PackedChunkSnapshot:
     :ivar key: Request and chunk identity.
     :ivar state: Current lifecycle state.
     :ivar prepared_writers: Canonically ordered accepted PREPARE writers.
-    :ivar committed_writers: Canonically ordered terminal DMA writers.
+    :ivar writer_outcomes: Canonically ordered authenticated terminal outcomes.
     :ivar quiesced_writers: Canonically ordered explicitly quiesced writers.
     :ivar lease_id: Current or released lease identity.
     :ivar ready_issued: Whether any writer could have observed READY.
@@ -410,7 +662,7 @@ class PackedChunkSnapshot:
     key: PackedChunkKey
     state: PackedProtocolState
     prepared_writers: tuple[StagingWriterId, ...]
-    committed_writers: tuple[StagingWriterId, ...]
+    writer_outcomes: tuple[PackedWriterOutcome, ...]
     quiesced_writers: tuple[StagingWriterId, ...]
     lease_id: int | None
     ready_issued: bool
@@ -428,12 +680,16 @@ class _PackedChunk:
     layout: StagingChunkLayout
     destination_binding: StagingEndpointBufferBinding
     expected_writers: tuple[StagingWriterId, ...]
+    writer_visibility_policy_digests: dict[StagingWriterId, bytes]
     state: PackedProtocolState = PackedProtocolState.COLLECTING
     prepares: dict[StagingWriterId, PackedPrepare] = dataclasses.field(
         default_factory=dict
     )
-    commits: dict[StagingWriterId, PackedCommit] = dataclasses.field(
+    writer_outcomes: dict[StagingWriterId, PackedWriterOutcome] = dataclasses.field(
         default_factory=dict
+    )
+    consumed_writer_outcome_tickets: set[object] = dataclasses.field(
+        default_factory=set
     )
     quiesced_writers: set[StagingWriterId] = dataclasses.field(default_factory=set)
     lease: PackedLease | None = None
@@ -469,6 +725,9 @@ class PackedDecodeProtocol:
     _allocator_callback_active: bool
     _chunks: dict[PackedChunkKey, _PackedChunk]
     _lock: threading.RLock
+    _writer_outcome_ticket_issuer: _PackedWriterOutcomeTicketIssuer
+    _writer_outcome_ticket_issuer_claimed: bool
+    _writer_outcome_ticket_nonce: object
 
     def __init__(self, allocator: PackedLeaseAllocator) -> None:
         """Initialize an empty decode protocol.
@@ -480,12 +739,51 @@ class PackedDecodeProtocol:
         self._allocator_callback_active = False
         self._chunks = {}
         self._lock = threading.RLock()
+        self._writer_outcome_ticket_nonce = object()
+        self._writer_outcome_ticket_issuer = _PackedWriterOutcomeTicketIssuer(
+            self._writer_outcome_ticket_nonce,
+            _WRITER_OUTCOME_TICKET_ISSUER_RECEIPT,
+        )
+        self._writer_outcome_ticket_issuer_claimed = False
+
+    def _claim_writer_outcome_ticket_issuer(
+        self,
+    ) -> _PackedWriterOutcomeTicketIssuer:
+        """Transfer DONE-admission authority to one destination coordinator.
+
+        :returns: Protocol-bound ticket issuer.
+        :raises RuntimeError: If an issuer has already been claimed.
+        """
+
+        with self._lock:
+            self._require_no_allocator_callback_locked()
+            if self._writer_outcome_ticket_issuer_claimed:
+                raise RuntimeError(
+                    "writer outcome ticket issuer has already been claimed"
+                )
+            self._writer_outcome_ticket_issuer_claimed = True
+            return self._writer_outcome_ticket_issuer
+
+    def _writer_visibility_policy_digests(
+        self,
+        key: PackedChunkKey,
+    ) -> dict[StagingWriterId, bytes]:
+        """Return immutable-value policy truth for coordinator registration.
+
+        :param key: Exact registered chunk identity.
+        :returns: Copy of the canonical writer policy digests.
+        """
+
+        with self._lock:
+            chunk = self._require_chunk_locked(key)
+            return dict(chunk.writer_visibility_policy_digests)
 
     def register_chunk(
         self,
         key: PackedChunkKey,
         spec: PackedLayoutSpec,
         destination_registry: StagingComponentBufferRegistry,
+        writer_visibility_policy_digests: dict[StagingWriterId, bytes],
     ) -> StagingChunkLayout:
         """Register trusted decode-local geometry and destination bounds.
 
@@ -496,6 +794,7 @@ class PackedDecodeProtocol:
         :param key: Request and chunk identity.
         :param spec: Trusted layout input assembled from bootstrap metadata.
         :param destination_registry: Decode-local registered buffers and pages.
+        :param writer_visibility_policy_digests: Exact policy per writer route.
         :returns: Canonical packed layout.
         :raises ValueError: If identity, geometry, topology, or bounds are invalid.
         """
@@ -513,6 +812,18 @@ class PackedDecodeProtocol:
         expected_writers = tuple(
             writer_layout.writer_id for writer_layout in layout.writers
         )
+        if set(writer_visibility_policy_digests) != set(expected_writers):
+            raise ValueError(
+                "writer visibility policies must exactly cover canonical writers"
+            )
+        owned_policy_digests: dict[StagingWriterId, bytes] = {}
+        for writer_id in expected_writers:
+            digest = writer_visibility_policy_digests[writer_id]
+            _validate_visibility_policy_digest(
+                digest,
+                f"writer {writer_id} visibility policy digest",
+            )
+            owned_policy_digests[writer_id] = digest
         with self._lock:
             self._require_no_allocator_callback_locked()
             if key in self._chunks:
@@ -523,6 +834,7 @@ class PackedDecodeProtocol:
                 layout=layout,
                 destination_binding=destination_binding,
                 expected_writers=expected_writers,
+                writer_visibility_policy_digests=owned_policy_digests,
             )
         return layout
 
@@ -567,62 +879,92 @@ class PackedDecodeProtocol:
                 return ()
             return self._allocate_and_ready_locked(chunk)
 
-    def handle_commit(
+    def handle_writer_outcome(
         self,
-        message: PackedCommit,
+        message: PackedWriterOutcome,
         authenticated_writer_id: StagingWriterId,
+        ticket: _PackedWriterOutcomeTicket | None = None,
     ) -> bool:
-        """Record terminal completion of one writer's registered transfer.
+        """Record one authenticated writer's proven terminal transport outcome.
 
-        COMMIT must be sent and accepted only after the writer's NIXL transfer
-        reports completion, never merely after enqueue. Identical duplicates are
-        idempotent and cannot advance consensus.
+        A successful outcome contributes to scatter consensus. An error fails
+        the chunk and proves only that exact writer terminal; every other
+        possible writer remains an owner until its own outcome or trusted local
+        quiescence proof arrives. Adapter callers must establish destination
+        CUDA visibility and supply its protocol-bound ticket before submitting
+        ``DONE`` here. Identical duplicates are idempotent and do not consume a
+        second ticket.
 
-        :param message: Untrusted COMMIT payload.
+        :param message: Untrusted terminal outcome payload.
         :param authenticated_writer_id: Writer bound to the transport peer.
-        :returns: Whether this COMMIT newly made scatter eligible.
+        :param ticket: Coordinator-issued admission required for new ``DONE``.
+        :returns: Whether this outcome newly made scatter eligible.
         :raises PackedProtocolError: If identity or lease metadata conflicts.
         """
 
         with self._lock:
-            chunk = self._require_chunk_locked(message.key)
-            if chunk.state in (
-                PackedProtocolState.RELEASED,
-                PackedProtocolState.FAILED_RELEASED,
-            ):
-                raise PackedProtocolError(
-                    chunk.key,
-                    f"COMMIT received after terminal state {chunk.state.value}",
+            chunk, previous = self._preflight_writer_outcome_locked(
+                message,
+                authenticated_writer_id,
+            )
+            if previous is not None:
+                self._release_failed_if_safe_locked(chunk)
+                return False
+            if message.status is PackedWriterOutcomeStatus.DONE:
+                self._consume_writer_outcome_ticket_locked(
+                    chunk,
+                    message,
+                    authenticated_writer_id,
+                    ticket,
                 )
-            if authenticated_writer_id != message.writer_id:
+            elif ticket is not None:
                 self._reject_locked(
                     chunk,
-                    "COMMIT writer identity does not match authenticated peer",
+                    "ERROR writer outcome must not contain a visibility ticket",
                 )
-            self._validate_commit_locked(chunk, message)
 
-            previous = chunk.commits.get(authenticated_writer_id)
-            if previous is not None:
-                if previous != message:
-                    self._reject_locked(
-                        chunk,
-                        f"conflicting duplicate COMMIT from {authenticated_writer_id}",
-                    )
-                return False
-
-            chunk.commits[authenticated_writer_id] = message
+            chunk.writer_outcomes[authenticated_writer_id] = message
             if chunk.state is PackedProtocolState.FAILED_QUARANTINED:
                 self._release_failed_if_safe_locked(chunk)
                 return False
-            if set(chunk.commits) != set(chunk.expected_writers):
+            if message.status is PackedWriterOutcomeStatus.ERROR:
+                self._fail_locked(
+                    chunk,
+                    f"writer {authenticated_writer_id} failed: {message.reason}",
+                )
+                return False
+            if set(chunk.writer_outcomes) != set(chunk.expected_writers):
                 return False
             if chunk.state is not PackedProtocolState.READY:
                 self._reject_locked(
                     chunk,
-                    f"complete COMMIT set is invalid in state {chunk.state.value}",
+                    "complete writer outcome set is invalid in state "
+                    f"{chunk.state.value}",
                 )
             chunk.state = PackedProtocolState.SCATTER_READY
             return True
+
+    def preflight_writer_outcome(
+        self,
+        message: PackedWriterOutcome,
+        authenticated_writer_id: StagingWriterId,
+    ) -> bool:
+        """Validate an outcome before a coordinator performs CUDA work.
+
+        This check does not admit or record a new outcome. The later commit
+        revalidates the same invariants under the protocol lock.
+
+        :param message: Untrusted terminal outcome payload.
+        :param authenticated_writer_id: Writer bound to the transport peer.
+        :returns: Whether the exact outcome still requires admission.
+        """
+
+        with self._lock:
+            _, previous = self._preflight_writer_outcome_locked(
+                message,
+                authenticated_writer_id,
+            )
+            return previous is None
 
     def begin_scatter(self, key: PackedChunkKey) -> PackedScatterWork:
         """Transfer lease ownership to one asynchronous scatter operation.
@@ -633,7 +975,7 @@ class PackedDecodeProtocol:
 
         :param key: Request and chunk identity.
         :returns: Immutable scatter inputs.
-        :raises PackedProtocolError: If writer COMMIT consensus is incomplete.
+        :raises PackedProtocolError: If successful writer consensus is incomplete.
         """
 
         with self._lock:
@@ -679,8 +1021,8 @@ class PackedDecodeProtocol:
 
         Failure before READY needs no quarantine. Failure after READY prohibits
         fallback and quarantines the lease until every possible writer DMA is
-        committed or explicitly quiesced. If scatter has begun, it must also
-        become terminal.
+        terminal by authenticated outcome or explicitly quiesced. If scatter
+        has begun, it must also become terminal.
 
         :param key: Request and chunk identity.
         :param reason: Reader-facing failure reason.
@@ -729,7 +1071,7 @@ class PackedDecodeProtocol:
         message. It is legal only after the chunk has already failed.
 
         :param key: Request and chunk identity.
-        :param writer_id: Canonical writer proven terminal without COMMIT.
+        :param writer_id: Canonical writer proven terminal without a wire outcome.
         :raises PackedProtocolError: If the chunk is not quarantined.
         """
 
@@ -780,7 +1122,10 @@ class PackedDecodeProtocol:
                 key=key,
                 state=chunk.state,
                 prepared_writers=tuple(sorted(chunk.prepares)),
-                committed_writers=tuple(sorted(chunk.commits)),
+                writer_outcomes=tuple(
+                    chunk.writer_outcomes[writer_id]
+                    for writer_id in sorted(chunk.writer_outcomes)
+                ),
                 quiesced_writers=tuple(sorted(chunk.quiesced_writers)),
                 lease_id=lease_id,
                 ready_issued=chunk.ready_issued,
@@ -879,30 +1224,126 @@ class PackedDecodeProtocol:
                 "PREPARE layout differs from decode-local canonical layout",
             )
 
-    def _validate_commit_locked(
+    def _validate_writer_outcome_locked(
         self,
         chunk: _PackedChunk,
-        message: PackedCommit,
+        message: PackedWriterOutcome,
     ) -> None:
-        """Validate one COMMIT against the issued READY lease.
+        """Validate one terminal outcome against the issued READY lease.
 
         :param chunk: Protocol-owned chunk.
-        :param message: Untrusted COMMIT payload.
-        :raises PackedProtocolError: If COMMIT could not follow issued READY.
+        :param message: Untrusted terminal outcome payload.
+        :raises PackedProtocolError: If the outcome could not follow issued READY.
         """
 
         if message.writer_id not in chunk.expected_writers:
             self._reject_locked(
                 chunk,
-                f"COMMIT names unexpected writer {message.writer_id}",
+                f"writer outcome names unexpected writer {message.writer_id}",
             )
         lease = chunk.lease
         if lease is None or not chunk.ready_issued:
-            self._reject_locked(chunk, "COMMIT arrived before READY")
+            self._reject_locked(chunk, "writer outcome arrived before READY")
         if message.digest != chunk.layout.digest:
-            self._reject_locked(chunk, "COMMIT digest differs from READY")
+            self._reject_locked(chunk, "writer outcome digest differs from READY")
         if message.lease_id != lease.lease_id:
-            self._reject_locked(chunk, "COMMIT lease differs from READY")
+            self._reject_locked(chunk, "writer outcome lease differs from READY")
+        visibility = message.visibility
+        if visibility is None:
+            return
+        expected_policy_digest = chunk.writer_visibility_policy_digests[
+            message.writer_id
+        ]
+        if visibility.policy_digest != expected_policy_digest:
+            self._reject_locked(
+                chunk,
+                "writer outcome visibility policy differs from READY",
+            )
+
+    def _preflight_writer_outcome_locked(
+        self,
+        message: PackedWriterOutcome,
+        authenticated_writer_id: StagingWriterId,
+    ) -> tuple[_PackedChunk, PackedWriterOutcome | None]:
+        """Validate exact writer metadata without admitting a new outcome.
+
+        :param message: Untrusted terminal outcome payload.
+        :param authenticated_writer_id: Writer bound to the transport peer.
+        :returns: Protocol chunk and an identical previously admitted outcome.
+        """
+
+        chunk = self._require_chunk_locked(message.key)
+        if chunk.state in (
+            PackedProtocolState.RELEASED,
+            PackedProtocolState.FAILED_RELEASED,
+        ):
+            raise PackedProtocolError(
+                chunk.key,
+                f"writer outcome received after terminal state {chunk.state.value}",
+            )
+        if authenticated_writer_id != message.writer_id:
+            self._reject_locked(
+                chunk,
+                "writer outcome identity does not match authenticated peer",
+            )
+        self._validate_writer_outcome_locked(chunk, message)
+        previous = chunk.writer_outcomes.get(authenticated_writer_id)
+        if previous is not None and previous != message:
+            self._reject_locked(
+                chunk,
+                f"conflicting duplicate writer outcome from {authenticated_writer_id}",
+            )
+        if previous is None and chunk.state not in (
+            PackedProtocolState.READY,
+            PackedProtocolState.FAILED_QUARANTINED,
+        ):
+            self._reject_locked(
+                chunk,
+                f"new writer outcome is invalid in state {chunk.state.value}",
+            )
+        return chunk, previous
+
+    def _consume_writer_outcome_ticket_locked(
+        self,
+        chunk: _PackedChunk,
+        message: PackedWriterOutcome,
+        authenticated_writer_id: StagingWriterId,
+        ticket: _PackedWriterOutcomeTicket | None,
+    ) -> None:
+        """Consume one exact protocol-bound destination visibility ticket.
+
+        :param chunk: Protocol-owned chunk.
+        :param message: Successful outcome being admitted.
+        :param authenticated_writer_id: Writer authenticated by the transport.
+        :param ticket: Candidate single-use admission.
+        """
+
+        if type(ticket) is not _PackedWriterOutcomeTicket:
+            self._reject_locked(
+                chunk,
+                "DONE writer outcome requires a destination visibility ticket",
+            )
+        if ticket._protocol_nonce is not self._writer_outcome_ticket_nonce:
+            self._reject_locked(
+                chunk,
+                "writer outcome ticket belongs to another protocol",
+            )
+        if ticket.message != message:
+            self._reject_locked(
+                chunk,
+                "writer outcome ticket belongs to another message",
+            )
+        if ticket.authenticated_writer_id != authenticated_writer_id:
+            self._reject_locked(
+                chunk,
+                "writer outcome ticket belongs to another authenticated writer",
+            )
+        if ticket._ticket_identity in chunk.consumed_writer_outcome_tickets:
+            self._reject_locked(
+                chunk,
+                "writer outcome ticket was already consumed",
+            )
+        chunk.consumed_writer_outcome_tickets.add(ticket._ticket_identity)
 
     def _allocate_and_ready_locked(
         self,
@@ -956,6 +1397,9 @@ class PackedDecodeProtocol:
                 key=chunk.key,
                 writer_id=writer_id,
                 digest=chunk.layout.digest,
+                visibility_policy_digest=chunk.writer_visibility_policy_digests[
+                    writer_id
+                ],
                 lease_id=lease.lease_id,
                 lease_base_address=lease.base_address,
                 projection_offset=projection.lease_offset,
@@ -1003,7 +1447,7 @@ class PackedDecodeProtocol:
 
         if chunk.state is not PackedProtocolState.FAILED_QUARANTINED:
             return
-        terminal_writers = set(chunk.commits) | chunk.quiesced_writers
+        terminal_writers = set(chunk.writer_outcomes) | chunk.quiesced_writers
         if terminal_writers != set(chunk.expected_writers):
             return
         if chunk.scatter_started and not chunk.scatter_terminal:
