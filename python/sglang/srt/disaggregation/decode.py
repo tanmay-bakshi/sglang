@@ -318,7 +318,7 @@ class _DecodeAllocationPreparation:
     """Pre-publication transaction state for one scheduler cohort.
 
     :ivar prepared_decode_reqs: Children whose migration leases are prepared.
-    :ivar publication_started: Whether metadata may have armed any writer.
+    :ivar publication_started: Whether staging or metadata may be externally visible.
     """
 
     prepared_decode_reqs: list[DecodeRequest] = field(default_factory=list)
@@ -936,7 +936,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prepared_count = len(preparation.prepared_decode_reqs)
             if preparation.publication_started:
                 logger.critical(
-                    "Decode preallocation failed after metadata publication began; "
+                    "Decode preallocation failed after external publication began; "
                     "retaining %d prepared allocation leases:\n%s",
                     prepared_count,
                     preparation_traceback,
@@ -1335,6 +1335,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for submission in metadata_submissions:
             decode_req = submission.decode_req
+            # Registration exposes the room to the background staging thread.
+            preparation.publication_started = True
             if (
                 self.transfer_queue.enable_staging
                 and decode_req.kv_receiver.require_staging
@@ -1342,7 +1344,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            preparation.publication_started = True
             decode_req.kv_receiver.send_metadata(
                 submission.page_indices,
                 decode_req.metadata_buffer_index,
