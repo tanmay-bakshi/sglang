@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::core::PrefillBootstrapEndpoint;
+
 use super::{
     digest_reserve_attempt, AuthorityDigest, DecoderGrantBinding, DecoderGrantChildAccounting,
     DecoderGrantChildBinding, DecoderGrantDigest, DecoderId, DecoderInferenceRoute,
     DecoderRequestShape, DecoderReservationDigest, DecoderReserveAttemptDigest,
     DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt,
-    EngineReleaseKind, EngineReleaseReceipt, PrefillBootstrapEndpoint, PrefillId,
-    PreparedGrantCancellationReceipt, UnboundGrantBinding, UnboundPreparedGrant,
+    EngineReleaseKind, EngineReleaseReceipt, PrefillId, PreparedGrantCancellationReceipt,
+    UnboundGrantBinding, UnboundPreparedGrant,
 };
 
 const SCHEMA_VERSION: u32 = 1;

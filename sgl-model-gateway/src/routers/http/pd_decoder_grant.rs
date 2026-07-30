@@ -13,6 +13,8 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::core::PrefillBootstrapEndpoint;
+
 mod control;
 
 pub use control::{
@@ -140,47 +142,6 @@ pub enum ProcessIdentityError {
     InvalidUrl(String),
     #[error("process launch instance cannot be the nil UUID")]
     NilInstanceId,
-}
-
-/// Generation-scoped prefill transport endpoint advertised by engine capabilities.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PrefillBootstrapEndpoint {
-    host: Arc<str>,
-    port: u16,
-}
-
-impl PrefillBootstrapEndpoint {
-    /// Construct the exact endpoint consumed by decoder-side pre-allocation.
-    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, EngineGrantError> {
-        let host = host.into();
-        if host.is_empty()
-            || host.trim() != host
-            || host.chars().any(|character| character.is_control())
-        {
-            return Err(EngineGrantError::InvalidGrant(
-                "prefill bootstrap host must be nonempty and control-free".to_string(),
-            ));
-        }
-        if port == 0 {
-            return Err(EngineGrantError::InvalidGrant(
-                "prefill bootstrap port must be nonzero".to_string(),
-            ));
-        }
-        Ok(Self {
-            host: Arc::from(host),
-            port,
-        })
-    }
-
-    /// Exact engine-advertised bootstrap host.
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// Exact engine-advertised bootstrap port.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
 }
 
 /// Inference shape supported by the prepared decoder reservation protocol.
@@ -2150,7 +2111,8 @@ pub(crate) fn issue_test_grant(
         Bytes::from_static(b"{}"),
         Bytes::from_static(b"{}"),
         prefill_id,
-        PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000)?,
+        PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000)
+            .map_err(|error| EngineGrantError::InvalidGrant(error.to_string()))?,
         request_chain_id,
         source_tp_size,
         decoder_id,
@@ -2417,6 +2379,9 @@ mod tests {
         assert!(PrefillBootstrapEndpoint::new(" 10.0.0.1", 5000).is_err());
         assert!(PrefillBootstrapEndpoint::new("10.0.0.1\n", 5000).is_err());
         assert!(PrefillBootstrapEndpoint::new("10.0.0.1", 0).is_err());
+        assert!(PrefillBootstrapEndpoint::new("localhost", 5000).is_err());
+        assert!(PrefillBootstrapEndpoint::new("127.0.0.1", 5000).is_err());
+        assert!(PrefillBootstrapEndpoint::new("[::1]", 5000).is_err());
     }
 
     #[test]

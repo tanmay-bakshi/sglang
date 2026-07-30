@@ -238,6 +238,26 @@ impl WorkerRegistry {
         *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
+    fn remove_from_indexes(&self, worker_id: &WorkerId, worker: &Arc<dyn Worker>) {
+        let model_id = worker.model_id().to_string();
+        if let Some(mut entry) = self.model_index.get_mut(&model_id) {
+            let workers: Vec<Arc<dyn Worker>> = entry
+                .iter()
+                .filter(|indexed| indexed.url() != worker.url())
+                .cloned()
+                .collect();
+            *entry = Arc::from(workers.into_boxed_slice());
+        }
+        self.rebuild_hash_ring(&model_id);
+
+        if let Some(mut workers) = self.type_workers.get_mut(worker.worker_type()) {
+            workers.retain(|id| id != worker_id);
+        }
+        if let Some(mut workers) = self.connection_workers.get_mut(worker.connection_mode()) {
+            workers.retain(|id| id != worker_id);
+        }
+    }
+
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
         let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
@@ -247,8 +267,9 @@ impl WorkerRegistry {
             WorkerId::new()
         };
 
-        // Store worker
-        self.workers.insert(worker_id.clone(), worker.clone());
+        if let Some(previous) = self.workers.insert(worker_id.clone(), worker.clone()) {
+            self.remove_from_indexes(&worker_id, &previous);
+        }
 
         // Update URL mapping
         self.url_to_id
@@ -831,5 +852,40 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn same_url_registration_replaces_every_selectable_index() {
+        let registry = WorkerRegistry::new();
+        let original: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker.test:8080")
+                .worker_type(WorkerType::Decode)
+                .label("model_id", "old-model")
+                .build(),
+        );
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker.test:8080")
+                .worker_type(WorkerType::Regular)
+                .label("model_id", "new-model")
+                .build(),
+        );
+
+        let original_id = registry.register(Arc::clone(&original));
+        let replacement_id = registry.register(Arc::clone(&replacement));
+
+        assert_eq!(original_id, replacement_id);
+        assert!(Arc::ptr_eq(
+            &registry.get(&replacement_id).unwrap(),
+            &replacement
+        ));
+        assert!(registry.get_by_model("old-model").is_empty());
+        let model_workers = registry.get_by_model("new-model");
+        assert_eq!(model_workers.len(), 1);
+        assert!(Arc::ptr_eq(&model_workers[0], &replacement));
+        assert!(registry.get_by_type(&WorkerType::Decode).is_empty());
+        let regular_workers = registry.get_by_type(&WorkerType::Regular);
+        assert_eq!(regular_workers.len(), 1);
+        assert!(Arc::ptr_eq(&regular_workers[0], &replacement));
+        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
     }
 }

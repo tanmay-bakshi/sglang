@@ -15,6 +15,7 @@ use tokio::{sync::OnceCell, time};
 use super::{
     model_card::{ModelCard, ProviderType},
     model_type::{Endpoint, ModelType},
+    pd_process::PdProcessMetadata,
     CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
@@ -599,6 +600,8 @@ pub struct WorkerMetadata {
     pub bootstrap_host: String,
     /// Cached bootstrap port (from WorkerType::Prefill)
     pub bootstrap_port: Option<u16>,
+    /// Engine-advertised, generation-scoped PD process metadata.
+    pub pd_process: Option<PdProcessMetadata>,
     /// Models this worker can serve.
     /// If empty, worker accepts any model (backward compatible behavior).
     pub models: Vec<ModelCard>,
@@ -2026,6 +2029,7 @@ mod tests {
             api_key: None,
             bootstrap_host: "test".to_string(),
             bootstrap_port: None,
+            pd_process: None,
             models: Vec::new(), // Empty = accepts any model
             default_provider: None,
             default_model_type: ModelType::LLM,
@@ -2056,6 +2060,7 @@ mod tests {
             api_key: None,
             bootstrap_host: "test".to_string(),
             bootstrap_port: None,
+            pd_process: None,
             models: vec![model1, model2],
             default_provider: None,
             default_model_type: ModelType::LLM,

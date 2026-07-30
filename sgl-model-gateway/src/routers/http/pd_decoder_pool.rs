@@ -37,6 +37,7 @@ pub struct EngineCompatibilityMetadata {
     kv_layout_fingerprint: Arc<str>,
     kv_cache_dtype: Arc<str>,
     wire_protocol: Arc<str>,
+    prepared_grant_protocol: Arc<str>,
     page_size: NonZeroUsize,
 }
 
@@ -47,6 +48,7 @@ impl EngineCompatibilityMetadata {
         kv_layout_fingerprint: impl Into<String>,
         kv_cache_dtype: impl Into<String>,
         wire_protocol: impl Into<String>,
+        prepared_grant_protocol: impl Into<String>,
         page_size: usize,
     ) -> Result<Self, DecoderPoolError> {
         let model_fingerprint = nonempty("model fingerprint", model_fingerprint.into())?;
@@ -54,6 +56,8 @@ impl EngineCompatibilityMetadata {
             nonempty("KV layout fingerprint", kv_layout_fingerprint.into())?;
         let kv_cache_dtype = nonempty("KV cache dtype", kv_cache_dtype.into())?;
         let wire_protocol = nonempty("wire protocol", wire_protocol.into())?;
+        let prepared_grant_protocol =
+            nonempty("prepared-grant protocol", prepared_grant_protocol.into())?;
         let page_size = NonZeroUsize::new(page_size).ok_or_else(|| {
             DecoderPoolError::InvalidConfiguration("page size must be nonzero".to_string())
         })?;
@@ -63,6 +67,7 @@ impl EngineCompatibilityMetadata {
             kv_layout_fingerprint: Arc::from(kv_layout_fingerprint),
             kv_cache_dtype: Arc::from(kv_cache_dtype),
             wire_protocol: Arc::from(wire_protocol),
+            prepared_grant_protocol: Arc::from(prepared_grant_protocol),
             page_size,
         })
     }
@@ -308,6 +313,15 @@ pub enum DecoderPoolError {
         decoder_id: DecoderId,
         active_cohorts: usize,
     },
+    #[error(
+        "prefill pool owns {request_chains} request chains, {assignments} assignments, {active_rooms} active rooms, and {quarantined_cohorts} quarantined cohorts"
+    )]
+    PrefillPoolInUse {
+        request_chains: usize,
+        assignments: usize,
+        active_rooms: usize,
+        quarantined_cohorts: usize,
+    },
     #[error("decoder {decoder_id} metadata is ineligible for this prefill pool: {reason}")]
     IneligibleDecoderMetadata {
         decoder_id: DecoderId,
@@ -315,6 +329,8 @@ pub enum DecoderPoolError {
     },
     #[error("logical request identity {0} already has an owner")]
     RequestAlreadyOwned(String),
+    #[error("prefill pool is draining and no longer accepts logical requests")]
+    PrefillPoolDraining,
     #[error("logical request owner was issued by another decoder pool")]
     ForeignRequestOwner,
     #[error("logical request owner is already finalized")]
@@ -447,6 +463,7 @@ struct PoolState {
     prefill_id: PrefillId,
     declared_prefill_tp_size: NonZeroUsize,
     compatibility: EngineCompatibilityMetadata,
+    accepting_requests: bool,
     replicas: HashMap<DecoderId, ReplicaState>,
     request_chains: HashMap<Uuid, RequestChainRecord>,
     active_request_ids: HashMap<Arc<str>, Uuid>,
@@ -504,6 +521,7 @@ impl DecoderPool {
                     prefill_id,
                     declared_prefill_tp_size,
                     compatibility,
+                    accepting_requests: true,
                     replicas: HashMap::new(),
                     request_chains: HashMap::new(),
                     active_request_ids: HashMap::new(),
@@ -516,6 +534,22 @@ impl DecoderPool {
 
     /// Register declared metadata for a decoder process generation.
     pub fn register(&self, metadata: DecoderReplicaMetadata) -> Result<(), DecoderPoolError> {
+        self.register_with_availability(metadata, DecoderAvailability::Ready)
+    }
+
+    /// Install a decoder generation without making it admission-selectable.
+    pub(crate) fn register_unavailable(
+        &self,
+        metadata: DecoderReplicaMetadata,
+    ) -> Result<(), DecoderPoolError> {
+        self.register_with_availability(metadata, DecoderAvailability::Unavailable)
+    }
+
+    fn register_with_availability(
+        &self,
+        metadata: DecoderReplicaMetadata,
+        availability: DecoderAvailability,
+    ) -> Result<(), DecoderPoolError> {
         let mut state = self.inner.state.lock();
         if state.replicas.contains_key(&metadata.id) {
             return Err(DecoderPoolError::DuplicateDecoder(metadata.id));
@@ -545,8 +579,7 @@ impl DecoderPool {
         if metadata.compatibility != state.compatibility {
             return Err(DecoderPoolError::IneligibleDecoderMetadata {
                 decoder_id: metadata.id,
-                reason: "model, KV layout, dtype, page size, or wire protocol metadata differs"
-                    .to_string(),
+                reason: "model, KV layout, dtype, page size, wire protocol, or prepared-grant protocol metadata differs".to_string(),
             });
         }
 
@@ -554,7 +587,7 @@ impl DecoderPool {
             metadata.id.clone(),
             ReplicaState {
                 metadata,
-                availability: DecoderAvailability::Ready,
+                availability,
                 active_cohorts: 0,
                 active_child_requests: 0,
                 quiescing_cohorts: 0,
@@ -563,6 +596,45 @@ impl DecoderPool {
                 remaining_decode_tokens: 0,
             },
         );
+        Ok(())
+    }
+
+    /// Drain one generation and activate its replacement under one pool lock.
+    pub(crate) fn activate_replacement(
+        &self,
+        draining_id: &DecoderId,
+        replacement_id: &DecoderId,
+    ) -> Result<(), DecoderPoolError> {
+        let mut state = self.inner.state.lock();
+        let draining = state
+            .replicas
+            .get(draining_id)
+            .ok_or_else(|| DecoderPoolError::UnknownDecoder(draining_id.clone()))?;
+        let replacement = state
+            .replicas
+            .get(replacement_id)
+            .ok_or_else(|| DecoderPoolError::UnknownDecoder(replacement_id.clone()))?;
+        if replacement.availability != DecoderAvailability::Unavailable {
+            return Err(DecoderPoolError::InvalidConfiguration(format!(
+                "replacement decoder {replacement_id} must be unavailable before activation"
+            )));
+        }
+        if draining.availability == DecoderAvailability::Unavailable {
+            return Err(DecoderPoolError::InvalidConfiguration(format!(
+                "decoder {draining_id} cannot be replaced while unavailable"
+            )));
+        }
+
+        state
+            .replicas
+            .get_mut(draining_id)
+            .expect("draining decoder was validated under the same pool lock")
+            .availability = DecoderAvailability::Draining;
+        state
+            .replicas
+            .get_mut(replacement_id)
+            .expect("replacement decoder was validated under the same pool lock")
+            .availability = DecoderAvailability::Ready;
         Ok(())
     }
 
@@ -579,6 +651,9 @@ impl DecoderPool {
         }
         let request_id: Arc<str> = Arc::from(request_id);
         let mut state = self.inner.state.lock();
+        if !state.accepting_requests {
+            return Err(DecoderPoolError::PrefillPoolDraining);
+        }
         if state.active_request_ids.contains_key(&request_id) {
             return Err(DecoderPoolError::RequestAlreadyOwned(
                 request_id.to_string(),
@@ -644,6 +719,11 @@ impl DecoderPool {
         Ok(())
     }
 
+    /// Close this prefill generation to new logical request ownership.
+    pub(crate) fn begin_draining(&self) {
+        self.inner.state.lock().accepting_requests = false;
+    }
+
     /// Update advisory load scales without changing allocator authority.
     pub fn update_scheduling_hints(
         &self,
@@ -680,6 +760,29 @@ impl DecoderPool {
         }
         state.replicas.remove(decoder_id);
         Ok(())
+    }
+
+    /// Prove that this prefill pool retains no request or transfer ownership.
+    pub(crate) fn ensure_retirable(&self) -> Result<(), DecoderPoolError> {
+        let state = self.inner.state.lock();
+        let quarantined_cohorts = state
+            .replicas
+            .values()
+            .map(|replica| replica.quarantined_cohorts)
+            .sum();
+        if state.request_chains.is_empty()
+            && state.assignments.is_empty()
+            && state.active_rooms.is_empty()
+            && quarantined_cohorts == 0
+        {
+            return Ok(());
+        }
+        Err(DecoderPoolError::PrefillPoolInUse {
+            request_chains: state.request_chains.len(),
+            assignments: state.assignments.len(),
+            active_rooms: state.active_rooms.len(),
+            quarantined_cohorts,
+        })
     }
 
     /// Return ordered decoder candidates for an allocator reservation attempt.
@@ -1495,9 +1598,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::core::PrefillBootstrapEndpoint;
     use crate::routers::http::pd_decoder_grant::{
         issue_test_grant, issue_test_quarantine_receipt, issue_test_release_receipt,
-        DecoderGrantChildAccounting, PrefillBootstrapEndpoint,
+        DecoderGrantChildAccounting,
     };
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
@@ -1518,11 +1622,19 @@ mod tests {
     }
 
     fn compatibility(protocol: &str) -> EngineCompatibilityMetadata {
+        compatibility_with_grant_protocol(protocol, "control-v1")
+    }
+
+    fn compatibility_with_grant_protocol(
+        wire_protocol: &str,
+        prepared_grant_protocol: &str,
+    ) -> EngineCompatibilityMetadata {
         EngineCompatibilityMetadata::new(
             "gemma-4-31b-nvfp4@sha256:model",
             "gemma4-full10-swa50@sha256:layout",
             "bfloat16",
-            protocol,
+            wire_protocol,
+            prepared_grant_protocol,
             1,
         )
         .unwrap()
@@ -1709,6 +1821,17 @@ mod tests {
         ));
         assert!(matches!(
             pool.register(replica("decode-wrong-wire", "packed-v2")),
+            Err(DecoderPoolError::IneligibleDecoderMetadata { .. })
+        ));
+        let wrong_grant_protocol = DecoderReplicaMetadata::new(
+            decoder_id("decode-wrong-grant-protocol"),
+            1,
+            compatibility_with_grant_protocol("packed-v1", "control-v2"),
+            scheduling(32, 32_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            pool.register(wrong_grant_protocol),
             Err(DecoderPoolError::IneligibleDecoderMetadata { .. })
         ));
     }
