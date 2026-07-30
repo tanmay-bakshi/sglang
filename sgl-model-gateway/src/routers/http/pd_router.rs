@@ -1716,7 +1716,13 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use uuid::Uuid;
+
+    use crate::core::{
+        BasicWorkerBuilder, DPAwareWorkerBuilder, KvTransferProtocol, PdMetadataSchema,
+        PdProcessMetadata, PdProcessRole, PrefillBootstrapEndpoint, PreparedGrantProtocol,
+        WorkerType,
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1734,9 +1740,40 @@ mod tests {
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(worker_type)
-            .build();
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type.clone());
+        let role = match worker_type {
+            WorkerType::Prefill { .. } => Some(PdProcessRole::Prefill),
+            WorkerType::Decode => Some(PdProcessRole::Decode),
+            WorkerType::Regular => None,
+        };
+        if let Some(role) = role {
+            builder = builder.pd_process(
+                PdProcessMetadata::new(
+                    PdMetadataSchema::V1,
+                    Uuid::new_v4(),
+                    role,
+                    match role {
+                        PdProcessRole::Prefill => 2,
+                        PdProcessRole::Decode => 1,
+                    },
+                    1,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "bf16",
+                    64,
+                    KvTransferProtocol::PackedV4,
+                    PreparedGrantProtocol::V1,
+                    match role {
+                        PdProcessRole::Prefill => Some(
+                            PrefillBootstrapEndpoint::new("prefill-transfer.test", 50_051).unwrap(),
+                        ),
+                        PdProcessRole::Decode => None,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let worker = builder.build();
         worker.set_healthy(healthy);
         Box::new(worker)
     }
@@ -1811,9 +1848,18 @@ mod tests {
         let decode_worker =
             create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
 
-        router.worker_registry.register(Arc::from(unhealthy_worker));
-        router.worker_registry.register(Arc::from(healthy_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
+        router
+            .worker_registry
+            .register(Arc::from(unhealthy_worker))
+            .unwrap();
+        router
+            .worker_registry
+            .register(Arc::from(healthy_worker))
+            .unwrap();
+        router
+            .worker_registry
+            .register(Arc::from(decode_worker))
+            .unwrap();
 
         let result = router.select_pd_pair(None, None, None).await;
 
@@ -1974,8 +2020,14 @@ mod tests {
         let decode_worker =
             create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
 
-        router.worker_registry.register(Arc::from(prefill_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
+        router
+            .worker_registry
+            .register(Arc::from(prefill_worker))
+            .unwrap();
+        router
+            .worker_registry
+            .register(Arc::from(decode_worker))
+            .unwrap();
 
         let prefill_workers = router.worker_registry.get_prefill_workers();
         let decode_workers = router.worker_registry.get_decode_workers();

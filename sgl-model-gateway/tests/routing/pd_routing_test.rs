@@ -5,7 +5,10 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        StatusCode,
+    },
 };
 use serde_json::json;
 use smg::config::RouterConfig;
@@ -35,6 +38,7 @@ mod pd_routing_tests {
                 ],
             )
             .power_of_two_policy(1)
+            .api_key("pd-test-secret")
             .host("127.0.0.1")
             .port(3800)
             .max_payload_size(256 * 1024 * 1024)
@@ -73,6 +77,7 @@ mod pd_routing_tests {
                 .method("POST")
                 .uri("/generate")
                 .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, "Bearer pd-test-secret")
                 .body(Body::from(serde_json::to_string(&payload).unwrap()))
                 .unwrap();
 
@@ -99,6 +104,7 @@ mod pd_routing_tests {
                 ],
             )
             .round_robin_policy()
+            .api_key("pd-test-secret")
             .host("127.0.0.1")
             .port(3801)
             .max_payload_size(256 * 1024 * 1024)
@@ -132,6 +138,7 @@ mod pd_routing_tests {
                 .method("POST")
                 .uri("/generate")
                 .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, "Bearer pd-test-secret")
                 .body(Body::from(serde_json::to_string(&payload).unwrap()))
                 .unwrap();
 
@@ -163,6 +170,7 @@ mod pd_routing_tests {
                 ],
             )
             .round_robin_policy()
+            .api_key("pd-test-secret")
             .host("127.0.0.1")
             .port(3802)
             .max_payload_size(256 * 1024 * 1024)
@@ -207,6 +215,7 @@ mod pd_routing_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Bearer pd-test-secret")
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
 

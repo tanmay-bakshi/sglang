@@ -4,10 +4,11 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::Metrics,
+    core::{steps::workflow_data::WorkerRemovalWorkflowData, WorkerRemovalOutcome},
+    observability::metrics::Metrics,
 };
 
 /// Step to remove workers from the worker registry.
@@ -49,12 +50,23 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
 
         let mut removed_count = 0;
         for worker_url in worker_urls.iter() {
-            if app_context
+            let outcome = app_context
                 .worker_registry
                 .remove_by_url(worker_url)
-                .is_some()
-            {
-                removed_count += 1;
+                .map_err(|error| WorkflowError::StepFailed {
+                    step_id: StepId::new("remove_from_worker_registry"),
+                    message: error.to_string(),
+                })?;
+            match outcome {
+                WorkerRemovalOutcome::Removed(_) => removed_count += 1,
+                WorkerRemovalOutcome::Draining { block, .. } => {
+                    debug!(
+                        "Unpublished worker {} while its PD generation drains retained ownership: {:?}",
+                        worker_url, block
+                    );
+                    removed_count += 1;
+                }
+                WorkerRemovalOutcome::NotFound => {}
             }
         }
 

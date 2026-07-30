@@ -244,7 +244,9 @@ pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option
             .build(),
     );
 
-    ctx.worker_registry.register(worker);
+    ctx.worker_registry
+        .register(worker)
+        .expect("external test worker registration must succeed");
 }
 
 /// Register an external worker with a custom model card that has aliases.
@@ -263,5 +265,7 @@ pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, mode
             .build(),
     );
 
-    ctx.worker_registry.register(worker);
+    ctx.worker_registry
+        .register(worker)
+        .expect("external test worker registration must succeed");
 }

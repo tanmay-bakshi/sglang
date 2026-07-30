@@ -2,6 +2,7 @@
 
 use std::{net::Ipv4Addr, num::NonZeroUsize, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Host;
 use uuid::Uuid;
@@ -46,6 +47,99 @@ impl PreparedGrantProtocol {
         match self {
             Self::V1 => "control-v1",
         }
+    }
+}
+
+/// Serializable prefill bootstrap endpoint advertised by an engine process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefillBootstrapAdvertisement {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Versioned process-generation contract read from SGLang's `/server_info`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdProcessAdvertisement {
+    pub schema: String,
+    pub launch_instance_id: String,
+    pub role: String,
+    pub tensor_parallel_size: usize,
+    pub data_parallel_size: usize,
+    pub model_fingerprint: String,
+    pub logical_kv_layout_fingerprint: String,
+    pub kv_dtype: String,
+    pub page_size: usize,
+    pub kv_transfer_protocol: String,
+    pub prepared_grant_protocol: String,
+    pub prefill_bootstrap_endpoint: Option<PrefillBootstrapAdvertisement>,
+}
+
+impl PdProcessAdvertisement {
+    /// Convert the wire contract through the domain's closed validators.
+    pub fn validate(&self) -> Result<PdProcessMetadata, PdProcessAdvertisementError> {
+        let schema = match self.schema.as_str() {
+            "v1" => PdMetadataSchema::V1,
+            schema => {
+                return Err(PdProcessAdvertisementError::UnsupportedSchema(
+                    schema.to_string(),
+                ));
+            }
+        };
+        let role = match self.role.as_str() {
+            "prefill" => PdProcessRole::Prefill,
+            "decode" => PdProcessRole::Decode,
+            role => {
+                return Err(PdProcessAdvertisementError::UnsupportedRole(
+                    role.to_string(),
+                ));
+            }
+        };
+        let kv_transfer_protocol = match self.kv_transfer_protocol.as_str() {
+            "packed-v4" => KvTransferProtocol::PackedV4,
+            protocol => {
+                return Err(PdProcessAdvertisementError::UnsupportedKvTransferProtocol(
+                    protocol.to_string(),
+                ));
+            }
+        };
+        let prepared_grant_protocol = match self.prepared_grant_protocol.as_str() {
+            "control-v1" => PreparedGrantProtocol::V1,
+            protocol => {
+                return Err(
+                    PdProcessAdvertisementError::UnsupportedPreparedGrantProtocol(
+                        protocol.to_string(),
+                    ),
+                );
+            }
+        };
+        let launch_instance_id = Uuid::parse_str(&self.launch_instance_id)
+            .map_err(PdProcessAdvertisementError::InvalidLaunchInstance)?;
+        if launch_instance_id.hyphenated().to_string() != self.launch_instance_id {
+            return Err(PdProcessAdvertisementError::NonCanonicalLaunchInstance);
+        }
+        let prefill_bootstrap_endpoint = self
+            .prefill_bootstrap_endpoint
+            .as_ref()
+            .map(|endpoint| PrefillBootstrapEndpoint::new(endpoint.host.clone(), endpoint.port))
+            .transpose()?;
+
+        PdProcessMetadata::new(
+            schema,
+            launch_instance_id,
+            role,
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.model_fingerprint.clone(),
+            self.logical_kv_layout_fingerprint.clone(),
+            self.kv_dtype.clone(),
+            self.page_size,
+            kv_transfer_protocol,
+            prepared_grant_protocol,
+            prefill_bootstrap_endpoint,
+        )
+        .map_err(PdProcessAdvertisementError::from)
     }
 }
 
@@ -308,6 +402,25 @@ pub enum PdProcessMetadataError {
     InvalidPageSize,
 }
 
+/// Rejection reasons for an engine-advertised PD process contract.
+#[derive(Debug, Error)]
+pub enum PdProcessAdvertisementError {
+    #[error("unsupported PD metadata schema {0:?}")]
+    UnsupportedSchema(String),
+    #[error("unsupported PD process role {0:?}")]
+    UnsupportedRole(String),
+    #[error("unsupported PD KV-transfer protocol {0:?}")]
+    UnsupportedKvTransferProtocol(String),
+    #[error("unsupported PD prepared-grant protocol {0:?}")]
+    UnsupportedPreparedGrantProtocol(String),
+    #[error("PD launch instance is not a UUID")]
+    InvalidLaunchInstance(#[source] uuid::Error),
+    #[error("PD launch instance must use canonical lowercase hyphenated UUID form")]
+    NonCanonicalLaunchInstance,
+    #[error(transparent)]
+    InvalidMetadata(#[from] PdProcessMetadataError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +526,73 @@ mod tests {
             Some(endpoint),
         )
         .is_err());
+    }
+
+    #[test]
+    fn advertisement_validates_through_domain_constructor() {
+        let launch_instance_id = Uuid::new_v4();
+        let advertisement: PdProcessAdvertisement = serde_json::from_value(serde_json::json!({
+            "schema": "v1",
+            "launch_instance_id": launch_instance_id,
+            "role": "prefill",
+            "tensor_parallel_size": 4,
+            "data_parallel_size": 1,
+            "model_fingerprint": DIGEST_A,
+            "logical_kv_layout_fingerprint": DIGEST_B,
+            "kv_dtype": "bf16",
+            "page_size": 64,
+            "kv_transfer_protocol": "packed-v4",
+            "prepared_grant_protocol": "control-v1",
+            "prefill_bootstrap_endpoint": {
+                "host": "10.20.30.40",
+                "port": 8998
+            }
+        }))
+        .unwrap();
+
+        let metadata = advertisement.validate().unwrap();
+        assert_eq!(metadata.launch_instance_id(), launch_instance_id);
+        assert_eq!(metadata.role(), PdProcessRole::Prefill);
+        assert_eq!(metadata.tensor_parallel_size(), 4);
+        assert_eq!(
+            metadata.prefill_bootstrap_endpoint(),
+            Some(&PrefillBootstrapEndpoint::new("10.20.30.40", 8998).unwrap())
+        );
+    }
+
+    #[test]
+    fn advertisement_rejects_open_ended_protocol_and_identity_values() {
+        let base = serde_json::json!({
+            "schema": "v1",
+            "launch_instance_id": Uuid::new_v4(),
+            "role": "decode",
+            "tensor_parallel_size": 1,
+            "data_parallel_size": 1,
+            "model_fingerprint": DIGEST_A,
+            "logical_kv_layout_fingerprint": DIGEST_B,
+            "kv_dtype": "bf16",
+            "page_size": 64,
+            "kv_transfer_protocol": "packed-v4",
+            "prepared_grant_protocol": "control-v1",
+            "prefill_bootstrap_endpoint": null
+        });
+
+        for (field, invalid) in [
+            ("schema", "v2"),
+            ("role", "regular"),
+            ("kv_transfer_protocol", "packed-v5"),
+            ("prepared_grant_protocol", "control-v2"),
+            ("model_fingerprint", "A"),
+            ("logical_kv_layout_fingerprint", "b"),
+            ("launch_instance_id", "not-a-uuid"),
+        ] {
+            let mut candidate = base.clone();
+            candidate[field] = serde_json::Value::String(invalid.to_string());
+            let advertisement: PdProcessAdvertisement = serde_json::from_value(candidate).unwrap();
+            assert!(
+                advertisement.validate().is_err(),
+                "accepted invalid {field}={invalid:?}"
+            );
+        }
     }
 }

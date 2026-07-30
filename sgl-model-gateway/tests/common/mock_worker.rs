@@ -19,7 +19,7 @@ use axum::{
     Router,
 };
 use futures_util::stream::{self, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
@@ -227,7 +227,7 @@ async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfi
 async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    if should_fail(&config).await {
+    if matches!(config.worker_type, WorkerType::Regular) && should_fail(&config).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -237,6 +237,7 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
             .into_response();
     }
 
+    let pd_process = mock_pd_process_advertisement(&config);
     Json(json!({
         "model_path": "mock-model-path",
         "tokenizer_path": "mock-tokenizer-path",
@@ -268,12 +269,45 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
         "schedule_policy": "lpm",
         "schedule_conservativeness": 1.0,
         "version": "0.3.0",
+        "pd_process": pd_process,
         "internal_states": [{
             "waiting_queue_size": 0,
             "running_queue_size": 0
         }]
     }))
     .into_response()
+}
+
+fn mock_pd_process_advertisement(config: &MockWorkerConfig) -> JsonValue {
+    let (role, tensor_parallel_size, prefill_bootstrap_endpoint) = match &config.worker_type {
+        WorkerType::Regular => return JsonValue::Null,
+        WorkerType::Prefill => (
+            "prefill",
+            2,
+            json!({
+                "host": "prefill-bootstrap.test",
+                "port": 8998
+            }),
+        ),
+        WorkerType::Decode => ("decode", 1, JsonValue::Null),
+    };
+
+    json!({
+        "schema": "v1",
+        "launch_instance_id": Uuid::from_u128(u128::from(config.port) + 1),
+        "role": role,
+        "tensor_parallel_size": tensor_parallel_size,
+        "data_parallel_size": 1,
+        "model_fingerprint":
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "logical_kv_layout_fingerprint":
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kv_dtype": "bf16",
+        "page_size": 64,
+        "kv_transfer_protocol": "packed-v4",
+        "prepared_grant_protocol": "control-v1",
+        "prefill_bootstrap_endpoint": prefill_bootstrap_endpoint
+    })
 }
 
 async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {

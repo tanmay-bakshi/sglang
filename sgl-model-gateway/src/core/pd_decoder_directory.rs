@@ -16,35 +16,35 @@ use super::{
 use crate::core::{PdProcessMetadata, PdProcessRole, PrefillBootstrapEndpoint, Worker, WorkerType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProcessAvailability {
+pub enum ProcessAvailability {
     Ready,
     Draining,
     Unavailable,
 }
 
 #[derive(Debug)]
-pub(crate) struct DecoderDirectoryEntry {
+pub struct DecoderDirectoryEntry {
     id: DecoderId,
     worker: Arc<dyn Worker>,
     metadata: PdProcessMetadata,
 }
 
 impl DecoderDirectoryEntry {
-    pub(crate) fn id(&self) -> &DecoderId {
+    pub fn id(&self) -> &DecoderId {
         &self.id
     }
 
-    pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
+    pub fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
     }
 
-    pub(crate) fn metadata(&self) -> &PdProcessMetadata {
+    pub fn metadata(&self) -> &PdProcessMetadata {
         &self.metadata
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct PrefillDirectoryEntry {
+pub struct PrefillDirectoryEntry {
     id: PrefillId,
     worker: Arc<dyn Worker>,
     metadata: PdProcessMetadata,
@@ -53,23 +53,23 @@ pub(crate) struct PrefillDirectoryEntry {
 }
 
 impl PrefillDirectoryEntry {
-    pub(crate) fn id(&self) -> &PrefillId {
+    pub fn id(&self) -> &PrefillId {
         &self.id
     }
 
-    pub(crate) fn worker(&self) -> &Arc<dyn Worker> {
+    pub fn worker(&self) -> &Arc<dyn Worker> {
         &self.worker
     }
 
-    pub(crate) fn metadata(&self) -> &PdProcessMetadata {
+    pub fn metadata(&self) -> &PdProcessMetadata {
         &self.metadata
     }
 
-    pub(crate) fn bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
+    pub fn bootstrap_endpoint(&self) -> &PrefillBootstrapEndpoint {
         &self.bootstrap_endpoint
     }
 
-    pub(crate) fn pool(&self) -> &DecoderPool {
+    pub fn pool(&self) -> &DecoderPool {
         &self.pool
     }
 }
@@ -95,15 +95,21 @@ struct DirectoryState {
     current_decoder_by_url: HashMap<String, DecoderId>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PdRetirementSweep {
+    pub(crate) retired: Vec<Arc<dyn Worker>>,
+    pub(crate) failures: Vec<PdDirectoryError>,
+}
+
 #[derive(Debug, Default)]
-pub(crate) struct PdProcessDirectory {
+pub struct PdProcessDirectory {
     state: RwLock<DirectoryState>,
 }
 
 impl PdProcessDirectory {
     /// All directory mutations take this lock before touching a pool. Pool code
     /// never calls back into the directory, which keeps the lock order acyclic.
-    pub(crate) fn admit_prefill(
+    pub fn admit_prefill(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
@@ -125,12 +131,12 @@ impl PdProcessDirectory {
         if state.prefills.contains_key(&id) {
             return Err(PdDirectoryError::DuplicatePrefill(id));
         }
-
         let compatible_decoders: Vec<(DecoderId, Arc<DecoderDirectoryEntry>)> = state
             .decoders
             .iter()
             .filter(|(_, record)| {
                 record.availability == ProcessAvailability::Ready
+                    && record.entry.id().url() != id.url()
                     && metadata.is_compatible_with(record.entry.metadata())
             })
             .map(|(decoder_id, record)| (decoder_id.clone(), Arc::clone(&record.entry)))
@@ -144,6 +150,9 @@ impl PdProcessDirectory {
                 previous.entry.pool().begin_draining();
                 previous.availability = ProcessAvailability::Draining;
             }
+        }
+        if let Some(previous_id) = state.current_decoder_by_url.get(id.url()).cloned() {
+            drain_decoder_locked(&mut state, &previous_id)?;
         }
 
         let entry = Arc::new(PrefillDirectoryEntry {
@@ -174,7 +183,7 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub(crate) fn admit_decoder(
+    pub fn admit_decoder(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
@@ -189,7 +198,6 @@ impl PdProcessDirectory {
         if state.decoders.contains_key(&id) {
             return Err(PdDirectoryError::DuplicateDecoder(id));
         }
-
         let entry = Arc::new(DecoderDirectoryEntry {
             id: id.clone(),
             worker,
@@ -200,6 +208,7 @@ impl PdProcessDirectory {
             .iter()
             .filter(|(_, record)| {
                 record.availability == ProcessAvailability::Ready
+                    && record.entry.id().url() != id.url()
                     && record.entry.metadata().is_compatible_with(entry.metadata())
             })
             .map(|(prefill_id, record)| (prefill_id.clone(), record.entry.pool().clone()))
@@ -224,6 +233,14 @@ impl PdProcessDirectory {
             .iter()
             .map(|(prefill_id, _)| prefill_id.clone())
             .collect();
+        if let Some(previous_prefill_id) = state.current_prefill_by_url.get(id.url()).cloned() {
+            let previous = state
+                .prefills
+                .get_mut(&previous_prefill_id)
+                .expect("current prefill generation must be retained");
+            previous.entry.pool().begin_draining();
+            previous.availability = ProcessAvailability::Draining;
+        }
         state
             .current_decoder_by_url
             .insert(id.url().to_string(), id.clone());
@@ -273,7 +290,69 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub(crate) fn drain_prefill(&self, id: &PrefillId) -> Result<(), PdDirectoryError> {
+    pub fn refresh_prefill(
+        &self,
+        worker: Arc<dyn Worker>,
+    ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
+        let metadata = required_metadata(&worker, PdProcessRole::Prefill)?.clone();
+        let id = PrefillId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let mut state = self.state.write();
+        if state.current_prefill_by_url.get(id.url()) != Some(&id) {
+            return Err(PdDirectoryError::ProcessNotCurrent);
+        }
+        let record = state
+            .prefills
+            .get_mut(&id)
+            .ok_or_else(|| PdDirectoryError::UnknownPrefill(id.clone()))?;
+        if record.availability != ProcessAvailability::Ready {
+            return Err(PdDirectoryError::ProcessNotReady);
+        }
+        if &metadata != record.entry.metadata() {
+            return Err(PdDirectoryError::GenerationMetadataChanged);
+        }
+
+        let entry = Arc::new(PrefillDirectoryEntry {
+            id,
+            worker,
+            metadata,
+            bootstrap_endpoint: record.entry.bootstrap_endpoint().clone(),
+            pool: record.entry.pool().clone(),
+        });
+        record.entry = Arc::clone(&entry);
+        Ok(entry)
+    }
+
+    pub fn refresh_decoder(
+        &self,
+        worker: Arc<dyn Worker>,
+    ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
+        let metadata = required_metadata(&worker, PdProcessRole::Decode)?.clone();
+        let id = DecoderId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let mut state = self.state.write();
+        if state.current_decoder_by_url.get(id.url()) != Some(&id) {
+            return Err(PdDirectoryError::ProcessNotCurrent);
+        }
+        let record = state
+            .decoders
+            .get_mut(&id)
+            .ok_or_else(|| PdDirectoryError::UnknownDecoder(id.clone()))?;
+        if record.availability != ProcessAvailability::Ready {
+            return Err(PdDirectoryError::ProcessNotReady);
+        }
+        if &metadata != record.entry.metadata() {
+            return Err(PdDirectoryError::GenerationMetadataChanged);
+        }
+
+        let entry = Arc::new(DecoderDirectoryEntry {
+            id,
+            worker,
+            metadata,
+        });
+        record.entry = Arc::clone(&entry);
+        Ok(entry)
+    }
+
+    pub fn drain_prefill(&self, id: &PrefillId) -> Result<(), PdDirectoryError> {
         let mut state = self.state.write();
         let record = state
             .prefills
@@ -284,91 +363,61 @@ impl PdProcessDirectory {
         Ok(())
     }
 
-    pub(crate) fn remove_drained_prefill(
+    pub fn remove_drained_prefill(
         &self,
         id: &PrefillId,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
-        let mut state = self.state.write();
-        let record = state
-            .prefills
-            .get(id)
-            .ok_or_else(|| PdDirectoryError::UnknownPrefill(id.clone()))?;
-        if record.availability != ProcessAvailability::Draining {
-            return Err(PdDirectoryError::ProcessNotDraining);
-        }
-        record.entry.pool().ensure_retirable()?;
-
-        let record = state
-            .prefills
-            .remove(id)
-            .expect("prefill was retained while retirement was proven");
-        if state.current_prefill_by_url.get(id.url()) == Some(id) {
-            state.current_prefill_by_url.remove(id.url());
-        }
-        for decoder in state.decoders.values_mut() {
-            decoder.pool_memberships.remove(id);
-        }
-        Ok(record.entry)
+        remove_drained_prefill_locked(&mut self.state.write(), id)
     }
 
-    pub(crate) fn drain_decoder(&self, id: &DecoderId) -> Result<(), PdDirectoryError> {
+    pub fn drain_decoder(&self, id: &DecoderId) -> Result<(), PdDirectoryError> {
         drain_decoder_locked(&mut self.state.write(), id)
     }
 
-    pub(crate) fn remove_drained_decoder(
+    pub fn remove_drained_decoder(
         &self,
         id: &DecoderId,
     ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
-        let mut state = self.state.write();
-        let availability = state
-            .decoders
-            .get(id)
-            .ok_or_else(|| PdDirectoryError::UnknownDecoder(id.clone()))?
-            .availability;
-        if availability != ProcessAvailability::Draining {
-            return Err(PdDirectoryError::ProcessNotDraining);
-        }
-
-        let memberships: Vec<PrefillId> = state
-            .decoders
-            .get(id)
-            .expect("decoder was checked under the same lock")
-            .pool_memberships
-            .iter()
-            .cloned()
-            .collect();
-        for prefill_id in memberships {
-            let result = state
-                .prefills
-                .get(&prefill_id)
-                .expect("membership names a retained prefill")
-                .entry
-                .pool()
-                .remove(id);
-            match result {
-                Ok(()) | Err(DecoderPoolError::UnknownDecoder(_)) => {
-                    state
-                        .decoders
-                        .get_mut(id)
-                        .expect("decoder is retained until every pool releases it")
-                        .pool_memberships
-                        .remove(&prefill_id);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        let record = state
-            .decoders
-            .remove(id)
-            .expect("decoder was retained while memberships were released");
-        if state.current_decoder_by_url.get(id.url()) == Some(id) {
-            state.current_decoder_by_url.remove(id.url());
-        }
-        Ok(record.entry)
+        remove_drained_decoder_locked(&mut self.state.write(), id)
     }
 
-    pub(crate) fn prefill(&self, id: &PrefillId) -> Option<Arc<PrefillDirectoryEntry>> {
+    pub(crate) fn retire_drained(&self) -> PdRetirementSweep {
+        let mut state = self.state.write();
+        let mut prefill_ids: Vec<PrefillId> = state
+            .prefills
+            .iter()
+            .filter(|(_, record)| record.availability == ProcessAvailability::Draining)
+            .map(|(id, _)| id.clone())
+            .collect();
+        prefill_ids.sort();
+        let mut decoder_ids: Vec<DecoderId> = state
+            .decoders
+            .iter()
+            .filter(|(_, record)| record.availability == ProcessAvailability::Draining)
+            .map(|(id, _)| id.clone())
+            .collect();
+        decoder_ids.sort();
+
+        let mut retired = Vec::new();
+        let mut failures = Vec::new();
+        for id in prefill_ids {
+            match remove_drained_prefill_locked(&mut state, &id) {
+                Ok(entry) => retired.push(Arc::clone(entry.worker())),
+                Err(PdDirectoryError::Pool(DecoderPoolError::PrefillPoolInUse { .. })) => {}
+                Err(error) => failures.push(error),
+            }
+        }
+        for id in decoder_ids {
+            match remove_drained_decoder_locked(&mut state, &id) {
+                Ok(entry) => retired.push(Arc::clone(entry.worker())),
+                Err(PdDirectoryError::Pool(DecoderPoolError::DecoderInUse { .. })) => {}
+                Err(error) => failures.push(error),
+            }
+        }
+        PdRetirementSweep { retired, failures }
+    }
+
+    pub fn prefill(&self, id: &PrefillId) -> Option<Arc<PrefillDirectoryEntry>> {
         self.state
             .read()
             .prefills
@@ -376,7 +425,7 @@ impl PdProcessDirectory {
             .map(|record| Arc::clone(&record.entry))
     }
 
-    pub(crate) fn begin_prefill_request(
+    pub fn begin_prefill_request(
         &self,
         id: &PrefillId,
         request_id: impl Into<String>,
@@ -393,7 +442,7 @@ impl PdProcessDirectory {
         Ok((Arc::clone(&record.entry), owner))
     }
 
-    pub(crate) fn decoder(&self, id: &DecoderId) -> Option<Arc<DecoderDirectoryEntry>> {
+    pub fn decoder(&self, id: &DecoderId) -> Option<Arc<DecoderDirectoryEntry>> {
         self.state
             .read()
             .decoders
@@ -401,7 +450,7 @@ impl PdProcessDirectory {
             .map(|record| Arc::clone(&record.entry))
     }
 
-    pub(crate) fn decoder_availability(&self, id: &DecoderId) -> Option<ProcessAvailability> {
+    pub fn decoder_availability(&self, id: &DecoderId) -> Option<ProcessAvailability> {
         self.state
             .read()
             .decoders
@@ -409,7 +458,7 @@ impl PdProcessDirectory {
             .map(|record| record.availability)
     }
 
-    pub(crate) fn prefill_availability(&self, id: &PrefillId) -> Option<ProcessAvailability> {
+    pub fn prefill_availability(&self, id: &PrefillId) -> Option<ProcessAvailability> {
         self.state
             .read()
             .prefills
@@ -417,7 +466,7 @@ impl PdProcessDirectory {
             .map(|record| record.availability)
     }
 
-    pub(crate) fn ready_prefills(&self) -> Vec<Arc<PrefillDirectoryEntry>> {
+    pub fn ready_prefills(&self) -> Vec<Arc<PrefillDirectoryEntry>> {
         let mut entries: Vec<Arc<PrefillDirectoryEntry>> = self
             .state
             .read()
@@ -438,6 +487,84 @@ fn rollback_unavailable_decoder(pools: &[(PrefillId, DecoderPool)], id: &Decoder
         pool.remove(id)
             .expect("unavailable decoder cannot own a cohort");
     }
+}
+
+fn remove_drained_prefill_locked(
+    state: &mut DirectoryState,
+    id: &PrefillId,
+) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
+    let record = state
+        .prefills
+        .get(id)
+        .ok_or_else(|| PdDirectoryError::UnknownPrefill(id.clone()))?;
+    if record.availability != ProcessAvailability::Draining {
+        return Err(PdDirectoryError::ProcessNotDraining);
+    }
+    record.entry.pool().ensure_retirable()?;
+
+    let record = state
+        .prefills
+        .remove(id)
+        .expect("prefill was retained while retirement was proven");
+    if state.current_prefill_by_url.get(id.url()) == Some(id) {
+        state.current_prefill_by_url.remove(id.url());
+    }
+    for decoder in state.decoders.values_mut() {
+        decoder.pool_memberships.remove(id);
+    }
+    Ok(record.entry)
+}
+
+fn remove_drained_decoder_locked(
+    state: &mut DirectoryState,
+    id: &DecoderId,
+) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
+    let availability = state
+        .decoders
+        .get(id)
+        .ok_or_else(|| PdDirectoryError::UnknownDecoder(id.clone()))?
+        .availability;
+    if availability != ProcessAvailability::Draining {
+        return Err(PdDirectoryError::ProcessNotDraining);
+    }
+
+    let memberships: Vec<PrefillId> = state
+        .decoders
+        .get(id)
+        .expect("decoder was checked under the same lock")
+        .pool_memberships
+        .iter()
+        .cloned()
+        .collect();
+    for prefill_id in memberships {
+        let result = state
+            .prefills
+            .get(&prefill_id)
+            .expect("membership names a retained prefill")
+            .entry
+            .pool()
+            .remove(id);
+        match result {
+            Ok(()) | Err(DecoderPoolError::UnknownDecoder(_)) => {
+                state
+                    .decoders
+                    .get_mut(id)
+                    .expect("decoder is retained until every pool releases it")
+                    .pool_memberships
+                    .remove(&prefill_id);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let record = state
+        .decoders
+        .remove(id)
+        .expect("decoder was retained while memberships were released");
+    if state.current_decoder_by_url.get(id.url()) == Some(id) {
+        state.current_decoder_by_url.remove(id.url());
+    }
+    Ok(record.entry)
 }
 
 fn drain_decoder_locked(
@@ -516,7 +643,7 @@ fn pool_metadata(
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum PdDirectoryError {
+pub enum PdDirectoryError {
     #[error("PD worker is missing typed process metadata")]
     MissingProcessMetadata,
     #[error("worker role and typed PD role differ")]
@@ -537,6 +664,10 @@ pub(crate) enum PdDirectoryError {
     ProcessNotDraining,
     #[error("process generation is not ready for new admissions")]
     ProcessNotReady,
+    #[error("process generation is not the current generation for its URL")]
+    ProcessNotCurrent,
+    #[error("process-generation metadata changed without a new launch identity")]
+    GenerationMetadataChanged,
     #[error(transparent)]
     InvalidProcessIdentity(#[from] ProcessIdentityError),
     #[error(transparent)]

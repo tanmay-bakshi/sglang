@@ -761,6 +761,9 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.
             "kv_events": server_args.describe_kv_events_publisher(),
+            # Capability presence is implementation-owned; configuration cannot
+            # synthesize transfer or control protocols.
+            "pd_process": server_args.pd_process_advertisement(None),
         }
     )
 

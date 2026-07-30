@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
 use crate::{core::steps::workflow_data::WorkerRegistrationData, observability::metrics::Metrics};
@@ -34,7 +34,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         let mut worker_ids = Vec::with_capacity(workers.len());
 
         for worker in workers.iter() {
-            let worker_id = app_context.worker_registry.register(Arc::clone(worker));
+            let worker_id = app_context
+                .worker_registry
+                .register(Arc::clone(worker))
+                .map_err(|error| WorkflowError::StepFailed {
+                    step_id: StepId::new("register_workers"),
+                    message: error.to_string(),
+                })?;
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
                 worker.url(),
