@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 PACKED_REQUEST_GENERATION_BYTES = 16
 PACKED_VISIBILITY_POLICY_DIGEST_BYTES = 32
+PACKED_NATIVE_ATTESTATION_DIGEST_BYTES = 32
 MAX_PACKED_WRITER_ERROR_BYTES = 4096
 MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES = 512
 
@@ -327,6 +328,12 @@ class PackedWriterVisibilityEvidence:
     :ivar lane_identifier: Bootstrap-pinned CUDA IPC or UCX lane identity.
     :ivar completion_mechanism: Exact source completion primitive observed.
     :ivar writer_action: Source-side action completed before the outcome.
+    :ivar native_handle_generation: NIXL handle generation authorized by a
+        native completion receipt.
+    :ivar native_descriptor_digest: Native digest of the exact submitted
+        descriptors.
+    :ivar native_evidence_digest: Native digest of the endpoint, remote-flush,
+        and loaded-runtime evidence.
     """
 
     policy_digest: bytes
@@ -334,6 +341,9 @@ class PackedWriterVisibilityEvidence:
     lane_identifier: str
     completion_mechanism: PackedWriterCompletionMechanism
     writer_action: PackedWriterVisibilityAction
+    native_handle_generation: int | None = None
+    native_descriptor_digest: bytes | None = None
+    native_evidence_digest: bytes | None = None
 
     def __post_init__(self) -> None:
         """Validate exact, bounded visibility evidence."""
@@ -360,22 +370,50 @@ class PackedWriterVisibilityEvidence:
         )
         expected_action = (
             PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
-            if self.transport_path is PackedTransportPath.CUDA_IPC
+            if self.completion_mechanism
+            is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
             else PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
         )
         if self.writer_action is not expected_action:
             raise ValueError(
-                "visibility writer_action does not match its transport path"
+                "visibility writer_action does not match its completion mechanism"
             )
-        expected_mechanism = (
-            PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
-            if self.transport_path is PackedTransportPath.CUDA_IPC
-            else PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
-        )
-        if self.completion_mechanism is not expected_mechanism:
+        if (
+            self.transport_path is PackedTransportPath.NIC_RDMA
+            and self.completion_mechanism
+            is not PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+        ):
+            raise ValueError("NIC RDMA visibility requires native NIXL completion")
+        if (
+            self.completion_mechanism
+            is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        ):
+            if (
+                self.native_handle_generation is not None
+                or self.native_descriptor_digest is not None
+                or self.native_evidence_digest is not None
+            ):
+                raise ValueError(
+                    "direct CUDA-event visibility must not contain native "
+                    "NIXL attestation"
+                )
+            return
+        if (
+            type(self.native_handle_generation) is not int
+            or self.native_handle_generation <= 0
+            or self.native_handle_generation >= (1 << 64)
+        ):
             raise ValueError(
-                "visibility completion_mechanism does not match its transport path"
+                "native NIXL visibility requires a positive uint64 handle generation"
             )
+        _validate_native_attestation_digest(
+            self.native_descriptor_digest,
+            "native descriptor digest",
+        )
+        _validate_native_attestation_digest(
+            self.native_evidence_digest,
+            "native evidence digest",
+        )
 
     @staticmethod
     def _validate_bounded_text(value: str, label: str, maximum_bytes: int) -> None:
@@ -391,6 +429,25 @@ class PackedWriterVisibilityEvidence:
         encoded_length = len(value.encode("utf-8"))
         if encoded_length > maximum_bytes:
             raise ValueError(f"{label} exceeds {maximum_bytes} UTF-8 bytes")
+
+
+def _validate_native_attestation_digest(
+    value: bytes | None,
+    label: str,
+) -> None:
+    """Validate one exact native SHA-256 attestation digest.
+
+    :param value: Candidate native digest.
+    :param label: Reader-facing field label.
+    """
+
+    if type(value) is not bytes:
+        raise TypeError(f"{label} must be bytes")
+    if len(value) != PACKED_NATIVE_ATTESTATION_DIGEST_BYTES:
+        raise ValueError(
+            f"{label} must contain {PACKED_NATIVE_ATTESTATION_DIGEST_BYTES} "
+            f"bytes, got {len(value)}"
+        )
 
 
 @dataclasses.dataclass(frozen=True)

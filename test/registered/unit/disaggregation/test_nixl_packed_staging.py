@@ -1,5 +1,6 @@
 import concurrent.futures
 import dataclasses
+import enum
 import gc
 import threading
 import weakref
@@ -45,16 +46,20 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedDestinationVisibilityError,
     PackedDestinationVisibilityPolicy,
     PackedDestinationVisibilityProof,
+    PackedDirectCudaEventAuthority,
     PackedGpuDirectFlushOptions,
     PackedGpuDirectFlushScope,
     PackedGpuDirectFlushTarget,
     PackedGpuDirectWritesOrdering,
     PackedIntervalLeaseAllocator,
+    PackedNixlRuntimeArtifactCohort,
+    PackedNixlRuntimeArtifactIdentity,
+    PackedNixlRuntimeRoot,
     PackedPeerIdentity,
     PackedReadyCoordinator,
     PackedReadyError,
     PackedRegistrationQuarantine,
-    PackedSourceVisibilityCompletion,
+    PackedSourceTransfer,
     PackedStagingArena,
     PackedTransferLane,
     PackedTransferLaneState,
@@ -62,8 +67,10 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     active_destination_page_arrays,
     build_component_buffer_registry,
     build_decode_spec,
+    build_nixl_ucx_lane_identifier,
     build_prefill_chunk,
     derive_destination_visibility_proof,
+    derive_nixl_ucx_runtime_artifact_components,
     writer_layout_for,
 )
 
@@ -90,15 +97,19 @@ WRITERS = tuple(
 class RecordingMemoryAgent:
     """CPU-only NIXL registration agent with cleanup fault injection."""
 
+    completion_receipts: dict[object, object]
     deregistrations: list[object]
     fail_deregistration: bool
+    name: str
     registrations: list[tuple[tuple[int, int, int, str], ...]]
 
     def __init__(self) -> None:
         """Initialize successful registration and cleanup."""
 
+        self.completion_receipts = {}
         self.deregistrations = []
         self.fail_deregistration = False
+        self.name = "prefill-agent"
         self.registrations = []
 
     def register_memory(
@@ -129,9 +140,119 @@ class RecordingMemoryAgent:
             raise RuntimeError("injected deregistration failure")
         self.deregistrations.append(registration)
 
+    def take_xfer_completion_receipt(self, handle: object) -> object | None:
+        """Take one exact fake native completion receipt.
+
+        :param handle: Exact fake transfer handle.
+        :returns: One-shot receipt, or ``None`` while pending.
+        """
+
+        return self.completion_receipts.pop(handle, None)
+
 
 class RetainedTransferOwner:
     """Weak-referenceable fake NIXL transfer or endpoint owner."""
+
+
+class NativeEnum(enum.Enum):
+    """Fake named pybind enum values used by native receipt tests."""
+
+    NIXL_SUCCESS = enum.auto()
+    NIXL_WRITE = enum.auto()
+    NIXL_XFER_ATTESTATION_REMOTE_FLUSHED = enum.auto()
+    VRAM_SEG = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeTransport:
+    """Fake immutable native UCX transport context."""
+
+    transport: str
+    device: str
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeSegment:
+    """Fake immutable native transfer segment."""
+
+    index: int
+    localAddress: int
+    remoteAddress: int
+    localDeviceId: int
+    remoteDeviceId: int
+    length: int
+    workerId: int
+    workerIdentity: int
+    endpointIdentity: int
+    requestInfo: str
+    posted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeEndpoint:
+    """Fake immutable native endpoint flush evidence."""
+
+    workerId: int
+    workerIdentity: int
+    endpointIdentity: int
+    segmentIndices: tuple[int, ...]
+    transports: tuple[NativeTransport, ...]
+    flushPosted: bool
+    remoteFlushed: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeRuntimeArtifact:
+    """Fake immutable loaded-runtime identity."""
+
+    component: str
+    path: str
+    buildId: str
+    version: str
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeCompletionReceipt:
+    """Fake immutable one-shot native completion receipt."""
+
+    handleIdentity: int
+    generation: int
+    state: NativeEnum
+    status: NativeEnum
+    submissionSealed: bool
+    completionClaimed: bool
+    backend: str
+    localAgent: str
+    remoteAgent: str
+    operation: NativeEnum
+    localMemoryType: NativeEnum
+    remoteMemoryType: NativeEnum
+    segments: tuple[NativeSegment, ...]
+    endpoints: tuple[NativeEndpoint, ...]
+    runtimeArtifacts: tuple[NativeRuntimeArtifact, ...]
+    descriptorDigest: str
+    evidenceDigest: str
+    error: str
+
+
+class RecordingDirectCudaEventAuthority(PackedDirectCudaEventAuthority):
+    """Fake one-shot direct CUDA-event completion owner."""
+
+    receipts: dict[object, object]
+
+    def __init__(self) -> None:
+        """Initialize without recorded events."""
+
+        self.receipts = {}
+
+    def take_recorded_event(self, transport_handle: object) -> object | None:
+        """Take one exact fake event authority.
+
+        :param transport_handle: Exact direct CUDA transfer owner.
+        :returns: One-shot authority, or ``None`` while pending.
+        """
+
+        return self.receipts.pop(transport_handle, None)
 
 
 class RecordingVisibilityExecutor(PackedDestinationVisibilityActionExecutor):
@@ -375,12 +496,14 @@ def _topology() -> PackedTopology:
 def _policy(
     *,
     transport_path: PackedTransportPath = PackedTransportPath.NIC_RDMA,
-    lane_identifier: str = "mlx5_0/1:ucx-rc",
+    lane_identifier: str = build_nixl_ucx_lane_identifier((("rc_mlx5", "mlx5_0:1"),)),
     completion_mechanism: PackedWriterCompletionMechanism | None = None,
     writes_ordering: PackedGpuDirectWritesOrdering = (
         PackedGpuDirectWritesOrdering.OWNER
     ),
     flush_options: PackedGpuDirectFlushOptions = PackedGpuDirectFlushOptions.HOST,
+    native_data_transport: str | None = None,
+    native_data_device: str | None = None,
 ) -> PackedDestinationVisibilityPolicy:
     """Build one decode-selected route and CUDA visibility policy.
 
@@ -389,6 +512,8 @@ def _policy(
     :param completion_mechanism: Exact source completion primitive.
     :param writes_ordering: Queried CUDA writes-ordering attribute.
     :param flush_options: Queried CUDA flush-options attribute.
+    :param native_data_transport: Exact selected UCX transport override.
+    :param native_data_device: Exact selected UCX device override.
     :returns: Immutable destination policy.
     """
 
@@ -399,12 +524,84 @@ def _policy(
             if transport_path is PackedTransportPath.CUDA_IPC
             else PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
         )
+    native_completion = (
+        selected_mechanism
+        is PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+    )
+    selected_transport = native_data_transport
+    selected_device = native_data_device
+    if native_completion and selected_transport is None:
+        selected_transport = (
+            "cuda_ipc" if transport_path is PackedTransportPath.CUDA_IPC else "rc_mlx5"
+        )
+    if native_completion and selected_device is None:
+        selected_device = (
+            "cuda0" if transport_path is PackedTransportPath.CUDA_IPC else "mlx5_0:1"
+        )
     return PackedDestinationVisibilityPolicy(
         transport_path=transport_path,
         lane_identifier=lane_identifier,
         completion_mechanism=selected_mechanism,
         writes_ordering=writes_ordering,
         flush_options=flush_options,
+        native_data_transport=selected_transport,
+        native_data_device=selected_device,
+        native_runtime_artifact_digest=(
+            _runtime_artifacts().digest if native_completion else None
+        ),
+    )
+
+
+def _runtime_artifacts() -> PackedNixlRuntimeArtifactCohort:
+    """Build the complete fake SHA runtime artifact catalog.
+
+    :returns: Immutable fake native runtime cohort.
+    """
+
+    specifications: dict[str, tuple[str, str, str]] = {
+        "libnixl": ("nixl", "lib/libnixl.so", "1.3.2"),
+        "libucp": ("ucx", "lib/libucp.so", "1.21.0"),
+        "libuct_cma": ("ucx", "lib/ucx/libuct_cma.so", "1.21.0"),
+        "libuct_cuda": ("ucx", "lib/ucx/libuct_cuda.so", "1.21.0"),
+        "libuct_cuda_gdrcopy": (
+            "ucx",
+            "lib/ucx/libuct_cuda_gdrcopy.so",
+            "1.21.0",
+        ),
+        "libuct_ib": ("ucx", "lib/ucx/libuct_ib.so", "1.21.0"),
+        "libuct_ib_efa": ("ucx", "lib/ucx/libuct_ib_efa.so", "1.21.0"),
+        "libuct_ib_mlx5": ("ucx", "lib/ucx/libuct_ib_mlx5.so", "1.21.0"),
+        "libuct_ib_mlx5_gda": (
+            "ucx",
+            "lib/ucx/libuct_ib_mlx5_gda.so",
+            "1.21.0",
+        ),
+        "libuct_knem": ("ucx", "lib/ucx/libuct_knem.so", "1.21.0"),
+        "libuct_xpmem": ("ucx", "lib/ucx/libuct_xpmem.so", "1.21.0"),
+        "ucx-plugin": (
+            "nixl",
+            "lib/plugins/libplugin_UCX.so",
+            "1.3.2",
+        ),
+    }
+    return PackedNixlRuntimeArtifactCohort(
+        roots=(
+            PackedNixlRuntimeRoot(root_id="nixl", path="/opt/nixl"),
+            PackedNixlRuntimeRoot(root_id="ucx", path="/opt/ucx"),
+        ),
+        artifacts=tuple(
+            PackedNixlRuntimeArtifactIdentity(
+                component=component,
+                root_id=root_id,
+                relative_path=relative_path,
+                build_id=f"{index:02x}" * 20,
+                version=version,
+            )
+            for index, (component, (root_id, relative_path, version)) in enumerate(
+                sorted(specifications.items()),
+                start=1,
+            )
+        ),
     )
 
 
@@ -431,12 +628,109 @@ def _visibility_evidence(
     :returns: Validated writer evidence.
     """
 
+    native_completion = (
+        policy.completion_mechanism
+        is PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+    )
     return PackedWriterVisibilityEvidence(
         policy_digest=policy.digest,
         transport_path=policy.transport_path,
         lane_identifier=policy.lane_identifier,
         completion_mechanism=policy.completion_mechanism,
         writer_action=policy.expected_writer_action,
+        native_handle_generation=1 if native_completion else None,
+        native_descriptor_digest=bytes.fromhex("11" * 32)
+        if native_completion
+        else None,
+        native_evidence_digest=bytes.fromhex("22" * 32) if native_completion else None,
+    )
+
+
+def _native_completion_receipt(
+    *,
+    agent: RecordingMemoryAgent,
+    transfer: PackedSourceTransfer,
+    source_address: int,
+    source_gpu_id: int = 3,
+    transport_context: tuple[tuple[str, str], ...] = (("rc_mlx5", "mlx5_0:1"),),
+) -> NativeCompletionReceipt:
+    """Build one valid native receipt for an exact packed transfer.
+
+    :param agent: Exact fake native owner.
+    :param transfer: Canonical packed source transfer.
+    :param source_address: Registered source lane address.
+    :param source_gpu_id: Source CUDA device identifier.
+    :param transport_context: Native endpoint transport/device context.
+    :returns: Immutable native completion receipt.
+    """
+
+    worker_id = 0
+    worker_identity = 0xB001
+    endpoint_identity = 0xE001
+    selected_transport, selected_device = transport_context[0]
+    segment = NativeSegment(
+        index=0,
+        localAddress=source_address,
+        remoteAddress=transfer.destination_address,
+        localDeviceId=source_gpu_id,
+        remoteDeviceId=transfer.destination.route.destination_gpu_id,
+        length=transfer.length_bytes,
+        workerId=worker_id,
+        workerIdentity=worker_identity,
+        endpointIdentity=endpoint_identity,
+        requestInfo=(
+            "{proto_send} put from cuda memory "
+            f"length {transfer.length_bytes} zero-copy "
+            f"{selected_transport}/{selected_device}"
+        ),
+        posted=True,
+    )
+    endpoint = NativeEndpoint(
+        workerId=worker_id,
+        workerIdentity=worker_identity,
+        endpointIdentity=endpoint_identity,
+        segmentIndices=(0,),
+        transports=tuple(
+            NativeTransport(transport=transport, device=device)
+            for transport, device in transport_context
+        ),
+        flushPosted=True,
+        remoteFlushed=True,
+    )
+    runtime_cohort = _runtime_artifacts()
+    runtime_identities = {
+        artifact.component: artifact for artifact in runtime_cohort.artifacts
+    }
+    runtime_components = derive_nixl_ucx_runtime_artifact_components(
+        tuple(transport for transport, _ in transport_context)
+    )
+    return NativeCompletionReceipt(
+        handleIdentity=0xA001,
+        generation=7,
+        state=NativeEnum.NIXL_XFER_ATTESTATION_REMOTE_FLUSHED,
+        status=NativeEnum.NIXL_SUCCESS,
+        submissionSealed=True,
+        completionClaimed=True,
+        backend="UCX",
+        localAgent=agent.name,
+        remoteAgent=transfer.destination.route.peer.agent_name,
+        operation=NativeEnum.NIXL_WRITE,
+        localMemoryType=NativeEnum.VRAM_SEG,
+        remoteMemoryType=NativeEnum.VRAM_SEG,
+        segments=(segment,),
+        endpoints=(endpoint,),
+        runtimeArtifacts=tuple(
+            NativeRuntimeArtifact(
+                component=component,
+                path=runtime_cohort.resolve_path(runtime_identities[component]),
+                buildId=runtime_identities[component].build_id,
+                version=runtime_identities[component].version,
+            )
+            for component in runtime_components
+        ),
+        descriptorDigest="11" * 32,
+        evidenceDigest="22" * 32,
+        error="",
     )
 
 
@@ -886,7 +1180,9 @@ def test_interval_allocator_requires_aligned_registered_base() -> None:
         )
 
 
-def _registered_ready() -> tuple[
+def _registered_ready(
+    visibility_policy: PackedDestinationVisibilityPolicy | None = None,
+) -> tuple[
     PackedReadyCoordinator,
     PackedPrepare,
     PackedReady,
@@ -894,6 +1190,7 @@ def _registered_ready() -> tuple[
 ]:
     """Register one source chunk and build its valid READY.
 
+    :param visibility_policy: Optional route-policy override.
     :returns: Coordinator, PREPARE, canonical READY, and authenticated peer.
     """
 
@@ -903,7 +1200,10 @@ def _registered_ready() -> tuple[
     )
     coordinator = PackedReadyCoordinator()
     peer = _peer()
-    capability = _capability(peer=peer)
+    capability = _capability(
+        peer=peer,
+        visibility_policy=visibility_policy,
+    )
     prepare = coordinator.register_chunk(
         key=KEY,
         destination=capability,
@@ -1107,6 +1407,65 @@ def test_ready_coordinator_never_hands_out_duplicate_dma_work() -> None:
         coordinator.handle_ready(ready, peer)
 
 
+@pytest.mark.parametrize(
+    ("transports", "route_components"),
+    [
+        (("posix", "self", "sysv", "tcp"), ()),
+        (("cuda_copy", "cuda_ipc"), ("libuct_cuda",)),
+        (
+            ("gdr_copy",),
+            ("libuct_cuda", "libuct_cuda_gdrcopy"),
+        ),
+        (
+            ("dc_mlx5", "gga_mlx5", "rc_mlx5", "ud_mlx5"),
+            ("libuct_ib", "libuct_ib_mlx5"),
+        ),
+        (
+            ("rc_gda",),
+            ("libuct_ib", "libuct_ib_mlx5", "libuct_ib_mlx5_gda"),
+        ),
+        (("rc_verbs", "ud_verbs"), ("libuct_ib",)),
+        (("srd",), ("libuct_ib", "libuct_ib_efa")),
+        (
+            ("cma", "knem", "xpmem"),
+            ("libuct_cma", "libuct_knem", "libuct_xpmem"),
+        ),
+    ],
+)
+def test_native_runtime_artifacts_follow_exact_transport_rules(
+    transports: tuple[str, ...],
+    route_components: tuple[str, ...],
+) -> None:
+    """The Python acceptance rule must remain identical to native NIXL."""
+
+    expected = tuple(sorted(("libnixl", "libucp", "ucx-plugin", *route_components)))
+
+    assert derive_nixl_ucx_runtime_artifact_components(transports) == expected
+
+
+def test_native_runtime_artifacts_reject_unknown_transport_names() -> None:
+    """A plausible module suffix must not widen the exact native rule table."""
+
+    with pytest.raises(ValueError, match="no runtime artifact rule"):
+        derive_nixl_ucx_runtime_artifact_components(("foo_mlx5",))
+
+
+def test_runtime_artifact_catalog_rejects_duplicate_components() -> None:
+    """A manifest catalog cannot contain two identities for one component."""
+
+    cohort = _runtime_artifacts()
+    duplicate = cohort.artifacts[0]
+    artifacts = tuple(
+        sorted(
+            (*cohort.artifacts, duplicate),
+            key=lambda artifact: artifact.component,
+        )
+    )
+
+    with pytest.raises(ValueError, match="components are not unique"):
+        dataclasses.replace(cohort, artifacts=artifacts)
+
+
 def test_transfer_lane_emits_exact_no_submit_error_and_closes_idempotently() -> None:
     """A pre-submit abort proves only its exact lease and remains reusable."""
 
@@ -1117,6 +1476,7 @@ def test_transfer_lane_emits_exact_no_submit_error_and_closes_idempotently() -> 
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
         quarantine=PackedRegistrationQuarantine(),
@@ -1133,22 +1493,14 @@ def test_transfer_lane_emits_exact_no_submit_error_and_closes_idempotently() -> 
     assert outcome.reason == "descriptor construction failed"
     assert lane.state is PackedTransferLaneState.IDLE
 
-    lane.reserve(transfer)
-    lane.arm_submission(RetainedTransferOwner())
-    armed_outcome = lane.abort_armed_without_submit(
-        "transport explicitly reported no submission"
-    )
-    assert armed_outcome.status is PackedWriterOutcomeStatus.ERROR
-    assert lane.state is PackedTransferLaneState.IDLE
-
     lane.close()
     lane.close()
     assert len(agent.deregistrations) == 1
     assert lane.state is PackedTransferLaneState.CLOSED
 
 
-def test_transfer_lane_emits_done_only_after_terminal_transport() -> None:
-    """A reserved lane cannot imply DONE before submitted transport terminates."""
+def test_transfer_lane_takes_exact_native_receipt_before_done() -> None:
+    """A lane derives DONE only from its exact native one-shot receipt."""
 
     coordinator, _, ready, peer = _registered_ready()
     transfer = coordinator.handle_ready(ready, peer)
@@ -1157,65 +1509,309 @@ def test_transfer_lane_emits_done_only_after_terminal_transport() -> None:
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
     )
 
     lane.reserve(transfer)
-    with pytest.raises(RuntimeError, match="terminality requires"):
-        lane.mark_transport_terminal()
+    with pytest.raises(RuntimeError, match="completion requires"):
+        lane.take_transport_completion()
     transport_handle = RetainedTransferOwner()
     lane.arm_submission(transport_handle)
-    with pytest.raises(TypeError, match="typed source completion"):
-        lane.mark_transport_terminal(completion="policy-only claim")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="another transport handle"):
-        lane.mark_transport_terminal(
-            completion=PackedSourceVisibilityCompletion(
-                transport_handle=RetainedTransferOwner(),
-                evidence=_visibility_evidence(_policy()),
-            )
-        )
-    outcome = lane.mark_transport_terminal(
-        completion=PackedSourceVisibilityCompletion(
-            transport_handle=transport_handle,
-            evidence=_visibility_evidence(_policy()),
-        )
+    assert lane.take_transport_completion() is None
+    agent.completion_receipts[transport_handle] = _native_completion_receipt(
+        agent=agent,
+        transfer=transfer,
+        source_address=lane.data_ptr,
     )
+    outcome = lane.take_transport_completion()
 
+    assert outcome is not None
     assert outcome.status is PackedWriterOutcomeStatus.DONE
     assert outcome.visibility is not None
     assert (
         outcome.visibility.writer_action
         is PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
     )
+    assert outcome.visibility.native_handle_generation == 7
+    assert outcome.visibility.native_descriptor_digest == bytes.fromhex("11" * 32)
+    assert outcome.visibility.native_evidence_digest == bytes.fromhex("22" * 32)
     assert outcome.reason is None
     assert lane.state is PackedTransferLaneState.IDLE
+    with pytest.raises(RuntimeError, match="completion requires"):
+        lane.take_transport_completion()
     lane.close()
 
 
-def test_transfer_lane_reuses_registration_after_terminal_transport_error() -> None:
-    """Exact terminal ERR clears submitted-handle ownership without visibility."""
+@pytest.mark.parametrize(
+    ("corruption", "error_match"),
+    [
+        ("remote-agent", "another remote agent"),
+        ("destination", "destination differs"),
+        ("remote-flush", "did not complete remote flush"),
+        ("runtime-build-id", "identity is incomplete"),
+        ("runtime-duplicate", "exact canonical route tuple"),
+        ("runtime-conflict", "exact canonical route tuple"),
+        ("runtime-order", "exact canonical route tuple"),
+        ("transport-context", "pinned native data resource"),
+        ("request-fallback", "forbidden fallback transport"),
+    ],
+)
+def test_transfer_lane_quarantines_invalid_native_receipt(
+    corruption: str,
+    error_match: str,
+) -> None:
+    """A taken receipt must bind every descriptor and visibility authority."""
 
     coordinator, _, ready, peer = _registered_ready()
+    transfer = coordinator.handle_ready(ready, peer)
+    agent = RecordingMemoryAgent()
+    quarantine = PackedRegistrationQuarantine()
+    lane = PackedTransferLane(
+        agent=agent,
+        destination_route=transfer.destination.route,
+        visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
+        gpu_id=3,
+        tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+        quarantine=quarantine,
+    )
+    handle = RetainedTransferOwner()
+    lane.reserve(transfer)
+    lane.arm_submission(handle)
+    receipt = _native_completion_receipt(
+        agent=agent,
+        transfer=transfer,
+        source_address=lane.data_ptr,
+    )
+    if corruption == "remote-agent":
+        receipt = dataclasses.replace(receipt, remoteAgent="another-decode")
+    elif corruption == "destination":
+        segment = dataclasses.replace(
+            receipt.segments[0],
+            remoteAddress=transfer.destination_address + 256,
+        )
+        receipt = dataclasses.replace(receipt, segments=(segment,))
+    elif corruption == "remote-flush":
+        endpoint = dataclasses.replace(
+            receipt.endpoints[0],
+            remoteFlushed=False,
+        )
+        receipt = dataclasses.replace(receipt, endpoints=(endpoint,))
+    elif corruption == "runtime-build-id":
+        artifact = dataclasses.replace(receipt.runtimeArtifacts[0], buildId="")
+        receipt = dataclasses.replace(
+            receipt,
+            runtimeArtifacts=(artifact, *receipt.runtimeArtifacts[1:]),
+        )
+    elif corruption == "runtime-duplicate":
+        artifact = receipt.runtimeArtifacts[0]
+        receipt = dataclasses.replace(
+            receipt,
+            runtimeArtifacts=(
+                artifact,
+                artifact,
+                *receipt.runtimeArtifacts[1:],
+            ),
+        )
+    elif corruption == "runtime-conflict":
+        artifact = receipt.runtimeArtifacts[0]
+        conflict = dataclasses.replace(
+            artifact,
+            path="/opt/nixl/lib/conflicting-libnixl.so",
+            buildId="ff" * 20,
+        )
+        receipt = dataclasses.replace(
+            receipt,
+            runtimeArtifacts=(
+                artifact,
+                conflict,
+                *receipt.runtimeArtifacts[1:],
+            ),
+        )
+    elif corruption == "runtime-order":
+        receipt = dataclasses.replace(
+            receipt,
+            runtimeArtifacts=(
+                receipt.runtimeArtifacts[1],
+                receipt.runtimeArtifacts[0],
+                *receipt.runtimeArtifacts[2:],
+            ),
+        )
+    elif corruption == "transport-context":
+        endpoint = dataclasses.replace(
+            receipt.endpoints[0],
+            transports=(NativeTransport("tcp", "eth0"),),
+        )
+        receipt = dataclasses.replace(receipt, endpoints=(endpoint,))
+    elif corruption == "request-fallback":
+        segment = dataclasses.replace(
+            receipt.segments[0],
+            requestInfo=(
+                "{proto_send} put from cuda memory "
+                f"length {transfer.length_bytes} zero-copy "
+                "rc_mlx5/mlx5_0:1 tcp/eth0"
+            ),
+        )
+        endpoint = dataclasses.replace(
+            receipt.endpoints[0],
+            transports=(
+                *receipt.endpoints[0].transports,
+                NativeTransport("tcp", "eth0"),
+            ),
+        )
+        receipt = dataclasses.replace(
+            receipt,
+            segments=(segment,),
+            endpoints=(endpoint,),
+        )
+    else:
+        raise AssertionError(f"unknown corruption case {corruption}")
+    agent.completion_receipts[handle] = receipt
+
+    with pytest.raises(ValueError, match=error_match):
+        lane.take_transport_completion()
+
+    assert lane.state is PackedTransferLaneState.POISONED
+    assert quarantine.count == 1
+    with pytest.raises(RuntimeError, match="validation"):
+        lane.close()
+
+
+def test_transfer_lane_supports_native_nixl_cuda_ipc_receipt() -> None:
+    """NIXL CUDA IPC uses remote-flush receipt authority, not a fake event."""
+
+    transport_context = (("cuda_ipc", "cuda0"),)
+    policy = _policy(
+        transport_path=PackedTransportPath.CUDA_IPC,
+        lane_identifier=build_nixl_ucx_lane_identifier(transport_context),
+        completion_mechanism=(
+            PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+        ),
+        writes_ordering=PackedGpuDirectWritesOrdering.NONE,
+        flush_options=PackedGpuDirectFlushOptions.NONE,
+    )
+    coordinator, _, ready, peer = _registered_ready(policy)
     transfer = coordinator.handle_ready(ready, peer)
     agent = RecordingMemoryAgent()
     lane = PackedTransferLane(
         agent=agent,
         destination_route=transfer.destination.route,
-        visibility_policy=_policy(),
+        visibility_policy=policy,
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+    )
+    handle = RetainedTransferOwner()
+    lane.reserve(transfer)
+    lane.arm_submission(handle)
+    agent.completion_receipts[handle] = _native_completion_receipt(
+        agent=agent,
+        transfer=transfer,
+        source_address=lane.data_ptr,
+        transport_context=transport_context,
+    )
+
+    outcome = lane.take_transport_completion()
+
+    assert outcome is not None
+    assert outcome.visibility is not None
+    assert (
+        outcome.visibility.completion_mechanism
+        is PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+    )
+    assert (
+        policy.required_action
+        is PackedDestinationVisibilityAction.TRANSPORT_REMOTE_FLUSH
+    )
+    lane.close()
+
+
+def test_transfer_lane_supports_direct_cuda_event_authority() -> None:
+    """Direct CUDA IPC consumes its bound exported-event authority once."""
+
+    policy = _policy(
+        transport_path=PackedTransportPath.CUDA_IPC,
+        lane_identifier="cuda-ipc:gpu3->gpu6",
+        completion_mechanism=(
+            PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        ),
+        writes_ordering=PackedGpuDirectWritesOrdering.NONE,
+        flush_options=PackedGpuDirectFlushOptions.NONE,
+    )
+    coordinator, _, ready, peer = _registered_ready(policy)
+    transfer = coordinator.handle_ready(ready, peer)
+    agent = RecordingMemoryAgent()
+    with pytest.raises(ValueError, match="exact event authority"):
+        PackedTransferLane(
+            agent=agent,
+            destination_route=transfer.destination.route,
+            visibility_policy=policy,
+            gpu_id=3,
+            tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+        )
+    authority = RecordingDirectCudaEventAuthority()
+    lane = PackedTransferLane(
+        agent=agent,
+        destination_route=transfer.destination.route,
+        visibility_policy=policy,
+        gpu_id=3,
+        tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+        direct_cuda_event_authority=authority,
+    )
+    handle = RetainedTransferOwner()
+    lane.reserve(transfer)
+    lane.arm_submission(handle)
+    assert lane.take_transport_completion() is None
+    authority.receipts[handle] = object()
+
+    outcome = lane.take_transport_completion()
+
+    assert outcome is not None
+    assert outcome.visibility is not None
+    assert (
+        outcome.visibility.writer_action
+        is PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
+    )
+    assert outcome.visibility.native_handle_generation is None
+    assert outcome.visibility.native_descriptor_digest is None
+    assert outcome.visibility.native_evidence_digest is None
+    assert (
+        policy.required_action
+        is PackedDestinationVisibilityAction.CUDA_STREAM_DEPENDENCY
+    )
+    lane.close()
+
+
+def test_submitted_failure_without_native_receipt_emits_no_outcome() -> None:
+    """A post-arm failure quarantines until native error authority exists."""
+
+    coordinator, _, ready, peer = _registered_ready()
+    transfer = coordinator.handle_ready(ready, peer)
+    agent = RecordingMemoryAgent()
+    quarantine = PackedRegistrationQuarantine()
+    lane = PackedTransferLane(
+        agent=agent,
+        destination_route=transfer.destination.route,
+        visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
+        gpu_id=3,
+        tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+        quarantine=quarantine,
     )
 
     lane.reserve(transfer)
     lane.arm_submission(RetainedTransferOwner())
-    outcome = lane.mark_transport_terminal(error="terminal NIXL transfer error")
+    lane.mark_submission_ambiguous(
+        "native transfer failed without an unforgeable error receipt"
+    )
 
-    assert outcome.status is PackedWriterOutcomeStatus.ERROR
-    assert outcome.visibility is None
-    assert lane.state is PackedTransferLaneState.IDLE
-    lane.close()
-    assert len(agent.deregistrations) == 1
+    assert lane.state is PackedTransferLaneState.POISONED
+    assert quarantine.count == 1
+    assert agent.deregistrations == []
+    with pytest.raises(RuntimeError, match="unforgeable error receipt"):
+        lane.close()
 
 
 def test_transfer_lane_rejects_another_destination_route() -> None:
@@ -1227,6 +1823,7 @@ def test_transfer_lane_rejects_another_destination_route() -> None:
         agent=RecordingMemoryAgent(),
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
     )
@@ -1268,6 +1865,7 @@ def test_idle_transfer_lane_reuses_registration_across_request_generations() -> 
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
     )
@@ -1302,6 +1900,7 @@ def test_transfer_lane_rejects_policy_not_bound_by_capability() -> None:
             agent=agent,
             destination_route=_capability().route,
             visibility_policy=_policy(lane_identifier="mlx5_9/1:substituted"),
+            expected_runtime_artifacts=_runtime_artifacts(),
             gpu_id=3,
             tensor=torch.empty(4096, dtype=torch.uint8),
         )
@@ -1320,6 +1919,7 @@ def test_ambiguous_submission_poison_retains_registration_without_outcome() -> N
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
         quarantine=quarantine,
@@ -1356,6 +1956,7 @@ def test_poisoned_lane_retains_complete_dma_cohort_after_caller_gc() -> None:
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=tensor,
         quarantine=quarantine,
@@ -1414,6 +2015,7 @@ def test_unquiesced_gather_failure_retains_lane_but_proves_no_remote_dma() -> No
         agent=RecordingMemoryAgent(),
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
         quarantine=quarantine,
@@ -1441,6 +2043,7 @@ def test_transfer_lane_deregistration_failure_is_strongly_retained() -> None:
         agent=agent,
         destination_route=transfer.destination.route,
         visibility_policy=_policy(),
+        expected_runtime_artifacts=_runtime_artifacts(),
         gpu_id=3,
         tensor=torch.empty(4096, dtype=torch.uint8),
         quarantine=quarantine,
@@ -1637,10 +2240,25 @@ def test_staging_arena_cannot_close_while_protocol_owns_a_live_lease() -> None:
         ),
         (
             _policy(
+                transport_path=PackedTransportPath.CUDA_IPC,
+                lane_identifier=build_nixl_ucx_lane_identifier(
+                    (("cuda_ipc", "cuda0"),)
+                ),
+                completion_mechanism=(
+                    PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+                ),
+                writes_ordering=PackedGpuDirectWritesOrdering.NONE,
+                flush_options=PackedGpuDirectFlushOptions.NONE,
+            ),
+            PackedDestinationVisibilityAction.TRANSPORT_REMOTE_FLUSH,
+            (),
+        ),
+        (
+            _policy(
                 lane_identifier="mlx5_0/1:ucx-ordered",
                 writes_ordering=PackedGpuDirectWritesOrdering.OWNER,
             ),
-            PackedDestinationVisibilityAction.OWNER_ORDERING,
+            PackedDestinationVisibilityAction.TRANSPORT_REMOTE_FLUSH,
             (),
         ),
         (
@@ -1652,7 +2270,12 @@ def test_staging_arena_cannot_close_while_protocol_owns_a_live_lease() -> None:
             (PackedDestinationVisibilityAction.GPUDIRECT_HOST_FLUSH,),
         ),
     ],
-    ids=["cuda-ipc", "ordered-nic", "host-flushed-nic"],
+    ids=[
+        "direct-cuda-ipc",
+        "nixl-cuda-ipc",
+        "ordered-nic",
+        "host-flushed-nic",
+    ],
 )
 def test_visibility_derivation_completes_destination_owned_action(
     policy: PackedDestinationVisibilityPolicy,
@@ -1696,6 +2319,9 @@ def test_visibility_rejects_unflushable_policy_and_unpinned_evidence() -> None:
             ),
             writes_ordering=PackedGpuDirectWritesOrdering.NONE,
             flush_options=PackedGpuDirectFlushOptions.MEMOPS,
+            native_data_transport="rc_mlx5",
+            native_data_device="mlx5_0:1",
+            native_runtime_artifact_digest=_runtime_artifacts().digest,
         )
     with pytest.raises(ValueError, match="terminal NIXL"):
         _policy(

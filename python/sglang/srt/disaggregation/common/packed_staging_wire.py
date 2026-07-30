@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
 )
 
-PACKED_WIRE_VERSION: int = 3
+PACKED_WIRE_VERSION: int = 4
 MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
 
 
@@ -168,6 +168,9 @@ class _WireWriterVisibilityEvidence(
     lane_identifier: str
     completion_mechanism: str
     writer_action: str
+    native_handle_generation: int | None
+    native_descriptor_digest: bytes | None
+    native_evidence_digest: bytes | None
 
 
 class _WireWriterOutcome(
@@ -366,6 +369,9 @@ def _encode_visibility_evidence(
         lane_identifier=evidence.lane_identifier,
         completion_mechanism=evidence.completion_mechanism.value,
         writer_action=evidence.writer_action.value,
+        native_handle_generation=evidence.native_handle_generation,
+        native_descriptor_digest=evidence.native_descriptor_digest,
+        native_evidence_digest=evidence.native_evidence_digest,
     )
 
 
@@ -386,6 +392,9 @@ def _decode_visibility_evidence(
             evidence.completion_mechanism
         ),
         writer_action=PackedWriterVisibilityAction(evidence.writer_action),
+        native_handle_generation=evidence.native_handle_generation,
+        native_descriptor_digest=evidence.native_descriptor_digest,
+        native_evidence_digest=evidence.native_evidence_digest,
     )
 
 

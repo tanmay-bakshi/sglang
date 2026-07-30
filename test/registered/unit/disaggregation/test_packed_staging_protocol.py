@@ -410,11 +410,6 @@ def visibility_evidence(
         if lane_identifier is None
         else lane_identifier
     )
-    writer_action = (
-        PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
-        if transport_path is PackedTransportPath.CUDA_IPC
-        else PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
-    )
     selected_mechanism = completion_mechanism
     if selected_mechanism is None:
         selected_mechanism = (
@@ -422,12 +417,27 @@ def visibility_evidence(
             if transport_path is PackedTransportPath.CUDA_IPC
             else PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
         )
+    writer_action = (
+        PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
+        if selected_mechanism
+        is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        else PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
+    )
+    native_completion = (
+        selected_mechanism
+        is PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+    )
     return PackedWriterVisibilityEvidence(
         policy_digest=selected_digest,
         transport_path=transport_path,
         lane_identifier=selected_lane,
         completion_mechanism=selected_mechanism,
         writer_action=writer_action,
+        native_handle_generation=1 if native_completion else None,
+        native_descriptor_digest=bytes.fromhex("11" * 32)
+        if native_completion
+        else None,
+        native_evidence_digest=bytes.fromhex("22" * 32) if native_completion else None,
     )
 
 
@@ -1231,6 +1241,14 @@ def test_prepare_wire_round_trip_is_deterministic(
         ),
         visibility_evidence(
             WRITERS[0],
+            transport_path=PackedTransportPath.CUDA_IPC,
+            lane_identifier="nixl-ucx-sha256:" + "3a" * 32,
+            completion_mechanism=(
+                PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+            ),
+        ),
+        visibility_evidence(
+            WRITERS[0],
             lane_identifier="mlx5_0/1:ucx-ordered",
         ),
         visibility_evidence(
@@ -1238,7 +1256,12 @@ def test_prepare_wire_round_trip_is_deterministic(
             lane_identifier="mlx5_1/1:ucx-unordered",
         ),
     ],
-    ids=["cuda-ipc", "ordered-nic", "host-flushed-nic"],
+    ids=[
+        "direct-cuda-ipc",
+        "nixl-cuda-ipc",
+        "ordered-nic",
+        "host-flushed-nic",
+    ],
 )
 def test_ready_and_writer_outcome_wire_round_trip(
     visibility: PackedWriterVisibilityEvidence,
@@ -1313,17 +1336,38 @@ def test_request_generation_and_outcome_reason_are_strict_domain_values() -> Non
             visibility_evidence(WRITERS[0]),
             completion_mechanism="free-form completion text",
         )
-    with pytest.raises(ValueError, match="does not match its transport path"):
+    with pytest.raises(ValueError, match="does not match its completion mechanism"):
         dataclasses.replace(
             visibility_evidence(WRITERS[0]),
             writer_action=PackedWriterVisibilityAction.CUDA_EVENT_RECORDED,
         )
-    with pytest.raises(ValueError, match="does not match its transport path"):
+    native_evidence = visibility_evidence(WRITERS[0])
+    with pytest.raises(ValueError, match="NIC RDMA visibility requires"):
         dataclasses.replace(
-            visibility_evidence(WRITERS[0]),
+            native_evidence,
             completion_mechanism=(
                 PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
             ),
+            writer_action=PackedWriterVisibilityAction.CUDA_EVENT_RECORDED,
+            native_handle_generation=None,
+            native_descriptor_digest=None,
+            native_evidence_digest=None,
+        )
+    with pytest.raises(ValueError, match="handle generation"):
+        dataclasses.replace(
+            native_evidence,
+            native_handle_generation=None,
+        )
+    with pytest.raises(ValueError, match="must not contain native NIXL"):
+        dataclasses.replace(
+            visibility_evidence(
+                WRITERS[0],
+                transport_path=PackedTransportPath.CUDA_IPC,
+                lane_identifier="cuda-ipc:gpu3->gpu6",
+            ),
+            native_handle_generation=1,
+            native_descriptor_digest=bytes.fromhex("11" * 32),
+            native_evidence_digest=bytes.fromhex("22" * 32),
         )
 
 

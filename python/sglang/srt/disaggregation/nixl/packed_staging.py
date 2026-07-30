@@ -2,6 +2,8 @@ import dataclasses
 import enum
 import hashlib
 import logging
+import os
+import re
 import threading
 import traceback
 from typing import Protocol
@@ -55,10 +57,47 @@ logger = logging.getLogger(__name__)
 MAIN_KV_COMPONENT = StagingComponentId(state_index=None, state_type=None)
 _UINT64_LIMIT = 1 << 64
 _CAPABILITY_GENERATION_BYTES = 16
+_NATIVE_BASE_RUNTIME_COMPONENTS = ("libnixl", "libucp", "ucx-plugin")
+_NATIVE_TRANSPORT_RUNTIME_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "cma": ("libuct_cma",),
+    "cuda_copy": ("libuct_cuda",),
+    "cuda_ipc": ("libuct_cuda",),
+    "dc_mlx5": ("libuct_ib", "libuct_ib_mlx5"),
+    "gdr_copy": ("libuct_cuda", "libuct_cuda_gdrcopy"),
+    "gga_mlx5": ("libuct_ib", "libuct_ib_mlx5"),
+    "knem": ("libuct_knem",),
+    "posix": (),
+    "rc_gda": ("libuct_ib", "libuct_ib_mlx5", "libuct_ib_mlx5_gda"),
+    "rc_mlx5": ("libuct_ib", "libuct_ib_mlx5"),
+    "rc_verbs": ("libuct_ib",),
+    "self": (),
+    "srd": ("libuct_ib", "libuct_ib_efa"),
+    "sysv": (),
+    "tcp": (),
+    "ud_mlx5": ("libuct_ib", "libuct_ib_mlx5"),
+    "ud_verbs": ("libuct_ib",),
+    "xpmem": ("libuct_xpmem",),
+}
+_NATIVE_KNOWN_RUNTIME_COMPONENTS = frozenset(
+    (
+        *_NATIVE_BASE_RUNTIME_COMPONENTS,
+        *(
+            component
+            for components in _NATIVE_TRANSPORT_RUNTIME_COMPONENTS.values()
+            for component in components
+        ),
+    )
+)
+_NATIVE_NIC_DATA_TRANSPORTS = frozenset(("rc_mlx5", "dc_mlx5"))
+_NATIVE_FORBIDDEN_FALLBACK_TRANSPORTS = frozenset(
+    ("cuda_copy", "tcp", "self", "posix", "sysv", "cma", "knem")
+)
 
 
 class PackedMemoryAgent(Protocol):
-    """NIXL memory-registration operations required by packed owners."""
+    """NIXL operations required by packed transfer lanes."""
+
+    name: str
 
     def register_memory(
         self,
@@ -81,6 +120,291 @@ class PackedMemoryAgent(Protocol):
         """
 
         ...
+
+    def take_xfer_completion_receipt(
+        self,
+        handle: object,
+    ) -> "PackedNixlCompletionReceipt | None":
+        """Take native success authority for one exact owned handle.
+
+        :param handle: Exact native transfer handle.
+        :returns: One-shot native receipt, or ``None`` while pending.
+        """
+
+        ...
+
+
+class PackedNixlEnumValue(Protocol):
+    """Named immutable enum value exported by the NIXL binding."""
+
+    name: str
+
+
+class PackedNixlAttestationTransport(Protocol):
+    """Native UCX transport and device identity."""
+
+    device: str
+    transport: str
+
+
+class PackedNixlAttestationSegment(Protocol):
+    """Native descriptor and submission evidence for one segment."""
+
+    endpointIdentity: int
+    index: int
+    length: int
+    localAddress: int
+    localDeviceId: int
+    posted: bool
+    remoteAddress: int
+    remoteDeviceId: int
+    requestInfo: str
+    workerId: int
+    workerIdentity: int
+
+
+class PackedNixlAttestationEndpoint(Protocol):
+    """Native endpoint context and remote-flush evidence."""
+
+    endpointIdentity: int
+    flushPosted: bool
+    remoteFlushed: bool
+    segmentIndices: tuple[int, ...]
+    transports: tuple[PackedNixlAttestationTransport, ...]
+    workerId: int
+    workerIdentity: int
+
+
+class PackedNixlRuntimeArtifact(Protocol):
+    """Identity of one loaded native runtime artifact."""
+
+    buildId: str
+    component: str
+    path: str
+    version: str
+
+
+class PackedNixlCompletionReceipt(Protocol):
+    """Immutable one-shot completion receipt returned by native NIXL."""
+
+    backend: str
+    completionClaimed: bool
+    descriptorDigest: str
+    endpoints: tuple[PackedNixlAttestationEndpoint, ...]
+    error: str
+    evidenceDigest: str
+    generation: int
+    handleIdentity: int
+    localAgent: str
+    localMemoryType: PackedNixlEnumValue
+    operation: PackedNixlEnumValue
+    remoteAgent: str
+    remoteMemoryType: PackedNixlEnumValue
+    runtimeArtifacts: tuple[PackedNixlRuntimeArtifact, ...]
+    segments: tuple[PackedNixlAttestationSegment, ...]
+    state: PackedNixlEnumValue
+    status: PackedNixlEnumValue
+    submissionSealed: bool
+
+
+def derive_nixl_ucx_runtime_artifact_components(
+    transports: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Derive the exact canonical runtime tuple for selected UCX transports.
+
+    :param transports: Complete native endpoint transport names.
+    :returns: Component-sorted base and route-module artifact names.
+    """
+
+    if type(transports) is not tuple:
+        raise TypeError("native UCX transports must be a tuple")
+    components = set(_NATIVE_BASE_RUNTIME_COMPONENTS)
+    for transport in transports:
+        if type(transport) is not str or len(transport) == 0:
+            raise ValueError("native UCX transport must be a non-empty string")
+        transport_components = _NATIVE_TRANSPORT_RUNTIME_COMPONENTS.get(transport)
+        if transport_components is None:
+            raise ValueError(
+                f"native UCX transport has no runtime artifact rule: {transport}"
+            )
+        components.update(transport_components)
+    return tuple(sorted(components))
+
+
+class PackedDirectCudaEventAuthority(Protocol):
+    """One-shot authority for an exact exported CUDA event."""
+
+    def take_recorded_event(self, transport_handle: object) -> object | None:
+        """Take completion authority after the exact event is recorded.
+
+        :param transport_handle: Exact direct CUDA transfer owner.
+        :returns: Opaque one-shot authority, or ``None`` while pending.
+        """
+
+        ...
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class PackedNixlRuntimeRoot:
+    """In-process root for one logically named native runtime.
+
+    :ivar root_id: Stable manifest identity independent of mount location.
+    :ivar path: Canonical absolute root in the current process namespace.
+    """
+
+    root_id: str
+    path: str
+
+    def __post_init__(self) -> None:
+        """Validate one exact runtime root."""
+
+        if (
+            type(self.root_id) is not str
+            or len(self.root_id) == 0
+            or "/" in self.root_id
+        ):
+            raise ValueError("runtime root_id must be a non-empty path-free string")
+        if type(self.path) is not str or not os.path.isabs(self.path):
+            raise ValueError("runtime root path must be absolute")
+        if os.path.realpath(self.path) != self.path:
+            raise ValueError("runtime root path must be canonical")
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class PackedNixlRuntimeArtifactIdentity:
+    """Expected loaded artifact identity from a SHA runtime manifest.
+
+    :ivar component: Native attestation component name.
+    :ivar root_id: Logical runtime root containing the artifact.
+    :ivar relative_path: Canonical path below that logical root.
+    :ivar build_id: Exact lowercase GNU build ID.
+    :ivar version: Exact runtime-reported component version.
+    """
+
+    component: str
+    root_id: str
+    relative_path: str
+    build_id: str
+    version: str
+
+    def __post_init__(self) -> None:
+        """Validate one path-independent runtime identity."""
+
+        for value, label in (
+            (self.component, "runtime component"),
+            (self.root_id, "runtime root_id"),
+            (self.relative_path, "runtime relative_path"),
+            (self.build_id, "runtime build_id"),
+            (self.version, "runtime version"),
+        ):
+            if type(value) is not str or len(value) == 0:
+                raise ValueError(f"{label} must be a non-empty string")
+        if os.path.isabs(self.relative_path):
+            raise ValueError("runtime relative_path must not be absolute")
+        if os.path.normpath(self.relative_path) != self.relative_path:
+            raise ValueError("runtime relative_path must be canonical")
+        if self.relative_path == ".." or self.relative_path.startswith("../"):
+            raise ValueError("runtime relative_path escapes its root")
+        if self.build_id != self.build_id.lower():
+            raise ValueError("runtime build_id must be lowercase")
+        try:
+            build_id = bytes.fromhex(self.build_id)
+        except ValueError as error:
+            raise ValueError("runtime build_id must be hexadecimal") from error
+        if len(build_id) == 0:
+            raise ValueError("runtime build_id must not be empty")
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedNixlRuntimeArtifactCohort:
+    """Immutable artifact catalog for one native runtime cohort.
+
+    :ivar roots: Canonical in-process mappings for logical manifest roots.
+    :ivar artifacts: Available component identities in canonical component
+        order.
+    """
+
+    roots: tuple[PackedNixlRuntimeRoot, ...]
+    artifacts: tuple[PackedNixlRuntimeArtifactIdentity, ...]
+
+    def __post_init__(self) -> None:
+        """Validate one immutable and complete runtime cohort."""
+
+        if type(self.roots) is not tuple or len(self.roots) == 0:
+            raise ValueError("runtime cohort roots must be a non-empty tuple")
+        if type(self.artifacts) is not tuple:
+            raise TypeError("runtime cohort artifacts must be a tuple")
+        if self.roots != tuple(sorted(self.roots)):
+            raise ValueError("runtime cohort roots are not in canonical order")
+        if self.artifacts != tuple(
+            sorted(self.artifacts, key=lambda artifact: artifact.component)
+        ):
+            raise ValueError("runtime cohort artifacts are not in canonical order")
+        root_ids = tuple(root.root_id for root in self.roots)
+        if len(set(root_ids)) != len(root_ids):
+            raise ValueError("runtime cohort root identifiers are not unique")
+        components = tuple(artifact.component for artifact in self.artifacts)
+        if len(set(components)) != len(components):
+            raise ValueError("runtime cohort artifact components are not unique")
+        missing_base = set(_NATIVE_BASE_RUNTIME_COMPONENTS) - set(components)
+        if len(missing_base) > 0:
+            raise ValueError(
+                "runtime artifact cohort is missing base components: "
+                + ", ".join(sorted(missing_base))
+            )
+        unknown = set(components) - _NATIVE_KNOWN_RUNTIME_COMPONENTS
+        if len(unknown) > 0:
+            raise ValueError(
+                "runtime artifact cohort contains unknown components: "
+                + ", ".join(sorted(unknown))
+            )
+        for artifact in self.artifacts:
+            self.resolve_path(artifact)
+
+    @property
+    def digest(self) -> bytes:
+        """Return path-independent runtime acceptance identity.
+
+        :returns: SHA-256 cohort digest.
+        """
+
+        digest = hashlib.sha256(b"sglang-packed-nixl-runtime-cohort-v1")
+        for artifact in self.artifacts:
+            for value in (
+                artifact.component,
+                artifact.root_id,
+                artifact.relative_path,
+                artifact.build_id,
+                artifact.version,
+            ):
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(4, "big"))
+                digest.update(encoded)
+        return digest.digest()
+
+    def resolve_path(self, artifact: PackedNixlRuntimeArtifactIdentity) -> str:
+        """Resolve one expected artifact below its in-process runtime root.
+
+        :param artifact: Exact cohort member.
+        :returns: Canonical absolute expected path.
+        """
+
+        root = next(
+            (
+                candidate
+                for candidate in self.roots
+                if candidate.root_id == artifact.root_id
+            ),
+            None,
+        )
+        if root is None:
+            raise ValueError(
+                f"runtime artifact references unknown root {artifact.root_id}"
+            )
+        path = os.path.realpath(os.path.join(root.path, artifact.relative_path))
+        if os.path.commonpath((root.path, path)) != root.path:
+            raise ValueError("runtime artifact path escapes its root")
+        return path
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,8 +472,39 @@ class PackedDestinationVisibilityAction(enum.StrEnum):
     """Visibility operation proven complete before scatter submission."""
 
     CUDA_STREAM_DEPENDENCY = "cuda_stream_dependency"
+    TRANSPORT_REMOTE_FLUSH = "transport_remote_flush"
     GPUDIRECT_HOST_FLUSH = "gpudirect_host_flush"
-    OWNER_ORDERING = "owner_ordering"
+
+
+def build_nixl_ucx_lane_identifier(
+    transports: tuple[tuple[str, str], ...],
+) -> str:
+    """Build the pinned identity of one native UCX endpoint context.
+
+    The native receipt reports the full endpoint transport/device set rather
+    than a caller-selected label. The policy binds its canonical digest so a
+    successful transfer cannot silently use another UCX endpoint topology.
+
+    :param transports: Native ``(transport, device)`` context pairs.
+    :returns: Stable bounded route identity.
+    """
+
+    canonical = tuple(sorted(set(transports)))
+    if len(canonical) == 0:
+        raise ValueError("native UCX lane requires at least one transport")
+    digest = hashlib.sha256(b"sglang-packed-nixl-ucx-lane-v1")
+    for transport, device in canonical:
+        if type(transport) is not str or len(transport) == 0:
+            raise ValueError("native UCX transport must be a non-empty string")
+        if type(device) is not str or len(device) == 0:
+            raise ValueError("native UCX device must be a non-empty string")
+        transport_bytes = transport.encode("utf-8")
+        device_bytes = device.encode("utf-8")
+        digest.update(len(transport_bytes).to_bytes(4, "big"))
+        digest.update(transport_bytes)
+        digest.update(len(device_bytes).to_bytes(4, "big"))
+        digest.update(device_bytes)
+    return f"nixl-ucx-sha256:{digest.hexdigest()}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,6 +519,9 @@ class PackedDestinationVisibilityPolicy:
     :ivar completion_mechanism: Exact source completion primitive.
     :ivar writes_ordering: CUDA GPUDirect writes-ordering attribute.
     :ivar flush_options: CUDA GPUDirect flush-options attribute bits.
+    :ivar native_data_transport: Exact UCX data transport for native NIXL.
+    :ivar native_data_device: Exact UCX data device for native NIXL.
+    :ivar native_runtime_artifact_digest: Expected SHA runtime cohort.
     """
 
     transport_path: PackedTransportPath
@@ -171,6 +529,9 @@ class PackedDestinationVisibilityPolicy:
     completion_mechanism: PackedWriterCompletionMechanism
     writes_ordering: PackedGpuDirectWritesOrdering
     flush_options: PackedGpuDirectFlushOptions
+    native_data_transport: str | None
+    native_data_device: str | None
+    native_runtime_artifact_digest: bytes | None
 
     def __post_init__(self) -> None:
         """Reject incomplete or unsafe CUDA visibility policies."""
@@ -204,13 +565,40 @@ class PackedDestinationVisibilityPolicy:
                 "visibility lane_identifier exceeds "
                 f"{MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES} UTF-8 bytes"
             )
-        if self.transport_path is PackedTransportPath.CUDA_IPC:
+        native_completion = (
+            self.completion_mechanism
+            is PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+        )
+        if not native_completion:
             if (
-                self.completion_mechanism
-                is not PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+                self.native_data_transport is not None
+                or self.native_data_device is not None
+                or self.native_runtime_artifact_digest is not None
             ):
                 raise ValueError(
-                    "CUDA IPC requires an exported CUDA event completion mechanism"
+                    "direct CUDA-event policy must not contain native NIXL authority"
+                )
+        else:
+            if (
+                type(self.native_data_transport) is not str
+                or len(self.native_data_transport) == 0
+                or type(self.native_data_device) is not str
+                or len(self.native_data_device) == 0
+            ):
+                raise ValueError(
+                    "native NIXL policy requires an exact data transport and device"
+                )
+            if (
+                type(self.native_runtime_artifact_digest) is not bytes
+                or len(self.native_runtime_artifact_digest) != 32
+            ):
+                raise ValueError(
+                    "native NIXL policy requires an exact runtime cohort digest"
+                )
+        if self.transport_path is PackedTransportPath.CUDA_IPC:
+            if native_completion and self.native_data_transport != "cuda_ipc":
+                raise ValueError(
+                    "native CUDA IPC requires the exact cuda_ipc data transport"
                 )
             return
         if (
@@ -220,6 +608,8 @@ class PackedDestinationVisibilityPolicy:
             raise ValueError(
                 "NIC RDMA requires a terminal NIXL transfer-handle mechanism"
             )
+        if self.native_data_transport not in _NATIVE_NIC_DATA_TRANSPORTS:
+            raise ValueError("NIC RDMA requires an approved hardware data transport")
         if self.writes_ordering >= PackedGpuDirectWritesOrdering.OWNER:
             return
         host_flush_available = (
@@ -237,10 +627,15 @@ class PackedDestinationVisibilityPolicy:
         :returns: Path-specific CUDA visibility action.
         """
 
-        if self.transport_path is PackedTransportPath.CUDA_IPC:
+        if (
+            self.completion_mechanism
+            is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        ):
             return PackedDestinationVisibilityAction.CUDA_STREAM_DEPENDENCY
+        if self.transport_path is PackedTransportPath.CUDA_IPC:
+            return PackedDestinationVisibilityAction.TRANSPORT_REMOTE_FLUSH
         if self.writes_ordering >= PackedGpuDirectWritesOrdering.OWNER:
-            return PackedDestinationVisibilityAction.OWNER_ORDERING
+            return PackedDestinationVisibilityAction.TRANSPORT_REMOTE_FLUSH
         return PackedDestinationVisibilityAction.GPUDIRECT_HOST_FLUSH
 
     @property
@@ -250,7 +645,10 @@ class PackedDestinationVisibilityPolicy:
         :returns: Exact writer action accepted in terminal evidence.
         """
 
-        if self.transport_path is PackedTransportPath.CUDA_IPC:
+        if (
+            self.completion_mechanism
+            is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        ):
             return PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
         return PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
 
@@ -268,6 +666,21 @@ class PackedDestinationVisibilityPolicy:
             self.completion_mechanism.value.encode("utf-8"),
             int(self.writes_ordering).to_bytes(4, "big"),
             int(self.flush_options).to_bytes(4, "big"),
+            (
+                self.native_data_transport.encode("utf-8")
+                if self.native_data_transport is not None
+                else b""
+            ),
+            (
+                self.native_data_device.encode("utf-8")
+                if self.native_data_device is not None
+                else b""
+            ),
+            (
+                self.native_runtime_artifact_digest
+                if self.native_runtime_artifact_digest is not None
+                else b""
+            ),
         )
         digest = hashlib.sha256()
         for field in fields:
@@ -2140,31 +2553,6 @@ class PackedTransferLaneState(enum.StrEnum):
     CLOSED = "closed"
 
 
-@dataclasses.dataclass(frozen=True)
-class PackedSourceVisibilityCompletion:
-    """Typed source-executor receipt for one exact submitted handle.
-
-    Transport adapters construct this only after the bound NIXL handle reaches
-    terminal DONE or the exported CUDA event has been recorded.
-
-    :ivar transport_handle: Exact handle whose ownership moved into the lane.
-    :ivar evidence: Bounded wire evidence produced by that source action.
-    """
-
-    transport_handle: object
-    evidence: PackedWriterVisibilityEvidence
-
-    def __post_init__(self) -> None:
-        """Validate one typed source completion receipt."""
-
-        if self.transport_handle is None:
-            raise ValueError("source visibility transport_handle must not be None")
-        if type(self.evidence) is not PackedWriterVisibilityEvidence:
-            raise TypeError(
-                "source visibility evidence must be PackedWriterVisibilityEvidence"
-            )
-
-
 class PackedTransferLane:
     """Presized per-route source buffer and exact transfer ownership state.
 
@@ -2177,6 +2565,8 @@ class PackedTransferLane:
     _active_transfer: PackedSourceTransfer | None
     _agent: PackedMemoryAgent
     _destination_route: PackedDestinationRouteBinding
+    _direct_cuda_event_authority: PackedDirectCudaEventAuthority | None
+    _expected_runtime_artifacts: PackedNixlRuntimeArtifactCohort | None
     _gpu_id: int
     _lock: threading.Lock
     _poison_reason: str | None
@@ -2197,6 +2587,8 @@ class PackedTransferLane:
         visibility_policy: PackedDestinationVisibilityPolicy,
         gpu_id: int,
         tensor: torch.Tensor,
+        direct_cuda_event_authority: PackedDirectCudaEventAuthority | None = None,
+        expected_runtime_artifacts: PackedNixlRuntimeArtifactCohort | None = None,
         quarantine: PackedRegistrationQuarantine = PACKED_REGISTRATION_QUARANTINE,
     ) -> None:
         """Register one presized source lane.
@@ -2206,6 +2598,10 @@ class PackedTransferLane:
         :param visibility_policy: Exact pinned path and CUDA policy.
         :param gpu_id: Source CUDA device identifier.
         :param tensor: Presized route-owned byte tensor.
+        :param direct_cuda_event_authority: Exact direct CUDA event owner,
+            required only for the exported-event mechanism.
+        :param expected_runtime_artifacts: Exact native runtime acceptance
+            policy required only for the NIXL completion mechanism.
         :param quarantine: Strong-retention owner for ambiguous cleanup.
         """
 
@@ -2221,11 +2617,43 @@ class PackedTransferLane:
             raise ValueError(
                 "transfer lane visibility policy differs from destination route"
             )
+        if type(agent.name) is not str or len(agent.name) == 0:
+            raise ValueError("packed transfer agent name must not be empty")
+        direct_cuda_event = (
+            visibility_policy.completion_mechanism
+            is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+        )
+        if direct_cuda_event and direct_cuda_event_authority is None:
+            raise ValueError(
+                "direct CUDA-event policy requires its exact event authority"
+            )
+        if not direct_cuda_event and direct_cuda_event_authority is not None:
+            raise ValueError(
+                "native NIXL policy must not contain direct CUDA-event authority"
+            )
+        if direct_cuda_event and expected_runtime_artifacts is not None:
+            raise ValueError(
+                "direct CUDA-event policy must not contain native runtime authority"
+            )
+        if not direct_cuda_event:
+            if type(expected_runtime_artifacts) is not PackedNixlRuntimeArtifactCohort:
+                raise TypeError(
+                    "native NIXL policy requires an exact runtime artifact cohort"
+                )
+            if (
+                expected_runtime_artifacts.digest
+                != visibility_policy.native_runtime_artifact_digest
+            ):
+                raise ValueError(
+                    "native runtime artifact cohort differs from route policy"
+                )
         _validate_packed_byte_tensor(tensor, "packed transfer lane")
         registration = _register_packed_tensor(agent, tensor, gpu_id)
         self._active_transfer = None
         self._agent = agent
         self._destination_route = destination_route
+        self._direct_cuda_event_authority = direct_cuda_event_authority
+        self._expected_runtime_artifacts = expected_runtime_artifacts
         self._gpu_id = gpu_id
         self._lock = threading.Lock()
         self._poison_reason = None
@@ -2334,33 +2762,6 @@ class PackedTransferLane:
             self._transport_owners = tuple(owners)
             self._state = PackedTransferLaneState.IN_FLIGHT
 
-    def abort_armed_without_submit(self, reason: str) -> PackedWriterOutcome:
-        """Disarm an initialized handle after explicit no-submit proof.
-
-        :param reason: Bounded terminal failure reason.
-        :returns: Exact error outcome proving no destination DMA was posted.
-        """
-
-        with self._lock:
-            if self._state is not PackedTransferLaneState.IN_FLIGHT:
-                raise RuntimeError(
-                    "armed no-submit abort requires in-flight lane ownership"
-                )
-            transfer = self._require_active_transfer_locked()
-            if self._transport_handle is None:
-                raise RuntimeError("armed lane has no initialized transport handle")
-            outcome = self._outcome_locked(
-                transfer,
-                PackedWriterOutcomeStatus.ERROR,
-                None,
-                reason,
-            )
-            self._active_transfer = None
-            self._transport_handle = None
-            self._transport_owners = ()
-            self._state = PackedTransferLaneState.IDLE
-            return outcome
-
     def abort_before_submit(
         self,
         reason: str,
@@ -2411,17 +2812,13 @@ class PackedTransferLane:
                 )
             self._poison_and_retain_locked(reason)
 
-    def mark_transport_terminal(
-        self,
-        error: str | None = None,
-        *,
-        completion: PackedSourceVisibilityCompletion | None = None,
-    ) -> PackedWriterOutcome:
-        """Produce an exact outcome after terminal NIXL DONE or ERR.
+    def take_transport_completion(self) -> PackedWriterOutcome | None:
+        """Take exact native or direct-event success authority once.
 
-        :param error: Terminal transport error, or ``None`` for success.
-        :param completion: Receipt produced by the terminal transport executor.
-        :returns: Exact authenticated terminal outcome for decode.
+        The lane calls the completion owner bound at construction. Callers
+        cannot manufacture successful evidence or substitute another handle.
+
+        :returns: Exact successful outcome, or ``None`` while pending.
         """
 
         with self._lock:
@@ -2430,37 +2827,34 @@ class PackedTransferLane:
                 PackedTransferLaneState.POISONED,
             ):
                 raise RuntimeError(
-                    "transport terminality requires in-flight or poisoned ownership"
+                    "transport completion requires in-flight or poisoned ownership"
                 )
-            if self._transport_handle is None:
+            handle = self._transport_handle
+            if handle is None:
                 raise RuntimeError(
-                    "transport terminality requires the exact submitted handle"
+                    "transport completion requires the exact submitted handle"
                 )
             transfer = self._require_active_transfer_locked()
-            status = (
-                PackedWriterOutcomeStatus.DONE
-                if error is None
-                else PackedWriterOutcomeStatus.ERROR
-            )
-            if status is PackedWriterOutcomeStatus.DONE:
-                if type(completion) is not PackedSourceVisibilityCompletion:
-                    raise TypeError(
-                        "successful transport terminality requires a typed "
-                        "source completion"
-                    )
-                if completion.transport_handle is not self._transport_handle:
-                    raise ValueError(
-                        "source completion belongs to another transport handle"
-                    )
-                visibility = completion.evidence
-                self._visibility_policy.validate_evidence(visibility)
-            else:
-                visibility = None
-            if status is PackedWriterOutcomeStatus.ERROR and completion is not None:
-                raise ValueError(
-                    "terminal transport error must not contain a source completion"
+            try:
+                visibility = self._take_visibility_evidence_locked(
+                    transfer,
+                    handle,
                 )
-            outcome = self._outcome_locked(transfer, status, visibility, error)
+            except Exception:
+                reason = "packed transport completion authority failed validation"
+                logger.error("%s:\n%s", reason, traceback.format_exc())
+                if self._state is not PackedTransferLaneState.POISONED:
+                    self._poison_and_retain_locked(reason)
+                raise
+            if visibility is None:
+                return None
+            self._visibility_policy.validate_evidence(visibility)
+            outcome = self._outcome_locked(
+                transfer,
+                PackedWriterOutcomeStatus.DONE,
+                visibility,
+                None,
+            )
             self._active_transfer = None
             self._transport_handle = None
             self._transport_owners = ()
@@ -2469,6 +2863,357 @@ class PackedTransferLane:
             else:
                 self._state = PackedTransferLaneState.POISONED
             return outcome
+
+    def _take_visibility_evidence_locked(
+        self,
+        transfer: PackedSourceTransfer,
+        transport_handle: object,
+    ) -> PackedWriterVisibilityEvidence | None:
+        """Take mechanism-specific completion while lane ownership is locked.
+
+        :param transfer: Exact active canonical transfer.
+        :param transport_handle: Exact armed transport owner.
+        :returns: Successful evidence, or ``None`` while pending.
+        """
+
+        mechanism = self._visibility_policy.completion_mechanism
+        if mechanism is PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED:
+            authority = self._direct_cuda_event_authority
+            if authority is None:
+                raise RuntimeError("direct CUDA-event authority was not retained")
+            receipt = authority.take_recorded_event(transport_handle)
+            if receipt is None:
+                return None
+            return PackedWriterVisibilityEvidence(
+                policy_digest=self._visibility_policy.digest,
+                transport_path=self._visibility_policy.transport_path,
+                lane_identifier=self._visibility_policy.lane_identifier,
+                completion_mechanism=mechanism,
+                writer_action=PackedWriterVisibilityAction.CUDA_EVENT_RECORDED,
+            )
+
+        receipt = self._agent.take_xfer_completion_receipt(transport_handle)
+        if receipt is None:
+            return None
+        return self._validate_native_completion_receipt_locked(
+            transfer,
+            receipt,
+        )
+
+    def _validate_native_completion_receipt_locked(
+        self,
+        transfer: PackedSourceTransfer,
+        receipt: PackedNixlCompletionReceipt,
+    ) -> PackedWriterVisibilityEvidence:
+        """Validate native receipt binding before emitting wire evidence.
+
+        :param transfer: Exact canonical transfer owned by the lane.
+        :param receipt: One-shot receipt taken from the exact owning agent.
+        :returns: Bounded authenticated writer evidence.
+        """
+
+        if (
+            type(receipt.handleIdentity) is not int
+            or receipt.handleIdentity <= 0
+            or receipt.handleIdentity >= _UINT64_LIMIT
+        ):
+            raise ValueError("native receipt has an invalid handle identity")
+        if (
+            type(receipt.generation) is not int
+            or receipt.generation <= 0
+            or receipt.generation >= _UINT64_LIMIT
+        ):
+            raise ValueError("native receipt has an invalid handle generation")
+        if not receipt.submissionSealed or not receipt.completionClaimed:
+            raise ValueError("native receipt did not seal and claim completion")
+        self._require_native_enum_name(
+            receipt.state,
+            "NIXL_XFER_ATTESTATION_REMOTE_FLUSHED",
+            "state",
+        )
+        self._require_native_enum_name(
+            receipt.status,
+            "NIXL_SUCCESS",
+            "status",
+        )
+        self._require_native_enum_name(
+            receipt.operation,
+            "NIXL_WRITE",
+            "operation",
+        )
+        self._require_native_enum_name(
+            receipt.localMemoryType,
+            "VRAM_SEG",
+            "local memory type",
+        )
+        self._require_native_enum_name(
+            receipt.remoteMemoryType,
+            "VRAM_SEG",
+            "remote memory type",
+        )
+        if receipt.backend != "UCX":
+            raise ValueError("native receipt backend is not UCX")
+        if receipt.localAgent != self._agent.name:
+            raise ValueError("native receipt belongs to another local agent")
+        if receipt.remoteAgent != self._destination_route.peer.agent_name:
+            raise ValueError("native receipt belongs to another remote agent")
+        if type(receipt.error) is not str or len(receipt.error) != 0:
+            raise ValueError("successful native receipt contains an error")
+        self._validate_native_segment_locked(transfer, receipt)
+        transport_context = self._validate_native_endpoints(receipt)
+        self._validate_native_data_path(
+            receipt.segments[0].requestInfo,
+            transport_context,
+        )
+        expected_lane = build_nixl_ucx_lane_identifier(transport_context)
+        if self._visibility_policy.lane_identifier != expected_lane:
+            raise ValueError(
+                "native UCX endpoint context differs from the pinned policy lane"
+            )
+        self._validate_native_runtime_artifacts(receipt, transport_context)
+        descriptor_digest = self._decode_native_digest(
+            receipt.descriptorDigest,
+            "descriptor",
+        )
+        evidence_digest = self._decode_native_digest(
+            receipt.evidenceDigest,
+            "evidence",
+        )
+        return PackedWriterVisibilityEvidence(
+            policy_digest=self._visibility_policy.digest,
+            transport_path=self._visibility_policy.transport_path,
+            lane_identifier=self._visibility_policy.lane_identifier,
+            completion_mechanism=self._visibility_policy.completion_mechanism,
+            writer_action=PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL,
+            native_handle_generation=receipt.generation,
+            native_descriptor_digest=descriptor_digest,
+            native_evidence_digest=evidence_digest,
+        )
+
+    def _validate_native_segment_locked(
+        self,
+        transfer: PackedSourceTransfer,
+        receipt: PackedNixlCompletionReceipt,
+    ) -> None:
+        """Validate the exact packed source and READY destination descriptors.
+
+        :param transfer: Exact canonical transfer owned by the lane.
+        :param receipt: Native receipt containing descriptor evidence.
+        """
+
+        if type(receipt.segments) is not tuple or len(receipt.segments) != 1:
+            raise ValueError("packed native receipt must contain one segment")
+        segment = receipt.segments[0]
+        tensor = self._require_tensor_locked()
+        if segment.index != 0:
+            raise ValueError("packed native segment index is not canonical")
+        if segment.localAddress != tensor.data_ptr():
+            raise ValueError("native segment source address differs from lane")
+        if segment.remoteAddress != transfer.destination_address:
+            raise ValueError("native segment destination differs from READY")
+        if segment.length != transfer.length_bytes:
+            raise ValueError("native segment length differs from canonical layout")
+        if segment.localDeviceId != self._gpu_id:
+            raise ValueError("native segment source GPU differs from lane")
+        if segment.remoteDeviceId != self._destination_route.destination_gpu_id:
+            raise ValueError("native segment destination GPU differs from route")
+        if not segment.posted:
+            raise ValueError("native segment was not posted")
+        if type(segment.requestInfo) is not str or len(segment.requestInfo) == 0:
+            raise ValueError("native segment request identity is empty")
+        if (
+            type(segment.workerIdentity) is not int
+            or segment.workerIdentity <= 0
+            or type(segment.endpointIdentity) is not int
+            or segment.endpointIdentity <= 0
+        ):
+            raise ValueError("native segment worker or endpoint identity is invalid")
+
+    @staticmethod
+    def _validate_native_endpoints(
+        receipt: PackedNixlCompletionReceipt,
+    ) -> tuple[tuple[str, str], ...]:
+        """Validate endpoint flush coverage and return canonical lane context.
+
+        :param receipt: Native receipt containing endpoint evidence.
+        :returns: Native transport and device context pairs.
+        """
+
+        if type(receipt.endpoints) is not tuple or len(receipt.endpoints) != 1:
+            raise ValueError("packed native receipt must contain one endpoint")
+        endpoint = receipt.endpoints[0]
+        segment = receipt.segments[0]
+        if endpoint.segmentIndices != (0,):
+            raise ValueError("native endpoint does not own the packed segment")
+        if (
+            endpoint.workerId != segment.workerId
+            or endpoint.workerIdentity != segment.workerIdentity
+            or endpoint.endpointIdentity != segment.endpointIdentity
+        ):
+            raise ValueError("native segment and endpoint identities differ")
+        if not endpoint.flushPosted or not endpoint.remoteFlushed:
+            raise ValueError("native endpoint did not complete remote flush")
+        if type(endpoint.transports) is not tuple or len(endpoint.transports) == 0:
+            raise ValueError("native endpoint transport context is empty")
+        context: list[tuple[str, str]] = []
+        for transport in endpoint.transports:
+            if type(transport.transport) is not str or len(transport.transport) == 0:
+                raise ValueError("native endpoint transport name is empty")
+            if type(transport.device) is not str or len(transport.device) == 0:
+                raise ValueError("native endpoint device name is empty")
+            context.append((transport.transport, transport.device))
+        return tuple(context)
+
+    def _validate_native_data_path(
+        self,
+        request_info: str,
+        endpoint_context: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Bind the selected PUT protocol to the pinned data transport.
+
+        The endpoint transport set is only configuration context. The pinned
+        UCX build's immutable ``ucp_request_query`` string names the resources
+        selected by the actual PUT protocol, which is the transfer-path proof.
+
+        :param request_info: Native selected-protocol description.
+        :param endpoint_context: Complete endpoint transport/device context.
+        """
+
+        expected_transport = self._visibility_policy.native_data_transport
+        expected_device = self._visibility_policy.native_data_device
+        if expected_transport is None or expected_device is None:
+            raise RuntimeError("native data-path policy is incomplete")
+        expected_resource = (expected_transport, expected_device)
+        if expected_resource not in endpoint_context:
+            raise ValueError(
+                "pinned native data resource is absent from endpoint context"
+            )
+        words = tuple(re.findall(r"[A-Za-z0-9_.:-]+", request_info))
+        if "put" not in words or "cuda" not in words or "memory" not in words:
+            raise ValueError("native request is not a CUDA-memory PUT")
+        selected_resources = tuple(
+            re.findall(
+                r"([A-Za-z0-9_.:-]+)/([A-Za-z0-9_.:-]+)",
+                request_info,
+            )
+        )
+        if len(selected_resources) == 0:
+            raise ValueError("native request does not expose selected resources")
+        if expected_resource not in selected_resources:
+            raise ValueError("native request did not select the pinned data transport")
+        selected_transports = {transport for transport, _ in selected_resources}
+        forbidden = selected_transports & _NATIVE_FORBIDDEN_FALLBACK_TRANSPORTS
+        if len(forbidden) > 0:
+            raise ValueError(
+                "native request selected a forbidden fallback transport: "
+                + ", ".join(sorted(forbidden))
+            )
+        if self._visibility_policy.transport_path is PackedTransportPath.CUDA_IPC:
+            if selected_transports != {"cuda_ipc"}:
+                raise ValueError("native CUDA IPC request selected a non-IPC transport")
+            return
+        if not selected_transports.issubset(_NATIVE_NIC_DATA_TRANSPORTS):
+            raise ValueError(
+                "native NIC request selected a non-RDMA hardware transport"
+            )
+
+    def _validate_native_runtime_artifacts(
+        self,
+        receipt: PackedNixlCompletionReceipt,
+        transport_context: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Validate immutable identities of all loaded attestation runtimes.
+
+        :param receipt: Native receipt containing runtime identities.
+        :param transport_context: Complete native endpoint resources.
+        """
+
+        artifacts = receipt.runtimeArtifacts
+        if type(artifacts) is not tuple:
+            raise TypeError("native runtime artifacts must be an immutable tuple")
+        expected_cohort = self._expected_runtime_artifacts
+        if expected_cohort is None:
+            raise RuntimeError("native runtime acceptance policy was not retained")
+        expected_components = derive_nixl_ucx_runtime_artifact_components(
+            tuple(transport for transport, _ in transport_context)
+        )
+        actual_components = tuple(artifact.component for artifact in artifacts)
+        if actual_components != expected_components:
+            raise ValueError(
+                "native receipt runtime artifacts do not match the exact "
+                "canonical route tuple"
+            )
+        for artifact in artifacts:
+            if (
+                type(artifact.component) is not str
+                or len(artifact.component) == 0
+                or type(artifact.path) is not str
+                or len(artifact.path) == 0
+                or type(artifact.buildId) is not str
+                or len(artifact.buildId) == 0
+                or type(artifact.version) is not str
+                or len(artifact.version) == 0
+            ):
+                raise ValueError("native runtime artifact identity is incomplete")
+            if not os.path.isabs(artifact.path):
+                raise ValueError("native runtime artifact path is not absolute")
+            if os.path.realpath(artifact.path) != artifact.path:
+                raise ValueError("native runtime artifact path is not canonical")
+        expected_by_component = {
+            artifact.component: artifact for artifact in expected_cohort.artifacts
+        }
+        for actual in artifacts:
+            expected = expected_by_component.get(actual.component)
+            if expected is None:
+                raise ValueError(
+                    f"native runtime artifact {actual.component} is absent "
+                    "from the route acceptance policy"
+                )
+            expected_path = expected_cohort.resolve_path(expected)
+            if (
+                actual.path != expected_path
+                or actual.buildId != expected.build_id
+                or actual.version != expected.version
+            ):
+                raise ValueError(
+                    f"native runtime artifact {expected.component} differs "
+                    "from the route acceptance policy"
+                )
+
+    @staticmethod
+    def _decode_native_digest(value: str, label: str) -> bytes:
+        """Decode one exact native SHA-256 digest.
+
+        :param value: Native lowercase hexadecimal digest.
+        :param label: Reader-facing digest label.
+        :returns: Exact 32-byte digest.
+        """
+
+        if type(value) is not str or len(value) != 64:
+            raise ValueError(f"native {label} digest is not SHA-256")
+        try:
+            digest = bytes.fromhex(value)
+        except ValueError as error:
+            raise ValueError(f"native {label} digest is not hexadecimal") from error
+        if len(digest) != 32:
+            raise ValueError(f"native {label} digest is not SHA-256")
+        return digest
+
+    @staticmethod
+    def _require_native_enum_name(
+        value: PackedNixlEnumValue,
+        expected: str,
+        label: str,
+    ) -> None:
+        """Validate one exact pybind enum identity by its exported name.
+
+        :param value: Native pybind enum value.
+        :param expected: Required exported enum name.
+        :param label: Reader-facing field label.
+        """
+
+        if type(value.name) is not str or value.name != expected:
+            raise ValueError(f"native receipt {label} is not {expected}")
 
     def close(self) -> None:
         """Terminally close or leak-safely quarantine this registration.
@@ -2557,11 +3302,18 @@ class PackedTransferLane:
             return
         transport_handle = self._transport_handle
         transport_owners = (transport_handle,) if transport_handle is not None else ()
+        direct_authority = self._direct_cuda_event_authority
+        direct_owners = (direct_authority,) if direct_authority is not None else ()
         self._quarantine.retain(
             tensor,
             registration,
             reason,
-            owners=(self._agent, *self._transport_owners, *transport_owners),
+            owners=(
+                self._agent,
+                *direct_owners,
+                *self._transport_owners,
+                *transport_owners,
+            ),
         )
         self._quarantine_retained = True
 
