@@ -553,14 +553,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::core::{
-        BasicWorkerBuilder, KvTransferProtocol, PdMetadataSchema, PreparedGrantProtocol,
-    };
-    use crate::routers::http::pd_decoder_grant::{
+    use crate::core::pd_decoder_grant::{
         issue_test_grant, issue_test_release_receipt, DecoderGrantChildAccounting,
         DecoderSlotGeneration, EngineReleaseKind,
     };
-    use crate::routers::http::pd_decoder_pool::RetryDisposition;
+    use crate::core::pd_decoder_pool::RetryDisposition;
+    use crate::core::{
+        BasicWorkerBuilder, KvTransferProtocol, PdMetadataSchema, PreparedGrantProtocol,
+    };
 
     const MODEL_FINGERPRINT: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

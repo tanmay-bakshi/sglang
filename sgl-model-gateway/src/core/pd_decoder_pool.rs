@@ -1598,11 +1598,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::core::PrefillBootstrapEndpoint;
-    use crate::routers::http::pd_decoder_grant::{
+    use crate::core::pd_decoder_grant::{
         issue_test_grant, issue_test_quarantine_receipt, issue_test_release_receipt,
         DecoderGrantChildAccounting,
     };
+    use crate::core::PrefillBootstrapEndpoint;
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
 
