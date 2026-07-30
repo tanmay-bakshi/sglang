@@ -12,7 +12,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode, PdProcessAdvertisement},
     routers::grpc::client::GrpcClient,
 };
 
@@ -41,6 +41,7 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+    pub pd_process: Option<PdProcessAdvertisement>,
 }
 
 /// Model information returned from /model_info endpoint.
@@ -273,14 +274,17 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
+        let (discovered_labels, detected_runtime, pd_process_advertisement) = match connection_mode
+        {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
+                let mut pd_process_advertisement = None;
 
                 // Fetch from /server_info for server-related metadata
                 if let Ok(server_info) =
                     get_server_info(&config.url, config.api_key.as_deref()).await
                 {
+                    pd_process_advertisement = server_info.pd_process;
                     if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
                         labels.insert("model_path".to_string(), model_path);
                     }
@@ -331,18 +335,18 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     }
                 }
 
-                Ok((labels, None))
+                Ok((labels, None, pd_process_advertisement))
             }
             ConnectionMode::Grpc { .. } => {
                 let runtime_type = config.runtime.as_deref();
                 fetch_grpc_metadata(&config.url, runtime_type)
                     .await
-                    .map(|(labels, runtime)| (labels, Some(runtime)))
+                    .map(|(labels, runtime)| (labels, Some(runtime), None))
             }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            (HashMap::new(), None)
+            (HashMap::new(), None, None)
         });
 
         let url = config.url.clone();
@@ -354,6 +358,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
         // Update workflow data
         context.data.discovered_labels = discovered_labels;
+        context.data.pd_process_advertisement = pd_process_advertisement;
         if let Some(runtime) = detected_runtime {
             debug!("Detected runtime type: {}", runtime);
             context.data.detected_runtime_type = Some(runtime);

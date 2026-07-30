@@ -13,7 +13,8 @@ use crate::{
         model_card::ModelCard,
         steps::workflow_data::LocalWorkerWorkflowData,
         worker::{HealthConfig, RuntimeType, WorkerType},
-        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, PdProcessMetadata, PdProcessRole,
+        Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -97,7 +98,47 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
         );
 
         // Parse worker type
-        let worker_type = parse_worker_type(config);
+        let mut worker_type = parse_worker_type(config);
+        let pd_process = validate_pd_process_contract(
+            &worker_type,
+            connection_mode,
+            config.api_key.as_deref(),
+            context.data.pd_process_advertisement.as_ref(),
+        )
+        .map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+        if let Some(metadata) = &pd_process {
+            if metadata.role() == PdProcessRole::Prefill {
+                worker_type = WorkerType::Prefill {
+                    bootstrap_port: Some(
+                        metadata
+                            .prefill_bootstrap_endpoint()
+                            .expect("validated prefill metadata contains an endpoint")
+                            .port(),
+                    ),
+                };
+            }
+            if config.dp_aware {
+                let discovered_dp_size = context
+                    .data
+                    .dp_info
+                    .as_ref()
+                    .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?
+                    .dp_size;
+                if discovered_dp_size != metadata.data_parallel_size() {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("create_worker"),
+                        message: format!(
+                            "PD process advertised DP{} but worker discovery resolved DP{}",
+                            metadata.data_parallel_size(),
+                            discovered_dp_size
+                        ),
+                    });
+                }
+            }
+        }
 
         // Get runtime type (for gRPC workers)
         let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
@@ -129,8 +170,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 runtime_type,
                 circuit_breaker_config,
                 health_config,
-                config,
+                config.api_key.as_deref(),
                 &final_labels,
+                pd_process.as_ref(),
             )?
         } else {
             create_single_worker(
@@ -141,8 +183,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 runtime_type,
                 circuit_breaker_config,
                 health_config,
-                config,
+                config.api_key.as_deref(),
                 &final_labels,
+                pd_process.as_ref(),
             )
         };
 
@@ -236,6 +279,52 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
+fn validate_pd_process_contract(
+    worker_type: &WorkerType,
+    connection_mode: &ConnectionMode,
+    api_key: Option<&str>,
+    advertisement: Option<&crate::core::PdProcessAdvertisement>,
+) -> Result<Option<PdProcessMetadata>, String> {
+    let configured_role = match worker_type {
+        WorkerType::Prefill { .. } => Some(PdProcessRole::Prefill),
+        WorkerType::Decode => Some(PdProcessRole::Decode),
+        WorkerType::Regular => None,
+    };
+
+    let Some(configured_role) = configured_role else {
+        if advertisement.is_some() {
+            return Err(
+                "worker is configured as regular but advertised a PD process contract".to_string(),
+            );
+        }
+        return Ok(None);
+    };
+    if !matches!(connection_mode, ConnectionMode::Http) {
+        return Err("PD worker registration requires authenticated HTTP discovery".to_string());
+    }
+    if api_key.is_none_or(str::is_empty) {
+        return Err(
+            "PD worker registration requires an API key for authenticated /server_info discovery"
+                .to_string(),
+        );
+    }
+    let advertisement = advertisement.ok_or_else(|| {
+        "PD worker registration requires a valid pd_process advertisement from /server_info"
+            .to_string()
+    })?;
+    let metadata = advertisement
+        .validate()
+        .map_err(|error| format!("invalid PD process advertisement: {error}"))?;
+    if metadata.role() != configured_role {
+        return Err(format!(
+            "worker is configured as {:?} but advertised {:?}",
+            configured_role,
+            metadata.role()
+        ));
+    }
+    Ok(Some(metadata))
+}
+
 fn determine_runtime_type(
     connection_mode: &ConnectionMode,
     data: &LocalWorkerWorkflowData,
@@ -303,8 +392,9 @@ fn create_dp_aware_workers(
     runtime_type: RuntimeType,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
-    config: &WorkerConfigRequest,
+    api_key: Option<&str>,
     final_labels: &HashMap<String, String>,
+    pd_process: Option<&PdProcessMetadata>,
 ) -> Result<Vec<Arc<dyn Worker>>, WorkflowError> {
     let dp_info = data
         .dp_info
@@ -327,11 +417,14 @@ fn create_dp_aware_workers(
                 .circuit_breaker_config(circuit_breaker_config.clone())
                 .health_config(health_config.clone());
 
-        if let Some(ref api_key) = config.api_key {
-            builder = builder.api_key(api_key.clone());
+        if let Some(api_key) = api_key {
+            builder = builder.api_key(api_key.to_string());
         }
         if !final_labels.is_empty() {
             builder = builder.labels(final_labels.clone());
+        }
+        if let Some(metadata) = pd_process {
+            builder = builder.pd_process(metadata.clone());
         }
 
         let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
@@ -360,8 +453,9 @@ fn create_single_worker(
     runtime_type: RuntimeType,
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
-    config: &WorkerConfigRequest,
+    api_key: Option<&str>,
     final_labels: &HashMap<String, String>,
+    pd_process: Option<&PdProcessMetadata>,
 ) -> Vec<Arc<dyn Worker>> {
     let health_check_disabled = health_config.disable_health_check;
 
@@ -373,11 +467,14 @@ fn create_single_worker(
         .circuit_breaker_config(circuit_breaker_config)
         .health_config(health_config);
 
-    if let Some(ref api_key) = config.api_key {
-        builder = builder.api_key(api_key.clone());
+    if let Some(api_key) = api_key {
+        builder = builder.api_key(api_key.to_string());
     }
     if !final_labels.is_empty() {
         builder = builder.labels(final_labels.clone());
+    }
+    if let Some(metadata) = pd_process {
+        builder = builder.pd_process(metadata.clone());
     }
 
     let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
@@ -395,4 +492,134 @@ fn create_single_worker(
     );
 
     vec![worker]
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::core::{
+        KvTransferProtocol, PdMetadataSchema, PdProcessAdvertisement,
+        PrefillBootstrapAdvertisement, PreparedGrantProtocol,
+    };
+
+    const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn advertisement(role: &str) -> PdProcessAdvertisement {
+        PdProcessAdvertisement {
+            schema: "v1".to_string(),
+            launch_instance_id: Uuid::new_v4().to_string(),
+            role: role.to_string(),
+            tensor_parallel_size: if role == "prefill" { 4 } else { 1 },
+            data_parallel_size: 1,
+            model_fingerprint: DIGEST_A.to_string(),
+            logical_kv_layout_fingerprint: DIGEST_B.to_string(),
+            kv_dtype: "bf16".to_string(),
+            page_size: 64,
+            kv_transfer_protocol: KvTransferProtocol::PackedV4.as_str().to_string(),
+            prepared_grant_protocol: PreparedGrantProtocol::V1.as_str().to_string(),
+            prefill_bootstrap_endpoint: (role == "prefill").then(|| {
+                PrefillBootstrapAdvertisement {
+                    host: "10.20.30.40".to_string(),
+                    port: 8998,
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn pd_contract_fails_closed_without_authenticated_http_discovery() {
+        let worker_type = WorkerType::Decode;
+        let decode = advertisement("decode");
+
+        assert!(validate_pd_process_contract(
+            &worker_type,
+            &ConnectionMode::Http,
+            Some("secret"),
+            None
+        )
+        .is_err());
+        assert!(validate_pd_process_contract(
+            &worker_type,
+            &ConnectionMode::Http,
+            None,
+            Some(&decode)
+        )
+        .is_err());
+        assert!(validate_pd_process_contract(
+            &worker_type,
+            &ConnectionMode::Grpc { port: Some(50051) },
+            Some("secret"),
+            Some(&decode)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pd_contract_rejects_configured_role_mismatch() {
+        let decode = advertisement("decode");
+
+        assert!(validate_pd_process_contract(
+            &WorkerType::Prefill {
+                bootstrap_port: None
+            },
+            &ConnectionMode::Http,
+            Some("secret"),
+            Some(&decode)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn regular_worker_rejects_pd_advertisement() {
+        let decode = advertisement("decode");
+
+        assert!(validate_pd_process_contract(
+            &WorkerType::Regular,
+            &ConnectionMode::Http,
+            None,
+            Some(&decode)
+        )
+        .is_err());
+        assert_eq!(
+            validate_pd_process_contract(&WorkerType::Regular, &ConnectionMode::Http, None, None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_metadata_reaches_built_worker() {
+        let metadata = PdProcessMetadata::new(
+            PdMetadataSchema::V1,
+            Uuid::new_v4(),
+            PdProcessRole::Decode,
+            1,
+            1,
+            DIGEST_A,
+            DIGEST_B,
+            "bf16",
+            64,
+            KvTransferProtocol::PackedV4,
+            PreparedGrantProtocol::V1,
+            None,
+        )
+        .unwrap();
+        let workers = create_single_worker(
+            "http://decode.test:30000",
+            ModelCard::new("test-model"),
+            WorkerType::Decode,
+            &ConnectionMode::Http,
+            RuntimeType::Sglang,
+            CircuitBreakerConfig::default(),
+            HealthConfig::default(),
+            None,
+            &HashMap::new(),
+            Some(&metadata),
+        );
+
+        assert_eq!(workers[0].metadata().pd_process.as_ref(), Some(&metadata));
+    }
 }

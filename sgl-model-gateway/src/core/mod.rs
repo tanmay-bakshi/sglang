@@ -18,6 +18,10 @@ pub mod job_queue;
 pub mod metrics_aggregator;
 pub mod model_card;
 pub mod model_type;
+pub mod pd_decoder_directory;
+pub mod pd_decoder_grant;
+pub mod pd_decoder_pool;
+pub mod pd_process;
 pub mod retry;
 pub mod steps;
 pub mod token_bucket;
@@ -32,6 +36,11 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
+pub use pd_process::{
+    KvTransferProtocol, PdMetadataSchema, PdProcessAdvertisement, PdProcessAdvertisementError,
+    PdProcessMetadata, PdProcessMetadataError, PdProcessRole, PrefillBootstrapAdvertisement,
+    PrefillBootstrapEndpoint, PreparedGrantProtocol,
+};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
@@ -39,5 +48,7 @@ pub use worker::{
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};
-pub use worker_registry::{HashRing, WorkerRegistry};
+pub use worker_registry::{
+    HashRing, PdRetirementBlock, WorkerRegistry, WorkerRegistryError, WorkerRemovalOutcome,
+};
 pub use worker_service::WorkerService;

@@ -4,6 +4,7 @@ use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     model_card::ModelCard,
     model_type::ModelType,
+    pd_process::PdProcessMetadata,
     worker::{
         parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
         RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
@@ -23,6 +24,7 @@ pub struct BasicWorkerBuilder {
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
+    pd_process: Option<PdProcessMetadata>,
 }
 
 impl BasicWorkerBuilder {
@@ -39,6 +41,7 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            pd_process: None,
         }
     }
 
@@ -55,6 +58,7 @@ impl BasicWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            pd_process: None,
         }
     }
 
@@ -112,6 +116,11 @@ impl BasicWorkerBuilder {
         self
     }
 
+    pub fn pd_process(mut self, metadata: PdProcessMetadata) -> Self {
+        self.pd_process = Some(metadata);
+        self
+    }
+
     /// Set models this worker can serve
     pub fn models(mut self, models: Vec<ModelCard>) -> Self {
         self.models = models;
@@ -150,6 +159,7 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
+            pd_process: self.pd_process,
             models: self.models,                // Empty = accepts any model
             default_provider: None,             // Native/passthrough
             default_model_type: ModelType::LLM, // Standard LLM capabilities
@@ -201,6 +211,7 @@ pub struct DPAwareWorkerBuilder {
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
+    pd_process: Option<PdProcessMetadata>,
 }
 
 impl DPAwareWorkerBuilder {
@@ -219,6 +230,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            pd_process: None,
         }
     }
 
@@ -242,6 +254,7 @@ impl DPAwareWorkerBuilder {
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
+            pd_process: None,
         }
     }
 
@@ -299,6 +312,11 @@ impl DPAwareWorkerBuilder {
         self
     }
 
+    pub fn pd_process(mut self, metadata: PdProcessMetadata) -> Self {
+        self.pd_process = Some(metadata);
+        self
+    }
+
     /// Set models this worker can serve
     pub fn models(mut self, models: Vec<ModelCard>) -> Self {
         self.models = models;
@@ -328,6 +346,9 @@ impl DPAwareWorkerBuilder {
         }
         if let Some(api_key) = self.api_key {
             builder = builder.api_key(api_key);
+        }
+        if let Some(metadata) = self.pd_process {
+            builder = builder.pd_process(metadata);
         }
 
         let base_worker = builder.build();

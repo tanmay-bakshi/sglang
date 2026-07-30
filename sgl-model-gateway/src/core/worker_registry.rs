@@ -14,14 +14,19 @@
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use smg_mesh::OptionalMeshSyncManager;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     core::{
         circuit_breaker::CircuitState,
+        pd_decoder_directory::{PdDirectoryError, PdProcessDirectory},
+        pd_decoder_grant::{DecoderId, PrefillId},
+        pd_decoder_pool::DecoderPoolError,
         worker::{HealthChecker, RuntimeType, WorkerType},
-        ConnectionMode, Worker,
+        ConnectionMode, PdProcessRole, Worker,
     },
     observability::metrics::Metrics,
 };
@@ -175,6 +180,40 @@ impl Default for WorkerId {
 /// Updates create new snapshots (copy-on-write semantics).
 type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
 
+#[derive(Debug)]
+pub enum WorkerRemovalOutcome {
+    NotFound,
+    Removed(Arc<dyn Worker>),
+    Draining {
+        worker: Arc<dyn Worker>,
+        block: PdRetirementBlock,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PdRetirementBlock {
+    PrefillPoolInUse {
+        request_chains: usize,
+        assignments: usize,
+        active_rooms: usize,
+        quarantined_cohorts: usize,
+    },
+    DecoderInUse {
+        decoder_id: String,
+        active_cohorts: usize,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum WorkerRegistryError {
+    #[error("invalid PD lifecycle transition for {worker_url}: {reason}")]
+    InvalidPdLifecycleTransition { worker_url: String, reason: String },
+    #[error("PD lifecycle operation failed for {worker_url}: {reason}")]
+    PdLifecycle { worker_url: String, reason: String },
+    #[error("PD retirement failed after {worker_url} was drained and unpublished: {reason}")]
+    PdRetirementFailedAfterDrain { worker_url: String, reason: String },
+}
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -197,6 +236,13 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Generation-aware authority for every PD process lifecycle.
+    pd_process_directory: Arc<PdProcessDirectory>,
+
+    /// Serializes directory transitions with generic index publication.
+    lifecycle: Arc<Mutex<()>>,
+
     /// Optional mesh sync manager for state synchronization
     /// When None, the registry works independently without mesh synchronization
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
@@ -213,6 +259,8 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            pd_process_directory: Arc::new(PdProcessDirectory::default()),
+            lifecycle: Arc::new(Mutex::new(())),
             mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
@@ -238,17 +286,55 @@ impl WorkerRegistry {
         *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
-    /// Register a new worker
-    pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
+    fn remove_from_indexes(&self, worker_id: &WorkerId, worker: &Arc<dyn Worker>) {
+        let model_id = worker.model_id().to_string();
+        if let Some(mut entry) = self.model_index.get_mut(&model_id) {
+            let workers: Vec<Arc<dyn Worker>> = entry
+                .iter()
+                .filter(|indexed| indexed.url() != worker.url())
+                .cloned()
+                .collect();
+            *entry = Arc::from(workers.into_boxed_slice());
+        }
+        self.rebuild_hash_ring(&model_id);
+
+        if let Some(mut workers) = self.type_workers.get_mut(worker.worker_type()) {
+            workers.retain(|id| id != worker_id);
+        }
+        if let Some(mut workers) = self.connection_workers.get_mut(worker.connection_mode()) {
+            workers.retain(|id| id != worker_id);
+        }
+    }
+
+    /// Register a new worker.
+    pub fn register(&self, worker: Arc<dyn Worker>) -> Result<WorkerId, WorkerRegistryError> {
+        let _lifecycle = self.lifecycle.lock();
+        self.retire_drained_locked()?;
+
         let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
-            // Worker with this URL already exists, update it
             existing_id.clone()
         } else {
             WorkerId::new()
         };
+        let previous = self.workers.get(&worker_id).map(|entry| entry.clone());
+        if let Err(error) = self.prepare_pd_registration(&worker, previous.as_ref()) {
+            if let Some(previous) = previous {
+                Metrics::set_worker_health(previous.url(), previous.is_healthy());
+            } else {
+                Metrics::remove_worker_metrics(worker.url());
+            }
+            return Err(error);
+        }
+        self.publish_worker(worker_id.clone(), worker);
+        Ok(worker_id)
+    }
 
-        // Store worker
-        self.workers.insert(worker_id.clone(), worker.clone());
+    fn publish_worker(&self, worker_id: WorkerId, worker: Arc<dyn Worker>) {
+        if let Some(previous) = self.workers.get(&worker_id).map(|entry| entry.clone()) {
+            self.remove_from_indexes(&worker_id, &previous);
+        }
+        self.workers.insert(worker_id.clone(), Arc::clone(&worker));
+        Metrics::set_worker_health(worker.url(), worker.is_healthy());
 
         // Update URL mapping
         self.url_to_id
@@ -292,8 +378,64 @@ impl WorkerRegistry {
                 0.0, // TODO: Get actual load
             );
         }
+    }
 
-        worker_id
+    fn prepare_pd_registration(
+        &self,
+        worker: &Arc<dyn Worker>,
+        previous: Option<&Arc<dyn Worker>>,
+    ) -> Result<(), WorkerRegistryError> {
+        let role = pd_worker_role(worker);
+        let previous_metadata = previous.and_then(|current| current.metadata().pd_process.as_ref());
+        let metadata = worker.metadata().pd_process.as_ref();
+
+        if previous_metadata.is_some() && role.is_none() {
+            return Err(WorkerRegistryError::InvalidPdLifecycleTransition {
+                worker_url: worker.url().to_string(),
+                reason: "a PD process cannot become a regular worker without retirement"
+                    .to_string(),
+            });
+        }
+        if let (Some(previous_metadata), Some(metadata)) = (previous_metadata, metadata) {
+            if previous_metadata.launch_instance_id() == metadata.launch_instance_id()
+                && previous_metadata.role() != metadata.role()
+            {
+                return Err(WorkerRegistryError::InvalidPdLifecycleTransition {
+                    worker_url: worker.url().to_string(),
+                    reason: "one launch generation cannot change PD roles".to_string(),
+                });
+            }
+        }
+
+        let same_generation = previous_metadata
+            .zip(metadata)
+            .is_some_and(|(current, incoming)| {
+                current.role() == incoming.role()
+                    && current.launch_instance_id() == incoming.launch_instance_id()
+            });
+        let result = match (role, same_generation) {
+            (Some(PdProcessRole::Prefill), true) => self
+                .pd_process_directory
+                .refresh_prefill(Arc::clone(worker))
+                .map(|_| ()),
+            (Some(PdProcessRole::Prefill), false) => self
+                .pd_process_directory
+                .admit_prefill(Arc::clone(worker))
+                .map(|_| ()),
+            (Some(PdProcessRole::Decode), true) => self
+                .pd_process_directory
+                .refresh_decoder(Arc::clone(worker))
+                .map(|_| ()),
+            (Some(PdProcessRole::Decode), false) => self
+                .pd_process_directory
+                .admit_decoder(Arc::clone(worker))
+                .map(|_| ()),
+            (None, _) => return Ok(()),
+        };
+        result.map_err(|error| WorkerRegistryError::PdLifecycle {
+            worker_url: worker.url().to_string(),
+            reason: error.to_string(),
+        })
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
@@ -312,60 +454,123 @@ impl WorkerRegistry {
             .find_map(|entry| (entry.value() == worker_id).then(|| entry.key().clone()))
     }
 
-    /// Remove a worker by ID
-    pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
-        if let Some((_, worker)) = self.workers.remove(worker_id) {
-            // Remove from URL mapping
-            self.url_to_id.remove(worker.url());
+    /// Remove a worker by ID.
+    pub fn remove(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<WorkerRemovalOutcome, WorkerRegistryError> {
+        let _lifecycle = self.lifecycle.lock();
+        self.retire_drained_locked()?;
+        let Some(worker) = self.workers.get(worker_id).map(|entry| entry.clone()) else {
+            return Ok(WorkerRemovalOutcome::NotFound);
+        };
+        let Some(role) = pd_worker_role(&worker) else {
+            self.remove_from_indexes(worker_id, &worker);
+            self.finalize_worker_removal(worker_id, &worker);
+            return Ok(WorkerRemovalOutcome::Removed(worker));
+        };
 
-            // Remove from model index using copy-on-write
-            // Create new snapshot without the removed worker
-            let worker_url = worker.url();
-            let model_id = worker.model_id().to_string();
-            if let Some(mut entry) = self.model_index.get_mut(&model_id) {
-                let new_workers: Vec<Arc<dyn Worker>> = entry
-                    .iter()
-                    .filter(|w| w.url() != worker_url)
-                    .cloned()
-                    .collect();
-                *entry = Arc::from(new_workers.into_boxed_slice());
+        let drain_result = match role {
+            PdProcessRole::Prefill => {
+                let id = prefill_id(&worker)?;
+                self.pd_process_directory
+                    .drain_prefill(&id)
+                    .map_err(|error| WorkerRegistryError::PdLifecycle {
+                        worker_url: worker.url().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                self.remove_from_indexes(worker_id, &worker);
+                self.finalize_worker_removal(worker_id, &worker);
+                self.pd_process_directory
+                    .remove_drained_prefill(&id)
+                    .map(|entry| Arc::clone(entry.worker()))
             }
-
-            // Rebuild hash ring for this model
-            self.rebuild_hash_ring(&model_id);
-
-            // Remove from type index
-            if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
-                type_workers.retain(|id| id != worker_id);
+            PdProcessRole::Decode => {
+                let id = decoder_id(&worker)?;
+                self.pd_process_directory
+                    .drain_decoder(&id)
+                    .map_err(|error| WorkerRegistryError::PdLifecycle {
+                        worker_url: worker.url().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                self.remove_from_indexes(worker_id, &worker);
+                self.finalize_worker_removal(worker_id, &worker);
+                self.pd_process_directory
+                    .remove_drained_decoder(&id)
+                    .map(|entry| Arc::clone(entry.worker()))
             }
-
-            // Remove from connection mode index
-            if let Some(mut conn_workers) =
-                self.connection_workers.get_mut(worker.connection_mode())
-            {
-                conn_workers.retain(|id| id != worker_id);
+        };
+        match drain_result {
+            Ok(retired) => Ok(WorkerRemovalOutcome::Removed(retired)),
+            Err(error) if retirement_block(&error).is_some() => {
+                Ok(WorkerRemovalOutcome::Draining {
+                    worker,
+                    block: retirement_block(&error)
+                        .expect("retirement block was classified in the match guard"),
+                })
             }
-
-            worker.set_healthy(false);
-            Metrics::remove_worker_metrics(worker.url());
-
-            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
-                mesh_sync.remove_worker_state(worker_id.as_str());
-            }
-
-            Some(worker)
-        } else {
-            None
+            Err(error) => Err(WorkerRegistryError::PdRetirementFailedAfterDrain {
+                worker_url: worker.url().to_string(),
+                reason: error.to_string(),
+            }),
         }
     }
 
-    /// Remove a worker by URL
-    pub fn remove_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        if let Some((_, worker_id)) = self.url_to_id.remove(url) {
-            self.remove(&worker_id)
-        } else {
-            None
+    /// Remove a worker by URL.
+    pub fn remove_by_url(&self, url: &str) -> Result<WorkerRemovalOutcome, WorkerRegistryError> {
+        let Some(worker_id) = self.url_to_id.get(url).map(|entry| entry.clone()) else {
+            return Ok(WorkerRemovalOutcome::NotFound);
+        };
+        self.remove(&worker_id)
+    }
+
+    pub fn retire_drained_pd_processes(&self) -> Result<usize, WorkerRegistryError> {
+        let _lifecycle = self.lifecycle.lock();
+        self.retire_drained_locked()
+    }
+
+    pub fn pd_process_directory(&self) -> &Arc<PdProcessDirectory> {
+        &self.pd_process_directory
+    }
+
+    fn retire_drained_locked(&self) -> Result<usize, WorkerRegistryError> {
+        let sweep = self.pd_process_directory.retire_drained();
+        let retired_count = sweep.retired.len();
+        if !sweep.failures.is_empty() {
+            let failure_count = sweep.failures.len();
+            let reasons = sweep
+                .failures
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<String>>()
+                .join("; ");
+            return Err(WorkerRegistryError::PdLifecycle {
+                worker_url: "<drained-generation-sweep>".to_string(),
+                reason: format!(
+                    "{failure_count} generation(s) failed retirement: {reasons}; \
+                     {retired_count} other generation(s) retired successfully"
+                ),
+            });
+        }
+        Ok(retired_count)
+    }
+
+    fn finalize_worker_removal(&self, worker_id: &WorkerId, worker: &Arc<dyn Worker>) {
+        let is_current = self
+            .workers
+            .get(worker_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, worker));
+        if !is_current {
+            return;
+        }
+        self.workers.remove(worker_id);
+        if self.url_to_id.get(worker.url()).as_deref() == Some(worker_id) {
+            self.url_to_id.remove(worker.url());
+        }
+        worker.set_healthy(false);
+        Metrics::remove_worker_metrics(worker.url());
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+            mesh_sync.remove_worker_state(worker_id.as_str());
         }
     }
 
@@ -652,6 +857,8 @@ impl WorkerRegistry {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
+        let pd_process_directory = Arc::clone(&self.pd_process_directory);
+        let lifecycle = Arc::clone(&self.lifecycle);
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -664,6 +871,20 @@ impl WorkerRegistry {
                 if shutdown_clone.load(Ordering::Acquire) {
                     tracing::debug!("Registry health checker shutting down");
                     break;
+                }
+
+                let sweep = {
+                    let _lifecycle = lifecycle.lock();
+                    pd_process_directory.retire_drained()
+                };
+                if !sweep.retired.is_empty() {
+                    tracing::debug!(
+                        "Retired {} drained PD process generation(s)",
+                        sweep.retired.len()
+                    );
+                }
+                for error in sweep.failures {
+                    tracing::error!("Failed to retire a drained PD process generation: {error}");
                 }
 
                 // Get all workers from registry
@@ -689,6 +910,72 @@ impl WorkerRegistry {
         });
 
         HealthChecker::new(handle, shutdown)
+    }
+}
+
+fn pd_worker_role(worker: &Arc<dyn Worker>) -> Option<PdProcessRole> {
+    match worker.worker_type() {
+        WorkerType::Prefill { .. } => Some(PdProcessRole::Prefill),
+        WorkerType::Decode => Some(PdProcessRole::Decode),
+        WorkerType::Regular => worker
+            .metadata()
+            .pd_process
+            .as_ref()
+            .map(|metadata| metadata.role()),
+    }
+}
+
+fn prefill_id(worker: &Arc<dyn Worker>) -> Result<PrefillId, WorkerRegistryError> {
+    let metadata = worker.metadata().pd_process.as_ref().ok_or_else(|| {
+        WorkerRegistryError::InvalidPdLifecycleTransition {
+            worker_url: worker.url().to_string(),
+            reason: "prefill worker is missing typed process metadata".to_string(),
+        }
+    })?;
+    PrefillId::new(worker.base_url(), metadata.launch_instance_id()).map_err(|error| {
+        WorkerRegistryError::InvalidPdLifecycleTransition {
+            worker_url: worker.url().to_string(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn decoder_id(worker: &Arc<dyn Worker>) -> Result<DecoderId, WorkerRegistryError> {
+    let metadata = worker.metadata().pd_process.as_ref().ok_or_else(|| {
+        WorkerRegistryError::InvalidPdLifecycleTransition {
+            worker_url: worker.url().to_string(),
+            reason: "decoder worker is missing typed process metadata".to_string(),
+        }
+    })?;
+    DecoderId::new(worker.base_url(), metadata.launch_instance_id()).map_err(|error| {
+        WorkerRegistryError::InvalidPdLifecycleTransition {
+            worker_url: worker.url().to_string(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn retirement_block(error: &PdDirectoryError) -> Option<PdRetirementBlock> {
+    match error {
+        PdDirectoryError::Pool(DecoderPoolError::PrefillPoolInUse {
+            request_chains,
+            assignments,
+            active_rooms,
+            quarantined_cohorts,
+        }) => Some(PdRetirementBlock::PrefillPoolInUse {
+            request_chains: *request_chains,
+            assignments: *assignments,
+            active_rooms: *active_rooms,
+            quarantined_cohorts: *quarantined_cohorts,
+        }),
+        PdDirectoryError::Pool(DecoderPoolError::DecoderInUse {
+            decoder_id,
+            active_cohorts,
+        }) => Some(PdRetirementBlock::DecoderInUse {
+            decoder_id: decoder_id.to_string(),
+            active_cohorts: *active_cohorts,
+        }),
+        _ => None,
     }
 }
 
@@ -729,10 +1016,70 @@ pub struct WorkerRegistryStats {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use uuid::Uuid;
 
     use super::*;
-    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::core::{
+        circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, KvTransferProtocol,
+        PdMetadataSchema, PdProcessMetadata, PrefillBootstrapEndpoint, PreparedGrantProtocol,
+    };
+
+    const MODEL_FINGERPRINT: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KV_LAYOUT_FINGERPRINT: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn pd_metadata(
+        role: PdProcessRole,
+        tp_size: usize,
+        launch_instance_id: Uuid,
+    ) -> PdProcessMetadata {
+        PdProcessMetadata::new(
+            PdMetadataSchema::V1,
+            launch_instance_id,
+            role,
+            tp_size,
+            1,
+            MODEL_FINGERPRINT,
+            KV_LAYOUT_FINGERPRINT,
+            "bf16",
+            64,
+            KvTransferProtocol::PackedV4,
+            PreparedGrantProtocol::V1,
+            match role {
+                PdProcessRole::Prefill => {
+                    Some(PrefillBootstrapEndpoint::new("prefill-transfer.test", 50_051).unwrap())
+                }
+                PdProcessRole::Decode => None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn pd_worker(
+        url: &str,
+        role: PdProcessRole,
+        tp_size: usize,
+        launch_instance_id: Uuid,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(match role {
+                    PdProcessRole::Prefill => WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    PdProcessRole::Decode => WorkerType::Decode,
+                })
+                .pd_process(pd_metadata(role, tp_size, launch_instance_id))
+                .build(),
+        )
+    }
 
     #[test]
     fn test_worker_registry() {
@@ -754,7 +1101,7 @@ mod tests {
         );
 
         // Register worker
-        let worker_id = registry.register(Arc::from(worker));
+        let worker_id = registry.register(Arc::from(worker)).unwrap();
 
         assert!(registry.get(&worker_id).is_some());
         assert!(registry.get_by_url("http://worker1:8080").is_some());
@@ -767,7 +1114,10 @@ mod tests {
         assert_eq!(stats.total_models, 1);
 
         // Remove worker
-        registry.remove(&worker_id);
+        assert!(matches!(
+            registry.remove(&worker_id).unwrap(),
+            WorkerRemovalOutcome::Removed(_)
+        ));
         assert!(registry.get(&worker_id).is_none());
     }
 
@@ -810,9 +1160,9 @@ mod tests {
         );
 
         // Register workers
-        registry.register(Arc::from(worker1));
-        registry.register(Arc::from(worker2));
-        registry.register(Arc::from(worker3));
+        registry.register(Arc::from(worker1)).unwrap();
+        registry.register(Arc::from(worker2)).unwrap();
+        registry.register(Arc::from(worker3)).unwrap();
 
         let llama_workers = registry.get_by_model("llama-3");
         assert_eq!(llama_workers.len(), 2);
@@ -827,9 +1177,387 @@ mod tests {
         let unknown_workers = registry.get_by_model("unknown-model");
         assert_eq!(unknown_workers.len(), 0);
 
-        registry.remove_by_url("http://worker1:8080");
+        registry.remove_by_url("http://worker1:8080").unwrap();
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn same_url_registration_replaces_every_selectable_index() {
+        let registry = WorkerRegistry::new();
+        let original: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker.test:8080")
+                .worker_type(WorkerType::Regular)
+                .label("model_id", "old-model")
+                .build(),
+        );
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker.test:8080")
+                .worker_type(WorkerType::Regular)
+                .label("model_id", "new-model")
+                .build(),
+        );
+
+        let original_id = registry.register(Arc::clone(&original)).unwrap();
+        let replacement_id = registry.register(Arc::clone(&replacement)).unwrap();
+
+        assert_eq!(original_id, replacement_id);
+        assert!(Arc::ptr_eq(
+            &registry.get(&replacement_id).unwrap(),
+            &replacement
+        ));
+        assert!(registry.get_by_model("old-model").is_empty());
+        let model_workers = registry.get_by_model("new-model");
+        assert_eq!(model_workers.len(), 1);
+        assert!(Arc::ptr_eq(&model_workers[0], &replacement));
+        let regular_workers = registry.get_by_type(&WorkerType::Regular);
+        assert_eq!(regular_workers.len(), 1);
+        assert!(Arc::ptr_eq(&regular_workers[0], &replacement));
+        assert_eq!(registry.get_by_connection(&ConnectionMode::Http).len(), 1);
+    }
+
+    #[test]
+    fn pd_startup_registration_seeds_both_orders_and_arbitrary_decoder_counts() {
+        for prefill_first in [false, true] {
+            for prefill_tp in [2, 4] {
+                let registry = WorkerRegistry::new();
+                let prefill = pd_worker(
+                    "http://prefill.test:30000",
+                    PdProcessRole::Prefill,
+                    prefill_tp,
+                    Uuid::from_u128(1),
+                );
+                if prefill_first {
+                    registry.register(Arc::clone(&prefill)).unwrap();
+                }
+                for index in 0..3 {
+                    registry
+                        .register(pd_worker(
+                            &format!("http://decode-{index}.test:30001"),
+                            PdProcessRole::Decode,
+                            1,
+                            Uuid::from_u128(10 + index),
+                        ))
+                        .unwrap();
+                }
+                if !prefill_first {
+                    registry.register(prefill).unwrap();
+                }
+
+                let ready = registry.pd_process_directory().ready_prefills();
+                assert_eq!(ready.len(), 1);
+                assert_eq!(ready[0].pool().snapshot().replicas.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn new_prefill_generation_publishes_after_old_generation_stops_admission() {
+        let registry = WorkerRegistry::new();
+        let old_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let worker_id = registry.register(Arc::clone(&old_worker)).unwrap();
+        let old_id = PrefillId::new(old_worker.base_url(), Uuid::from_u128(1)).unwrap();
+        let (old_entry, mut owner) = registry
+            .pd_process_directory()
+            .begin_prefill_request(&old_id, "owned-old-generation")
+            .unwrap();
+
+        let new_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            4,
+            Uuid::from_u128(2),
+        );
+        let replacement_id = registry.register(Arc::clone(&new_worker)).unwrap();
+        let new_id = PrefillId::new(new_worker.base_url(), Uuid::from_u128(2)).unwrap();
+
+        assert_eq!(worker_id, replacement_id);
+        assert!(Arc::ptr_eq(&registry.get(&worker_id).unwrap(), &new_worker));
+        assert!(Arc::ptr_eq(
+            registry
+                .pd_process_directory()
+                .prefill(&old_id)
+                .unwrap()
+                .worker(),
+            &old_worker
+        ));
+        assert_eq!(
+            registry
+                .pd_process_directory()
+                .prefill_availability(&old_id),
+            Some(crate::core::pd_decoder_directory::ProcessAvailability::Draining)
+        );
+        assert!(registry
+            .pd_process_directory()
+            .begin_prefill_request(&old_id, "too-late")
+            .is_err());
+        assert!(Arc::ptr_eq(
+            registry
+                .pd_process_directory()
+                .prefill(&new_id)
+                .unwrap()
+                .worker(),
+            &new_worker
+        ));
+        assert_eq!(registry.retire_drained_pd_processes().unwrap(), 0);
+
+        old_entry.pool().finalize_request(&mut owner).unwrap();
+        assert_eq!(registry.retire_drained_pd_processes().unwrap(), 1);
+        assert!(registry.pd_process_directory().prefill(&old_id).is_none());
+        assert!(Arc::ptr_eq(&registry.get(&worker_id).unwrap(), &new_worker));
+    }
+
+    #[test]
+    fn failed_new_generation_never_replaces_generic_selection() {
+        let registry = WorkerRegistry::new();
+        let old_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let worker_id = registry.register(Arc::clone(&old_worker)).unwrap();
+        let invalid_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            3,
+            Uuid::from_u128(2),
+        );
+
+        assert!(registry.register(invalid_worker).is_err());
+        assert!(Arc::ptr_eq(&registry.get(&worker_id).unwrap(), &old_worker));
+        let ready = registry.pd_process_directory().ready_prefills();
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(ready[0].worker(), &old_worker));
+    }
+
+    #[test]
+    fn new_launch_can_repurpose_a_url_but_one_generation_cannot_change_roles() {
+        let registry = WorkerRegistry::new();
+        let prefill = pd_worker(
+            "http://process.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let worker_id = registry.register(Arc::clone(&prefill)).unwrap();
+        let prefill_id = PrefillId::new(prefill.base_url(), Uuid::from_u128(1)).unwrap();
+        let same_generation_decode = pd_worker(
+            "http://process.test:30000",
+            PdProcessRole::Decode,
+            1,
+            Uuid::from_u128(1),
+        );
+
+        assert!(matches!(
+            registry.register(same_generation_decode),
+            Err(WorkerRegistryError::InvalidPdLifecycleTransition { .. })
+        ));
+        assert!(Arc::ptr_eq(&registry.get(&worker_id).unwrap(), &prefill));
+
+        let new_generation_decode = pd_worker(
+            "http://process.test:30000",
+            PdProcessRole::Decode,
+            1,
+            Uuid::from_u128(2),
+        );
+        let replacement_id = registry
+            .register(Arc::clone(&new_generation_decode))
+            .unwrap();
+        let decoder_id =
+            DecoderId::new(new_generation_decode.base_url(), Uuid::from_u128(2)).unwrap();
+
+        assert_eq!(worker_id, replacement_id);
+        assert!(Arc::ptr_eq(
+            &registry.get(&worker_id).unwrap(),
+            &new_generation_decode
+        ));
+        assert_eq!(
+            registry
+                .pd_process_directory()
+                .prefill_availability(&prefill_id),
+            Some(crate::core::pd_decoder_directory::ProcessAvailability::Draining)
+        );
+        assert!(Arc::ptr_eq(
+            registry
+                .pd_process_directory()
+                .decoder(&decoder_id)
+                .unwrap()
+                .worker(),
+            &new_generation_decode
+        ));
+    }
+
+    #[test]
+    fn removal_unpublishes_before_owned_generation_retires_and_allows_restart() {
+        let registry = WorkerRegistry::new();
+        let old_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let old_worker_id = registry.register(Arc::clone(&old_worker)).unwrap();
+        let old_id = PrefillId::new(old_worker.base_url(), Uuid::from_u128(1)).unwrap();
+        let (old_entry, mut owner) = registry
+            .pd_process_directory()
+            .begin_prefill_request(&old_id, "owned-removal")
+            .unwrap();
+
+        let outcome = registry.remove(&old_worker_id).unwrap();
+        assert!(matches!(
+            outcome,
+            WorkerRemovalOutcome::Draining {
+                block: PdRetirementBlock::PrefillPoolInUse { .. },
+                ..
+            }
+        ));
+        assert!(registry.get(&old_worker_id).is_none());
+        assert!(registry.get_by_url(old_worker.url()).is_none());
+        assert!(registry.get_by_model(old_worker.model_id()).is_empty());
+
+        let new_worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            4,
+            Uuid::from_u128(2),
+        );
+        let new_worker_id = registry.register(Arc::clone(&new_worker)).unwrap();
+        assert_ne!(old_worker_id, new_worker_id);
+        assert!(Arc::ptr_eq(
+            &registry.get(&new_worker_id).unwrap(),
+            &new_worker
+        ));
+
+        old_entry.pool().finalize_request(&mut owner).unwrap();
+        assert_eq!(registry.retire_drained_pd_processes().unwrap(), 1);
+        assert!(registry.pd_process_directory().prefill(&old_id).is_none());
+        assert!(Arc::ptr_eq(
+            &registry.get(&new_worker_id).unwrap(),
+            &new_worker
+        ));
+    }
+
+    #[test]
+    fn property_refresh_preserves_generation_metadata_and_pool_identity() {
+        let registry = WorkerRegistry::new();
+        let original = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let worker_id = registry.register(Arc::clone(&original)).unwrap();
+        let process_id = PrefillId::new(original.base_url(), Uuid::from_u128(1)).unwrap();
+        let original_entry = registry
+            .pd_process_directory()
+            .prefill(&process_id)
+            .unwrap();
+        let refreshed: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(original.url())
+                .worker_type(original.worker_type().clone())
+                .label("priority", "7")
+                .pd_process(
+                    original
+                        .metadata()
+                        .pd_process
+                        .clone()
+                        .expect("test worker has typed metadata"),
+                )
+                .build(),
+        );
+
+        let refreshed_id = registry.register(Arc::clone(&refreshed)).unwrap();
+        let refreshed_entry = registry
+            .pd_process_directory()
+            .prefill(&process_id)
+            .unwrap();
+        assert_eq!(worker_id, refreshed_id);
+        assert!(Arc::ptr_eq(&registry.get(&worker_id).unwrap(), &refreshed));
+        assert!(Arc::ptr_eq(refreshed_entry.worker(), &refreshed));
+        assert_eq!(
+            original_entry.pool().snapshot(),
+            refreshed_entry.pool().snapshot()
+        );
+        assert_eq!(registry.pd_process_directory().ready_prefills().len(), 1);
+    }
+
+    #[test]
+    fn successful_pd_removal_erases_generic_and_directory_state() {
+        let registry = WorkerRegistry::new();
+        let worker = pd_worker(
+            "http://prefill.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            Uuid::from_u128(1),
+        );
+        let worker_id = registry.register(Arc::clone(&worker)).unwrap();
+        let process_id = PrefillId::new(worker.base_url(), Uuid::from_u128(1)).unwrap();
+
+        assert!(matches!(
+            registry.remove(&worker_id).unwrap(),
+            WorkerRemovalOutcome::Removed(_)
+        ));
+        assert!(registry.get(&worker_id).is_none());
+        assert!(registry
+            .pd_process_directory()
+            .prefill(&process_id)
+            .is_none());
+    }
+
+    #[test]
+    fn registry_replacement_serializes_against_prefill_request_admission() {
+        for iteration in 0..32 {
+            let registry = Arc::new(WorkerRegistry::new());
+            let old_worker = pd_worker(
+                "http://prefill-race.test:30000",
+                PdProcessRole::Prefill,
+                2,
+                Uuid::from_u128(iteration * 2 + 1),
+            );
+            registry.register(Arc::clone(&old_worker)).unwrap();
+            let old_id =
+                PrefillId::new(old_worker.base_url(), Uuid::from_u128(iteration * 2 + 1)).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let admission_registry = Arc::clone(&registry);
+            let admission_barrier = Arc::clone(&barrier);
+            let admission = thread::spawn(move || {
+                admission_barrier.wait();
+                if let Ok((entry, mut owner)) = admission_registry
+                    .pd_process_directory()
+                    .begin_prefill_request(&old_id, format!("request-{iteration}"))
+                {
+                    entry.pool().finalize_request(&mut owner).unwrap();
+                }
+            });
+
+            let replacement_registry = Arc::clone(&registry);
+            let replacement_barrier = Arc::clone(&barrier);
+            let replacement = thread::spawn(move || {
+                replacement_barrier.wait();
+                let worker = pd_worker(
+                    "http://prefill-race.test:30000",
+                    PdProcessRole::Prefill,
+                    4,
+                    Uuid::from_u128(iteration * 2 + 2),
+                );
+                replacement_registry.register(Arc::clone(&worker)).unwrap();
+                worker
+            });
+
+            admission.join().unwrap();
+            let replacement = replacement.join().unwrap();
+            assert!(Arc::ptr_eq(
+                &registry.get_by_url(replacement.url()).unwrap(),
+                &replacement
+            ));
+        }
     }
 }

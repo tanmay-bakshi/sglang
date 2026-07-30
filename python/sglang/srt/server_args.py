@@ -41,6 +41,11 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreTrueAction,
     LoRAPathAction,
 )
+from sglang.srt.arg_groups.pd_disaggregation_hook import (
+    PdProcessRuntimeCapabilities,
+    build_pd_process_advertisement,
+    handle_pd_disaggregation,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -1279,6 +1284,11 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     # API related
     # -------------------------------------------------------------------------
+    launch_instance_id: A[
+        str,
+        Arg(no_cli=True),
+        NS("serving"),
+    ] = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     api_key: A[
         Optional[str],
         "Set API key of the server. It is also used in the OpenAI API compatible server.",
@@ -2959,6 +2969,21 @@ class ServerArgs:
         "Bootstrap server port on the prefill server. Default is 8998.",
         NS("disagg"),
     ] = 8998
+    pd_model_fingerprint: A[
+        Optional[str],
+        "Canonical lowercase SHA-256 fingerprint of the model weights advertised to the PD router.",
+        NS("disagg"),
+    ] = None
+    pd_logical_kv_layout_fingerprint: A[
+        Optional[str],
+        "Canonical lowercase SHA-256 fingerprint of the TP-independent logical KV layout advertised to the PD router.",
+        NS("disagg"),
+    ] = None
+    pd_prefill_bootstrap_advertise_host: A[
+        Optional[str],
+        "Explicit non-local bootstrap host advertised by a PD prefill process.",
+        NS("disagg"),
+    ] = None
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
@@ -3409,6 +3434,7 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+        self._handle_launch_instance_id()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3587,6 +3613,20 @@ class ServerArgs:
 
         materialize_declarations(self)
 
+    def _handle_launch_instance_id(self):
+        """Validate the process-generation UUID shared by all engine processes."""
+        try:
+            launch_instance_id = uuid.UUID(self.launch_instance_id)
+        except (AttributeError, ValueError) as error:
+            raise ValueError(
+                "launch_instance_id must be a canonical, non-nil UUID"
+            ) from error
+        if (
+            launch_instance_id.int == 0
+            or str(launch_instance_id) != self.launch_instance_id
+        ):
+            raise ValueError("launch_instance_id must be a canonical, non-nil UUID")
+
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -3717,11 +3757,15 @@ class ServerArgs:
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_pd_disaggregation(self):
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_pd_disaggregation,
-        )
-
         handle_pd_disaggregation(self)
+
+    def pd_process_advertisement(
+        self, runtime_capabilities: PdProcessRuntimeCapabilities | None
+    ) -> Optional[dict[str, Any]]:
+        """Return the validated PD process-generation advertisement."""
+        return build_pd_process_advertisement(
+            self, runtime_capabilities=runtime_capabilities
+        )
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
@@ -9013,7 +9057,7 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
-        instance_id = uuid.uuid4().hex[:12]
+        instance_id = server_args.launch_instance_id
 
         decoupled_spec_ipc_config = None
         if server_args.decoupled_spec_role != "null":

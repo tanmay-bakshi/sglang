@@ -17,9 +17,10 @@ use super::{
     DecoderRequestShape, DecoderReservationDigest, DecoderReserveAttemptDigest,
     DecoderReserveRefusalDisposition, DecoderReserveRefusalReceipt, DecoderSlotGeneration,
     EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt, EngineReleaseKind,
-    EngineReleaseReceipt, PrefillBootstrapEndpoint, PrefillId, PreparedGrantCancellationReceipt,
-    UnboundGrantBinding, UnboundPreparedGrant,
+    EngineReleaseReceipt, PrefillId, PreparedGrantCancellationReceipt, UnboundGrantBinding,
+    UnboundPreparedGrant,
 };
+use crate::core::PrefillBootstrapEndpoint;
 
 const SCHEMA_VERSION: u32 = 1;
 const CONTROL_PATH: &str = "/_internal/pd/v1/decode-reservations";
@@ -2219,8 +2220,7 @@ mod tests {
     use serde_json::json;
     use tokio::{net::TcpListener, task::JoinHandle};
 
-    use super::super::BoundPreparedGrant;
-    use super::*;
+    use super::{super::BoundPreparedGrant, *};
 
     const PROMPT_SECRET: &str = "prompt-secret-never-log-7d33f2";
 

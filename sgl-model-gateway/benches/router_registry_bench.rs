@@ -1,7 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg::core::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType};
+use smg::core::{
+    BasicWorkerBuilder, CircuitBreakerConfig, KvTransferProtocol, PdMetadataSchema,
+    PdProcessMetadata, PdProcessRole, PreparedGrantProtocol, WorkerRegistry, WorkerType,
+};
+use uuid::Uuid;
 
 // Helper to populate registry
 fn setup_registry(count: usize) -> Arc<WorkerRegistry> {
@@ -17,13 +21,34 @@ fn setup_registry(count: usize) -> Arc<WorkerRegistry> {
             WorkerType::Decode
         };
 
-        let worker = BasicWorkerBuilder::new(format!("http://worker-{}:8000", i))
+        let mut builder = BasicWorkerBuilder::new(format!("http://worker-{}:8000", i))
             .worker_type(worker_type)
             .labels(labels)
-            .circuit_breaker_config(CircuitBreakerConfig::default())
-            .build();
+            .circuit_breaker_config(CircuitBreakerConfig::default());
+        if i % 2 != 0 {
+            builder = builder.pd_process(
+                PdProcessMetadata::new(
+                    PdMetadataSchema::V1,
+                    Uuid::from_u128(i as u128 + 1),
+                    PdProcessRole::Decode,
+                    1,
+                    1,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "bf16",
+                    64,
+                    KvTransferProtocol::PackedV4,
+                    PreparedGrantProtocol::V1,
+                    None,
+                )
+                .expect("benchmark PD metadata must be valid"),
+            );
+        }
+        let worker = builder.build();
 
-        registry.register(Arc::from(worker));
+        registry
+            .register(Arc::from(worker))
+            .expect("benchmark worker registration must succeed");
     }
     registry
 }
