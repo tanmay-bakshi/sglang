@@ -7,6 +7,8 @@ use thiserror::Error;
 use url::Host;
 use uuid::Uuid;
 
+use super::http_origin::HttpOrigin;
+
 /// Versioned schema for process-generation metadata.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PdMetadataSchema {
@@ -203,6 +205,30 @@ fn is_localhost_name(domain: &str) -> bool {
 
 fn is_unusable_ipv4(address: Ipv4Addr) -> bool {
     address.is_loopback() || address.is_unspecified() || address.is_multicast()
+}
+
+/// Closed origin and generation contract for one PD process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PdProcessRegistration {
+    origin: HttpOrigin,
+    metadata: PdProcessMetadata,
+}
+
+impl PdProcessRegistration {
+    /// Bind validated process metadata to its canonical HTTP origin.
+    pub fn new(origin: HttpOrigin, metadata: PdProcessMetadata) -> Self {
+        Self { origin, metadata }
+    }
+
+    /// Return the process's canonical HTTP origin.
+    pub fn origin(&self) -> &HttpOrigin {
+        &self.origin
+    }
+
+    /// Return the generation-scoped process contract.
+    pub fn metadata(&self) -> &PdProcessMetadata {
+        &self.metadata
+    }
 }
 
 /// Closed compatibility and launch metadata for one process generation.

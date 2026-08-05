@@ -10,7 +10,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Tuple,
     runtime_checkable,
 )
 
@@ -162,6 +161,24 @@ class InitLoadBackParams:
     req: Optional[Req] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class LoadBackResult:
+    """Result of preparing a host-to-device cache restoration.
+
+    :ivar new_full_device_indices: Newly allocated full-KV device indices.
+    :ivar restored_node: Deepest cache node restored to device residency.
+    :ivar queued_any_component: Whether an asynchronous component transfer was queued.
+    :ivar full_tokens: Number of full-KV tokens restored by this operation.
+    :ivar swa_tokens: Number of sliding-window tokens restored by this operation.
+    """
+
+    new_full_device_indices: torch.Tensor
+    restored_node: Any
+    queued_any_component: bool
+    full_tokens: int
+    swa_tokens: int
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -234,12 +251,20 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_parallel, get_server_args
 
         server_args = get_server_args()
-        labels = {"cache_type": self.__class__.__name__}
-        if server_args.extra_metric_labels:
+        parallel = get_parallel()
+        labels = {}
+        if server_args.extra_metric_labels is not None:
             labels.update(server_args.extra_metric_labels)
+        labels.update(
+            {
+                "cache_type": self.__class__.__name__,
+                "pp_rank": parallel.pp_rank,
+                "tp_rank": parallel.tp_rank,
+            }
+        )
         radix_cache_cls = resolve_collector_class(
             server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -352,9 +377,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
-        """
-        Preparing KV cache loading from host to device.
+    ) -> LoadBackResult:
+        """Prepare KV-cache restoration from host to device.
+
+        :param params: Cache-specific restoration parameters.
+        :returns: The prepared restoration and its transfer state.
         """
         raise NotImplementedError()
 

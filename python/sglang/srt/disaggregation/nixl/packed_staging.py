@@ -3,7 +3,6 @@ import enum
 import hashlib
 import logging
 import os
-import re
 import threading
 import traceback
 from typing import Protocol
@@ -159,6 +158,7 @@ class PackedNixlAttestationSegment(Protocol):
     remoteAddress: int
     remoteDeviceId: int
     requestInfo: str
+    selectedTransports: tuple[PackedNixlAttestationTransport, ...]
     workerId: int
     workerIdentity: int
 
@@ -1194,6 +1194,49 @@ class PackedDestinationOutcomeCoordinator:
             if policies is not None:
                 for writer_id in policies:
                     self._proofs.pop((key, writer_id), None)
+            self._retiring.remove(key)
+
+    def cancel_unpublished_chunk(self, key: PackedChunkKey) -> None:
+        """Forget one coordinator and protocol registration before publication.
+
+        :param key: Exact request and chunk identity.
+        :raises PackedDestinationVisibilityError: If asynchronous work exists.
+        """
+
+        with self._lock:
+            if key in self._retiring:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility chunk retirement is already in progress"
+                )
+            policies = self._policies.get(key)
+            if policies is None:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility policy is not registered"
+                )
+            if self._active_done_handlers.get(key, 0) != 0:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility DONE handling is still in progress"
+                )
+            if any(attempt_key[0] == key for attempt_key in self._attempts):
+                raise PackedDestinationVisibilityError(
+                    "destination visibility action is still in progress"
+                )
+            if any(proof_key[0] == key for proof_key in self._proofs):
+                raise PackedDestinationVisibilityError(
+                    "unpublished destination chunk contains visibility proofs"
+                )
+            self._retiring.add(key)
+        protocol_cancelled = False
+        try:
+            self._protocol.cancel_unpublished_chunk(key)
+            protocol_cancelled = True
+        finally:
+            if not protocol_cancelled:
+                with self._lock:
+                    self._retiring.remove(key)
+        with self._lock:
+            self._policies.pop(key)
+            self._active_done_handlers.pop(key, None)
             self._retiring.remove(key)
 
 
@@ -2961,10 +3004,7 @@ class PackedTransferLane:
             raise ValueError("successful native receipt contains an error")
         self._validate_native_segment_locked(transfer, receipt)
         transport_context = self._validate_native_endpoints(receipt)
-        self._validate_native_data_path(
-            receipt.segments[0].requestInfo,
-            transport_context,
-        )
+        self._validate_native_data_path(receipt.segments[0], transport_context)
         expected_lane = build_nixl_ucx_lane_identifier(transport_context)
         if self._visibility_policy.lane_identifier != expected_lane:
             raise ValueError(
@@ -3066,16 +3106,18 @@ class PackedTransferLane:
 
     def _validate_native_data_path(
         self,
-        request_info: str,
+        segment: PackedNixlAttestationSegment,
         endpoint_context: tuple[tuple[str, str], ...],
     ) -> None:
         """Bind the selected PUT protocol to the pinned data transport.
 
         The endpoint transport set is only configuration context. The pinned
-        UCX build's immutable ``ucp_request_query`` string names the resources
-        selected by the actual PUT protocol, which is the transfer-path proof.
+        UCX build captures an immutable, typed ``selectedTransports`` tuple from
+        the actual PUT request's ``ucp_request_query`` result. ``requestInfo``
+        remains diagnostic and digest-bound, but its UCX prose is not protocol
+        authority.
 
-        :param request_info: Native selected-protocol description.
+        :param segment: Native segment containing typed selected resources.
         :param endpoint_context: Complete endpoint transport/device context.
         """
 
@@ -3088,19 +3130,23 @@ class PackedTransferLane:
             raise ValueError(
                 "pinned native data resource is absent from endpoint context"
             )
-        words = tuple(re.findall(r"[A-Za-z0-9_.:-]+", request_info))
-        if "put" not in words or "cuda" not in words or "memory" not in words:
-            raise ValueError("native request is not a CUDA-memory PUT")
-        selected_resources = tuple(
-            re.findall(
-                r"([A-Za-z0-9_.:-]+)/([A-Za-z0-9_.:-]+)",
-                request_info,
-            )
-        )
-        if len(selected_resources) == 0:
+        transports = segment.selectedTransports
+        if type(transports) is not tuple or len(transports) == 0:
             raise ValueError("native request does not expose selected resources")
+        selected_resources: list[tuple[str, str]] = []
+        for transport in transports:
+            if type(transport.transport) is not str or len(transport.transport) == 0:
+                raise ValueError("native selected transport name is empty")
+            if type(transport.device) is not str or len(transport.device) == 0:
+                raise ValueError("native selected transport device is empty")
+            selected_resources.append((transport.transport, transport.device))
+        canonical_resources = tuple(sorted(set(selected_resources)))
+        if tuple(selected_resources) != canonical_resources:
+            raise ValueError("native selected resources are not canonical")
         if expected_resource not in selected_resources:
             raise ValueError("native request did not select the pinned data transport")
+        if not set(selected_resources).issubset(set(endpoint_context)):
+            raise ValueError("native selected resource is absent from endpoint context")
         selected_transports = {transport for transport, _ in selected_resources}
         forbidden = selected_transports & _NATIVE_FORBIDDEN_FALLBACK_TRANSPORTS
         if len(forbidden) > 0:
@@ -3379,12 +3425,25 @@ class PackedGatherError(RuntimeError):
 class PackedScatterSubmission:
     """Resources retained until one asynchronous scatter event is terminal.
 
+    :ivar started_event: CUDA event immediately preceding this scatter's work.
     :ivar event: CUDA completion event.
     :ivar resources: Temporary pointer and page tensors used by kernels.
     """
 
+    started_event: torch.cuda.Event
     event: torch.cuda.Event
     resources: tuple[torch.Tensor, ...]
+
+    def elapsed_milliseconds(self) -> float:
+        """Return exact device time after terminal completion.
+
+        :returns: CUDA-stream elapsed time in milliseconds.
+        :raises RuntimeError: If the scatter is not terminal.
+        """
+
+        if not self.event.query():
+            raise RuntimeError("packed scatter duration requested before completion")
+        return float(self.started_event.elapsed_time(self.event))
 
 
 class PackedCopyExecutor:
@@ -3550,6 +3609,8 @@ class PackedCopyExecutor:
         retained: list[torch.Tensor] = []
         try:
             with torch.cuda.stream(self._scatter_stream):
+                started_event = torch.cuda.Event(enable_timing=True)
+                started_event.record(self._scatter_stream)
                 for writer_layout in work.layout.writers:
                     for group in writer_layout.copy_groups:
                         active = work.destination_binding.require(group.component_id)
@@ -3584,7 +3645,7 @@ class PackedCopyExecutor:
                             bytes_per_entry=bytes_per_entry,
                             block_size=256,
                         )
-                event = torch.cuda.Event()
+                event = torch.cuda.Event(enable_timing=True)
                 event.record(self._scatter_stream)
         except Exception:
             logger.error(
@@ -3599,7 +3660,11 @@ class PackedCopyExecutor:
                     traceback.format_exc(),
                 )
             raise
-        return PackedScatterSubmission(event=event, resources=tuple(retained))
+        return PackedScatterSubmission(
+            started_event=started_event,
+            event=event,
+            resources=tuple(retained),
+        )
 
     def synchronize_scatter(self) -> None:
         """Wait until every submitted scatter on the dedicated stream is terminal."""
@@ -3617,6 +3682,7 @@ class PackedStagingArena:
     _copy_executor: PackedCopyExecutor | None
     _gpu_id: int
     _lock: threading.Lock
+    _owns_registration: bool
     _peer: PackedPeerIdentity
     _protocol: PackedDecodeProtocol
     _quarantine: PackedRegistrationQuarantine
@@ -3632,6 +3698,7 @@ class PackedStagingArena:
         gpu_id: int,
         peer: PackedPeerIdentity,
         arena_generation: bytes,
+        registration: object | None = None,
         alignment_bytes: int = DEFAULT_STAGING_ALIGNMENT_BYTES,
         quarantine: PackedRegistrationQuarantine = PACKED_REGISTRATION_QUARANTINE,
     ) -> None:
@@ -3642,6 +3709,8 @@ class PackedStagingArena:
         :param gpu_id: Destination CUDA device identifier.
         :param peer: This exact destination agent process identity.
         :param arena_generation: Generation of this registration.
+        :param registration: Existing registration covering ``tensor``. When
+            supplied, its external owner retains deregistration authority.
         :param alignment_bytes: Lease and writer-projection alignment.
         :param quarantine: Strong-retention owner for ambiguous cleanup.
         """
@@ -3662,7 +3731,9 @@ class PackedStagingArena:
             total_size=tensor.numel(),
             alignment_bytes=alignment_bytes,
         )
-        registration = _register_packed_tensor(agent, tensor, gpu_id)
+        owns_registration = registration is None
+        if registration is None:
+            registration = _register_packed_tensor(agent, tensor, gpu_id)
         self._agent = agent
         self._allocator = allocator
         self._arena_generation = generation
@@ -3670,6 +3741,7 @@ class PackedStagingArena:
         self._copy_executor = None
         self._gpu_id = gpu_id
         self._lock = threading.Lock()
+        self._owns_registration = owns_registration
         self._peer = peer
         self._protocol = PackedDecodeProtocol(allocator)
         self._quarantine = quarantine
@@ -3782,20 +3854,23 @@ class PackedStagingArena:
                     )
                     self._closed = True
                     raise
-            try:
-                self._agent.deregister_memory(registration)
-            except Exception:
-                reason = "packed staging arena deregistration failed"
-                logger.error("%s:\n%s", reason, traceback.format_exc())
-                owners: tuple[object, ...] = (executor,) if executor is not None else ()
-                self._retain_locked(
-                    tensor,
-                    registration,
-                    reason,
-                    owners=owners,
-                )
-                self._closed = True
-                raise
+            if self._owns_registration:
+                try:
+                    self._agent.deregister_memory(registration)
+                except Exception:
+                    reason = "packed staging arena deregistration failed"
+                    logger.error("%s:\n%s", reason, traceback.format_exc())
+                    owners: tuple[object, ...] = (
+                        (executor,) if executor is not None else ()
+                    )
+                    self._retain_locked(
+                        tensor,
+                        registration,
+                        reason,
+                        owners=owners,
+                    )
+                    self._closed = True
+                    raise
             self._registration = None
             self._tensor = None
             self._closed = True

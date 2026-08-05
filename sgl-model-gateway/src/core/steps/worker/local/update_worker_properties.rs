@@ -89,6 +89,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .clone()
                 .or_else(|| worker.metadata().api_key.clone());
 
+            if worker.is_dp_aware() && worker.metadata().pd_process.is_some() {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("update_worker_properties"),
+                    message: "PD process registrations cannot use DP-aware worker expansion"
+                        .to_string(),
+                });
+            }
+
             // Create a new worker with updated properties
             let new_worker: Arc<dyn Worker> = if worker.is_dp_aware() {
                 // For DP-aware workers, extract DP info and rebuild
@@ -103,15 +111,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         .runtime_type(worker.metadata().runtime_type.clone())
                         .labels(updated_labels)
                         .health_config(updated_health_config.clone())
+                        .circuit_breaker_config(worker.circuit_breaker().config().clone())
+                        .circuit_breaker(worker.circuit_breaker().clone())
+                        .initially_healthy(worker.is_healthy())
                         .models(worker.metadata().models.clone());
 
                 if let Some(ref api_key) = updated_api_key {
                     builder = builder.api_key(api_key.clone());
                 }
-                if let Some(pd_process) = worker.metadata().pd_process.clone() {
-                    builder = builder.pd_process(pd_process);
-                }
-
                 Arc::new(builder.build())
             } else {
                 // For basic workers, rebuild with updated properties
@@ -121,6 +128,9 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     .runtime_type(worker.metadata().runtime_type.clone())
                     .labels(updated_labels)
                     .health_config(updated_health_config.clone())
+                    .circuit_breaker_config(worker.circuit_breaker().config().clone())
+                    .circuit_breaker(worker.circuit_breaker().clone())
+                    .initially_healthy(worker.is_healthy())
                     .models(worker.metadata().models.clone());
 
                 if let Some(ref api_key) = updated_api_key {
@@ -135,7 +145,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
             app_context
                 .worker_registry
-                .register(new_worker.clone())
+                .replace_if_current(worker, new_worker.clone())
                 .map_err(|error| WorkflowError::StepFailed {
                     step_id: StepId::new("update_worker_properties"),
                     message: error.to_string(),

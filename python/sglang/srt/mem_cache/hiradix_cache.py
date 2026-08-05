@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    LoadBackResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -1370,7 +1371,7 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ):
+    ) -> LoadBackResult:
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
@@ -1379,14 +1380,23 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                return LoadBackResult(
+                    new_full_device_indices=loading_values,
+                    restored_node=last_node,
+                    queued_any_component=True,
+                    full_tokens=len(loading_values),
+                    swa_tokens=0,
+                )
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return (
-            self._empty_match_result.device_indices,
-            last_node,
+        return LoadBackResult(
+            new_full_device_indices=self._empty_match_result.device_indices,
+            restored_node=last_node,
+            queued_any_component=False,
+            full_tokens=0,
+            swa_tokens=0,
         )
 
     def query_storage_hit_length(

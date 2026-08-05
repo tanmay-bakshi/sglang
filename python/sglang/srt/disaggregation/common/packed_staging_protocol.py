@@ -3,6 +3,7 @@ import enum
 import logging
 import threading
 import traceback
+from itertools import pairwise
 from typing import Never, Protocol
 
 from sglang.srt.disaggregation.common.staging_layout import (
@@ -24,8 +25,11 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 logger = logging.getLogger(__name__)
 
 PACKED_REQUEST_GENERATION_BYTES = 16
+PACKED_REQUEST_DIGEST_BYTES = 32
+PACKED_TEARDOWN_GENERATION_BYTES = 16
 PACKED_VISIBILITY_POLICY_DIGEST_BYTES = 32
 PACKED_NATIVE_ATTESTATION_DIGEST_BYTES = 32
+MAX_PACKED_AUXILIARY_DESTINATION_SEGMENTS = 4096
 MAX_PACKED_WRITER_ERROR_BYTES = 4096
 MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES = 512
 
@@ -78,6 +82,354 @@ class PackedChunkKey:
                 f"{PACKED_REQUEST_GENERATION_BYTES} bytes, got "
                 f"{len(self.request_generation)}"
             )
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class PackedRequestKey:
+    """Stable identity shared by every chunk in one packed request.
+
+    :ivar room_id: Bootstrap room identifying the request.
+    :ivar request_generation: Decode allocation generation preventing replay.
+    """
+
+    room_id: int
+    request_generation: bytes
+
+    def __post_init__(self) -> None:
+        """Validate the packed request identity."""
+
+        if type(self.request_generation) is not bytes:
+            raise TypeError("request_generation must be bytes")
+        if type(self.room_id) is not int or self.room_id < 0:
+            raise ValueError(
+                f"room_id must be a non-negative integer, got {self.room_id!r}"
+            )
+        if len(self.request_generation) != PACKED_REQUEST_GENERATION_BYTES:
+            raise ValueError(
+                "request_generation must contain "
+                f"{PACKED_REQUEST_GENERATION_BYTES} bytes, got "
+                f"{len(self.request_generation)}"
+            )
+
+    @classmethod
+    def from_chunk_key(cls, key: PackedChunkKey) -> "PackedRequestKey":
+        """Project one chunk identity to its request identity.
+
+        :param key: Exact request-local chunk identity.
+        :returns: Stable request identity.
+        """
+
+        return cls(
+            room_id=key.room_id,
+            request_generation=key.request_generation,
+        )
+
+
+def _validate_request_digest(value: bytes, label: str) -> None:
+    """Validate one exact request transcript digest.
+
+    :param value: Candidate SHA-256 digest.
+    :param label: Reader-facing field label.
+    """
+
+    if type(value) is not bytes:
+        raise TypeError(f"{label} must be bytes")
+    if len(value) != PACKED_REQUEST_DIGEST_BYTES:
+        raise ValueError(
+            f"{label} must contain {PACKED_REQUEST_DIGEST_BYTES} bytes, "
+            f"got {len(value)}"
+        )
+
+
+def _validate_nonnegative_uint64(value: int, label: str) -> None:
+    """Validate one bounded unsigned generation or index.
+
+    :param value: Candidate integer.
+    :param label: Reader-facing field label.
+    """
+
+    if type(value) is not int or value < 0 or value >= (1 << 64):
+        raise ValueError(f"{label} must be a uint64")
+
+
+def _validate_positive_uint64(value: int, label: str) -> None:
+    """Validate one bounded nonzero native integer.
+
+    :param value: Candidate integer.
+    :param label: Reader-facing field label.
+    """
+
+    if type(value) is not int or value <= 0 or value >= (1 << 64):
+        raise ValueError(f"{label} must be a positive uint64")
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class PackedAuxiliaryDestinationSegment:
+    """One ordered decoder-owned auxiliary metadata destination.
+
+    :ivar address: Exact process-local destination address for one metadata row.
+    :ivar item_length: Exact byte count copied into that address.
+    """
+
+    address: int
+    item_length: int
+
+    def __post_init__(self) -> None:
+        """Validate one bounded native DRAM segment."""
+
+        _validate_positive_uint64(
+            self.address,
+            "auxiliary destination address",
+        )
+        _validate_positive_uint64(
+            self.item_length,
+            "auxiliary destination item_length",
+        )
+        if self.address + self.item_length > (1 << 64):
+            raise ValueError(
+                "auxiliary destination segment exceeds uint64 address space"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedAuxiliaryPlan:
+    """Decoder-authored ownership contract for request auxiliary metadata.
+
+    :ivar key: Exact allocation-derived packed request identity.
+    :ivar request_slot_generation: Decode request-slot reuse generation.
+    :ivar metadata_buffer_index: Exact reserved metadata row.
+    :ivar metadata_slot_generation: Exact metadata-row reuse generation.
+    :ivar destination_segments: Ordered row addresses and item lengths.
+    :ivar canonical_writer_id: First writer in the destination-local cohort.
+    :ivar destination_process_generation: Exact destination process generation.
+    :ivar native_route_digest: Decode-selected native transport route digest.
+    :ivar runtime_cohort_digest: Exact loaded runtime cohort digest.
+    """
+
+    key: PackedRequestKey
+    request_slot_generation: int
+    metadata_buffer_index: int
+    metadata_slot_generation: bytes
+    destination_segments: tuple[PackedAuxiliaryDestinationSegment, ...]
+    canonical_writer_id: StagingWriterId
+    destination_process_generation: bytes
+    native_route_digest: bytes
+    runtime_cohort_digest: bytes
+
+    def __post_init__(self) -> None:
+        """Own and validate one complete immutable metadata destination plan."""
+
+        if type(self.key) is not PackedRequestKey:
+            raise TypeError("auxiliary plan key must be PackedRequestKey")
+        _validate_nonnegative_uint64(
+            self.request_slot_generation,
+            "auxiliary request_slot_generation",
+        )
+        _validate_nonnegative_uint64(
+            self.metadata_buffer_index,
+            "auxiliary metadata_buffer_index",
+        )
+        if type(self.metadata_slot_generation) is not bytes:
+            raise TypeError("auxiliary metadata_slot_generation must be bytes")
+        if len(self.metadata_slot_generation) != PACKED_REQUEST_GENERATION_BYTES:
+            raise ValueError(
+                "auxiliary metadata_slot_generation must contain "
+                f"{PACKED_REQUEST_GENERATION_BYTES} bytes"
+            )
+        segments = tuple(self.destination_segments)
+        object.__setattr__(self, "destination_segments", segments)
+        if len(segments) == 0:
+            raise ValueError(
+                "auxiliary plan must contain at least one destination segment"
+            )
+        if len(segments) > MAX_PACKED_AUXILIARY_DESTINATION_SEGMENTS:
+            raise ValueError(
+                "auxiliary plan destination segment count exceeds "
+                f"{MAX_PACKED_AUXILIARY_DESTINATION_SEGMENTS}"
+            )
+        if any(
+            type(segment) is not PackedAuxiliaryDestinationSegment
+            for segment in segments
+        ):
+            raise TypeError(
+                "auxiliary destination segments must be "
+                "PackedAuxiliaryDestinationSegment"
+            )
+        if len(set(segments)) != len(segments):
+            raise ValueError("auxiliary plan contains duplicate destination segments")
+        writer_id = self.canonical_writer_id
+        segments_by_address = tuple(
+            sorted(segments, key=lambda segment: segment.address)
+        )
+        for previous, current in pairwise(segments_by_address):
+            if current.address < previous.address + previous.item_length:
+                raise ValueError(
+                    "auxiliary plan contains overlapping destination segments"
+                )
+        if type(writer_id) is not StagingWriterId:
+            raise TypeError("auxiliary canonical_writer_id must be StagingWriterId")
+        writer_fields = (
+            writer_id.transfer_source_rank,
+            writer_id.source_attn_tp_rank,
+            writer_id.source_pp_rank,
+            writer_id.source_cp_rank,
+        )
+        if any(
+            type(value) is not int or value < 0 or value >= (1 << 32)
+            for value in writer_fields
+        ):
+            raise ValueError("auxiliary canonical writer ranks must be uint32 values")
+        if writer_id.source_pp_rank != 0 or writer_id.source_cp_rank != 0:
+            raise ValueError("auxiliary canonical writer must use PP0 and CP0")
+        if type(self.destination_process_generation) is not bytes:
+            raise TypeError("auxiliary destination_process_generation must be bytes")
+        if len(self.destination_process_generation) != PACKED_REQUEST_GENERATION_BYTES:
+            raise ValueError(
+                "auxiliary destination_process_generation must contain "
+                f"{PACKED_REQUEST_GENERATION_BYTES} bytes"
+            )
+        _validate_request_digest(
+            self.native_route_digest,
+            "auxiliary native_route_digest",
+        )
+        _validate_request_digest(
+            self.runtime_cohort_digest,
+            "auxiliary runtime_cohort_digest",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedAuxiliaryOutcome:
+    """Authenticated terminal outcome for the exact auxiliary metadata plan.
+
+    :ivar plan: Complete decoder-authored destination plan.
+    :ivar writer_id: Claimed source writer identity.
+    :ivar native_dram_handle_generation: Exact terminal native DRAM handle.
+    :ivar descriptor_digest: Native digest of exact submitted DRAM descriptors.
+    :ivar evidence_digest: Native digest of endpoint and runtime evidence.
+    """
+
+    plan: PackedAuxiliaryPlan
+    writer_id: StagingWriterId
+    native_dram_handle_generation: int
+    descriptor_digest: bytes
+    evidence_digest: bytes
+
+    def __post_init__(self) -> None:
+        """Validate bounded terminal auxiliary outcome evidence."""
+
+        if type(self.plan) is not PackedAuxiliaryPlan:
+            raise TypeError("auxiliary outcome plan must be PackedAuxiliaryPlan")
+        if type(self.writer_id) is not StagingWriterId:
+            raise TypeError("auxiliary outcome writer_id must be StagingWriterId")
+        if self.writer_id != self.plan.canonical_writer_id:
+            raise ValueError(
+                "auxiliary outcome writer differs from the plan's canonical writer"
+            )
+        _validate_positive_uint64(
+            self.native_dram_handle_generation,
+            "auxiliary native_dram_handle_generation",
+        )
+        _validate_request_digest(
+            self.descriptor_digest,
+            "auxiliary descriptor_digest",
+        )
+        _validate_request_digest(
+            self.evidence_digest,
+            "auxiliary evidence_digest",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedRequestTeardown:
+    """Destination request for one writer to retire a complete request.
+
+    :ivar key: Exact packed request identity.
+    :ivar writer_id: Exact source writer being retired.
+    :ivar request_slot_generation: Decode request-slot reuse generation.
+    :ivar writer_manifest_digest: Exact writer-membership digest.
+    :ivar allocation_digest: Exact decode allocation digest.
+    :ivar teardown_generation: One-shot request teardown generation.
+    :ivar auxiliary_handle_generation: Exact auxiliary DRAM handle retired by
+        the canonical writer, otherwise None.
+    """
+
+    key: PackedRequestKey
+    writer_id: StagingWriterId
+    request_slot_generation: int
+    writer_manifest_digest: bytes
+    allocation_digest: bytes
+    teardown_generation: bytes
+    auxiliary_handle_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate bounded request teardown identity."""
+
+        if type(self.key) is not PackedRequestKey:
+            raise TypeError("teardown key must be PackedRequestKey")
+        if type(self.writer_id) is not StagingWriterId:
+            raise TypeError("teardown writer_id must be StagingWriterId")
+        _validate_nonnegative_uint64(
+            self.request_slot_generation,
+            "teardown request_slot_generation",
+        )
+        _validate_request_digest(
+            self.writer_manifest_digest,
+            "teardown writer_manifest_digest",
+        )
+        _validate_request_digest(
+            self.allocation_digest,
+            "teardown allocation_digest",
+        )
+        if type(self.teardown_generation) is not bytes:
+            raise TypeError("teardown_generation must be bytes")
+        if len(self.teardown_generation) != PACKED_TEARDOWN_GENERATION_BYTES:
+            raise ValueError(
+                "teardown_generation must contain "
+                f"{PACKED_TEARDOWN_GENERATION_BYTES} bytes, got "
+                f"{len(self.teardown_generation)}"
+            )
+        if self.auxiliary_handle_generation is not None:
+            _validate_positive_uint64(
+                self.auxiliary_handle_generation,
+                "teardown auxiliary_handle_generation",
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedRequestTeardownAck:
+    """Authenticated acknowledgement of one exact request teardown.
+
+    :ivar key: Exact packed request identity.
+    :ivar writer_id: Claimed source writer identity.
+    :ivar request_slot_generation: Decode request-slot reuse generation.
+    :ivar writer_manifest_digest: Exact writer-membership digest.
+    :ivar allocation_digest: Exact decode allocation digest.
+    :ivar teardown_generation: Exact one-shot teardown generation.
+    :ivar auxiliary_handle_generation: Exact auxiliary DRAM handle retired by
+        the canonical writer, otherwise None.
+    """
+
+    key: PackedRequestKey
+    writer_id: StagingWriterId
+    request_slot_generation: int
+    writer_manifest_digest: bytes
+    allocation_digest: bytes
+    teardown_generation: bytes
+    auxiliary_handle_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate bounded request teardown acknowledgement identity."""
+
+        PackedRequestTeardown(
+            key=self.key,
+            writer_id=self.writer_id,
+            request_slot_generation=self.request_slot_generation,
+            writer_manifest_digest=self.writer_manifest_digest,
+            allocation_digest=self.allocation_digest,
+            teardown_generation=self.teardown_generation,
+            auxiliary_handle_generation=self.auxiliary_handle_generation,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1211,6 +1563,35 @@ class PackedDecodeProtocol:
                 raise PackedProtocolError(
                     key,
                     f"chunk cannot retire in state {chunk.state.value}",
+                )
+            del self._chunks[key]
+
+    def cancel_unpublished_chunk(self, key: PackedChunkKey) -> None:
+        """Forget one chunk that was never exposed to a source writer.
+
+        This path exists only for request preparation rollback. Once a PREPARE
+        has been accepted, external ownership may exist and normal failure plus
+        quiescence must retire the chunk instead.
+
+        :param key: Exact request and chunk identity.
+        :raises PackedProtocolError: If the chunk may have an external owner.
+        """
+
+        with self._lock:
+            chunk = self._require_chunk_locked(key)
+            if chunk.state is not PackedProtocolState.COLLECTING:
+                raise PackedProtocolError(
+                    key,
+                    f"unpublished cancellation is invalid in state {chunk.state.value}",
+                )
+            if (
+                len(chunk.prepares) != 0
+                or chunk.ready_issued
+                or chunk.lease is not None
+            ):
+                raise PackedProtocolError(
+                    key,
+                    "unpublished cancellation found source-visible ownership",
                 )
             del self._chunks[key]
 

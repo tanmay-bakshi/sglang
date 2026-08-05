@@ -914,17 +914,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
-    if !config.router_config.health_check.disable_health_check {
-        let _health_checker = app_context
-            .worker_registry
-            .start_health_checker(config.router_config.health_check.check_interval_secs);
-        debug!(
-            "Started health checker for workers with {}s interval",
-            config.router_config.health_check.check_interval_secs
-        );
-    } else {
-        info!("Global health checks disabled via CLI/config; skipping health checker");
-    }
+    let _health_checker = app_context
+        .worker_registry
+        .start_health_checker(config.router_config.health_check.check_interval_secs);
+    debug!(
+        "Started registry maintenance and health monitoring with {}s interval",
+        config.router_config.health_check.check_interval_secs
+    );
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;

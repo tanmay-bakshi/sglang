@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -231,6 +231,23 @@ class HybridCacheController(BaseHiCacheController):
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
+    def register_index_aligned_pool(self, entry: PoolEntry) -> None:
+        """Attach a sidecar that shares the primary KV slot indices.
+
+        :param entry: Sidecar host/device pool pair.
+        :raises TypeError: If this controller does not own a host-pool group.
+        """
+
+        if not isinstance(self.mem_pool_host, HostPoolGroup):
+            raise TypeError("Index-aligned sidecars require a HostPoolGroup")
+
+        self.mem_pool_host.register_index_aligned_pool(entry)
+        if self.enable_storage:
+            self.storage_backend.register_mem_host_pool_v2(
+                entry.host_pool,
+                entry.name,
+            )
 
     @staticmethod
     def parse_storage_backend_extra_config(

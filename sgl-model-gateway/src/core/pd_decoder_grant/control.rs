@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::{Bytes, BytesMut};
 use reqwest::{
-    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+    header::{HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
     redirect::Policy,
     Client, ClientBuilder, RequestBuilder, Response, StatusCode,
 };
@@ -16,9 +16,9 @@ use super::{
     DecoderGrantChildBinding, DecoderGrantDigest, DecoderId, DecoderInferenceRoute,
     DecoderRequestShape, DecoderReservationDigest, DecoderReserveAttemptDigest,
     DecoderReserveRefusalDisposition, DecoderReserveRefusalReceipt, DecoderSlotGeneration,
-    EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt, EngineReleaseKind,
-    EngineReleaseReceipt, PrefillId, PreparedGrantCancellationReceipt, UnboundGrantBinding,
-    UnboundPreparedGrant,
+    EngineAbortOutcome, EngineCompletionOutcome, EngineGrantError, EngineQuarantineReceipt,
+    EngineReleaseKind, EngineReleaseReceipt, PrefillId, PreparedGrantCancellationReceipt,
+    UnboundGrantBinding, UnboundPreparedGrant,
 };
 use crate::core::PrefillBootstrapEndpoint;
 
@@ -28,6 +28,7 @@ const GRANT_TOKEN_BYTES: usize = 32;
 const MAX_REASON_CODE_BYTES: usize = 64;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 512 * 1024;
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const IDENTITY_CONTENT_ENCODING: &str = "identity";
 const RID_KEY: &str = "rid";
 const BOOTSTRAP_HOST_KEY: &str = "bootstrap_host";
@@ -45,6 +46,33 @@ const GATEWAY_OWNED_REQUEST_KEYS: [&str; 10] = [
     "data_parallel_rank",
     "http_worker_ipc",
 ];
+
+/// Decoder process authorization used only for the initial reservation request.
+#[derive(Clone)]
+pub struct DecoderControlAuthorization(Arc<str>);
+
+impl DecoderControlAuthorization {
+    /// Validate one configured decoder API key without exposing it on failure.
+    pub fn new(value: impl Into<String>) -> Result<Self, EngineGrantError> {
+        let value = value.into();
+        if value.is_empty() || HeaderValue::from_str(&format!("Bearer {value}")).is_err() {
+            return Err(EngineGrantError::InvalidGrant(
+                "decoder_control_authorization_invalid".to_string(),
+            ));
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DecoderControlAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DecoderControlAuthorization([REDACTED])")
+    }
+}
 
 /// Validated client request before gateway identities are assigned.
 #[derive(Clone)]
@@ -670,12 +698,25 @@ impl DecoderGrantControlClient {
     /// authority and prompt-bearing transcripts, so these policies are
     /// invariants rather than caller choices.
     pub fn from_builder(builder: ClientBuilder) -> Result<Self, EngineGrantError> {
+        Self::from_builder_with_timeout(builder, CONTROL_REQUEST_TIMEOUT)
+    }
+
+    fn from_builder_with_timeout(
+        builder: ClientBuilder,
+        request_timeout: Duration,
+    ) -> Result<Self, EngineGrantError> {
+        if request_timeout.is_zero() {
+            return Err(EngineGrantError::InvalidGrant(
+                "decoder_control_request_timeout_invalid".to_string(),
+            ));
+        }
         let client = builder
             .redirect(Policy::none())
             .no_gzip()
             .no_brotli()
             .no_deflate()
             .no_zstd()
+            .timeout(request_timeout)
             .build()
             .map_err(|_| {
                 EngineGrantError::InvalidGrant("decoder_control_client_build_failed".to_string())
@@ -684,20 +725,35 @@ impl DecoderGrantControlClient {
     }
 
     /// Pin one exact reserve attempt before any allocator I/O.
-    pub fn begin_reserve(
+    pub fn begin_authorized_reserve(
         &self,
         reservation: impl Into<Arc<DecoderGrantReservation>>,
+        authorization: DecoderControlAuthorization,
     ) -> ReserveReconciliationGrant {
         ReserveReconciliationGrant {
             client: self.clone(),
             reservation: Some(reservation.into()),
+            authorization,
             polled: false,
         }
+    }
+
+    #[cfg(test)]
+    fn begin_reserve(
+        &self,
+        reservation: impl Into<Arc<DecoderGrantReservation>>,
+    ) -> ReserveReconciliationGrant {
+        self.begin_authorized_reserve(
+            reservation,
+            DecoderControlAuthorization::new("test-decoder-api-key")
+                .expect("the test decoder API key must be a valid bearer value"),
+        )
     }
 
     async fn reserve_once(
         &self,
         reservation: &DecoderGrantReservation,
+        authorization: &DecoderControlAuthorization,
     ) -> Result<UnboundPreparedGrant, EngineGrantError> {
         let endpoint = format!("{}{CONTROL_PATH}/reserve", reservation.decoder_id.url());
         let request = ReserveRequest {
@@ -718,6 +774,7 @@ impl DecoderGrantControlClient {
             child_request_ids: reservation.child_request_ids(),
         };
         let response = control_post(&self.client, endpoint)
+            .bearer_auth(authorization.expose())
             .json(&request)
             .send()
             .await
@@ -992,6 +1049,7 @@ fn validate_reserve_refusal_receipt(
 pub struct ReserveReconciliationGrant {
     client: DecoderGrantControlClient,
     reservation: Option<Arc<DecoderGrantReservation>>,
+    authorization: DecoderControlAuthorization,
     polled: bool,
 }
 
@@ -1000,6 +1058,7 @@ impl fmt::Debug for ReserveReconciliationGrant {
         formatter
             .debug_struct("ReserveReconciliationGrant")
             .field("reservation", &self.reservation)
+            .field("authorization", &self.authorization)
             .field("polled", &self.polled)
             .finish()
     }
@@ -1015,7 +1074,9 @@ impl ReserveReconciliationGrant {
     pub async fn reconcile_reserve(&mut self) -> Result<UnboundPreparedGrant, EngineGrantError> {
         self.polled = true;
         let client = self.client.clone();
-        let result = client.reserve_once(self.reservation()?).await;
+        let result = client
+            .reserve_once(self.reservation()?, &self.authorization)
+            .await;
         match result {
             Ok(grant) => {
                 self.reservation = None;
@@ -1317,7 +1378,7 @@ impl RetainedGrantControl {
     pub(super) async fn complete(
         &self,
         binding: &DecoderGrantBinding,
-    ) -> Result<EngineReleaseReceipt, EngineGrantError> {
+    ) -> Result<EngineCompletionOutcome, EngineGrantError> {
         let request = BindingControlRequest::new(binding);
         let receipt = send_control(
             &self.client,
@@ -1327,13 +1388,35 @@ impl RetainedGrantControl {
             &request,
         )
         .await?;
-        validate_control_receipt(
-            &receipt,
-            WireOperation::Complete,
-            WireGrantState::Completed,
-            binding,
-        )?;
-        release_receipt(receipt, binding, EngineReleaseKind::Completed)
+        match receipt.state {
+            WireGrantState::Completed => {
+                validate_control_receipt(
+                    &receipt,
+                    WireOperation::Complete,
+                    WireGrantState::Completed,
+                    binding,
+                )?;
+                Ok(EngineCompletionOutcome::Completed(release_receipt(
+                    receipt,
+                    binding,
+                    EngineReleaseKind::Completed,
+                )?))
+            }
+            WireGrantState::Quarantined => {
+                validate_control_receipt(
+                    &receipt,
+                    WireOperation::Complete,
+                    WireGrantState::Quarantined,
+                    binding,
+                )?;
+                Ok(EngineCompletionOutcome::Quarantined(quarantine_receipt(
+                    receipt, binding,
+                )?))
+            }
+            state => Err(EngineGrantError::ProtocolViolation(format!(
+                "complete returned state {state:?}, expected completed or quarantined"
+            ))),
+        }
     }
 
     pub(super) async fn abort(
@@ -2212,15 +2295,25 @@ mod tests {
         cell::{Ref, RefCell},
         collections::{HashMap, VecDeque},
         convert::Infallible,
+        future,
         sync::{Arc, Mutex},
     };
 
     use axum::{body::Body, extract::State, http::Request, response::Response, Router};
     use http_body_util::BodyExt;
     use serde_json::json;
-    use tokio::{net::TcpListener, task::JoinHandle};
+    use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
     use super::{super::BoundPreparedGrant, *};
+    use crate::{
+        config::types::RetryConfig,
+        core::{
+            pd_decoder_directory::PdProcessDirectory, BasicWorkerBuilder, HttpOrigin,
+            KvTransferProtocol, PdMetadataSchema, PdProcessMetadata, PdProcessRegistration,
+            PdProcessRole, PdReservedRequestSession, PrefillBootstrapEndpoint,
+            PreparedGrantProtocol, Worker, WorkerType,
+        },
+    };
 
     const PROMPT_SECRET: &str = "prompt-secret-never-log-7d33f2";
 
@@ -2228,6 +2321,7 @@ mod tests {
     enum PlannedBody {
         Full(Bytes),
         Chunked(Vec<Bytes>),
+        Pending,
     }
 
     #[derive(Clone)]
@@ -2262,6 +2356,14 @@ mod tests {
             }
         }
 
+        fn pending() -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: Vec::new(),
+                body: PlannedBody::Pending,
+            }
+        }
+
         fn with_status(mut self, status: StatusCode) -> Self {
             self.status = status;
             self
@@ -2282,10 +2384,84 @@ mod tests {
         body: Value,
     }
 
+    struct SessionGrant {
+        binding: DecoderGrantBinding,
+        final_request_body: Bytes,
+        reserve_response: Value,
+    }
+
+    struct SessionEngine {
+        grant: Option<SessionGrant>,
+        terminal: Arc<Notify>,
+    }
+
+    impl SessionEngine {
+        fn new(terminal: Arc<Notify>) -> Self {
+            Self {
+                grant: None,
+                terminal,
+            }
+        }
+
+        fn handle(&mut self, path: &str, body_bytes: &Bytes, body: &Value) -> PlannedResponse {
+            if path == format!("{CONTROL_PATH}/reserve") {
+                if self.grant.is_none() {
+                    self.grant = Some(build_session_grant(body));
+                }
+                return response(
+                    self.grant
+                        .as_ref()
+                        .expect("session reserve installed a grant")
+                        .reserve_response
+                        .clone(),
+                );
+            }
+
+            let grant = self
+                .grant
+                .as_ref()
+                .expect("session control operation requires a reserved grant");
+            let grant_id = grant.binding.grant_id();
+            if path == format!("{CONTROL_PATH}/{grant_id}/bind") {
+                assert_eq!(body_bytes, &grant.final_request_body);
+                return response(receipt(
+                    &grant.binding,
+                    WireOperation::Bind,
+                    WireGrantState::Prepared,
+                ));
+            }
+            if path == format!("{CONTROL_PATH}/{grant_id}/promote") {
+                return response(receipt(
+                    &grant.binding,
+                    WireOperation::Promote,
+                    WireGrantState::Promoted,
+                ));
+            }
+            if path == format!("{CONTROL_PATH}/{grant_id}/complete") {
+                self.terminal.notify_one();
+                return response(receipt(
+                    &grant.binding,
+                    WireOperation::Complete,
+                    WireGrantState::Completed,
+                ));
+            }
+            if path == format!("{CONTROL_PATH}/{grant_id}/abort") {
+                self.terminal.notify_one();
+                return response(receipt(
+                    &grant.binding,
+                    WireOperation::Abort,
+                    WireGrantState::Aborted,
+                ));
+            }
+            panic!("session engine received unexpected control path {path}");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct TestServerState {
         responses: Arc<Mutex<HashMap<String, VecDeque<PlannedResponse>>>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        session_engine: Arc<Mutex<Option<SessionEngine>>>,
     }
 
     async fn control_handler(
@@ -2316,6 +2492,14 @@ mod tests {
             .unwrap()
             .get_mut(&path)
             .and_then(VecDeque::pop_front)
+            .or_else(|| {
+                state
+                    .session_engine
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .map(|engine| engine.handle(&path, &body_bytes, &body))
+            })
             .expect("test server received an unplanned control request");
         let mut response = Response::builder().status(planned.status);
         for (name, value) in &planned.headers {
@@ -2326,6 +2510,7 @@ mod tests {
             PlannedBody::Chunked(chunks) => Body::from_stream(tokio_stream::iter(
                 chunks.into_iter().map(Ok::<Bytes, Infallible>),
             )),
+            PlannedBody::Pending => future::pending::<Body>().await,
         };
         response.body(body).unwrap()
     }
@@ -2349,6 +2534,255 @@ mod tests {
 
     fn uuid(value: &str) -> Uuid {
         Uuid::parse_str(value).unwrap()
+    }
+
+    fn build_session_grant(request: &Value) -> SessionGrant {
+        let prefill_process: WireProcessIdentity =
+            serde_json::from_value(request["prefill_process"].clone()).unwrap();
+        let decoder_process: WireProcessIdentity =
+            serde_json::from_value(request["decoder_process"].clone()).unwrap();
+        let bootstrap: WireBootstrapEndpoint =
+            serde_json::from_value(request["prefill_bootstrap_endpoint"].clone()).unwrap();
+        let prefill_id = PrefillId::new(
+            HttpOrigin::parse(&prefill_process.url).unwrap(),
+            prefill_process.instance_id,
+        )
+        .unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse(&decoder_process.url).unwrap(),
+            decoder_process.instance_id,
+        )
+        .unwrap();
+        let prefill_bootstrap_endpoint =
+            PrefillBootstrapEndpoint::new(bootstrap.host.clone(), bootstrap.port).unwrap();
+        let request_chain_id =
+            serde_json::from_value(request["logical_request_chain_id"].clone()).unwrap();
+        let reservation_attempt_id =
+            serde_json::from_value(request["reservation_attempt_id"].clone()).unwrap();
+        let reserve_attempt_digest = DecoderReserveAttemptDigest::from_hex(
+            request["reserve_attempt_digest"].as_str().unwrap(),
+        )
+        .unwrap();
+        let source_tp_size = request["source_tp_size"].as_u64().unwrap() as usize;
+        let prepared_ttl_ms = request["prepared_ttl_ms"].as_u64().unwrap();
+        let inference_route = match request["inference_route"].as_str().unwrap() {
+            "/generate" => DecoderInferenceRoute::Generate,
+            "/v1/chat/completions" => DecoderInferenceRoute::ChatCompletions,
+            "/v1/completions" => DecoderInferenceRoute::Completions,
+            route => panic!("unexpected session inference route {route}"),
+        };
+        let request_shape = match request["request_shape"].as_str().unwrap() {
+            "scalar" => DecoderRequestShape::Scalar,
+            "batch" => DecoderRequestShape::Batch,
+            shape => panic!("unexpected session request shape {shape}"),
+        };
+        let base_request_body = Bytes::copy_from_slice(
+            request["base_request_body_json"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        );
+        let child_request_ids: Vec<Uuid> =
+            serde_json::from_value(request["child_request_ids"].clone()).unwrap();
+        let grant_id = Uuid::new_v4();
+        let prepared_expires_at_unix_ms = 2_000_000_000_000u64;
+        let mut allocations = Vec::with_capacity(child_request_ids.len());
+        let mut children = Vec::with_capacity(child_request_ids.len());
+        for (index, child_request_id) in child_request_ids.iter().copied().enumerate() {
+            let digest_byte = u8::try_from(index + 1).unwrap();
+            let slot_generation = Uuid::new_v4();
+            let writer_manifest_digest = AuthorityDigest([digest_byte; 32]);
+            let allocation_digest = AuthorityDigest([digest_byte + 16; 32]);
+            let bootstrap_room = 10_000 + index as u64;
+            let request_slot = 20_000 + index as u64;
+            let request_generation = 30_000 + index as u64;
+            children.push(
+                DecoderGrantChildBinding::new(
+                    child_request_id,
+                    DecoderSlotGeneration::new(slot_generation),
+                    bootstrap_room,
+                    request_slot,
+                    request_generation,
+                    writer_manifest_digest,
+                    allocation_digest,
+                    DecoderGrantChildAccounting::new(512 + index, 64 + index),
+                )
+                .unwrap(),
+            );
+            allocations.push(json!({
+                "child_request_id": child_request_id,
+                "decoder_slot_generation": slot_generation,
+                "bootstrap_room": bootstrap_room,
+                "request_slot": request_slot,
+                "request_generation": request_generation,
+                "writer_manifest_digest": hex_digest(writer_manifest_digest),
+                "allocation_digest": hex_digest(allocation_digest),
+                "reserved_kv_tokens": 512 + index,
+                "remaining_decode_tokens": 64 + index,
+            }));
+        }
+        let unbound = UnboundGrantBinding::new(
+            grant_id,
+            reservation_attempt_id,
+            reserve_attempt_digest,
+            inference_route,
+            request_shape,
+            prepared_ttl_ms,
+            prepared_expires_at_unix_ms,
+            base_request_body,
+            prefill_id,
+            prefill_bootstrap_endpoint,
+            request_chain_id,
+            source_tp_size,
+            decoder_id,
+            children,
+        )
+        .unwrap();
+        let final_request_body = build_bound_request(&unbound).unwrap();
+        let binding = unbound.bind(final_request_body.clone());
+        let reserve_response = json!({
+            "schema_version": SCHEMA_VERSION,
+            "state": "prepared",
+            "grant_id": grant_id,
+            "grant_token": URL_SAFE_NO_PAD.encode([0x5a; GRANT_TOKEN_BYTES]),
+            "prefill_process": request["prefill_process"],
+            "prefill_bootstrap_endpoint": request["prefill_bootstrap_endpoint"],
+            "decoder_process": request["decoder_process"],
+            "logical_request_chain_id": request_chain_id,
+            "reservation_attempt_id": reservation_attempt_id,
+            "reserve_attempt_digest": reserve_attempt_digest.to_hex(),
+            "source_tp_size": source_tp_size,
+            "prepared_ttl_ms": prepared_ttl_ms,
+            "inference_route": inference_route.as_str(),
+            "request_shape": request_shape.as_str(),
+            "reservation_digest": binding.reservation_digest().to_hex(),
+            "allocations": allocations,
+            "prepared_expires_at_unix_ms": prepared_expires_at_unix_ms,
+        });
+        SessionGrant {
+            binding,
+            final_request_body,
+            reserve_response,
+        }
+    }
+
+    const SESSION_MODEL_FINGERPRINT: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SESSION_KV_LAYOUT_FINGERPRINT: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION_API_KEY: &str = "session-engine-api-key";
+
+    fn session_process_metadata(
+        role: PdProcessRole,
+        tensor_parallel_size: usize,
+        launch_instance_id: Uuid,
+    ) -> PdProcessMetadata {
+        PdProcessMetadata::new(
+            PdMetadataSchema::V1,
+            launch_instance_id,
+            role,
+            tensor_parallel_size,
+            1,
+            SESSION_MODEL_FINGERPRINT,
+            SESSION_KV_LAYOUT_FINGERPRINT,
+            "bf16",
+            64,
+            KvTransferProtocol::PackedV4,
+            PreparedGrantProtocol::V1,
+            (role == PdProcessRole::Prefill)
+                .then(|| PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 42_000).unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn session_worker(
+        url: &str,
+        role: PdProcessRole,
+        tensor_parallel_size: usize,
+        launch_instance_id: Uuid,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .api_key(SESSION_API_KEY)
+                .worker_type(match role {
+                    PdProcessRole::Prefill => WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    PdProcessRole::Decode => WorkerType::Decode,
+                })
+                .pd_process(PdProcessRegistration::new(
+                    HttpOrigin::parse(url).unwrap(),
+                    session_process_metadata(role, tensor_parallel_size, launch_instance_id),
+                ))
+                .build(),
+        )
+    }
+
+    fn session_directory(
+        decoder_url: &str,
+        prefill_tp_size: usize,
+    ) -> (Arc<PdProcessDirectory>, PrefillId) {
+        let directory = Arc::new(PdProcessDirectory::default());
+        let prefill = directory
+            .admit_prefill(session_worker(
+                "http://prefill.test:30000",
+                PdProcessRole::Prefill,
+                prefill_tp_size,
+                Uuid::new_v4(),
+            ))
+            .unwrap();
+        directory
+            .admit_decoder(session_worker(
+                decoder_url,
+                PdProcessRole::Decode,
+                1,
+                Uuid::new_v4(),
+            ))
+            .unwrap();
+        (directory, prefill.id().clone())
+    }
+
+    fn session_template() -> DecoderRequestTemplate {
+        DecoderRequestTemplate::new(
+            DecoderInferenceRoute::ChatCompletions,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"production-shaped"}]}"#),
+        )
+        .unwrap()
+    }
+
+    async fn wait_for_session_cleanup(directory: &PdProcessDirectory, prefill_id: &PrefillId) {
+        let cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = directory.prefill(prefill_id).unwrap().pool().snapshot();
+                let decoder = &snapshot.replicas[0];
+                if snapshot.active_logical_requests == 0
+                    && decoder.pending_admissions == 0
+                    && decoder.active_cohorts == 0
+                    && decoder.quiescing_cohorts == 0
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if cleanup.is_err() {
+            let snapshot = directory.prefill(prefill_id).unwrap().pool().snapshot();
+            panic!("session actor did not release its pool ownership: {snapshot:?}");
+        }
+    }
+
+    async fn wait_for_request_count(state: &TestServerState, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.requests.lock().unwrap().len() >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("test server did not receive {expected} requests"));
     }
 
     struct Fixture {
@@ -2409,12 +2843,15 @@ mod tests {
         source_tp_size: usize,
     ) -> Fixture {
         let prefill_id = PrefillId::new(
-            "http://prefill.test:30000",
+            HttpOrigin::parse("http://prefill.test:30000").unwrap(),
             uuid("10000000-0000-4000-8000-000000000001"),
         )
         .unwrap();
-        let decoder_id =
-            DecoderId::new(decoder_url, uuid("20000000-0000-4000-8000-000000000002")).unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse(decoder_url).unwrap(),
+            uuid("20000000-0000-4000-8000-000000000002"),
+        )
+        .unwrap();
         let bootstrap = PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 42000).unwrap();
         let chain_id = uuid("30000000-0000-4000-8000-000000000003");
         let grant_id = uuid("40000000-0000-4000-8000-000000000004");
@@ -2682,8 +3119,16 @@ mod tests {
 
     #[test]
     fn reservation_derives_route_shape_and_requires_exact_rids() {
-        let prefill_id = PrefillId::new("http://prefill.test:30000", Uuid::new_v4()).unwrap();
-        let decoder_id = DecoderId::new("http://decoder.test:30001", Uuid::new_v4()).unwrap();
+        let prefill_id = PrefillId::new(
+            HttpOrigin::parse("http://prefill.test:30000").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse("http://decoder.test:30001").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap();
         let bootstrap = PrefillBootstrapEndpoint::new("bootstrap.test", 40000).unwrap();
         let prepare = |route: DecoderInferenceRoute, body: Value| {
             DecoderRequestTemplate::new(route, Bytes::from(serde_json::to_vec(&body).unwrap()))?
@@ -2964,7 +3409,10 @@ mod tests {
         assert!(!reservation_debug.contains(PROMPT_SECRET));
         let client = DecoderGrantControlClient::new().unwrap();
         let mut reserve = client.begin_reserve(fixture.take_reservation());
-        assert_debug_redacted(&reserve, &[PROMPT_SECRET, &fixture.token]);
+        assert_debug_redacted(
+            &reserve,
+            &[PROMPT_SECRET, &fixture.token, "test-decoder-api-key"],
+        );
         let mut unbound = reserve.reconcile_reserve().await.unwrap();
         assert_debug_redacted(&unbound, &[PROMPT_SECRET, &fixture.token]);
         let mut binding = unbound.begin_bind().unwrap();
@@ -2982,8 +3430,12 @@ mod tests {
         assert_debug_redacted(&retained, &[PROMPT_SECRET, &fixture.token]);
         let mut completion = retained.begin_test_completion().unwrap();
         assert_debug_redacted(&completion, &[PROMPT_SECRET, &fixture.token]);
-        let release = completion.reconcile_completion().await.unwrap();
-        assert_eq!(release.kind(), EngineReleaseKind::Completed);
+        let outcome = completion.reconcile_completion().await.unwrap();
+        assert!(matches!(
+            outcome,
+            EngineCompletionOutcome::Completed(ref receipt)
+                if receipt.kind() == EngineReleaseKind::Completed
+        ));
 
         let requests = state.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
@@ -3003,6 +3455,10 @@ mod tests {
                 Some(IDENTITY_CONTENT_ENCODING)
             );
         }
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer test-decoder-api-key")
+        );
         for request in &requests[1..] {
             assert_eq!(
                 request.authorization.as_deref(),
@@ -3052,6 +3508,213 @@ mod tests {
             requests[0].body["reservation_attempt_id"],
             attempt_id.to_string()
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reserve_timeout_retries_the_same_attempt_transcript() {
+        let (server_url, state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        install_plans(
+            &state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    PlannedResponse::pending(),
+                ),
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+            ]),
+        );
+
+        let client = DecoderGrantControlClient::from_builder_with_timeout(
+            Client::builder(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let attempt_id = fixture.binding.reservation_attempt_id();
+        let mut reserve = client.begin_reserve(fixture.take_reservation());
+        assert!(matches!(
+            reserve.reconcile_reserve().await,
+            Err(EngineGrantError::AmbiguousReserve(reason)) if reason == "request_timeout"
+        ));
+        assert_eq!(reserve.reservation_attempt_id().unwrap(), attempt_id);
+        let grant = reserve.reconcile_reserve().await.unwrap();
+        assert_eq!(grant.reservation_attempt_id(), attempt_id);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body_bytes, requests[1].body_bytes);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn production_session_runs_reserve_bind_promote_and_complete_for_tp2_and_tp4() {
+        for prefill_tp_size in [2, 4] {
+            let (server_url, state, task) = start_server().await;
+            let terminal = Arc::new(Notify::new());
+            *state.session_engine.lock().unwrap() = Some(SessionEngine::new(Arc::clone(&terminal)));
+            let (directory, prefill_id) = session_directory(&server_url, prefill_tp_size);
+            let client = DecoderGrantControlClient::new().unwrap();
+
+            let reserved = tokio::time::timeout(
+                Duration::from_secs(2),
+                PdReservedRequestSession::establish(
+                    Arc::clone(&directory),
+                    &prefill_id,
+                    format!("tp{prefill_tp_size}-complete"),
+                    None,
+                    session_template(),
+                    &client,
+                    &RetryConfig::default(),
+                ),
+            )
+            .await
+            .expect("session establishment timed out")
+            .unwrap();
+            {
+                let requests = state.requests.lock().unwrap();
+                let paths: Vec<&str> = requests
+                    .iter()
+                    .map(|request| request.path.as_str())
+                    .collect();
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], format!("{CONTROL_PATH}/reserve"));
+                assert!(paths[1].ends_with("/bind"));
+            }
+            let session = tokio::time::timeout(Duration::from_secs(2), reserved.promote())
+                .await
+                .expect("session promotion timed out")
+                .unwrap();
+            let request_body: Value = serde_json::from_slice(&session.request_body()).unwrap();
+            assert!(request_body[RID_KEY].is_string());
+            assert_eq!(request_body[BOOTSTRAP_HOST_KEY], "prefill-bootstrap.test");
+            assert_eq!(request_body[BOOTSTRAP_PORT_KEY], 42_000);
+            assert_eq!(request_body[BOOTSTRAP_ROOM_KEY], 10_000);
+
+            tokio::time::timeout(Duration::from_secs(2), session.complete())
+                .await
+                .expect("session completion timed out")
+                .unwrap();
+            wait_for_session_cleanup(&directory, &prefill_id).await;
+
+            let requests = state.requests.lock().unwrap();
+            let paths: Vec<&str> = requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect();
+            assert_eq!(paths.len(), 4);
+            assert_eq!(paths[0], format!("{CONTROL_PATH}/reserve"));
+            assert!(paths[1].ends_with("/bind"));
+            assert!(paths[2].ends_with("/promote"));
+            assert!(paths[3].ends_with("/complete"));
+            assert_eq!(requests[0].body["source_tp_size"], prefill_tp_size);
+            drop(requests);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_production_session_aborts_engine_and_releases_pool_ownership() {
+        let (server_url, state, task) = start_server().await;
+        let terminal = Arc::new(Notify::new());
+        *state.session_engine.lock().unwrap() = Some(SessionEngine::new(Arc::clone(&terminal)));
+        let (directory, prefill_id) = session_directory(&server_url, 2);
+        let client = DecoderGrantControlClient::new().unwrap();
+        let session = PdReservedRequestSession::establish(
+            Arc::clone(&directory),
+            &prefill_id,
+            "dropped-production-session",
+            None,
+            session_template(),
+            &client,
+            &RetryConfig::default(),
+        )
+        .await
+        .unwrap()
+        .promote()
+        .await
+        .unwrap();
+
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(2), terminal.notified())
+            .await
+            .expect("dropped session did not dispatch engine abort");
+        wait_for_session_cleanup(&directory, &prefill_id).await;
+
+        let requests = state.requests.lock().unwrap();
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0], format!("{CONTROL_PATH}/reserve"));
+        assert!(paths[1].ends_with("/bind"));
+        assert!(paths[2].ends_with("/promote"));
+        assert!(paths[3].ends_with("/abort"));
+        drop(requests);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_promotion_waiter_aborts_engine_and_releases_pool_ownership() {
+        let (server_url, state, task) = start_server().await;
+        let terminal = Arc::new(Notify::new());
+        *state.session_engine.lock().unwrap() = Some(SessionEngine::new(Arc::clone(&terminal)));
+        let (directory, prefill_id) = session_directory(&server_url, 4);
+        let client = DecoderGrantControlClient::new().unwrap();
+        let reserved = PdReservedRequestSession::establish(
+            Arc::clone(&directory),
+            &prefill_id,
+            "cancelled-production-promotion",
+            None,
+            session_template(),
+            &client,
+            &RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let grant_id = state
+            .session_engine
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .grant
+            .as_ref()
+            .unwrap()
+            .binding
+            .grant_id();
+        install_plans(
+            &state,
+            plan([(
+                format!("{CONTROL_PATH}/{grant_id}/promote"),
+                PlannedResponse::pending(),
+            )]),
+        );
+
+        let promotion = tokio::spawn(reserved.promote());
+        wait_for_request_count(&state, 3).await;
+        promotion.abort();
+        assert!(promotion.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), terminal.notified())
+            .await
+            .expect("cancelled promotion did not dispatch engine abort");
+        wait_for_session_cleanup(&directory, &prefill_id).await;
+
+        let requests = state.requests.lock().unwrap();
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0], format!("{CONTROL_PATH}/reserve"));
+        assert!(paths[1].ends_with("/bind"));
+        assert!(paths[2].ends_with("/promote"));
+        assert!(paths[3].ends_with("/abort"));
+        drop(requests);
         task.abort();
     }
 
@@ -3655,6 +4318,52 @@ mod tests {
         assert!(matches!(quarantined, EngineAbortOutcome::Quarantined(_)));
     }
 
+    async fn run_completion_state(state: WireGrantState) -> EngineCompletionOutcome {
+        let (server_url, server_state, task) = start_server().await;
+        let fixture = fixture(&server_url, 1);
+        let grant_id = fixture.binding.grant_id();
+        install_plans(
+            &server_state,
+            plan([
+                (
+                    format!("{CONTROL_PATH}/reserve"),
+                    response(fixture.reserve_response.clone()),
+                ),
+                (
+                    format!("{CONTROL_PATH}/{grant_id}/promote"),
+                    response(receipt(
+                        &fixture.binding,
+                        WireOperation::Promote,
+                        WireGrantState::Promoted,
+                    )),
+                ),
+                (
+                    format!("{CONTROL_PATH}/{grant_id}/complete"),
+                    response(receipt(&fixture.binding, WireOperation::Complete, state)),
+                ),
+            ]),
+        );
+        let mut grant = reserve_bound(&server_state, &fixture).await;
+        let mut promotion = grant.begin_test_promotion().unwrap();
+        let mut retained = promotion.reconcile_promotion().await.unwrap();
+        let mut completion = retained.begin_test_completion().unwrap();
+        let outcome = completion.reconcile_completion().await.unwrap();
+        assert_eq!(server_state.requests.lock().unwrap().len(), 4);
+        task.abort();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_only_authoritative_completed_or_quarantined_states() {
+        let completed = run_completion_state(WireGrantState::Completed).await;
+        assert!(matches!(completed, EngineCompletionOutcome::Completed(_)));
+        let quarantined = run_completion_state(WireGrantState::Quarantined).await;
+        assert!(matches!(
+            quarantined,
+            EngineCompletionOutcome::Quarantined(_)
+        ));
+    }
+
     #[tokio::test]
     async fn explicit_quarantine_returns_retention_receipt() {
         let (server_url, state, task) = start_server().await;
@@ -3747,8 +4456,12 @@ mod tests {
         let mut completion = retained.begin_test_completion().unwrap();
         assert!(completion.reconcile_completion().await.is_err());
         assert!(format!("{completion:?}").contains("has_control: true"));
-        let release = completion.reconcile_completion().await.unwrap();
-        assert_eq!(release.kind(), EngineReleaseKind::Completed);
+        let outcome = completion.reconcile_completion().await.unwrap();
+        assert!(matches!(
+            outcome,
+            EngineCompletionOutcome::Completed(ref receipt)
+                if receipt.kind() == EngineReleaseKind::Completed
+        ));
         assert_eq!(state.requests.lock().unwrap().len(), 5);
         task.abort();
     }

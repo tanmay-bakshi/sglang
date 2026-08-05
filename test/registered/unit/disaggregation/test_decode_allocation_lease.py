@@ -1,7 +1,9 @@
 import dataclasses
+import sys
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DECODE_ALLOCATION_COMPONENT_ORDER,
     DecodeAllocationComponent,
@@ -13,7 +15,10 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLifecycleUnavailable,
     DecodeWriterManifest,
 )
-from sglang.srt.mem_cache.allocation_pin import AllocationPinnedError
+from sglang.srt.mem_cache.allocation_pin import (
+    AllocationPinnedError,
+    AllocationPinSnapshot,
+)
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -203,6 +208,7 @@ def _complete_teardown(
     :param lease: Exact allocation lease to advance.
     """
 
+    fixture.authority.record_publication(lease, fixture.lifecycle)
     fixture.authority.record_submission(lease, fixture.lifecycle)
     fixture.authority.record_writer_completion(lease, fixture.lifecycle)
     fixture.authority.record_scatter_completion(lease, fixture.lifecycle)
@@ -256,18 +262,45 @@ def test_tp_manifest_and_component_participation_are_exact(
         assert all(item.generation_order == phase for item in participation)
         assert all(item.component is component for item in participation)
         assert all(
-            item.zero_work is expected_zero_work[phase]
-            for item in participation
+            item.zero_work is expected_zero_work[phase] for item in participation
         )
         assert tuple(
             item.writer_id.source_attn_tp_rank for item in participation
-        ) == tuple(
-            range(source_tp_size)
-        )
+        ) == tuple(range(source_tp_size))
+
+
+@pytest.mark.parametrize(
+    ("source_tp_size", "destination_tp_size", "destination_tp_rank", "source_ranks"),
+    (
+        (2, 1, 0, (0, 1)),
+        (4, 1, 0, (0, 1, 2, 3)),
+        (2, 2, 0, (0,)),
+        (2, 2, 1, (1,)),
+        (4, 2, 0, (0, 1)),
+        (4, 2, 1, (2, 3)),
+    ),
+)
+def test_manifest_selects_exact_destination_local_writers(
+    source_tp_size: int,
+    destination_tp_size: int,
+    destination_tp_rank: int,
+    source_ranks: tuple[int, ...],
+) -> None:
+    """Manifest membership follows the compatible TP routing topology."""
+
+    manifest = DecodeWriterManifest.for_tensor_parallel(
+        source_tp_size,
+        destination_tp_size,
+        destination_tp_rank,
+    )
+
+    assert (
+        tuple(writer.source_attn_tp_rank for writer in manifest.writers) == source_ranks
+    )
 
 
 def test_manifest_rejects_missing_and_duplicate_writers() -> None:
-    """Writer manifests reject incomplete and duplicated source membership."""
+    """Writer manifests reject incomplete and duplicated local membership."""
 
     canonical = DecodeWriterManifest.for_tensor_parallel(2)
     with pytest.raises(ValueError, match="writer count"):
@@ -299,6 +332,31 @@ def test_receipt_uses_allocator_derived_static_physical_identity() -> None:
     assert mamba.zero_work
     assert mamba.virtual_pages == ()
     assert mamba.physical_pages == ()
+
+
+def test_receipt_preserves_request_logical_page_order() -> None:
+    """Keep scatter order even when the pin registry canonicalizes page IDs."""
+
+    claim = DecodeAllocationComponentClaim(
+        component=DecodeAllocationComponent.FULL,
+        logical_start=0,
+        logical_length=4,
+        allocator=object(),
+        indices=torch.tensor([6, 7, 4, 5], dtype=torch.int64),
+    )
+    receipt = DecodeAllocationLeaseAuthority._component_receipt(
+        claim,
+        AllocationPinSnapshot(
+            allocator_label="reordered",
+            page_size=2,
+            virtual_pages=(2, 3),
+            physical_pages=(12, 13),
+            quarantined=False,
+        ),
+    )
+
+    assert receipt.virtual_pages == (3, 2)
+    assert receipt.physical_pages == (13, 12)
 
 
 def test_nonzero_mamba_is_pinned_and_gemma_zero_work_is_explicit() -> None:
@@ -344,9 +402,7 @@ def test_live_lease_blocks_request_and_component_reuse() -> None:
     with pytest.raises(AllocationPinnedError, match="clear"):
         fixture.full_allocator.clear()
     with pytest.raises(AllocationPinnedError, match="restore"):
-        fixture.full_allocator.restore_state(
-            fixture.full_allocator.backup_state()
-        )
+        fixture.full_allocator.restore_state(fixture.full_allocator.backup_state())
 
 
 def test_failed_component_pin_rolls_back_every_prior_owner() -> None:
@@ -389,9 +445,7 @@ def test_stale_request_generation_fails_before_component_pins() -> None:
     fixture = _lease_fixture()
     request_slot = fixture.request.req_pool_idx
     assert request_slot is not None
-    actual_generation = int(
-        fixture.request_pool.req_generation[request_slot].item()
-    )
+    actual_generation = int(fixture.request_pool.req_generation[request_slot].item())
     with pytest.raises(AllocationPinnedError, match="generation changed"):
         fixture.authority.acquire(
             request_pool=fixture.request_pool,
@@ -434,6 +488,122 @@ def test_commit_returns_migration_pin_without_freeing_request_storage() -> None:
     fixture.request_pool.free(fixture.request)
     assert fixture.full_allocator.available_size() == 32
     assert fixture.request_pool.available_size() == 4
+
+
+def test_legacy_consumption_commit_returns_published_pins() -> None:
+    """A consumed legacy transfer returns ownership to normal request cleanup."""
+
+    fixture = _lease_fixture()
+    full_available_after_alloc = fixture.full_allocator.available_size()
+    request_available_after_alloc = fixture.request_pool.available_size()
+    lease = _acquire(fixture)
+    fixture.authority.record_publication(lease, fixture.lifecycle)
+
+    with pytest.raises(AllocationPinnedError, match="pinned"):
+        fixture.request_pool.free(fixture.request)
+    with pytest.raises(DecodeAllocationLeaseError, match="exact lifecycle"):
+        fixture.authority.commit_legacy_to_request_after_consumption(
+            lease,
+            object(),
+        )
+    assert (
+        fixture.authority.snapshot(lease).state
+        is DecodeAllocationLeaseState.PUBLISHED
+    )
+
+    fixture.authority.commit_legacy_to_request_after_consumption(
+        lease,
+        fixture.lifecycle,
+    )
+    assert (
+        fixture.authority.snapshot(lease).state
+        is DecodeAllocationLeaseState.COMMITTED_TO_REQUEST
+    )
+    assert fixture.full_allocator.available_size() == full_available_after_alloc
+    assert fixture.request_pool.available_size() == request_available_after_alloc
+
+    fixture.authority.retire_terminal(lease)
+    fixture.full_allocator.free(fixture.full_indices)
+    fixture.swa_allocator.free(fixture.swa_indices)
+    fixture.request_pool.free(fixture.request)
+    assert fixture.full_allocator.available_size() == 32
+    assert fixture.request_pool.available_size() == 4
+
+
+def test_legacy_consumption_commit_cannot_bypass_lifecycle_edges() -> None:
+    """Prepared and submitted transactions cannot use the legacy success edge."""
+
+    fixture = _lease_fixture()
+    lease = _acquire(fixture)
+    with pytest.raises(DecodeAllocationLeaseError, match="published transfer"):
+        fixture.authority.commit_legacy_to_request_after_consumption(
+            lease,
+            fixture.lifecycle,
+        )
+
+    fixture.authority.record_publication(lease, fixture.lifecycle)
+    fixture.authority.record_submission(lease, fixture.lifecycle)
+    with pytest.raises(DecodeAllocationLeaseError, match="published transfer"):
+        fixture.authority.commit_legacy_to_request_after_consumption(
+            lease,
+            fixture.lifecycle,
+        )
+
+
+def test_legacy_terminal_failure_authorizes_canonical_abort_cleanup() -> None:
+    """A terminal legacy failure unpins only through a consumed abort permit."""
+
+    fixture = _lease_fixture()
+    full_available_after_alloc = fixture.full_allocator.available_size()
+    request_available_after_alloc = fixture.request_pool.available_size()
+    lease = _acquire(fixture)
+    fixture.authority.record_publication(lease, fixture.lifecycle)
+
+    with pytest.raises(DecodeAllocationLeaseError, match="exact lifecycle"):
+        fixture.authority.authorize_legacy_abort_after_terminal_failure(
+            lease,
+            object(),
+        )
+    permit = fixture.authority.authorize_legacy_abort_after_terminal_failure(
+        lease,
+        fixture.lifecycle,
+    )
+    assert (
+        fixture.authority.snapshot(lease).state
+        is DecodeAllocationLeaseState.ABORT_AUTHORIZED
+    )
+    assert fixture.full_allocator.available_size() == full_available_after_alloc
+    assert fixture.request_pool.available_size() == request_available_after_alloc
+    with pytest.raises(DecodeAllocationLeaseError, match="permit consumption"):
+        fixture.authority.retire_terminal(lease)
+
+    fixture.authority.consume_abort_permit(lease, permit)
+    fixture.full_allocator.free(fixture.full_indices)
+    fixture.swa_allocator.free(fixture.swa_indices)
+    fixture.request_pool.free(fixture.request)
+    fixture.authority.retire_terminal(lease)
+    assert fixture.full_allocator.available_size() == 32
+    assert fixture.request_pool.available_size() == 4
+
+
+def test_legacy_terminal_failure_cannot_bypass_lifecycle_edges() -> None:
+    """Only published legacy allocations can use the terminal failure edge."""
+
+    fixture = _lease_fixture()
+    lease = _acquire(fixture)
+    with pytest.raises(DecodeAllocationLeaseError, match="published transfer"):
+        fixture.authority.authorize_legacy_abort_after_terminal_failure(
+            lease,
+            fixture.lifecycle,
+        )
+
+    fixture.authority.record_publication(lease, fixture.lifecycle)
+    fixture.authority.record_submission(lease, fixture.lifecycle)
+    with pytest.raises(DecodeAllocationLeaseError, match="published transfer"):
+        fixture.authority.authorize_legacy_abort_after_terminal_failure(
+            lease,
+            fixture.lifecycle,
+        )
 
 
 def test_pre_submission_rollback_returns_pin_to_live_request() -> None:
@@ -495,6 +665,7 @@ def test_teardown_authenticates_generation_manifest_and_allocation() -> None:
 
     fixture = _lease_fixture()
     lease = _acquire(fixture, source_tp_size=4)
+    fixture.authority.record_publication(lease, fixture.lifecycle)
     fixture.authority.record_submission(lease, fixture.lifecycle)
     fixture.authority.record_writer_completion(lease, fixture.lifecycle)
     fixture.authority.record_scatter_completion(lease, fixture.lifecycle)
@@ -513,9 +684,7 @@ def test_teardown_authenticates_generation_manifest_and_allocation() -> None:
             lease,
             fixture.lifecycle,
             request_generation=snapshot.request_generation,
-            writer_manifest_digest=_alter_digest(
-                snapshot.writer_manifest.digest
-            ),
+            writer_manifest_digest=_alter_digest(snapshot.writer_manifest.digest),
             allocation_digest=snapshot.allocation_digest,
         )
     with pytest.raises(DecodeAllocationLeaseError, match="allocation digest"):
@@ -559,7 +728,7 @@ def test_unbound_transport_lifecycle_hard_gates_submission() -> None:
         ),
     )
     with pytest.raises(DecodeAllocationLifecycleUnavailable, match="not bound"):
-        authority.record_submission(lease, object())
+        authority.record_publication(lease, object())
 
 
 def test_phase_order_is_exact_and_one_shot() -> None:
@@ -569,7 +738,13 @@ def test_phase_order_is_exact_and_one_shot() -> None:
     lease = _acquire(fixture)
     with pytest.raises(DecodeAllocationLeaseError, match="invalid"):
         fixture.authority.record_writer_completion(lease, fixture.lifecycle)
+    fixture.authority.record_publication(lease, fixture.lifecycle)
+    assert (
+        fixture.authority.snapshot(lease).state is DecodeAllocationLeaseState.PUBLISHED
+    )
     fixture.authority.record_submission(lease, fixture.lifecycle)
+    with pytest.raises(DecodeAllocationLeaseError, match="invalid"):
+        fixture.authority.record_publication(lease, fixture.lifecycle)
     with pytest.raises(DecodeAllocationLeaseError, match="invalid"):
         fixture.authority.record_submission(lease, fixture.lifecycle)
     fixture.authority.record_writer_completion(lease, fixture.lifecycle)
@@ -602,6 +777,7 @@ def test_ambiguity_quarantines_complete_local_allocation() -> None:
 
     fixture = _lease_fixture()
     lease = _acquire(fixture)
+    fixture.authority.record_publication(lease, fixture.lifecycle)
     fixture.authority.record_submission(lease, fixture.lifecycle)
     fixture.authority.quarantine(lease, "native handle terminality is unknown")
     snapshot = fixture.authority.snapshot(lease)
@@ -616,3 +792,7 @@ def test_ambiguity_quarantines_complete_local_allocation() -> None:
             lease,
             fixture.lifecycle,
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

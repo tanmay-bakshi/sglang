@@ -1,4 +1,5 @@
 import argparse
+import sys
 from dataclasses import dataclass, replace
 from typing import cast
 
@@ -9,6 +10,9 @@ import torch.distributed as dist
 from sglang.srt import distributed, runtime_context
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _TEST_WORLD_SIZE = 2
 _TEST_HIDDEN_SIZE = 32
@@ -750,3 +754,7 @@ def test_committed_static_contract_never_falls_back(
 
     with pytest.raises(RuntimeError, match=error_match):
         gatherer(x)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

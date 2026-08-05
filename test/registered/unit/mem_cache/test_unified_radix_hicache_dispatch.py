@@ -1,7 +1,24 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+import torch
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
+)
+from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.mem_cache.base_prefix_cache import (
+    IncLockRefResult,
+    InitLoadBackParams,
+    LoadBackResult,
+)
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
@@ -18,6 +35,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     register_stack_strategy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -228,6 +246,306 @@ class TestApplyStackResult(unittest.TestCase):
         kvcache.register_layer_transfer_counter.assert_called_once()
         params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
         cache.register_sidecar_pool.assert_not_called()
+
+
+class _FullSWACompletionEvent:
+    """Model the merged stream event owned by the hybrid cache controller."""
+
+    full_complete: bool
+    swa_complete: bool
+    query_count: int
+    synchronize_count: int
+
+    def __init__(self) -> None:
+        """Initialize an incomplete full-plus-SWA transfer event."""
+
+        self.full_complete = False
+        self.swa_complete = False
+        self.query_count = 0
+        self.synchronize_count = 0
+
+    def query(self) -> bool:
+        """Return whether both component copies have completed.
+
+        :returns: Whether the merged controller event is signaled.
+        """
+
+        self.query_count += 1
+        return self.full_complete and self.swa_complete
+
+    def synchronize(self) -> None:
+        """Acknowledge a signaled merged controller event."""
+
+        if not self.query():
+            raise AssertionError("cannot acknowledge an incomplete load-back event")
+        self.synchronize_count += 1
+
+
+class TestUnifiedLoadBackCompletion(unittest.TestCase):
+    @staticmethod
+    def _make_cache(
+        finish_event: _FullSWACompletionEvent, node_id: int
+    ) -> SimpleNamespace:
+        """Build a cache double that runs the production reaping path.
+
+        :param finish_event: Rank-local merged component event.
+        :param node_id: Ongoing load-back operation identifier.
+        :returns: Unified cache completion double.
+        """
+
+        cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                layer_done_counter=SimpleNamespace(
+                    events=[SimpleNamespace(finish_event=finish_event)]
+                ),
+                ack_load_queue=[
+                    HiCacheAck(
+                        start_event=finish_event,
+                        finish_event=finish_event,
+                        node_ids=[node_id],
+                    )
+                ],
+            ),
+            ongoing_load_back={node_id: (object(), object(), object())},
+            dec_lock_ref=MagicMock(),
+            dec_host_lock_ref=MagicMock(),
+            metrics_collector=None,
+            pp_rank=0,
+            _all_reduce=MagicMock(),
+        )
+        cache.loading_check = MagicMock(
+            side_effect=lambda: UnifiedRadixCache.loading_check(cache)
+        )
+        return cache
+
+    @staticmethod
+    def _make_decode_req() -> SimpleNamespace:
+        """Build a request whose network KV transfer is complete.
+
+        :returns: Pending local-restore request double.
+        """
+
+        receiver = MagicMock()
+        receiver.poll.return_value = KVPoll.Success
+        return SimpleNamespace(
+            kv_receiver=receiver,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+        )
+
+    @staticmethod
+    def _poll_all(
+        caches: list[SimpleNamespace], decode_reqs: list[SimpleNamespace]
+    ) -> list[KVPoll]:
+        """Advance local completion and poll each rank-local receiver gate.
+
+        :param caches: Rank-local unified cache doubles.
+        :param decode_reqs: Rank-local decode request doubles.
+        :returns: Rank-local receiver poll states.
+        """
+
+        polls = []
+        for cache, decode_req in zip(caches, decode_reqs, strict=True):
+            if (
+                decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
+                and UnifiedRadixCache.is_load_back_event_done(cache, 0)
+            ):
+                decode_req.hicache_restore_status = HiCacheRestoreResult.READY
+            polls.append(HiCacheRestoreGatedKVReceiver(decode_req).poll())
+        return polls
+
+    def test_negative_ticket_is_complete_without_reaping(self) -> None:
+        event = _FullSWACompletionEvent()
+        cache = self._make_cache(event, node_id=7)
+
+        self.assertTrue(UnifiedRadixCache.is_load_back_event_done(cache, -1))
+        self.assertEqual(event.query_count, 0)
+        cache.loading_check.assert_not_called()
+        self.assertEqual(len(cache.cache_controller.ack_load_queue), 1)
+
+    def test_tp_ranks_wait_for_full_and_swa_before_receiver_success(self) -> None:
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                events = [_FullSWACompletionEvent() for _ in range(tp_size)]
+                caches = [
+                    self._make_cache(event, node_id=rank + 1)
+                    for rank, event in enumerate(events)
+                ]
+                for cache in caches:
+                    cache._all_reduce.side_effect = lambda value, _op: value.fill_(
+                        min(
+                            int(event.full_complete and event.swa_complete)
+                            for event in events
+                        )
+                    )
+                decode_reqs = [self._make_decode_req() for _ in range(tp_size)]
+
+                self.assertEqual(
+                    self._poll_all(caches, decode_reqs),
+                    [KVPoll.Transferring] * tp_size,
+                )
+                for event in events:
+                    event.full_complete = True
+                self.assertEqual(
+                    self._poll_all(caches, decode_reqs),
+                    [KVPoll.Transferring] * tp_size,
+                )
+                for cache in caches:
+                    cache.loading_check.assert_not_called()
+                    self.assertEqual(len(cache.cache_controller.ack_load_queue), 1)
+
+                if tp_size == 2:
+                    events[0].swa_complete = True
+                    polls = self._poll_all(caches, decode_reqs)
+                    self.assertEqual(polls, [KVPoll.Transferring] * tp_size)
+                    for cache in caches:
+                        cache.loading_check.assert_not_called()
+
+                for event in events:
+                    event.swa_complete = True
+                self.assertEqual(
+                    self._poll_all(caches, decode_reqs),
+                    [KVPoll.Success] * tp_size,
+                )
+                for event, cache in zip(events, caches, strict=True):
+                    cache.loading_check.assert_called_once_with()
+                    self.assertEqual(event.synchronize_count, 1)
+                    self.assertEqual(cache.cache_controller.ack_load_queue, [])
+                    self.assertEqual(cache.ongoing_load_back, {})
+                    cache.dec_lock_ref.assert_called_once()
+                    cache.dec_host_lock_ref.assert_called_once()
+
+
+class TestUnifiedLoadBackResult(unittest.TestCase):
+    _BEST_NODE = 29
+    _OLD_DEVICE_NODE = 11
+
+    @classmethod
+    def _restore(
+        cls, full_physical_tokens: int, swa_physical_tokens: int
+    ) -> tuple[
+        LoadBackResult,
+        UnifiedRadixCache,
+        PoolTransfer,
+        PoolTransfer | None,
+    ]:
+        """Run a unified load-back with controller-allocated component copies.
+
+        :param full_physical_tokens: Physical full-KV indices in the transfer.
+        :param swa_physical_tokens: Physical SWA indices in the transfer.
+        :returns: Public result, cache, and queued full/SWA transfers.
+        """
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        kv_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.arange(full_physical_tokens, dtype=torch.int64),
+        )
+        swa_transfer: PoolTransfer | None = None
+        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
+        if swa_physical_tokens > 0:
+            swa_transfer = PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=torch.arange(swa_physical_tokens, dtype=torch.int64),
+            )
+            component_transfers[SWA] = [swa_transfer]
+
+        tree_core = MagicMock()
+        tree_core.build_load_back_spec.return_value = (
+            kv_transfer,
+            component_transfers,
+        )
+        tree_core.commit_load_back.return_value = []
+        tree_core.is_full_device_evicted.return_value = full_physical_tokens > 0
+        tree_core.empty_match_result = SimpleNamespace(
+            device_indices=torch.empty((0,), dtype=torch.int64)
+        )
+        cache.tree_core = tree_core
+
+        controller = MagicMock()
+
+        def load(
+            *,
+            host_indices: torch.Tensor,
+            node_id: int,
+            extra_pools: list[PoolTransfer] | None,
+        ) -> torch.Tensor:
+            """Allocate physical destinations for the queued transfers.
+
+            :param host_indices: Full-KV source indices.
+            :param node_id: Restored radix node.
+            :param extra_pools: Auxiliary component transfers.
+            :returns: Full-KV destination indices.
+            """
+
+            if node_id != cls._BEST_NODE:
+                raise AssertionError(f"unexpected restored node {node_id}")
+            transfers = extra_pools if extra_pools is not None else ()
+            for transfer in transfers:
+                if transfer.name == PoolName.SWA:
+                    transfer.device_indices = torch.arange(
+                        int(transfer.host_indices.numel()), dtype=torch.int64
+                    )
+            return torch.arange(int(host_indices.numel()), dtype=torch.int64)
+
+        controller.load.side_effect = load
+        cache.cache_controller = controller
+        cache._components_tuple = ()
+        cache.inc_host_lock_ref = MagicMock(return_value=IncLockRefResult(delta=0))
+        cache.inc_lock_ref = MagicMock(return_value=IncLockRefResult(delta=0))
+        cache.dec_lock_ref = MagicMock()
+        cache.dec_host_lock_ref = MagicMock()
+        cache._apply_cache_actions = MagicMock()
+        cache.token_to_kv_pool_allocator = SimpleNamespace(
+            full_available_size=MagicMock(return_value=1024)
+        )
+        cache.sidecar_pool_specs = []
+        cache.load_back_threshold = 0
+        cache.is_swa_enabled = True
+        cache.ongoing_load_back = {}
+
+        req = SimpleNamespace(
+            last_node=cls._OLD_DEVICE_NODE,
+            swa_host_hit_length=int(swa_physical_tokens > 0),
+            mamba_host_hit_length=0,
+        )
+        result = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=cls._BEST_NODE,
+                host_hit_length=int(full_physical_tokens > 0),
+                req=req,
+            )
+        )
+        return result, cache, kv_transfer, swa_transfer
+
+    def test_full_and_swa_result_uses_queued_physical_sizes(self) -> None:
+        result, cache, kv_transfer, swa_transfer = self._restore(6, 4)
+
+        self.assertTrue(result.queued_any_component)
+        self.assertEqual(result.restored_node, self._BEST_NODE)
+        self.assertEqual(result.new_full_device_indices.numel(), 6)
+        self.assertEqual(result.full_tokens, 6)
+        self.assertEqual(result.swa_tokens, 4)
+        self.assertIsNotNone(kv_transfer.device_indices)
+        self.assertIsNotNone(swa_transfer)
+        self.assertIsNotNone(swa_transfer.device_indices)
+        self.assertEqual(kv_transfer.device_indices.numel(), 6)
+        self.assertEqual(swa_transfer.device_indices.numel(), 4)
+        cache.tree_core.collect_full_device_indices.assert_not_called()
+
+    def test_swa_only_result_restores_node_without_new_full_indices(self) -> None:
+        result, cache, kv_transfer, swa_transfer = self._restore(0, 4)
+
+        self.assertTrue(result.queued_any_component)
+        self.assertEqual(result.restored_node, self._BEST_NODE)
+        self.assertEqual(result.new_full_device_indices.numel(), 0)
+        self.assertEqual(result.full_tokens, 0)
+        self.assertEqual(result.swa_tokens, 4)
+        self.assertIsNotNone(kv_transfer.device_indices)
+        self.assertIsNotNone(swa_transfer)
+        self.assertIsNotNone(swa_transfer.device_indices)
+        self.assertEqual(kv_transfer.device_indices.numel(), 0)
+        self.assertEqual(swa_transfer.device_indices.numel(), 4)
+        cache.tree_core.collect_full_device_indices.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -8,19 +8,18 @@
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use bytes::Bytes;
-use reqwest::Url;
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
 use super::pd_decoder_pool::{DecoderGrantPoolBinding, PendingCancellationPin};
-use crate::core::PrefillBootstrapEndpoint;
+use crate::core::{HttpOrigin, PrefillBootstrapEndpoint};
 
 mod control;
 
 pub use control::{
-    DecoderGrantControlClient, DecoderGrantReservation, DecoderRequestTemplate,
-    ReserveReconciliationGrant,
+    DecoderControlAuthorization, DecoderGrantControlClient, DecoderGrantReservation,
+    DecoderRequestTemplate, ReserveReconciliationGrant,
 };
 
 const GRANT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-grant-v4";
@@ -29,52 +28,27 @@ const RESERVE_ATTEMPT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-reserve-attempt
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ProcessIdentity {
-    url: Arc<str>,
+    origin: HttpOrigin,
     instance_id: Uuid,
 }
 
 impl ProcessIdentity {
-    fn new(url: impl Into<String>, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
+    fn new(origin: HttpOrigin, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
         if instance_id.is_nil() {
             return Err(ProcessIdentityError::NilInstanceId);
         }
-        let url = url.into();
-        let parsed = Url::parse(&url)
-            .map_err(|error| ProcessIdentityError::InvalidUrl(error.to_string()))?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(ProcessIdentityError::InvalidUrl(
-                "process URL must use http or https".to_string(),
-            ));
-        }
-        if parsed.host_str().is_none() {
-            return Err(ProcessIdentityError::InvalidUrl(
-                "process URL must contain a host".to_string(),
-            ));
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(ProcessIdentityError::InvalidUrl(
-                "process URL cannot contain credentials".to_string(),
-            ));
-        }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
-            return Err(ProcessIdentityError::InvalidUrl(
-                "process URL cannot contain a query or fragment".to_string(),
-            ));
-        }
-        if parsed.path() != "/" {
-            return Err(ProcessIdentityError::InvalidUrl(
-                "process URL must be an origin without a path".to_string(),
-            ));
-        }
-        let canonical_url = parsed.as_str().trim_end_matches('/').to_string();
         Ok(Self {
-            url: Arc::from(canonical_url),
+            origin,
             instance_id,
         })
     }
 
     fn url(&self) -> &str {
-        &self.url
+        self.origin.as_str()
+    }
+
+    fn origin(&self) -> &HttpOrigin {
+        &self.origin
     }
 
     fn instance_id(&self) -> Uuid {
@@ -88,13 +62,18 @@ pub struct PrefillId(ProcessIdentity);
 
 impl PrefillId {
     /// Construct an identity from the selected worker URL and launch instance.
-    pub fn new(url: impl Into<String>, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
-        Ok(Self(ProcessIdentity::new(url, instance_id)?))
+    pub fn new(origin: HttpOrigin, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
+        Ok(Self(ProcessIdentity::new(origin, instance_id)?))
     }
 
     /// Canonical selected worker base URL.
     pub fn url(&self) -> &str {
         self.0.url()
+    }
+
+    /// Canonical selected worker origin.
+    pub fn origin(&self) -> &HttpOrigin {
+        self.0.origin()
     }
 
     /// SGLang launch generation from ``PortArgs.instance_id``.
@@ -115,8 +94,8 @@ pub struct DecoderId(ProcessIdentity);
 
 impl DecoderId {
     /// Construct an identity from the selected worker URL and launch instance.
-    pub fn new(url: impl Into<String>, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
-        Ok(Self(ProcessIdentity::new(url, instance_id)?))
+    pub fn new(origin: HttpOrigin, instance_id: Uuid) -> Result<Self, ProcessIdentityError> {
+        Ok(Self(ProcessIdentity::new(origin, instance_id)?))
     }
 
     /// Canonical selected worker base URL.
@@ -125,6 +104,11 @@ impl DecoderId {
     }
 
     /// SGLang launch generation from ``PortArgs.instance_id``.
+    /// Canonical selected worker origin.
+    pub fn origin(&self) -> &HttpOrigin {
+        self.0.origin()
+    }
+
     pub fn instance_id(&self) -> Uuid {
         self.0.instance_id()
     }
@@ -139,8 +123,6 @@ impl fmt::Display for DecoderId {
 /// Invalid process-generation identity.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ProcessIdentityError {
-    #[error("invalid process URL: {0}")]
-    InvalidUrl(String),
     #[error("process launch instance cannot be the nil UUID")]
     NilInstanceId,
 }
@@ -2291,10 +2273,12 @@ impl fmt::Debug for CompletionReconciliationGrant {
 
 impl CompletionReconciliationGrant {
     /// Reconcile only the pinned completion operation.
-    pub async fn reconcile_completion(&mut self) -> Result<EngineReleaseReceipt, EngineGrantError> {
-        let receipt = self.control()?.complete(&self.binding).await?;
+    pub async fn reconcile_completion(
+        &mut self,
+    ) -> Result<EngineCompletionOutcome, EngineGrantError> {
+        let outcome = self.control()?.complete(&self.binding).await?;
         self.control = None;
-        Ok(receipt)
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -2582,6 +2566,15 @@ pub enum EngineReleaseKind {
     PreparedCancelled,
     Completed,
     Aborted,
+}
+
+/// Engine-authoritative result of a completion request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EngineCompletionOutcome {
+    /// Every child completed and its allocation was released.
+    Completed(EngineReleaseReceipt),
+    /// Completion could not prove safe release, so every allocation remains retained.
+    Quarantined(EngineQuarantineReceipt),
 }
 
 /// Engine-authoritative result of an abort request.
@@ -3162,8 +3155,16 @@ mod tests {
 
     fn process_ids() -> (PrefillId, DecoderId) {
         (
-            PrefillId::new("http://prefill:30000", Uuid::new_v4()).unwrap(),
-            DecoderId::new("http://decode:30001", Uuid::new_v4()).unwrap(),
+            PrefillId::new(
+                HttpOrigin::parse("http://prefill:30000").unwrap(),
+                Uuid::new_v4(),
+            )
+            .unwrap(),
+            DecoderId::new(
+                HttpOrigin::parse("http://decode:30001").unwrap(),
+                Uuid::new_v4(),
+            )
+            .unwrap(),
         )
     }
 
@@ -3279,7 +3280,7 @@ mod tests {
                 br#"{"input_ids":[[1,2,3],[4,5]],"rid":["01020304-0506-4708-890a-0b0c0d0e0f10","f0e0d0c0-b0a0-4908-8706-050403020100"],"bootstrap_host":["10.20.30.40","10.20.30.40"],"bootstrap_port":[50051,50051],"bootstrap_room":[41,42]}"#,
             ),
             prefill_id: PrefillId::new(
-                "https://prefill.example:8443",
+                HttpOrigin::parse("https://prefill.example:8443").unwrap(),
                 Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
             )
             .unwrap(),
@@ -3292,7 +3293,7 @@ mod tests {
                 .unwrap(),
             source_tp_size: 4,
             decoder_id: DecoderId::new(
-                "http://decode.example:30001",
+                HttpOrigin::parse("http://decode.example:30001").unwrap(),
                 Uuid::parse_str("12345678-9abc-4def-8123-456789abcdef").unwrap(),
             )
             .unwrap(),
@@ -3330,16 +3331,27 @@ mod tests {
     #[test]
     fn process_identity_binds_url_and_launch_instance() {
         let instance_id = Uuid::new_v4();
-        let first = DecoderId::new("http://decode:30001/", instance_id).unwrap();
-        let same = DecoderId::new("http://decode:30001", instance_id).unwrap();
-        let reused_url = DecoderId::new("http://decode:30001", Uuid::new_v4()).unwrap();
+        let first = DecoderId::new(
+            HttpOrigin::parse("http://decode:30001/").unwrap(),
+            instance_id,
+        )
+        .unwrap();
+        let same = DecoderId::new(
+            HttpOrigin::parse("http://decode:30001").unwrap(),
+            instance_id,
+        )
+        .unwrap();
+        let reused_url = DecoderId::new(
+            HttpOrigin::parse("http://decode:30001").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap();
         assert_eq!(first, same);
         assert_ne!(first, reused_url);
     }
 
     #[test]
-    fn process_identity_accepts_only_nonnil_http_origins() {
-        let instance_id = Uuid::new_v4();
+    fn http_origin_rejects_non_origin_urls_and_process_identity_rejects_nil_generation() {
         for url in [
             "ftp://decode.test:30001",
             "http://user@decode.test:30001",
@@ -3347,9 +3359,13 @@ mod tests {
             "http://decode.test:30001?generation=1",
             "http://decode.test:30001#worker",
         ] {
-            assert!(DecoderId::new(url, instance_id).is_err(), "{url}");
+            assert!(HttpOrigin::parse(url).is_err(), "{url}");
         }
-        assert!(DecoderId::new("http://decode.test:30001", Uuid::nil()).is_err());
+        assert!(DecoderId::new(
+            HttpOrigin::parse("http://decode.test:30001").unwrap(),
+            Uuid::nil(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3385,13 +3401,14 @@ mod tests {
         });
         assert_reserve_change(|value| {
             value.prefill_id = PrefillId::new(
-                "https://other-prefill.example:8443",
+                HttpOrigin::parse("https://other-prefill.example:8443").unwrap(),
                 value.prefill_id.instance_id(),
             )
             .unwrap()
         });
         assert_reserve_change(|value| {
-            value.prefill_id = PrefillId::new(value.prefill_id.url(), Uuid::new_v4()).unwrap()
+            value.prefill_id =
+                PrefillId::new(value.prefill_id.origin().clone(), Uuid::new_v4()).unwrap()
         });
         assert_reserve_change(|value| {
             value.prefill_bootstrap_endpoint =
@@ -3401,13 +3418,14 @@ mod tests {
         assert_reserve_change(|value| value.source_tp_size = 2);
         assert_reserve_change(|value| {
             value.decoder_id = DecoderId::new(
-                "http://other-decode.example:30001",
+                HttpOrigin::parse("http://other-decode.example:30001").unwrap(),
                 value.decoder_id.instance_id(),
             )
             .unwrap()
         });
         assert_reserve_change(|value| {
-            value.decoder_id = DecoderId::new(value.decoder_id.url(), Uuid::new_v4()).unwrap()
+            value.decoder_id =
+                DecoderId::new(value.decoder_id.origin().clone(), Uuid::new_v4()).unwrap()
         });
         assert_reserve_change(|value| value.children.swap(0, 1));
 

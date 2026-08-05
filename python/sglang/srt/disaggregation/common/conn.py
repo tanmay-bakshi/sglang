@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import dataclasses
+import hashlib
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -25,6 +29,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
     StateType,
+)
+from sglang.srt.disaggregation.common.decode_allocation_lease import (
+    DecodeAllocationLease,
+    DecodeAllocationLeaseAuthority,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -44,7 +52,19 @@ from sglang.srt.utils.network import (
     get_zmq_socket_on_host,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.disaggregation.nixl.packed_staging_request import (
+        PackedDecodeRequestTransaction,
+        PackedRequestPublication,
+    )
+
 logger = logging.getLogger(__name__)
+
+NIXL_BOOTSTRAP_PEER_PROTOCOL = "nixl-peer-handle-v1"
+SERIALIZED_RANK_LIMIT = 1 << 32
+NIXL_AGENT_NAME_MAX_BYTES = 256
+NIXL_AGENT_METADATA_MAX_BYTES = 512 * 1024
+NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH = 4 * ((NIXL_AGENT_METADATA_MAX_BYTES + 2) // 3)
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -133,10 +153,29 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    attn_dp_rank: int
+    attn_cp_rank: int
+    attn_tp_rank: int
+    pp_rank: int
+    transfer_source_rank: int | None = None
+    transport_protocol: str | None = None
+    nixl_agent_name: str | None = None
+    nixl_agent_metadata: str | None = None
+    nixl_agent_metadata_sha256: str | None = None
+    process_generation: str | None = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        self.attn_dp_rank = int(self.attn_dp_rank)
+        self.attn_cp_rank = int(self.attn_cp_rank)
+        self.attn_tp_rank = int(self.attn_tp_rank)
+        self.pp_rank = int(self.pp_rank)
+        self.transfer_source_rank = (
+            int(self.transfer_source_rank)
+            if self.transfer_source_rank is not None
+            else None
+        )
 
 
 class CommonKVManager(BaseKVManager):
@@ -146,6 +185,7 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        defer_prefill_bootstrap_registration: bool = False,
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -221,7 +261,8 @@ class CommonKVManager(BaseKVManager):
             self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
                 self.bootstrap_port
             )
-            self.register_to_bootstrap()
+            if not defer_prefill_bootstrap_registration:
+                self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
@@ -267,6 +308,145 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def supports_packed_decode_request_transactions(self) -> bool:
+        """Return whether the complete packed request runtime is initialized.
+
+        :returns: ``False`` for managers without request-scoped packed actors.
+        """
+
+        return False
+
+    def prepared_grant_protocol(self) -> str | None:
+        """Return the live prefill actor protocol for prepared decoder grants.
+
+        :returns: A closed protocol identifier, otherwise ``None``.
+        """
+
+        return None
+
+    def attach_packed_decode_scheduler(
+        self,
+        metadata_allocator: object,
+        consumer_authority: object,
+    ) -> None:
+        """Attach scheduler-owned metadata resources to a packed actor.
+
+        Managers without a packed decode actor intentionally ignore the
+        attachment. Their capability remains unavailable through
+        :meth:`supports_packed_decode_request_transactions`.
+
+        :param metadata_allocator: Existing decode metadata-row allocator.
+        :param consumer_authority: Scheduler queue that consumes row contents.
+        """
+
+        del metadata_allocator, consumer_authority
+
+    def prepare_packed_decode_request_transaction(
+        self,
+        *,
+        room_id: int,
+        request_owner: object,
+        metadata_buffer_index: int,
+        allocation_lease: DecodeAllocationLease,
+        allocation_authority: DecodeAllocationLeaseAuthority,
+        lifecycle_authority: object,
+        source_tp_size: int,
+    ) -> PackedDecodeRequestTransaction | None:
+        """Construct a request transaction before allocation publication.
+
+        :param room_id: Decoder-minted non-recycled bootstrap room.
+        :param request_owner: Exact retained decode request.
+        :param metadata_buffer_index: Exact reserved auxiliary metadata slot.
+        :param allocation_lease: Prepared decode allocation lease.
+        :param allocation_authority: Exact allocation lease authority.
+        :param lifecycle_authority: Trusted transport lifecycle authority.
+        :param source_tp_size: Source attention tensor-parallel width.
+        :returns: A prepared transaction, otherwise ``None`` when unavailable.
+        """
+
+        return None
+
+    def send_packed_decode_request_metadata(
+        self,
+        *,
+        transaction: PackedDecodeRequestTransaction,
+        publication: PackedRequestPublication,
+        receiver: CommonKVReceiver,
+        page_indices: npt.NDArray[np.int32],
+        metadata_buffer_index: int,
+        state_indices: list[object] | None,
+        decode_prefix_len: int,
+    ) -> None:
+        """Enter published metadata into a request-scoped packed actor.
+
+        :param transaction: Exact retained request transaction.
+        :param publication: Matching irreversible publication.
+        :param receiver: Exact retained decode receiver.
+        :param page_indices: Complete destination main-KV page array.
+        :param metadata_buffer_index: Reserved auxiliary metadata slot.
+        :param state_indices: Complete destination state page arrays.
+        :param decode_prefix_len: Decoder-reused prefix length.
+        :raises RuntimeError: If the packed request runtime is unavailable.
+        """
+
+        raise RuntimeError("packed decode request runtime is unavailable")
+
+    def poll_packed_decode_request_transaction(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> KVPoll:
+        """Advance one packed decode transaction on the scheduler thread.
+
+        :param transaction: Exact request transaction.
+        :returns: Current packed transfer state.
+        :raises RuntimeError: If the manager has no packed decode actor.
+        """
+
+        del transaction
+        raise RuntimeError("packed decode request runtime is unavailable")
+
+    def cancel_unpublished_packed_decode_request_transaction(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> object:
+        """Cancel and retire one request before metadata publication.
+
+        :param transaction: Exact prepared request transaction.
+        :returns: Exact retained request owner.
+        :raises RuntimeError: If the manager has no packed decode actor.
+        """
+
+        del transaction
+        raise RuntimeError("packed decode request runtime is unavailable")
+
+    def complete_packed_decode_request_metadata_consumption(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Release one packed metadata row after scheduler consumption.
+
+        :param transaction: Exact committed request transaction.
+        :raises RuntimeError: If the manager has no packed decode actor.
+        """
+
+        del transaction
+        raise RuntimeError("packed decode request runtime is unavailable")
+
+    def quarantine_packed_decode_request_transaction(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+        reason: str,
+    ) -> None:
+        """Quarantine every resource retained by one packed transaction.
+
+        :param transaction: Exact request transaction.
+        :param reason: Stable failure reason.
+        :raises RuntimeError: If the manager has no packed decode actor.
+        """
+
+        del transaction, reason
+        raise RuntimeError("packed decode request runtime is unavailable")
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -660,6 +840,7 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": self.server_args.port,
         }
+        payload.update(self._bootstrap_transport_registration())
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         last_failure = "bootstrap registration was not attempted"
@@ -695,6 +876,14 @@ class CommonKVManager(BaseKVManager):
             "Prefill instance failed to register to bootstrap server after "
             f"{max_retries} attempts: {last_failure}"
         )
+
+    def _bootstrap_transport_registration(self) -> dict[str, object]:
+        """Return transport-owned fields for one prefill rank registration.
+
+        :returns: Transport registration fields, empty for common backends.
+        """
+
+        return {}
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:
@@ -1485,9 +1674,7 @@ def _resolve_bootstrap_int(
     """
 
     if current is not None and current != candidate:
-        raise ValueError(
-            f"inconsistent bootstrap {field}: {candidate} != {current}"
-        )
+        raise ValueError(f"inconsistent bootstrap {field}: {candidate} != {current}")
     return candidate
 
 
@@ -1525,10 +1712,154 @@ def _resolve_bootstrap_bool(
     """
 
     if current is not None and current != candidate:
-        raise ValueError(
-            f"inconsistent bootstrap {field}: {candidate} != {current}"
-        )
+        raise ValueError(f"inconsistent bootstrap {field}: {candidate} != {current}")
     return candidate
+
+
+def validate_serialized_rank(value: object, field: str) -> int:
+    """Validate one unsigned 32-bit rank received across a process boundary.
+
+    :param value: Candidate serialized rank.
+    :param field: Attribute name for diagnostics.
+    :returns: Validated rank.
+    :raises ValueError: If the value is not a JSON integer in the uint32 range.
+    """
+
+    if type(value) is not int or value < 0 or value >= SERIALIZED_RANK_LIMIT:
+        raise ValueError(f"invalid serialized {field}")
+    return value
+
+
+def validate_nixl_agent_name(value: object) -> str:
+    """Validate one bounded ASCII NIXL agent name.
+
+    :param value: Candidate serialized agent name.
+    :returns: Validated agent name.
+    :raises ValueError: If the value is empty, non-ASCII, or too large.
+    """
+
+    if type(value) is not str or len(value) == 0:
+        raise ValueError("invalid NIXL agent name")
+    try:
+        encoded_name = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("NIXL agent name must be ASCII") from error
+    if len(encoded_name) > NIXL_AGENT_NAME_MAX_BYTES:
+        raise ValueError(f"NIXL agent name exceeds {NIXL_AGENT_NAME_MAX_BYTES} bytes")
+    return value
+
+
+def validate_nixl_agent_metadata(value: object) -> bytes:
+    """Validate one bounded raw NIXL metadata document.
+
+    :param value: Candidate native metadata.
+    :returns: Validated metadata.
+    :raises ValueError: If the value is empty, not bytes, or too large.
+    """
+
+    if type(value) is not bytes or len(value) == 0:
+        raise ValueError("invalid NIXL agent metadata")
+    if len(value) > NIXL_AGENT_METADATA_MAX_BYTES:
+        raise ValueError(
+            f"NIXL agent metadata exceeds {NIXL_AGENT_METADATA_MAX_BYTES} bytes"
+        )
+    return value
+
+
+def decode_nixl_agent_metadata(value: object) -> bytes:
+    """Decode one bounded canonical base64 NIXL metadata document.
+
+    :param value: Candidate serialized metadata.
+    :returns: Decoded metadata.
+    :raises ValueError: If the value is empty, malformed, noncanonical, or too large.
+    """
+
+    if type(value) is not str or len(value) == 0:
+        raise ValueError("invalid NIXL agent metadata")
+    if len(value) > NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH:
+        raise ValueError("encoded NIXL agent metadata exceeds the bounded decoded size")
+    try:
+        metadata = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("invalid NIXL agent metadata encoding") from error
+    validate_nixl_agent_metadata(metadata)
+    if base64.b64encode(metadata).decode("ascii") != value:
+        raise ValueError("NIXL agent metadata is not canonical base64")
+    return metadata
+
+
+def _parse_bootstrap_transport_registration(
+    data: dict[str, object],
+) -> dict[str, object | None]:
+    """Validate one optional transport-specific rank identity.
+
+    :param data: Bootstrap registration JSON.
+    :returns: Normalized fields for :class:`PrefillRankInfo`.
+    :raises ValueError: If the registration is partial or internally inconsistent.
+    """
+
+    field_names = (
+        "nixl_agent_name",
+        "nixl_agent_metadata",
+        "nixl_agent_metadata_sha256",
+        "process_generation",
+        "transfer_source_rank",
+    )
+    transport_protocol = data.get("transport_protocol")
+    if transport_protocol is None:
+        if any(data.get(field_name) is not None for field_name in field_names):
+            raise ValueError(
+                "transport_protocol is required with transport peer identity"
+            )
+        return {
+            "transport_protocol": None,
+            **{field_name: None for field_name in field_names},
+        }
+
+    if transport_protocol != NIXL_BOOTSTRAP_PEER_PROTOCOL:
+        raise ValueError(
+            f"unsupported bootstrap transport_protocol: {transport_protocol!r}"
+        )
+
+    string_fields = (
+        "nixl_agent_metadata_sha256",
+        "process_generation",
+    )
+    for field_name in string_fields:
+        value = data.get(field_name)
+        if type(value) is not str or len(value) == 0:
+            raise ValueError(f"invalid bootstrap {field_name}")
+
+    nixl_agent_name = validate_nixl_agent_name(data.get("nixl_agent_name"))
+    encoded_metadata = data.get("nixl_agent_metadata")
+    metadata = decode_nixl_agent_metadata(encoded_metadata)
+    metadata_sha256 = data["nixl_agent_metadata_sha256"]
+    process_generation = data["process_generation"]
+    assert isinstance(metadata_sha256, str)
+    assert isinstance(process_generation, str)
+
+    if hashlib.sha256(metadata).hexdigest() != metadata_sha256:
+        raise ValueError("bootstrap nixl_agent_metadata digest mismatch")
+
+    try:
+        parsed_generation = uuid.UUID(process_generation)
+    except ValueError as error:
+        raise ValueError("invalid bootstrap process_generation") from error
+    if str(parsed_generation) != process_generation:
+        raise ValueError("bootstrap process_generation must be a canonical UUID")
+
+    transfer_source_rank = validate_serialized_rank(
+        data.get("transfer_source_rank"), "transfer_source_rank"
+    )
+
+    return {
+        "transport_protocol": transport_protocol,
+        "nixl_agent_name": nixl_agent_name,
+        "nixl_agent_metadata": encoded_metadata,
+        "nixl_agent_metadata_sha256": metadata_sha256,
+        "process_generation": process_generation,
+        "transfer_source_rank": transfer_source_rank,
+    }
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
@@ -1657,18 +1988,27 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         data = await request.json()
         try:
             attn_tp_size = int(data["attn_tp_size"])
-            attn_tp_rank = int(data["attn_tp_rank"])
+            attn_tp_rank = validate_serialized_rank(
+                data["attn_tp_rank"], "attn_tp_rank"
+            )
             attn_cp_size = int(data["attn_cp_size"])
-            attn_cp_rank = int(data["attn_cp_rank"])
+            attn_cp_rank = validate_serialized_rank(
+                data["attn_cp_rank"], "attn_cp_rank"
+            )
             attn_dp_size = int(data["attn_dp_size"])
-            attn_dp_rank = int(data["attn_dp_rank"])
+            attn_dp_rank = validate_serialized_rank(
+                data["attn_dp_rank"], "attn_dp_rank"
+            )
             pp_size = int(data["pp_size"])
-            pp_rank = int(data["pp_rank"])
+            pp_rank = validate_serialized_rank(data["pp_rank"], "pp_rank")
             system_dp_size = int(data["system_dp_size"])
-            system_dp_rank = int(data["system_dp_rank"])
+            system_dp_rank = validate_serialized_rank(
+                data["system_dp_rank"], "system_dp_rank"
+            )
             rank_port = int(data["rank_port"])
             page_size = int(data["page_size"])
             prefill_http_port = int(data["prefill_http_port"])
+            transport_registration = _parse_bootstrap_transport_registration(data)
         except (KeyError, TypeError, ValueError) as error:
             return web.Response(
                 text=f"Invalid bootstrap registration: {error}",
@@ -1677,12 +2017,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         rank_ip = data.get("rank_ip")
         kv_cache_dtype = data.get("kv_cache_dtype")
-        load_balance_method = data.get(
-            "load_balance_method", "follow_bootstrap_room"
-        )
-        enable_dsa_cache_layer_split = data.get(
-            "enable_dsa_cache_layer_split", False
-        )
+        load_balance_method = data.get("load_balance_method", "follow_bootstrap_room")
+        enable_dsa_cache_layer_split = data.get("enable_dsa_cache_layer_split", False)
         if type(rank_ip) is not str or len(rank_ip) == 0:
             return web.Response(text="Invalid bootstrap rank_ip", status=400)
         if type(kv_cache_dtype) is not str or len(kv_cache_dtype) == 0:
@@ -1788,13 +2124,27 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
-            tp_group_table[pp_rank] = PrefillRankInfo(
+            rank_info = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                attn_dp_rank=dp_group,
+                attn_cp_rank=attn_cp_rank,
+                attn_tp_rank=attn_tp_rank,
+                pp_rank=pp_rank,
+                **transport_registration,
             )
-            self._registered_ranks.add(
-                (dp_group, attn_cp_rank, attn_tp_rank, pp_rank)
-            )
+            existing_rank_info = tp_group_table.get(pp_rank)
+            if existing_rank_info is not None and existing_rank_info != rank_info:
+                return web.Response(
+                    text=(
+                        "conflicting bootstrap registration for "
+                        f"DP{dp_group} CP{attn_cp_rank} "
+                        f"TP{attn_tp_rank} PP{pp_rank}"
+                    ),
+                    status=409,
+                )
+            tp_group_table[pp_rank] = rank_info
+            self._registered_ranks.add((dp_group, attn_cp_rank, attn_tp_rank, pp_rank))
             if self._is_ready():
                 self._ready_event.set()
 
@@ -1925,9 +2275,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._cleanup_task = self._loop.create_task(
-                self._cleanup_expired_entries()
-            )
+            self._cleanup_task = self._loop.create_task(self._cleanup_expired_entries())
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:

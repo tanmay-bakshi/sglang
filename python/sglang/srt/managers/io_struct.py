@@ -288,6 +288,11 @@ class GenerateReqInput:
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
+    decode_reservation_grant_id: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
@@ -918,6 +923,133 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
 
     def __iter__(self):
         return iter(self.batch)
+
+
+class DecodeReservationPrepareReqInput(BaseReq, kw_only=True):
+    """Prepare one exact decoder reservation in the scheduler."""
+
+    correlation_id: str
+    grant_id: str
+    attempt: dict[str, Any]
+    tokenized_requests: tuple[TokenizedGenerateReqInput, ...]
+    prepared_expires_at_unix_ms: int | None = None
+
+    def __repr__(self) -> str:
+        """Return a prompt-redacted representation.
+
+        :returns: Safe diagnostic representation.
+        """
+
+        return (
+            "DecodeReservationPrepareReqInput("
+            f"correlation_id={self.correlation_id!r}, "
+            f"grant_id={self.grant_id!r}, "
+            f"request_count={len(self.tokenized_requests)})"
+        )
+
+
+class DecodeReservationBindReqInput(BaseReq, kw_only=True):
+    """Bind exact final inference bytes to one prepared reservation."""
+
+    correlation_id: str
+    grant_id: str
+    request_body: bytes
+
+    def __repr__(self) -> str:
+        """Return a prompt-redacted representation.
+
+        :returns: Safe diagnostic representation.
+        """
+
+        return (
+            "DecodeReservationBindReqInput("
+            f"correlation_id={self.correlation_id!r}, "
+            f"grant_id={self.grant_id!r}, "
+            f"request_body_bytes={len(self.request_body)})"
+        )
+
+
+class DecodeReservationTransitionReqInput(BaseReq, kw_only=True):
+    """Apply one bound decoder reservation lifecycle transition."""
+
+    correlation_id: str
+    grant_id: str
+    operation: str
+    transcript: dict[str, Any]
+
+    def __repr__(self) -> str:
+        """Return a transcript-redacted representation.
+
+        :returns: Safe diagnostic representation.
+        """
+
+        return (
+            "DecodeReservationTransitionReqInput("
+            f"correlation_id={self.correlation_id!r}, "
+            f"grant_id={self.grant_id!r}, "
+            f"operation={self.operation!r})"
+        )
+
+
+class DecodeReservationCancelUnboundReqInput(BaseReq, kw_only=True):
+    """Cancel one prepared reservation before final-body binding."""
+
+    correlation_id: str
+    grant_id: str
+    transcript: dict[str, Any]
+
+    def __repr__(self) -> str:
+        """Return a transcript-redacted representation.
+
+        :returns: Safe diagnostic representation.
+        """
+
+        return (
+            "DecodeReservationCancelUnboundReqInput("
+            f"correlation_id={self.correlation_id!r}, "
+            f"grant_id={self.grant_id!r})"
+        )
+
+
+class DecodeInferenceAttachReqInput(BaseReq, kw_only=True):
+    """Attach one promoted reservation to its exact inference request."""
+
+    correlation_id: str
+    grant_id: str
+    inference_route: str
+    request_body: bytes
+
+    def __repr__(self) -> str:
+        """Return a prompt-redacted representation.
+
+        :returns: Safe diagnostic representation.
+        """
+
+        return (
+            "DecodeInferenceAttachReqInput("
+            f"correlation_id={self.correlation_id!r}, "
+            f"grant_id={self.grant_id!r}, "
+            f"inference_route={self.inference_route!r}, "
+            f"request_body_bytes={len(self.request_body)})"
+        )
+
+
+class DecodeReservationControlReqOutput(BaseReq, kw_only=True):
+    """Correlated authoritative scheduler control result."""
+
+    correlation_id: str
+    operation: str
+    success: bool
+    response: dict[str, Any] | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+class DecodeReservationExpiryReqOutput(BaseReq, kw_only=True):
+    """Unsolicited prompt-free scheduler expiry result."""
+
+    cancelled_grant_ids: tuple[str, ...]
+    quarantined_grant_ids: tuple[str, ...]
 
 
 @dataclass

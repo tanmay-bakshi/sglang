@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    DecodeReservationPrepareReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -215,6 +216,9 @@ class SchedulerRequestReceiver:
             ):
                 for sub_req in req:
                     sub_req.unwrap_pickle_fields()
+            elif isinstance(req, DecodeReservationPrepareReqInput):
+                for tokenized_request in req.tokenized_requests:
+                    tokenized_request.unwrap_pickle_fields()
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode

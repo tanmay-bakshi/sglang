@@ -1239,21 +1239,23 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         scheduler_info = self._scheduler_init_result.scheduler_infos[0]
-        runtime_capabilities = runtime_capabilities_from_scheduler_info(
-            scheduler_info
-        )
+        runtime_capabilities = runtime_capabilities_from_scheduler_info(scheduler_info)
+        server_args = self.tokenizer_manager.server_args
+        server_info_values = {
+            **dataclasses.asdict(server_args),
+            **scheduler_info,
+        }
         return msgspec_to_builtins(
-            {
-                **dataclasses.asdict(self.tokenizer_manager.server_args),
-                **scheduler_info,
-                "internal_states": internal_states,
-                "version": __version__,
-                "pd_process": (
-                    self.tokenizer_manager.server_args.pd_process_advertisement(
+            server_args.public_server_args_dict(
+                {
+                    **server_info_values,
+                    "internal_states": internal_states,
+                    "version": __version__,
+                    "pd_process": server_args.pd_process_advertisement(
                         runtime_capabilities
-                    )
-                ),
-            }
+                    ),
+                }
+            )
         )
 
     def init_weights_update_group(

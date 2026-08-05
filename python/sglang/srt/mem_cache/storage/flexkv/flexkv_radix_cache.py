@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    LoadBackResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -274,23 +275,25 @@ class FlexKVRadixCache(RadixCache):
     # init_load_back (MP RETRIEVE)
     # ------------------------------------------------------------------
 
-    def init_load_back(  # type: ignore[override]
+    def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
+    ) -> LoadBackResult:
         """MP RETRIEVE. Allocates uncached slots and fires the FlexKV
         load; inserts the resulting TreeNode."""
         req = params.req
         last_node: TreeNode = params.best_match_node
         marker = self._load_markers.pop(req.rid, None)
         if marker is None:
-            # ``match_prefix`` decided there was no work to do, but the
-            # scheduler still called us. Release any held task and
-            # return an empty load.
             self.flexkv_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackResult(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
+                queued_any_component=False,
+                full_tokens=0,
+                swa_tokens=0,
             )
 
         result = self._allocate_and_load(
@@ -308,11 +311,23 @@ class FlexKVRadixCache(RadixCache):
             # is idempotent for the case where allocation failed before
             # we even popped the held task.
             self.flexkv_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackResult(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
+                queued_any_component=False,
+                full_tokens=0,
+                swa_tokens=0,
             )
-        return result
+        new_indices, restored_node = result
+        return LoadBackResult(
+            new_full_device_indices=new_indices,
+            restored_node=restored_node,
+            queued_any_component=False,
+            full_tokens=len(new_indices),
+            swa_tokens=0,
+        )
 
     def _allocate_and_load(
         self,

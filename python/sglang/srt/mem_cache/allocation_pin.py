@@ -130,9 +130,7 @@ class AllocationPinRegistry:
 
         with self._lock:
             conflicts = tuple(
-                page_id
-                for page_id in owned_page_ids
-                if page_id in self._owners_by_page
+                page_id for page_id in owned_page_ids if page_id in self._owners_by_page
             )
             if len(conflicts) > 0:
                 raise AllocationPinnedError(

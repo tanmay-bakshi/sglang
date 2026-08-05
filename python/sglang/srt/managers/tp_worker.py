@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
@@ -54,6 +54,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+_PREFILL_FORWARD_BATCH_INIT_SPAN = "sglang.prefill.forward_batch_init"
+_PREFILL_MODEL_RUNNER_DISPATCH_SPAN = "sglang.prefill.model_runner_dispatch"
+_NULL_PROFILE_RANGE = nullcontext()
 
 
 class BaseTpWorker(ABC):
@@ -539,23 +544,28 @@ class TpModelWorker(BaseTpWorker):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
-        # Get forward batch from schedule batch
-        if batch is not None:
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(batch.hicache_consumer_index)
+        prefill_batch = batch is not None and batch.forward_mode.is_prefill()
+        forward_batch_init_range = (
+            profile_range(_PREFILL_FORWARD_BATCH_INIT_SPAN)
+            if prefill_batch
+            else _NULL_PROFILE_RANGE
+        )
+        with forward_batch_init_range:
+            if batch is not None:
+                self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                capture_hidden_mode=capture_hidden_mode,
-                return_hidden_states_before_norm=False,
-            )
-        else:
-            # FIXME(lsyin): unify the interface of forward_batch
-            assert forward_batch is not None
-            assert (
-                capture_hidden_mode is None
-            ), "capture_hidden_mode override requires a ScheduleBatch input"
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    self.model_runner,
+                    capture_hidden_mode=capture_hidden_mode,
+                    return_hidden_states_before_norm=False,
+                )
+            else:
+                # FIXME(lsyin): unify the interface of forward_batch
+                assert forward_batch is not None
+                assert (
+                    capture_hidden_mode is None
+                ), "capture_hidden_mode override requires a ScheduleBatch input"
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -564,10 +574,16 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
+            model_runner_dispatch_range = (
+                profile_range(_PREFILL_MODEL_RUNNER_DISPATCH_SPAN)
+                if forward_batch.forward_mode.is_prefill()
+                else _NULL_PROFILE_RANGE
             )
+            with model_runner_dispatch_range:
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -620,10 +636,16 @@ class TpModelWorker(BaseTpWorker):
 
             return batch_result
         else:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
+            model_runner_dispatch_range = (
+                profile_range(_PREFILL_MODEL_RUNNER_DISPATCH_SPAN)
+                if forward_batch.forward_mode.is_prefill()
+                else _NULL_PROFILE_RANGE
             )
+            with model_runner_dispatch_range:
+                out = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

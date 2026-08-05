@@ -19,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -160,7 +159,10 @@ def make_next_draft_input(
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    return DFlashDraftInputV2.from_next_tokens(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+    )
 
 
 def resolve_greedy_mask(

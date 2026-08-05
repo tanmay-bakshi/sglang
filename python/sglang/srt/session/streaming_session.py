@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    LoadBackResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -590,7 +591,7 @@ class StreamingSession(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, params: InitLoadBackParams):
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackResult:
         return self.inner.init_load_back(params)
 
     def ready_to_load_host_cache(self):

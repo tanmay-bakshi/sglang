@@ -13,7 +13,6 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -116,22 +115,6 @@ def build_draft_tp_worker(
         draft_model_runner=draft_model_runner,
         draft_model=draft_model_runner.model,
         resolved_attention_backend=draft_backend,
-    )
-
-
-def make_draft_input_v2(
-    *,
-    bonus_tokens: torch.Tensor,
-    new_seq_lens: torch.Tensor,
-) -> DFlashDraftInputV2:
-    bs = int(new_seq_lens.numel())
-    device = bonus_tokens.device
-    return DFlashDraftInputV2(
-        topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
-        topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
-        bonus_tokens=bonus_tokens.to(dtype=torch.int64),
-        new_seq_lens=new_seq_lens.to(dtype=torch.int64),
-        hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
     )
 
 

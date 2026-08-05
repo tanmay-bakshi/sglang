@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Iterator, Optional
 
 import torch
+
 from sglang.srt.mem_cache.allocation_pin import (
     AllocationPin,
     AllocationPinRegistry,
@@ -206,9 +207,7 @@ class MambaSlotAllocator:
         slot_ids = tuple(
             sorted(
                 int(slot_id)
-                for slot_id in torch.unique(
-                    indices.detach().to(dtype=torch.int64)
-                )
+                for slot_id in torch.unique(indices.detach().to(dtype=torch.int64))
                 .cpu()
                 .tolist()
             )

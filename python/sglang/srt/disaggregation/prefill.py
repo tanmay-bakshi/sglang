@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
+    resolve_kv_layer_ids,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -203,6 +204,10 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_layer_ids = resolve_kv_layer_ids(
+            self.token_to_kv_pool,
+            len(kv_data_ptrs),
+        )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -215,19 +220,23 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            draft_kv_layer_ids = resolve_kv_layer_ids(
+                self.draft_token_to_kv_pool,
+                len(draft_kv_data_ptrs),
+            )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_layer_ids = (
+                [*kv_layer_ids, *draft_kv_layer_ids]
+                if len(kv_layer_ids) > 0 and len(draft_kv_layer_ids) > 0
+                else []
+            )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
-        )
+        kv_args.kv_layer_ids = kv_layer_ids
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

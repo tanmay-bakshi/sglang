@@ -238,6 +238,31 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
+    def test_pd_decode_radix_cache_allows_dflash(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="DFLASH",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="EAGLE",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "incompatible with speculative decoding",
+        ):
+            server_args._handle_pd_disaggregation()
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):

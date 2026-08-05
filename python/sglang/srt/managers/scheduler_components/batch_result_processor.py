@@ -760,6 +760,16 @@ class SchedulerBatchResultProcessor:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
+            if batch.spec_algorithm.is_dflash():
+                self.metrics_collector.increment_speculative_cuda_graph_pass(
+                    stage="dflash_verify",
+                    value=can_run_cuda_graph,
+                )
+                if result.spec_draft_can_run_cuda_graph is not None:
+                    self.metrics_collector.increment_speculative_cuda_graph_pass(
+                        stage="dflash_draft",
+                        value=result.spec_draft_can_run_cuda_graph,
+                    )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 

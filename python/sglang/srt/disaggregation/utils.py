@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -15,6 +27,8 @@ from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -37,6 +51,8 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+_INT64_MAX = (1 << 63) - 1
+_UINT64_MODULUS = 1 << 64
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -89,6 +105,251 @@ class DisaggregationMode(Enum):
 #########################
 
 
+@dataclass(frozen=True)
+class SingletonPollProgressStats:
+    """Immutable counters for one TP1 transfer-polling stream.
+
+    :ivar polls: Number of rank-local poll vectors observed.
+    :ivar progress_transitions: Number of complete-vector changes after the first poll.
+    :ivar stalled_polls: Number of polls whose complete vector matched the prior poll.
+    :ivar yields: Number of explicit cooperative scheduler yields.
+    :ivar skipped_collectives: Number of singleton Gloo collectives replaced by this policy.
+    :ivar cumulative_requested_sleep_us: Requested sleep across all explicit yields.
+    :ivar cumulative_observed_yield_ns: Wall time spent inside explicit yields.
+    :ivar max_consecutive_stalled_polls: Largest observed unchanged-poll run.
+    """
+
+    polls: int
+    progress_transitions: int
+    stalled_polls: int
+    yields: int
+    skipped_collectives: int
+    cumulative_requested_sleep_us: int
+    cumulative_observed_yield_ns: int
+    max_consecutive_stalled_polls: int
+
+    def as_dict(self) -> dict[str, int]:
+        """Return a serialization-ready counter mapping.
+
+        :returns: Counter names mapped to their integer values.
+        """
+
+        return {
+            "polls": self.polls,
+            "progress_transitions": self.progress_transitions,
+            "stalled_polls": self.stalled_polls,
+            "yields": self.yields,
+            "skipped_collectives": self.skipped_collectives,
+            "cumulative_requested_sleep_us": self.cumulative_requested_sleep_us,
+            "cumulative_observed_yield_ns": self.cumulative_observed_yield_ns,
+            "max_consecutive_stalled_polls": self.max_consecutive_stalled_polls,
+        }
+
+
+class SingletonPollProgressPolicy:
+    """Bound CPU monopolization while TP1 transfer polling makes no progress."""
+
+    GLOO_MODE: ClassVar[Literal["gloo"]] = "gloo"
+    YIELD_MODE: ClassVar[Literal["yield"]] = "yield"
+    SCHED_YIELD_MODE: ClassVar[Literal["sched_yield"]] = "sched_yield"
+    DEFAULT_YIELD_CADENCE: ClassVar[int] = 1
+    DEFAULT_YIELD_SLEEP_US: ClassVar[int] = 0
+    DEFAULT_LOG_INTERVAL_POLLS: ClassVar[int] = 65_536
+    MAX_YIELD_CADENCE: ClassVar[int] = 1_024
+    MAX_YIELD_SLEEP_US: ClassVar[int] = 1_000
+
+    _stream_name: str
+    _mode: Literal["gloo", "yield", "sched_yield"]
+    _yield_cadence: int
+    _yield_sleep_us: int
+    _log_interval_polls: int
+    _previous_polls: tuple[int, ...] | None
+    _consecutive_stalled_polls: int
+    _polls: int
+    _progress_transitions: int
+    _stalled_polls: int
+    _yields: int
+    _skipped_collectives: int
+    _cumulative_requested_sleep_us: int
+    _cumulative_observed_yield_ns: int
+    _max_consecutive_stalled_polls: int
+
+    def __init__(
+        self,
+        stream_name: str,
+        mode: Literal["gloo", "yield", "sched_yield"] = GLOO_MODE,
+        yield_cadence: int = DEFAULT_YIELD_CADENCE,
+        yield_sleep_us: int = DEFAULT_YIELD_SLEEP_US,
+        log_interval_polls: int = DEFAULT_LOG_INTERVAL_POLLS,
+    ) -> None:
+        """Initialize one queue-local TP1 polling policy.
+
+        :param stream_name: Stable stream label used in diagnostic logs.
+        :param mode: Singleton progress mechanism: ``gloo``, ``yield``, or
+            ``sched_yield``.
+        :param yield_cadence: Consecutive unchanged polls allowed per explicit yield.
+        :param yield_sleep_us: Requested sleep in ``yield`` mode. Zero invokes
+            ``time.sleep(0)``.
+        :param log_interval_polls: Poll cadence for debug counter snapshots.
+        :raises ValueError: If any bound is invalid or unsafe.
+        """
+
+        if len(stream_name) == 0:
+            raise ValueError("stream_name must not be empty")
+        if mode not in (
+            self.GLOO_MODE,
+            self.YIELD_MODE,
+            self.SCHED_YIELD_MODE,
+        ):
+            raise ValueError("mode must be 'gloo', 'yield', or 'sched_yield'")
+        if yield_cadence < 1 or yield_cadence > self.MAX_YIELD_CADENCE:
+            raise ValueError(f"yield_cadence must be in [1, {self.MAX_YIELD_CADENCE}]")
+        if yield_sleep_us < 0 or yield_sleep_us > self.MAX_YIELD_SLEEP_US:
+            raise ValueError(
+                f"yield_sleep_us must be in [0, {self.MAX_YIELD_SLEEP_US}]"
+            )
+        if mode == self.SCHED_YIELD_MODE and yield_sleep_us != 0:
+            raise ValueError("sched_yield mode requires yield_sleep_us=0")
+        if log_interval_polls < 1:
+            raise ValueError("log_interval_polls must be positive")
+
+        self._stream_name = stream_name
+        self._mode = mode
+        self._yield_cadence = yield_cadence
+        self._yield_sleep_us = yield_sleep_us
+        self._log_interval_polls = log_interval_polls
+        self._previous_polls = None
+        self._consecutive_stalled_polls = 0
+        self._polls = 0
+        self._progress_transitions = 0
+        self._stalled_polls = 0
+        self._yields = 0
+        self._skipped_collectives = 0
+        self._cumulative_requested_sleep_us = 0
+        self._cumulative_observed_yield_ns = 0
+        self._max_consecutive_stalled_polls = 0
+
+    def observe(self, polls: list[int]) -> None:
+        """Observe one local poll vector and yield when stalled cadence expires.
+
+        :param polls: Complete rank-local poll-state vector in queue order.
+        """
+
+        current_polls = tuple(int(poll) for poll in polls)
+        self._polls += 1
+        if self.replaces_collective:
+            self._skipped_collectives += 1
+
+        if self._previous_polls is None:
+            self._previous_polls = current_polls
+            self._maybe_log()
+            return
+
+        if current_polls != self._previous_polls:
+            self._previous_polls = current_polls
+            self._progress_transitions += 1
+            self._consecutive_stalled_polls = 0
+            self._maybe_log()
+            return
+
+        self._stalled_polls += 1
+        self._consecutive_stalled_polls += 1
+        self._max_consecutive_stalled_polls = max(
+            self._max_consecutive_stalled_polls,
+            self._consecutive_stalled_polls,
+        )
+        if (
+            not self.replaces_collective
+            or self._consecutive_stalled_polls < self._yield_cadence
+        ):
+            self._maybe_log()
+            return
+
+        self._yield_for_progress()
+        self._consecutive_stalled_polls = 0
+        self._maybe_log()
+
+    def mark_idle(self) -> None:
+        """Reset comparison state when a queue no longer has active pollers."""
+
+        self._previous_polls = None
+        self._consecutive_stalled_polls = 0
+
+    @property
+    def replaces_collective(self) -> bool:
+        """Return whether this policy replaces singleton Gloo dispatch.
+
+        :returns: True for either explicit cooperative-yield mode.
+        """
+
+        return self._mode in (self.YIELD_MODE, self.SCHED_YIELD_MODE)
+
+    def diagnostic_state(self) -> dict[str, int | str]:
+        """Return effective configuration and lifetime counters.
+
+        :returns: Serialization-ready policy configuration and counters.
+        """
+
+        return {
+            "mode": self._mode,
+            "yield_cadence": self._yield_cadence,
+            "yield_sleep_us": self._yield_sleep_us,
+            **self.snapshot().as_dict(),
+        }
+
+    def snapshot(self) -> SingletonPollProgressStats:
+        """Return an immutable lifetime-counter snapshot.
+
+        :returns: Current polling, progress, stall, and yield counters.
+        """
+
+        return SingletonPollProgressStats(
+            polls=self._polls,
+            progress_transitions=self._progress_transitions,
+            stalled_polls=self._stalled_polls,
+            yields=self._yields,
+            skipped_collectives=self._skipped_collectives,
+            cumulative_requested_sleep_us=self._cumulative_requested_sleep_us,
+            cumulative_observed_yield_ns=self._cumulative_observed_yield_ns,
+            max_consecutive_stalled_polls=self._max_consecutive_stalled_polls,
+        )
+
+    def _yield_for_progress(self) -> None:
+        started_ns = time.perf_counter_ns()
+        if self._mode == self.SCHED_YIELD_MODE:
+            os.sched_yield()
+        else:
+            requested_sleep_seconds: int | float = (
+                0 if self._yield_sleep_us == 0 else self._yield_sleep_us / 1_000_000
+            )
+            time.sleep(requested_sleep_seconds)
+        elapsed_ns = time.perf_counter_ns() - started_ns
+        self._yields += 1
+        self._cumulative_requested_sleep_us += self._yield_sleep_us
+        self._cumulative_observed_yield_ns += max(elapsed_ns, 0)
+
+    def _maybe_log(self) -> None:
+        if self._polls % self._log_interval_polls != 0:
+            return
+
+        stats = self.snapshot()
+        logger.debug(
+            "TP1 transfer poll counters: stream=%s mode=%s polls=%d progress=%d "
+            "stalled=%d yields=%d skipped_collectives=%d "
+            "requested_sleep_us=%d observed_yield_ns=%d max_stalled=%d",
+            self._stream_name,
+            self._mode,
+            stats.polls,
+            stats.progress_transitions,
+            stats.stalled_polls,
+            stats.yields,
+            stats.skipped_collectives,
+            stats.cumulative_requested_sleep_us,
+            stats.cumulative_observed_yield_ns,
+            stats.max_consecutive_stalled_polls,
+        )
+
+
 def _get_failure_prob() -> float:
     try:
         return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
@@ -137,6 +398,7 @@ def poll_and_all_reduce(
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    singleton_progress_policy: SingletonPollProgressPolicy | None = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -148,9 +410,30 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    return _reduce_poll_values(polls, gloo_group, singleton_progress_policy)
+
+
+def _reduce_poll_values(
+    polls: list[int],
+    group: dist.ProcessGroup,
+    singleton_progress_policy: SingletonPollProgressPolicy | None = None,
+) -> list[int]:
+    """Reduce poll states across ranks or apply an explicit TP1 yield policy.
+
+    :param polls: Rank-local transfer states.
+    :param group: Process group whose ranks must agree on each state.
+    :param singleton_progress_policy: Explicit policy allowed to replace a singleton collective.
+    :returns: Transfer states reduced with ``MIN`` across the group.
+    """
+
+    if group.size() == 1 and singleton_progress_policy is not None:
+        singleton_progress_policy.observe(polls)
+        if singleton_progress_policy.replaces_collective:
+            return polls
+
+    poll_tensor = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=group)
+    return [int(value) for value in poll_tensor.tolist()]
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -179,6 +462,7 @@ def poll_and_all_reduce_with_staging(
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    singleton_progress_policy: SingletonPollProgressPolicy | None = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -199,9 +483,11 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    return _reduce_poll_values(
+        raw_polls,
+        gloo_group,
+        singleton_progress_policy,
+    )
 
 
 #########################
@@ -233,6 +519,8 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
+    """Contiguous request metadata buffers shared across PD transport."""
+
     def __init__(
         self,
         size: int,
@@ -385,6 +673,23 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
+    def _store_bootstrap_room(self, row_index: int, room_id: int) -> None:
+        """Store one unsigned room without PyTorch scalar narrowing.
+
+        :param row_index: Destination metadata row.
+        :param room_id: Unsigned 64-bit bootstrap room.
+        """
+
+        if type(room_id) is not int or room_id < 0 or room_id >= _UINT64_MODULUS:
+            raise ValueError("bootstrap_room must be a uint64")
+        if self.bootstrap_room.dtype == torch.uint64:
+            signed_room_id = (
+                room_id if room_id <= _INT64_MAX else room_id - _UINT64_MODULUS
+            )
+            self.bootstrap_room.view(torch.int64)[row_index, 0] = signed_room_id
+            return
+        self.bootstrap_room[row_index, 0] = room_id
+
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
@@ -501,9 +806,8 @@ class MetadataBuffers:
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        room_id = req.bootstrap_room if req.bootstrap_room is not None else 0
+        self._store_bootstrap_room(req.metadata_buffer_index, room_id)
 
 
 #########################
@@ -928,6 +1232,47 @@ def append_state_component(
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
+
+
+def resolve_kv_layer_ids(kv_pool, registered_entry_count: int) -> list[int]:
+    """Resolve stable layer identities for one registered main-KV pool.
+
+    Plain MHA pools register K layers followed by V layers but historically do
+    not expose those identities. Composite Gemma and hybrid pools already own
+    an explicit mapping. Returning an empty list preserves the unsupported
+    legacy contract for pool layouts whose entry identity is not known.
+
+    :param kv_pool: Registered token-to-KV pool.
+    :param registered_entry_count: Number of registered main-KV tensors.
+    :returns: Layer IDs aligned exactly with registration order, or an empty
+        list when the pool layout is unsupported.
+    :raises ValueError: If a supported pool reports inconsistent geometry.
+    """
+
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+    )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if registered_entry_count < 0:
+        raise ValueError("registered_entry_count must be non-negative")
+    if isinstance(kv_pool, MHATokenToKVPool):
+        if registered_entry_count != kv_pool.layer_num * 2:
+            return []
+        layer_ids = list(
+            range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
+        )
+        return [*layer_ids, *layer_ids]
+    if isinstance(kv_pool, (SWAKVPool, HybridLinearKVPool)):
+        layer_ids = list(kv_pool.get_kv_layer_ids())
+        if len(layer_ids) != registered_entry_count:
+            raise ValueError(
+                "registered KV entry count differs from stable layer identities: "
+                f"{registered_entry_count} and {len(layer_ids)}"
+            )
+        return layer_ids
+    return []
 
 
 def setup_state_kv_args(

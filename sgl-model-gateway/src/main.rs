@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rand::{distr::Alphanumeric, Rng};
@@ -562,8 +566,21 @@ struct CliArgs {
 
     // ==================== Control Plane Authentication ====================
     /// API key for worker authorization
-    #[arg(long, help_heading = "Control Plane Authentication")]
+    #[arg(
+        long,
+        conflicts_with = "api_key_file",
+        help_heading = "Control Plane Authentication"
+    )]
     api_key: Option<String>,
+
+    /// File containing the API key for worker authorization
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "api_key",
+        help_heading = "Control Plane Authentication"
+    )]
+    api_key_file: Option<PathBuf>,
 
     /// JWT issuer URL for OIDC authentication
     #[arg(
@@ -691,6 +708,17 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
 }
 
 impl CliArgs {
+    fn resolve_api_key(&self) -> ConfigResult<Option<String>> {
+        match (&self.api_key, &self.api_key_file) {
+            (Some(api_key), None) => Ok(Some(api_key.clone())),
+            (None, Some(path)) => load_api_key_file(path).map(Some),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(ConfigError::IncompatibleConfig {
+                reason: "api_key and api_key_file cannot both be configured".to_string(),
+            }),
+        }
+    }
+
     /// Build control plane authentication configuration from CLI args.
     fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
         // Build JWT config if issuer and audience are provided
@@ -906,6 +934,8 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        let api_key = self.resolve_api_key()?;
+
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
         let mode = if matches!(self.backend, Backend::Openai) {
@@ -1047,7 +1077,7 @@ impl CliArgs {
             })
             .history_backend(history_backend)
             .log_level(&self.log_level)
-            .maybe_api_key(self.api_key.as_ref())
+            .maybe_api_key(api_key.as_ref())
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -1183,6 +1213,69 @@ impl CliArgs {
             control_plane_auth,
             mesh_server_config,
         }
+    }
+}
+
+fn load_api_key_file(path: &Path) -> ConfigResult<String> {
+    let contents = fs::read_to_string(path).map_err(|error| ConfigError::InvalidValue {
+        field: "api_key_file".to_string(),
+        value: "<redacted>".to_string(),
+        reason: format!("failed to read API key file: {error}"),
+    })?;
+    let api_key = contents
+        .strip_suffix("\r\n")
+        .or_else(|| contents.strip_suffix('\n'))
+        .unwrap_or(&contents);
+    if api_key.is_empty() || api_key.contains('\r') || api_key.contains('\n') {
+        return Err(ConfigError::InvalidValue {
+            field: "api_key_file".to_string(),
+            value: "<redacted>".to_string(),
+            reason: "API key file must contain exactly one nonempty line".to_string(),
+        });
+    }
+    Ok(api_key.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_file_loads_one_line_without_retaining_the_terminator() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker-api-key");
+        fs::write(&path, "secret-value\r\n").unwrap();
+
+        let api_key = load_api_key_file(&path).unwrap();
+
+        assert_eq!(api_key, "secret-value");
+    }
+
+    #[test]
+    fn api_key_file_rejects_empty_and_multiline_values_without_disclosure() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, contents) in [("empty", "\n"), ("multiline", "first\nsecond\n")] {
+            let path = directory.path().join(name);
+            fs::write(&path, contents).unwrap();
+
+            let error = load_api_key_file(&path).unwrap_err().to_string();
+
+            assert!(error.contains("exactly one nonempty line"));
+            assert!(!error.contains(contents));
+        }
+    }
+
+    #[test]
+    fn inline_and_file_api_keys_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "sgl-model-gateway",
+            "--api-key",
+            "inline-secret",
+            "--api-key-file",
+            "/run/secrets/worker-api-key",
+        ]);
+
+        assert!(result.is_err());
     }
 }
 

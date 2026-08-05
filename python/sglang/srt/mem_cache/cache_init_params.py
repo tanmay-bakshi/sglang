@@ -7,7 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
@@ -20,6 +20,7 @@ class CacheInitParams:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    draft_token_to_kv_pool: KVCache | None = None
 
     is_eagle: bool = False
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None

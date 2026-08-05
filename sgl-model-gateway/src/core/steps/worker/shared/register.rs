@@ -42,26 +42,25 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                     message: error.to_string(),
                 })?;
             debug!(
-                "Registered worker {} (model: {}) with ID {:?}",
+                "Registered worker {} (models: {:?}) with ID {:?}",
                 worker.url(),
-                worker.model_id(),
+                worker.model_ids(),
                 worker_id
             );
             worker_ids.push(worker_id);
         }
 
-        // Collect unique worker configurations to avoid redundant metric updates
-        let unique_configs: HashSet<_> = workers
-            .iter()
-            .map(|w| {
-                let meta = w.metadata();
-                (
-                    meta.worker_type.clone(),
-                    meta.connection_mode.clone(),
-                    w.model_id().to_string(),
-                )
-            })
-            .collect();
+        let mut unique_configs = HashSet::new();
+        for worker in workers {
+            let metadata = worker.metadata();
+            for model_id in worker.model_ids() {
+                unique_configs.insert((
+                    metadata.worker_type.clone(),
+                    metadata.connection_mode.clone(),
+                    model_id.to_string(),
+                ));
+            }
+        }
 
         // Update Layer 3 worker pool size metrics per unique type/connection/model
         for (worker_type, connection_mode, model_id) in unique_configs {

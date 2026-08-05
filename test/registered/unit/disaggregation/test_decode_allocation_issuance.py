@@ -1,9 +1,11 @@
 import dataclasses
+import sys
 from types import SimpleNamespace
 from typing import Never
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
     DecodeAllocationLeaseAuthority,
@@ -29,9 +31,25 @@ class _Request:
     """Minimal live request carrying allocation identity."""
 
     req_pool_idx: int | None = None
+    kv: object | None = None
     mamba_pool_idx: torch.Tensor | None = None
     inflight_middle_chunks: int = 0
     kv_committed_len: int = 0
+    origin_input_ids: list[int] = dataclasses.field(
+        default_factory=lambda: list(range(8))
+    )
+    output_ids: list[int] = dataclasses.field(default_factory=list)
+    rid: str = "request"
+    extend_range: range | None = None
+
+    def set_extend_range(self, start: int, end: int) -> None:
+        """Set the allocated request range.
+
+        :param start: Inclusive range start.
+        :param end: Exclusive range end.
+        """
+
+        self.extend_range = range(start, end)
 
 
 @dataclasses.dataclass
@@ -48,12 +66,16 @@ def _fixture(
     allocator: TokenToKVPoolAllocator | SWATokenToKVPoolAllocator,
     *,
     source_tp_size: int,
+    destination_tp_size: int = 1,
+    destination_tp_rank: int = 0,
     sliding_window_size: int | None = None,
 ) -> _IssuanceFixture:
     """Build one exact live request and queue authority.
 
     :param allocator: Concrete or SWA composite KV allocator.
     :param source_tp_size: TP2 or TP4 prefill width.
+    :param destination_tp_size: Decode attention TP width.
+    :param destination_tp_rank: Decode attention TP rank.
     :param sliding_window_size: Active SWA window.
     :returns: CPU-only issuance fixture.
     """
@@ -77,14 +99,20 @@ def _fixture(
     queue = object.__new__(DecodePreallocQueue)
     queue.req_to_token_pool = request_pool
     queue.token_to_kv_pool_allocator = allocator
-    queue.tp_size = 1
+    queue.kv_manager = SimpleNamespace(
+        attn_tp_size=destination_tp_size,
+        attn_tp_rank=destination_tp_rank,
+    )
     queue.scheduler = SimpleNamespace(
+        enable_hisparse=False,
         sliding_window_size=sliding_window_size,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="gemma4")
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="gemma4")),
+        server_args=SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=False,
         ),
     )
     queue.allocation_lease_authority = DecodeAllocationLeaseAuthority()
+    queue.token_to_kv_pool = object()
     return _IssuanceFixture(
         queue=queue,
         request_pool=request_pool,
@@ -153,7 +181,7 @@ def test_live_tp2_tp4_to_tp1_issuance_pins_exact_full_mapping(
 
     fixture.queue._acquire_decode_allocation_lease(
         fixture.decode_request,
-        prefix_len=2,
+        migration_start=2,
         migration_end=8,
     )
 
@@ -179,6 +207,99 @@ def test_live_tp2_tp4_to_tp1_issuance_pins_exact_full_mapping(
         fixture.request_pool.free(fixture.request)
 
 
+@pytest.mark.parametrize("destination_tp_rank", (0, 1))
+def test_live_tp2_to_tp2_issuance_binds_rank_local_writer(
+    destination_tp_rank: int,
+) -> None:
+    """Each TP2 decoder rank leases only its routed source writer."""
+
+    allocator = _token_allocator()
+    fixture = _fixture(
+        allocator,
+        source_tp_size=2,
+        destination_tp_size=2,
+        destination_tp_rank=destination_tp_rank,
+    )
+    indices = allocator.alloc(8)
+    assert indices is not None
+    slot = fixture.request.req_pool_idx
+    assert slot is not None
+    fixture.request_pool.write((slot, slice(0, 8)), indices)
+
+    fixture.queue._acquire_decode_allocation_lease(
+        fixture.decode_request,
+        migration_start=0,
+        migration_end=8,
+    )
+
+    lease = fixture.decode_request.allocation_lease
+    assert lease is not None
+    snapshot = fixture.queue.allocation_lease_authority.snapshot(lease)
+    manifest = snapshot.writer_manifest
+    assert manifest.destination_tp_size == 2
+    assert manifest.destination_tp_rank == destination_tp_rank
+    assert tuple(writer.source_attn_tp_rank for writer in manifest.writers) == (
+        destination_tp_rank,
+    )
+    assert len(snapshot.writer_participation) == 3
+    assert all(
+        item.writer_id.source_attn_tp_rank == destination_tp_rank
+        for item in snapshot.writer_participation
+    )
+
+
+def test_issuance_rejects_destination_tp_wider_than_source() -> None:
+    """A destination width without complete source coverage fails before pinning."""
+
+    allocator = _token_allocator()
+    fixture = _fixture(
+        allocator,
+        source_tp_size=2,
+        destination_tp_size=4,
+        destination_tp_rank=0,
+    )
+    indices = allocator.alloc(8)
+    assert indices is not None
+    slot = fixture.request.req_pool_idx
+    assert slot is not None
+    fixture.request_pool.write((slot, slice(0, 8)), indices)
+
+    with pytest.raises(DecodeAllocationLeaseError, match="divisible"):
+        fixture.queue._acquire_decode_allocation_lease(
+            fixture.decode_request,
+            migration_start=0,
+            migration_end=8,
+        )
+
+    assert fixture.decode_request.allocation_lease is None
+
+
+@pytest.mark.parametrize("source_tp_size", (2, 4))
+def test_reserved_issuance_uses_authorized_source_before_receiver_handshake(
+    source_tp_size: int,
+) -> None:
+    """Reserved preallocation issues its lease before receiver bootstrap."""
+
+    allocator = _token_allocator()
+    fixture = _fixture(allocator, source_tp_size=source_tp_size)
+    fixture.request_pool.free(fixture.request)
+    fixture.decode_request.kv_receiver = SimpleNamespace(require_staging=False)
+
+    kv_indices = fixture.queue._pre_alloc(
+        fixture.request,
+        decode_req=fixture.decode_request,
+        migration_end=len(fixture.request.origin_input_ids),
+        source_tp_size=source_tp_size,
+    )
+
+    assert kv_indices.numel() == len(fixture.request.origin_input_ids)
+    lease = fixture.decode_request.allocation_lease
+    assert lease is not None
+    snapshot = fixture.queue.allocation_lease_authority.snapshot(lease)
+    assert snapshot.writer_manifest.source_tp_size == source_tp_size
+    assert snapshot.request_slot == fixture.request.req_pool_idx
+
+
 def test_live_swa_claim_uses_only_migration_owned_active_window() -> None:
     """SWA pins the live window intersection, not unrelated prompt KV."""
 
@@ -196,7 +317,7 @@ def test_live_swa_claim_uses_only_migration_owned_active_window() -> None:
 
     fixture.queue._acquire_decode_allocation_lease(
         fixture.decode_request,
-        prefix_len=2,
+        migration_start=2,
         migration_end=8,
     )
 
@@ -214,8 +335,8 @@ def test_live_swa_claim_uses_only_migration_owned_active_window() -> None:
     assert mamba.zero_work
 
 
-def test_hicache_gap_must_have_final_mapping_before_issuance() -> None:
-    """A promised but unmapped HiCache gap fails closed before publication."""
+def test_hicache_restore_gap_is_excluded_from_migration_ownership() -> None:
+    """An unmapped restore gap is valid because prefill cannot write it."""
 
     allocator = _token_allocator()
     fixture = _fixture(allocator, source_tp_size=2)
@@ -225,16 +346,18 @@ def test_hicache_gap_must_have_final_mapping_before_issuance() -> None:
     assert slot is not None
     fixture.request_pool.write((slot, slice(5, 8)), indices)
 
-    with pytest.raises(
-        DecodeAllocationLeaseError,
-        match="HiCache restore destinations must be final",
-    ):
-        fixture.queue._acquire_decode_allocation_lease(
-            fixture.decode_request,
-            prefix_len=2,
-            migration_end=8,
-        )
-    assert fixture.decode_request.allocation_lease is None
+    fixture.queue._acquire_decode_allocation_lease(
+        fixture.decode_request,
+        migration_start=5,
+        migration_end=8,
+    )
+
+    lease = fixture.decode_request.allocation_lease
+    assert lease is not None
+    full = fixture.queue.allocation_lease_authority.snapshot(lease).components[0]
+    assert full.logical_start == 5
+    assert full.logical_length == 3
+    assert full.virtual_pages == tuple(indices.tolist())
 
 
 def test_failed_child_rolls_back_every_prepared_child_lease() -> None:
@@ -265,13 +388,13 @@ def test_failed_child_rolls_back_every_prepared_child_lease() -> None:
 
     first.queue._acquire_decode_allocation_lease(
         first.decode_request,
-        prefix_len=0,
+        migration_start=0,
         migration_end=4,
     )
     with pytest.raises(DecodeAllocationLeaseError, match="incomplete"):
         first.queue._acquire_decode_allocation_lease(
             second,
-            prefix_len=0,
+            migration_start=0,
             migration_end=4,
         )
     first.queue._rollback_decode_allocation_leases([first.decode_request])
@@ -321,13 +444,13 @@ def test_post_acquire_prepublication_failure_rolls_back_entire_cohort(
         del rids_to_check
         first.queue._acquire_decode_allocation_lease(
             first.decode_request,
-            prefix_len=0,
+            migration_start=0,
             migration_end=4,
         )
         preparation.record_prepared(first.decode_request)
         first.queue._acquire_decode_allocation_lease(
             second,
-            prefix_len=0,
+            migration_start=0,
             migration_end=4,
         )
         preparation.record_prepared(second)
@@ -375,7 +498,7 @@ def test_failure_after_publication_boundary_retains_prepared_lease(
         del rids_to_check
         fixture.queue._acquire_decode_allocation_lease(
             fixture.decode_request,
-            prefix_len=0,
+            migration_start=0,
             migration_end=4,
         )
         preparation.record_prepared(fixture.decode_request)
@@ -395,3 +518,7 @@ def test_failure_after_publication_boundary_retains_prepared_lease(
         allocator.free(indices)
     with pytest.raises(AllocationPinnedError):
         fixture.request_pool.free(fixture.request)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

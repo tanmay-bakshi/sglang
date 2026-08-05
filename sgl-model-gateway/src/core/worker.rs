@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +16,7 @@ use tokio::{sync::OnceCell, time};
 use super::{
     model_card::{ModelCard, ProviderType},
     model_type::{Endpoint, ModelType},
-    pd_process::PdProcessMetadata,
+    pd_process::PdProcessRegistration,
     CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
@@ -284,6 +285,11 @@ pub trait Worker: Send + Sync + fmt::Debug {
                 self.metadata().labels.get("model_id").map(|s| s.as_str())
             })
             .unwrap_or(UNKNOWN_MODEL_ID)
+    }
+
+    /// Get every model identity served by this worker.
+    fn model_ids(&self) -> Vec<&str> {
+        self.metadata().model_ids()
     }
 
     /// Get the priority of this worker (higher value = higher priority)
@@ -580,7 +586,7 @@ impl Default for HealthConfig {
 }
 
 /// Metadata associated with a worker
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerMetadata {
     /// Worker URL
     pub url: String,
@@ -601,7 +607,7 @@ pub struct WorkerMetadata {
     /// Cached bootstrap port (from WorkerType::Prefill)
     pub bootstrap_port: Option<u16>,
     /// Engine-advertised, generation-scoped PD process metadata.
-    pub pd_process: Option<PdProcessMetadata>,
+    pub pd_process: Option<PdProcessRegistration>,
     /// Models this worker can serve.
     /// If empty, worker accepts any model (backward compatible behavior).
     pub models: Vec<ModelCard>,
@@ -610,6 +616,27 @@ pub struct WorkerMetadata {
     pub default_provider: Option<ProviderType>,
     /// Default model type for unknown models (defaults to LLM capabilities).
     pub default_model_type: ModelType,
+}
+
+impl fmt::Debug for WorkerMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerMetadata")
+            .field("url", &self.url)
+            .field("worker_type", &self.worker_type)
+            .field("connection_mode", &self.connection_mode)
+            .field("runtime_type", &self.runtime_type)
+            .field("labels", &self.labels)
+            .field("health_config", &self.health_config)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("bootstrap_host", &self.bootstrap_host)
+            .field("bootstrap_port", &self.bootstrap_port)
+            .field("pd_process", &self.pd_process)
+            .field("models", &self.models)
+            .field("default_provider", &self.default_provider)
+            .field("default_model_type", &self.default_model_type)
+            .finish()
+    }
 }
 
 impl WorkerMetadata {
@@ -642,9 +669,29 @@ impl WorkerMetadata {
             .or(self.default_provider.as_ref())
     }
 
-    /// Get all model IDs this worker can serve
-    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
-        self.models.iter().map(|m| m.id.as_str())
+    /// Get all model identities this worker can serve, including aliases.
+    ///
+    /// Workers without model cards use their model label when present and otherwise
+    /// use the wildcard model identity.
+    pub fn model_ids(&self) -> Vec<&str> {
+        if self.models.is_empty() {
+            return vec![self
+                .labels
+                .get("model_id")
+                .map(String::as_str)
+                .unwrap_or(UNKNOWN_MODEL_ID)];
+        }
+
+        let mut seen = HashSet::new();
+        let mut model_ids = Vec::new();
+        for model in &self.models {
+            for model_id in std::iter::once(&model.id).chain(model.aliases.iter()) {
+                if seen.insert(model_id.as_str()) {
+                    model_ids.push(model_id.as_str());
+                }
+            }
+        }
+        model_ids
     }
 }
 
@@ -1314,6 +1361,19 @@ mod tests {
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         DPAwareWorkerBuilder,
     };
+
+    #[test]
+    fn worker_debug_redacts_api_key() {
+        const SECRET: &str = "worker-api-key-that-must-not-leak";
+
+        let worker = crate::core::BasicWorkerBuilder::new("http://worker.test")
+            .api_key(SECRET)
+            .build();
+        let debug = format!("{worker:?}");
+
+        assert!(!debug.contains(SECRET));
+        assert!(debug.contains("api_key_configured: true"));
+    }
 
     #[test]
     fn test_parse_bootstrap_host_strips_dp_rank_suffix() {

@@ -62,6 +62,31 @@ class DFlashDraftInputV2(SpecInput):
         self.num_tokens_per_req = 1
         self.num_tokens_for_logprob_per_req = 1
 
+    @classmethod
+    def from_next_tokens(
+        cls,
+        bonus_tokens: torch.Tensor,
+        new_seq_lens: torch.Tensor,
+    ) -> "DFlashDraftInputV2":
+        """Build the state that seeds the next DFlash decode iteration.
+
+        :param bonus_tokens: Target tokens that begin the next draft blocks.
+        :param new_seq_lens: Committed sequence lengths before those tokens.
+        :returns: Draft state with DFlash's unused EAGLE-shaped fields empty.
+        """
+
+        batch_size = int(new_seq_lens.numel())
+        device = bonus_tokens.device
+        return cls(
+            topk_p=torch.empty((batch_size, 0), device=device, dtype=torch.float32),
+            topk_index=torch.empty((batch_size, 0), device=device, dtype=torch.int64),
+            bonus_tokens=bonus_tokens.to(dtype=torch.int64),
+            new_seq_lens=new_seq_lens.to(device=device, dtype=torch.int64),
+            hidden_states=torch.empty(
+                (batch_size, 0), device=device, dtype=torch.float16
+            ),
+        )
+
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
     ) -> None:
@@ -102,12 +127,9 @@ class DFlashDraftInputV2(SpecInput):
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
-        return cls(
-            topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
-            topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
+        return cls.from_next_tokens(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
-            hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
         )
 
     def prepare_for_decode(self, batch: ScheduleBatch):

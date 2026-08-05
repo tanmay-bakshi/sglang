@@ -30,11 +30,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
                 WorkflowError::ContextValueNotFound("updated_workers".to_string())
             })?;
 
-        // Collect affected models
-        let affected_models: HashSet<String> = updated_workers
-            .iter()
-            .map(|w| w.model_id().to_string())
-            .collect();
+        let mut affected_models = HashSet::new();
+        for worker in updated_workers {
+            for model_id in worker.model_ids() {
+                affected_models.insert(model_id.to_string());
+            }
+        }
 
         debug!(
             "Updating policies for {} affected model(s) after worker update",

@@ -1203,6 +1203,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         mode = "decode_cuda_graph" if value else "decode_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
+    def increment_speculative_cuda_graph_pass(
+        self,
+        stage: str,
+        value: bool,
+    ) -> None:
+        mode = f"{stage}_cuda_graph" if value else f"{stage}_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
     def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
         mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)

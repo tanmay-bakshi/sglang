@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import (
     is_multimodal_piecewise_cuda_graph_supported,
@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -18,6 +19,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+)
+from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
+    TcPiecewiseCudaGraphBackend,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -60,6 +64,15 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             )
         )
 
+    def test_gemma4_lm_prefill_is_opted_in(self) -> None:
+        """Gemma4 participates in validated multimodal PCG promotion."""
+
+        self.assertTrue(
+            is_multimodal_piecewise_cuda_graph_supported(
+                ["Gemma4ForConditionalGeneration"]
+            )
+        )
+
     def test_unknown_multimodal_arch_is_not_opted_in(self):
         self.assertFalse(
             is_multimodal_piecewise_cuda_graph_supported(
@@ -84,6 +97,58 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
         disable_if_incompatible.assert_called_once()
+
+    def test_explicit_tc_piecewise_backend_lock_is_preserved(self) -> None:
+        """An explicit prefill backend remains locked during compatibility."""
+
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            is_multimodal_piecewise_cuda_graph_supported=True
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+
+        with patch.object(
+            ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
+        ) as disable_if_incompatible:
+            args._apply_cuda_graph_compatibility()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
+        disable_if_incompatible.assert_not_called()
+
+    def test_gemma4_direct_language_model_is_compiled(self) -> None:
+        """PCG compiles Gemma4's direct language-model module."""
+
+        language_model = SimpleNamespace()
+        backend = TcPiecewiseCudaGraphBackend.__new__(TcPiecewiseCudaGraphBackend)
+        backend._language_model = language_model
+        backend._compile_config = SimpleNamespace(compiler="eager")
+        backend._pool = None
+        backend._device_module = object()
+        runner = SimpleNamespace(
+            capture_num_tokens=[4, 16],
+            _run_dummy_forward=MagicMock(),
+            run_dummy_multimodal_deepstack_forward=MagicMock(),
+        )
+
+        module = (
+            "sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend"
+        )
+        with (
+            patch.object(TcPiecewiseCudaGraphBackend, "install_compile") as install,
+            patch(f"{module}.get_parallel", return_value=SimpleNamespace(tp_rank=1)),
+            patch(f"{module}.get_or_create_global_graph_memory_pool") as get_pool,
+            patch(f"{module}.set_graph_pool_id"),
+            patch(f"{module}._toggle_multi_platform_ops"),
+        ):
+            graph_pool = object()
+            get_pool.return_value = graph_pool
+            backend._run_compile_pass(runner)
+
+        self.assertIs(install.call_args.args[0], language_model)
+        self.assertIs(install.call_args.kwargs["graph_pool"], graph_pool)
 
     def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
         runner = self._make_prefill_runner(Backend.TC_PIECEWISE)

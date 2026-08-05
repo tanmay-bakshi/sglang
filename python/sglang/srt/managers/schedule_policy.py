@@ -100,12 +100,17 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    input_len = len(token_ids)
+    key_limit = req._compute_max_prefix_len(input_len)
+
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap
     # the match by the trailing sliding window so it gets re-prefilled, rewriting
     # this request's SWA ring. No-op for other layouts.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if reprefill_tail > 0:
+        swa_limit = max(0, input_len - reprefill_tail)
+        key_limit = min(key_limit, swa_limit)
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -135,9 +140,8 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
-    max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
-        len(req.prefix_indices) + req.host_hit_length, max_len
+        len(req.prefix_indices) + req.host_hit_length, key_limit
     )
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -1154,14 +1158,20 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                load_back_result = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                req.last_node = load_back_result.restored_node
+                req.prefix_indices = torch.cat(
+                    [
+                        req.prefix_indices,
+                        load_back_result.new_full_device_indices,
+                    ]
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 

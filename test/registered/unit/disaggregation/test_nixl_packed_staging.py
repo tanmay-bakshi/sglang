@@ -2,12 +2,14 @@ import concurrent.futures
 import dataclasses
 import enum
 import gc
+import sys
 import threading
 import weakref
 
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
@@ -73,6 +75,11 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     derive_nixl_ucx_runtime_artifact_components,
     writer_layout_for,
 )
+from sglang.srt.disaggregation.utils import resolve_kv_layer_ids
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 SWA_COMPONENT = StagingComponentId(state_index=0, state_type=StateType.SWA)
 REQUEST_GENERATION = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -185,6 +192,7 @@ class NativeSegment:
     workerIdentity: int
     endpointIdentity: int
     requestInfo: str
+    selectedTransports: tuple[NativeTransport, ...]
     posted: bool
 
 
@@ -639,9 +647,9 @@ def _visibility_evidence(
         completion_mechanism=policy.completion_mechanism,
         writer_action=policy.expected_writer_action,
         native_handle_generation=1 if native_completion else None,
-        native_descriptor_digest=bytes.fromhex("11" * 32)
-        if native_completion
-        else None,
+        native_descriptor_digest=(
+            bytes.fromhex("11" * 32) if native_completion else None
+        ),
         native_evidence_digest=bytes.fromhex("22" * 32) if native_completion else None,
     )
 
@@ -653,6 +661,7 @@ def _native_completion_receipt(
     source_address: int,
     source_gpu_id: int = 3,
     transport_context: tuple[tuple[str, str], ...] = (("rc_mlx5", "mlx5_0:1"),),
+    request_memory_identity: str = "cuda memory",
 ) -> NativeCompletionReceipt:
     """Build one valid native receipt for an exact packed transfer.
 
@@ -661,6 +670,7 @@ def _native_completion_receipt(
     :param source_address: Registered source lane address.
     :param source_gpu_id: Source CUDA device identifier.
     :param transport_context: Native endpoint transport/device context.
+    :param request_memory_identity: Diagnostic UCX source-memory description.
     :returns: Immutable native completion receipt.
     """
 
@@ -679,9 +689,15 @@ def _native_completion_receipt(
         workerIdentity=worker_identity,
         endpointIdentity=endpoint_identity,
         requestInfo=(
-            "{proto_send} put from cuda memory "
+            f"{{proto_send}} put from {request_memory_identity} "
             f"length {transfer.length_bytes} zero-copy "
             f"{selected_transport}/{selected_device}"
+        ),
+        selectedTransports=(
+            NativeTransport(
+                transport=selected_transport,
+                device=selected_device,
+            ),
         ),
         posted=True,
     )
@@ -899,16 +915,20 @@ def _decode_spec(
 def _destination_outcome_fixture(
     action_executor: PackedDestinationVisibilityActionExecutor,
     *,
-    policies: dict[
-        StagingWriterId,
-        PackedDestinationVisibilityPolicy,
-    ]
-    | None = None,
-    coordinator_policies: dict[
-        StagingWriterId,
-        PackedDestinationVisibilityPolicy,
-    ]
-    | None = None,
+    policies: (
+        dict[
+            StagingWriterId,
+            PackedDestinationVisibilityPolicy,
+        ]
+        | None
+    ) = None,
+    coordinator_policies: (
+        dict[
+            StagingWriterId,
+            PackedDestinationVisibilityPolicy,
+        ]
+        | None
+    ) = None,
     protocol_type: type[PackedDecodeProtocol] = PackedDecodeProtocol,
 ) -> tuple[
     PackedDecodeProtocol,
@@ -1030,6 +1050,106 @@ def test_decode_rebuilds_supported_source_layouts(
     )
 
     assert decode_spec.build() == source_spec.build()
+
+
+@pytest.mark.parametrize("source_tp_size", (2, 4))
+def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
+    source_tp_size: int,
+) -> None:
+    """Packed TP2/TP4 writers preserve heterogeneous target and draft KV."""
+
+    draft_pool = object.__new__(MHATokenToKVPool)
+    draft_pool.start_layer = 0
+    draft_pool.layer_num = 5
+    draft_layer_ids = resolve_kv_layer_ids(draft_pool, registered_entry_count=10)
+    target_layer_ids = [
+        5,
+        11,
+        17,
+        23,
+        29,
+        35,
+        41,
+        47,
+        53,
+        59,
+    ] * 2
+    layer_ids = [*target_layer_ids, *draft_layer_ids]
+    page_size = 16
+    target_destination_item_len = page_size * 16 * 256 * 2
+    draft_destination_item_len = page_size * 8 * 128 * 2
+    destination_item_lens = [target_destination_item_len] * 20 + [
+        draft_destination_item_len
+    ] * 10
+    source_item_lens = [
+        item_len // source_tp_size for item_len in destination_item_lens
+    ]
+
+    def make_kv_args(item_lens: list[int]) -> KVArgs:
+        """Build one CPU-only main-KV registration.
+
+        :param item_lens: Per-entry bytes for one physical page.
+        :returns: Registration metadata aligned with the DFlash layer IDs.
+        """
+
+        kv_args = KVArgs()
+        kv_args.kv_data_ptrs = [
+            0x100000 + entry_index * 0x10000
+            for entry_index in range(len(item_lens))
+        ]
+        kv_args.kv_data_lens = [item_len * 64 for item_len in item_lens]
+        kv_args.kv_item_lens = item_lens
+        kv_args.kv_layer_ids = layer_ids
+        kv_args.state_types = []
+        kv_args.state_data_ptrs = []
+        kv_args.state_data_lens = []
+        kv_args.state_item_lens = []
+        kv_args.state_layer_ids = []
+        kv_args.page_size = page_size
+        return kv_args
+
+    destination = make_kv_args(destination_item_lens)
+    destination_registration = PackedDestinationRegistration(
+        main_item_lens=tuple(destination.kv_item_lens),
+        main_layer_ids=tuple(destination.kv_layer_ids),
+        state_item_lens=(),
+        state_layer_ids=(),
+        page_size=page_size,
+    )
+    writers = tuple(
+        StagingWriterId(
+            transfer_source_rank=rank,
+            source_attn_tp_rank=rank,
+            source_pp_rank=0,
+            source_cp_rank=0,
+        )
+        for rank in range(source_tp_size)
+    )
+    source_spec, _ = build_prefill_chunk(
+        key=KEY,
+        is_last=True,
+        kv_args=make_kv_args(source_item_lens),
+        destination_registration=destination_registration,
+        components=(_component_pages(MAIN_KV_COMPONENT),),
+        source_tp_size=source_tp_size,
+        destination_tp_size=1,
+        destination_tp_rank=0,
+        writers=writers,
+    )
+    decode_spec = build_decode_spec(
+        chunk_id=KEY.chunk_id,
+        is_last=True,
+        spans=source_spec.spans,
+        kv_args=destination,
+        expected_writers=writers,
+        source_tp_size=source_tp_size,
+        destination_tp_size=1,
+        destination_tp_rank=0,
+    )
+
+    assert draft_layer_ids == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+    assert source_spec.source_components[0].item_lens == tuple(source_item_lens)
+    assert source_spec.build() == decode_spec.build()
 
 
 def test_source_builder_rejects_final_chunk_omitting_registered_swa() -> None:
@@ -1499,7 +1619,13 @@ def test_transfer_lane_emits_exact_no_submit_error_and_closes_idempotently() -> 
     assert lane.state is PackedTransferLaneState.CLOSED
 
 
-def test_transfer_lane_takes_exact_native_receipt_before_done() -> None:
+@pytest.mark.parametrize(
+    "request_memory_identity",
+    ("cuda memory", "cuda/cuda0"),
+)
+def test_transfer_lane_takes_exact_native_receipt_before_done(
+    request_memory_identity: str,
+) -> None:
     """A lane derives DONE only from its exact native one-shot receipt."""
 
     coordinator, _, ready, peer = _registered_ready()
@@ -1524,6 +1650,7 @@ def test_transfer_lane_takes_exact_native_receipt_before_done() -> None:
         agent=agent,
         transfer=transfer,
         source_address=lane.data_ptr,
+        request_memory_identity=request_memory_identity,
     )
     outcome = lane.take_transport_completion()
 
@@ -1652,6 +1779,10 @@ def test_transfer_lane_quarantines_invalid_native_receipt(
                 "{proto_send} put from cuda memory "
                 f"length {transfer.length_bytes} zero-copy "
                 "rc_mlx5/mlx5_0:1 tcp/eth0"
+            ),
+            selectedTransports=(
+                *receipt.segments[0].selectedTransports,
+                NativeTransport("tcp", "eth0"),
             ),
         )
         endpoint = dataclasses.replace(
@@ -2094,6 +2225,30 @@ def test_staging_arena_owns_registration_allocator_protocol_and_capability() -> 
     arena.close()
     arena.close()
     assert len(agent.deregistrations) == 1
+
+
+def test_staging_arena_preserves_adopted_registration_ownership() -> None:
+    """An adopted registration remains owned by the legacy staging pool."""
+
+    agent = RecordingMemoryAgent()
+    tensor = _aligned_cpu_byte_tensor(4096)
+    registration = object()
+    arena = PackedStagingArena(
+        agent=agent,
+        tensor=tensor,
+        gpu_id=6,
+        peer=_peer(),
+        arena_generation=ARENA_GENERATION,
+        registration=registration,
+        alignment_bytes=256,
+    )
+
+    assert agent.registrations == []
+
+    arena.close()
+    arena.close()
+
+    assert agent.deregistrations == []
 
 
 def test_staging_arena_cleanup_failure_is_strongly_retained() -> None:
@@ -2755,3 +2910,7 @@ def test_cuda_ipc_visibility_fails_without_imported_writer_event() -> None:
             completed_action=(PackedDestinationVisibilityAction.CUDA_STREAM_DEPENDENCY),
             _action_receipt=object(),
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -1533,6 +1533,45 @@ class HostPoolGroup:
             for entry in entries
         )
 
+    def register_index_aligned_pool(self, entry: PoolEntry) -> None:
+        """Register a pool that reuses the anchor pool's physical indices.
+
+        :param entry: Host/device pool pair whose slots correspond one-to-one
+            with the primary anchor slots.
+        :raises ValueError: If the pool name or index geometry is incompatible.
+        """
+
+        if entry.name in self.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered")
+        if entry.is_primary_index_anchor:
+            raise ValueError("An index-aligned sidecar cannot replace the anchor pool")
+
+        host_pool = entry.host_pool
+        if host_pool.page_size != self.page_size or host_pool.size != self.size:
+            raise ValueError(
+                f"Host pool {entry.name} must match anchor index geometry: "
+                f"page_size={host_pool.page_size}, size={host_pool.size}; "
+                f"anchor_page_size={self.page_size}, anchor_size={self.size}"
+            )
+
+        anchor_device_pool = self.anchor_entry.device_pool
+        if (
+            entry.device_pool.page_size != anchor_device_pool.page_size
+            or entry.device_pool.size < anchor_device_pool.size
+        ):
+            raise ValueError(
+                f"Device pool {entry.name} cannot cover every anchor index: "
+                f"page_size={entry.device_pool.page_size}, size={entry.device_pool.size}; "
+                f"anchor_page_size={anchor_device_pool.page_size}, "
+                f"anchor_size={anchor_device_pool.size}"
+            )
+
+        self.entries.append(entry)
+        self.entry_map[entry.name] = entry
+        self.can_use_write_back_jit = self.can_use_write_back_jit and bool(
+            getattr(host_pool, "can_use_write_back_jit", False)
+        )
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer

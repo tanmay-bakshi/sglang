@@ -1,26 +1,6 @@
-from __future__ import annotations
-
 import logging
-
-logger = logging.getLogger(__name__)
-
 from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class KVCacheBuildResult:
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
-    sliding_window_size: Optional[int]
-    full_tokens_per_layer: Optional[int]
-    swa_tokens_per_layer: Optional[int]
-    req_to_token_pool: object
-    token_to_kv_pool_allocator: object
-    disable_radix_cache: bool
-    tree_cache: object
-
-
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import (
@@ -34,9 +14,42 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    SidecarPoolSpec,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    KVCache,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class KVCacheBuildResult:
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: int | None
+    full_tokens_per_layer: int | None
+    swa_tokens_per_layer: int | None
+    req_to_token_pool: object
+    token_to_kv_pool_allocator: object
+    disable_radix_cache: bool
+    tree_cache: object
+
 
 if TYPE_CHECKING:
 
@@ -53,12 +66,17 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
+    draft_worker: "BaseTpWorker | None",
+    spec_algorithm: "SpeculativeAlgorithm",
+    server_args: "ServerArgs",
+) -> KVCache | None:
+    """Return the current speculative worker's draft KV pool.
+
+    :param draft_worker: Speculative worker that owns the draft runner.
+    :param spec_algorithm: Active speculative algorithm.
+    :param server_args: Resolved server configuration.
+    :returns: Draft token-to-KV pool, or ``None`` when none exists.
+    """
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
@@ -70,12 +88,78 @@ def get_draft_kv_pool(
     return draft_runner.token_to_kv_pool
 
 
+def _make_draft_layer_mapper(
+    draft_host_pool: HostKVCache,
+) -> Callable[[int], int | None]:
+    """Map target transfer steps onto draft-local layer indices.
+
+    :param draft_host_pool: Draft host pool registered as a KV sidecar.
+    :returns: Layer mapper for a :class:`PoolEntry`.
+    """
+
+    start_layer = int(draft_host_pool.start_layer)
+    end_layer = start_layer + int(draft_host_pool.layer_num)
+
+    def map_layer(layer_id: int) -> int | None:
+        if layer_id < start_layer or layer_id >= end_layer:
+            return None
+        return layer_id - start_layer
+
+    return map_layer
+
+
+def _register_unified_hicache_draft(
+    *,
+    tree_cache: "BasePrefixCache",
+    draft_device_pool: KVCache,
+    draft_host_pool: HostKVCache,
+) -> None:
+    """Register draft KV in the Unified HiCache component lifecycle.
+
+    :param tree_cache: Unified target radix cache.
+    :param draft_device_pool: Draft KV storage sharing target full-KV indices.
+    :param draft_host_pool: Host mirror with the same physical slot geometry.
+    :raises TypeError: If the target cache does not use the Unified controller.
+    :raises ValueError: If the target transfer cannot cover every draft layer.
+    """
+
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if not isinstance(tree_cache, UnifiedRadixCache):
+        raise TypeError("Hybrid HiCache draft registration requires UnifiedRadixCache")
+    controller = tree_cache.cache_controller
+    if not isinstance(controller, HybridCacheController):
+        raise TypeError("Unified draft registration requires HybridCacheController")
+    if draft_host_pool.layer_num > controller.layer_num:
+        raise ValueError(
+            "Draft HiCache has more layers than the target transfer lifecycle: "
+            f"draft_layers={draft_host_pool.layer_num}, "
+            f"target_transfer_layers={controller.layer_num}"
+        )
+
+    controller.register_index_aligned_pool(
+        PoolEntry(
+            name=PoolName.DRAFT,
+            host_pool=draft_host_pool,
+            device_pool=draft_device_pool,
+            layer_mapper=_make_draft_layer_mapper(draft_host_pool),
+        )
+    )
+    tree_cache.register_sidecar_pool(
+        SidecarPoolSpec(
+            pool_name=PoolName.DRAFT,
+            indices_from_pool=PoolName.KV,
+            hit_policy=PoolHitPolicy.ALL_PAGES,
+        )
+    )
+
+
 def maybe_register_hicache_draft(
     *,
-    tree_cache: BasePrefixCache,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
+    tree_cache: "BasePrefixCache",
+    draft_worker: "BaseTpWorker | None",
+    spec_algorithm: "SpeculativeAlgorithm",
+    server_args: "ServerArgs",
     enable_hierarchical_cache: bool,
     page_size: int,
 ) -> None:
@@ -91,13 +175,13 @@ def maybe_register_hicache_draft(
     if draft_kv_pool is None:
         return
 
-    from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-    )
-    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+    controller = tree_cache.cache_controller
+    if (
+        isinstance(controller, HybridCacheController)
+        and isinstance(controller.mem_pool_host, HostPoolGroup)
+        and PoolName.DRAFT in controller.mem_pool_host.entry_map
+    ):
+        return
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -105,9 +189,16 @@ def maybe_register_hicache_draft(
 
     # Create host pool for draft with the same slot count as the target host pool,
     # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary = tree_cache.cache_controller.mem_pool_host
+    primary = controller.mem_pool_host
+    if server_args.hicache_size > 0:
+        raise RuntimeError(
+            "Fixed-size HiCache requires draft KV registration during "
+            "the initial host-pool budget split"
+        )
     kw = dict(
-        host_to_device_ratio=primary.size / pool.size,
+        # HostKVCache rounds ``floor(size * ratio)`` up to the next page. Pick
+        # the last token in the anchor capacity so the rounded result is exact.
+        host_to_device_ratio=(primary.size - 1) / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,
@@ -118,35 +209,44 @@ def maybe_register_hicache_draft(
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
-        logger.warning(
-            "Draft pool type %s not supported for HiCache, skipping.",
-            type(pool).__name__,
+        message = f"Draft pool type {type(pool).__name__} is not supported by HiCache"
+        if spec_algorithm.is_dflash():
+            raise RuntimeError(message)
+        logger.warning("%s; skipping draft KV offload.", message)
+        return
+
+    if isinstance(controller, HybridCacheController):
+        _register_unified_hicache_draft(
+            tree_cache=tree_cache,
+            draft_device_pool=pool,
+            draft_host_pool=draft_host_pool,
         )
         return
 
-    tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+    controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
 def build_kv_cache(
     *,
-    server_args: ServerArgs,
-    model_config: ModelConfig,
-    tp_worker: BaseTpWorker,
+    server_args: "ServerArgs",
+    model_config: "ModelConfig",
+    tp_worker: "BaseTpWorker",
     page_size: int,
-    spec_algorithm: SpeculativeAlgorithm,
-    attn_tp_cpu_group: ProcessGroup,
-    tp_cpu_group: ProcessGroup,
-    attn_cp_cpu_group: ProcessGroup,
+    spec_algorithm: "SpeculativeAlgorithm",
+    attn_tp_cpu_group: "ProcessGroup",
+    tp_cpu_group: "ProcessGroup",
+    attn_cp_cpu_group: "ProcessGroup",
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: ParallelState,
-    tp_group: GroupCoordinator,
-    pp_group: GroupCoordinator,
+    ps: "ParallelState",
+    tp_group: "GroupCoordinator",
+    pp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
+    draft_token_to_kv_pool: KVCache | None,
 ) -> KVCacheBuildResult:
-    sliding_window_size: Optional[int] = None
-    full_tokens_per_layer: Optional[int] = None
-    swa_tokens_per_layer: Optional[int] = None
+    sliding_window_size: int | None = None
+    full_tokens_per_layer: int | None = None
+    swa_tokens_per_layer: int | None = None
     uses_transformers_backend = (
         get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
     )
@@ -172,6 +272,9 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    hicache_draft_kv_pool = draft_token_to_kv_pool
+    if isinstance(hicache_draft_kv_pool, HybridLinearKVPool):
+        hicache_draft_kv_pool = hicache_draft_kv_pool.full_kv_pool
 
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -182,23 +285,15 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
+        and is_hybrid_ssm
     ):
-        if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with Mamba/SSM models"
+        )
 
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -208,6 +303,7 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        draft_token_to_kv_pool=hicache_draft_kv_pool,
         # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
         # TreeCache.page_size should keep the same as allocator.page_size to
         # avoid kv page eviction conflicts.

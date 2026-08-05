@@ -1,10 +1,17 @@
 import msgspec
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedAuxiliaryDestinationSegment,
+    PackedAuxiliaryOutcome,
+    PackedAuxiliaryPlan,
     PackedChunkKey,
     PackedLayoutSpec,
     PackedPrepare,
     PackedReady,
+    PackedRequestKey,
+    PackedRequestTeardown,
+    PackedRequestTeardownAck,
     PackedTopology,
     PackedTransportPath,
     PackedWriterCompletionMechanism,
@@ -20,7 +27,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
 )
 
-PACKED_WIRE_VERSION: int = 4
+PACKED_WIRE_VERSION: int = 6
 MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
 
 
@@ -37,6 +44,17 @@ class _WireChunkKey(
 
     room_id: int
     chunk_id: int
+    request_generation: bytes
+
+
+class _WireRequestKey(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of :class:`PackedRequestKey`."""
+
+    room_id: int
     request_generation: bytes
 
 
@@ -89,6 +107,35 @@ class _WireWriterId(
     source_attn_tp_rank: int
     source_pp_rank: int
     source_cp_rank: int
+
+
+class _WireAuxiliaryDestinationSegment(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of one auxiliary destination segment."""
+
+    address: int
+    item_length: int
+
+
+class _WireAuxiliaryPlanFields(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of one decoder-authored auxiliary plan."""
+
+    key: _WireRequestKey
+    request_slot_generation: int
+    metadata_buffer_index: int
+    metadata_slot_generation: bytes
+    destination_segments: tuple[_WireAuxiliaryDestinationSegment, ...]
+    canonical_writer_id: _WireWriterId
+    destination_process_generation: bytes
+    native_route_digest: bytes
+    runtime_cohort_digest: bytes
 
 
 class _WireTopology(
@@ -192,8 +239,92 @@ class _WireWriterOutcome(
     reason: str | None
 
 
-PackedWireMessage = PackedPrepare | PackedReady | PackedWriterOutcome
-_WireMessage = _WirePrepare | _WireReady | _WireWriterOutcome
+class _WireAuxiliaryPlan(
+    msgspec.Struct,
+    tag="auxiliary_plan",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned decoder-authored auxiliary-plan envelope."""
+
+    version: int
+    plan: _WireAuxiliaryPlanFields
+
+
+class _WireAuxiliaryOutcome(
+    msgspec.Struct,
+    tag="auxiliary_outcome",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned terminal auxiliary-outcome envelope."""
+
+    version: int
+    plan: _WireAuxiliaryPlanFields
+    writer_id: _WireWriterId
+    native_dram_handle_generation: int
+    descriptor_digest: bytes
+    evidence_digest: bytes
+
+
+class _WireRequestTeardown(
+    msgspec.Struct,
+    tag="request_teardown",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned request teardown envelope."""
+
+    version: int
+    key: _WireRequestKey
+    writer_id: _WireWriterId
+    request_slot_generation: int
+    writer_manifest_digest: bytes
+    allocation_digest: bytes
+    teardown_generation: bytes
+    auxiliary_handle_generation: int | None
+
+
+class _WireRequestTeardownAck(
+    msgspec.Struct,
+    tag="request_teardown_ack",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned request teardown acknowledgement envelope."""
+
+    version: int
+    key: _WireRequestKey
+    writer_id: _WireWriterId
+    request_slot_generation: int
+    writer_manifest_digest: bytes
+    allocation_digest: bytes
+    teardown_generation: bytes
+    auxiliary_handle_generation: int | None
+
+
+PackedWireMessage = (
+    PackedAuxiliaryPlan
+    | PackedAuxiliaryOutcome
+    | PackedPrepare
+    | PackedReady
+    | PackedWriterOutcome
+    | PackedRequestTeardown
+    | PackedRequestTeardownAck
+)
+_WireMessage = (
+    _WireAuxiliaryPlan
+    | _WireAuxiliaryOutcome
+    | _WirePrepare
+    | _WireReady
+    | _WireWriterOutcome
+    | _WireRequestTeardown
+    | _WireRequestTeardownAck
+)
 _ENCODER = msgspec.msgpack.Encoder()
 _DECODER = msgspec.msgpack.Decoder(_WireMessage, strict=True)
 
@@ -222,6 +353,32 @@ def _decode_chunk_key(key: _WireChunkKey) -> PackedChunkKey:
     return PackedChunkKey(
         room_id=key.room_id,
         chunk_id=key.chunk_id,
+        request_generation=key.request_generation,
+    )
+
+
+def _encode_request_key(key: PackedRequestKey) -> _WireRequestKey:
+    """Convert a domain request key into its wire shape.
+
+    :param key: Domain request identity.
+    :returns: Immutable wire identity.
+    """
+
+    return _WireRequestKey(
+        room_id=key.room_id,
+        request_generation=key.request_generation,
+    )
+
+
+def _decode_request_key(key: _WireRequestKey) -> PackedRequestKey:
+    """Convert a wire request key into its validated domain shape.
+
+    :param key: Wire request identity.
+    :returns: Validated domain identity.
+    """
+
+    return PackedRequestKey(
+        room_id=key.room_id,
         request_generation=key.request_generation,
     )
 
@@ -351,6 +508,62 @@ def _decode_writer_id(writer_id: _WireWriterId) -> StagingWriterId:
         source_attn_tp_rank=writer_id.source_attn_tp_rank,
         source_pp_rank=writer_id.source_pp_rank,
         source_cp_rank=writer_id.source_cp_rank,
+    )
+
+
+def _encode_auxiliary_plan(
+    plan: PackedAuxiliaryPlan,
+) -> _WireAuxiliaryPlanFields:
+    """Convert an auxiliary plan into its exact wire shape.
+
+    :param plan: Decoder-authored domain plan.
+    :returns: Immutable wire plan fields.
+    """
+
+    return _WireAuxiliaryPlanFields(
+        key=_encode_request_key(plan.key),
+        request_slot_generation=plan.request_slot_generation,
+        metadata_buffer_index=plan.metadata_buffer_index,
+        metadata_slot_generation=plan.metadata_slot_generation,
+        destination_segments=tuple(
+            _WireAuxiliaryDestinationSegment(
+                address=segment.address,
+                item_length=segment.item_length,
+            )
+            for segment in plan.destination_segments
+        ),
+        canonical_writer_id=_encode_writer_id(plan.canonical_writer_id),
+        destination_process_generation=plan.destination_process_generation,
+        native_route_digest=plan.native_route_digest,
+        runtime_cohort_digest=plan.runtime_cohort_digest,
+    )
+
+
+def _decode_auxiliary_plan(
+    plan: _WireAuxiliaryPlanFields,
+) -> PackedAuxiliaryPlan:
+    """Convert untrusted auxiliary plan fields into the domain shape.
+
+    :param plan: Untrusted wire plan fields.
+    :returns: Validated decoder-authored plan.
+    """
+
+    return PackedAuxiliaryPlan(
+        key=_decode_request_key(plan.key),
+        request_slot_generation=plan.request_slot_generation,
+        metadata_buffer_index=plan.metadata_buffer_index,
+        metadata_slot_generation=plan.metadata_slot_generation,
+        destination_segments=tuple(
+            PackedAuxiliaryDestinationSegment(
+                address=segment.address,
+                item_length=segment.item_length,
+            )
+            for segment in plan.destination_segments
+        ),
+        canonical_writer_id=_decode_writer_id(plan.canonical_writer_id),
+        destination_process_generation=plan.destination_process_generation,
+        native_route_digest=plan.native_route_digest,
+        runtime_cohort_digest=plan.runtime_cohort_digest,
     )
 
 
@@ -485,7 +698,21 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
     """
 
     wire_message: _WireMessage
-    if type(message) is PackedPrepare:
+    if type(message) is PackedAuxiliaryPlan:
+        wire_message = _WireAuxiliaryPlan(
+            version=PACKED_WIRE_VERSION,
+            plan=_encode_auxiliary_plan(message),
+        )
+    elif type(message) is PackedAuxiliaryOutcome:
+        wire_message = _WireAuxiliaryOutcome(
+            version=PACKED_WIRE_VERSION,
+            plan=_encode_auxiliary_plan(message.plan),
+            writer_id=_encode_writer_id(message.writer_id),
+            native_dram_handle_generation=(message.native_dram_handle_generation),
+            descriptor_digest=message.descriptor_digest,
+            evidence_digest=message.evidence_digest,
+        )
+    elif type(message) is PackedPrepare:
         wire_message = _WirePrepare(
             version=PACKED_WIRE_VERSION,
             key=_encode_chunk_key(message.key),
@@ -519,6 +746,28 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
                 else None
             ),
             reason=message.reason,
+        )
+    elif type(message) is PackedRequestTeardown:
+        wire_message = _WireRequestTeardown(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_request_key(message.key),
+            writer_id=_encode_writer_id(message.writer_id),
+            request_slot_generation=message.request_slot_generation,
+            writer_manifest_digest=message.writer_manifest_digest,
+            allocation_digest=message.allocation_digest,
+            teardown_generation=message.teardown_generation,
+            auxiliary_handle_generation=message.auxiliary_handle_generation,
+        )
+    elif type(message) is PackedRequestTeardownAck:
+        wire_message = _WireRequestTeardownAck(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_request_key(message.key),
+            writer_id=_encode_writer_id(message.writer_id),
+            request_slot_generation=message.request_slot_generation,
+            writer_manifest_digest=message.writer_manifest_digest,
+            allocation_digest=message.allocation_digest,
+            teardown_generation=message.teardown_generation,
+            auxiliary_handle_generation=message.auxiliary_handle_generation,
         )
     else:
         raise TypeError(f"unsupported packed wire message: {type(message)!r}")
@@ -556,6 +805,18 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
                 "unsupported packed wire version "
                 f"{wire_message.version}; expected {PACKED_WIRE_VERSION}"
             )
+        if type(wire_message) is _WireAuxiliaryPlan:
+            return _decode_auxiliary_plan(wire_message.plan)
+        if type(wire_message) is _WireAuxiliaryOutcome:
+            return PackedAuxiliaryOutcome(
+                plan=_decode_auxiliary_plan(wire_message.plan),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                native_dram_handle_generation=(
+                    wire_message.native_dram_handle_generation
+                ),
+                descriptor_digest=wire_message.descriptor_digest,
+                evidence_digest=wire_message.evidence_digest,
+            )
         if type(wire_message) is _WirePrepare:
             return PackedPrepare(
                 key=_decode_chunk_key(wire_message.key),
@@ -587,6 +848,26 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
                     else None
                 ),
                 reason=wire_message.reason,
+            )
+        if type(wire_message) is _WireRequestTeardown:
+            return PackedRequestTeardown(
+                key=_decode_request_key(wire_message.key),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                request_slot_generation=wire_message.request_slot_generation,
+                writer_manifest_digest=wire_message.writer_manifest_digest,
+                allocation_digest=wire_message.allocation_digest,
+                teardown_generation=wire_message.teardown_generation,
+                auxiliary_handle_generation=wire_message.auxiliary_handle_generation,
+            )
+        if type(wire_message) is _WireRequestTeardownAck:
+            return PackedRequestTeardownAck(
+                key=_decode_request_key(wire_message.key),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                request_slot_generation=wire_message.request_slot_generation,
+                writer_manifest_digest=wire_message.writer_manifest_digest,
+                allocation_digest=wire_message.allocation_digest,
+                teardown_generation=wire_message.teardown_generation,
+                auxiliary_handle_generation=wire_message.auxiliary_handle_generation,
             )
         raise PackedWireError(
             f"unsupported packed wire message: {type(wire_message)!r}"

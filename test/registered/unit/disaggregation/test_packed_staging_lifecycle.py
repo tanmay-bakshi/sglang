@@ -1,9 +1,11 @@
 import concurrent.futures
 import dataclasses
+import sys
 import threading
 
 import numpy as np
 import pytest
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
 )
@@ -51,6 +53,9 @@ from sglang.srt.disaggregation.nixl.packed_staging_lifecycle import (
     PackedWriterProjection,
     require_nixl_ucx_native_attestation,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 ALIGNMENT_BYTES = 256
 REQUEST_GENERATION = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -1180,3 +1185,7 @@ def test_teardown_release_failure_quarantines_every_resource() -> None:
         harness.arena_owner,
     ):
         assert harness.quarantine.retains(retained)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

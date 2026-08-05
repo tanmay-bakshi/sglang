@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    LoadBackResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -283,16 +284,13 @@ class LMCRadixCache(RadixCache):
             best_match_node=new_node,
         )
 
-    def init_load_back(
-        self, params: InitLoadBackParams
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackResult:
         """MP RETRIEVE.
 
         Called by the scheduler when ``match_prefix`` returned
         ``host_hit_length > 0``. Uses the cached LOOKUP result to
         allocate slots and fire RETRIEVE, inserts the resulting
-        TreeNode into the radix tree, and returns
-        ``(new_indices, new_last_node)``.
+        TreeNode into the radix tree, and returns the restored state.
         """
         req = params.req
         marker = self._mp_load_back_markers.pop(req.rid)
@@ -315,11 +313,23 @@ class LMCRadixCache(RadixCache):
             # retrieve returned nothing (locks already released by
             # retrieve_kv). release_pending is idempotent on locks_held.
             self.lmcache_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackResult(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
+                queued_any_component=False,
+                full_tokens=0,
+                swa_tokens=0,
             )
-        return result
+        new_indices, restored_node = result
+        return LoadBackResult(
+            new_full_device_indices=new_indices,
+            restored_node=restored_node,
+            queued_any_component=False,
+            full_tokens=len(new_indices),
+            swa_tokens=0,
+        )
 
     def _load_back(
         self,

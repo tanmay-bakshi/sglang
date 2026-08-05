@@ -136,6 +136,28 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_metadata_buffer_roundtrips_full_uint64_room_domain(self):
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+        )
+        rooms = (1 << 63, (1 << 64) - 1)
+
+        for row_index, room_id in enumerate(rooms):
+            req = self._make_req(None, metadata_buffer_index=row_index)
+            req.bootstrap_room = room_id
+            buffers.set_buf(req)
+
+            self.assertEqual(
+                buffers.bootstrap_room[row_index, 0].item(),
+                room_id,
+            )
+            self.assertEqual(
+                buffers.get_buf(row_index)[-1][0].item(),
+                room_id,
+            )
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),

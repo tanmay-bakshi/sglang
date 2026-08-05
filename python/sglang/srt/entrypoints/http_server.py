@@ -71,6 +71,11 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.decode_reservation_control import (
+    attach_native_generate_request,
+    handle_attached_openai_request,
+    install_decode_reservation_routes,
+)
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -155,7 +160,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    DecodeReservationSchedulerError,
+    ServerStatus,
+    TokenizerManager,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -440,6 +449,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _get_decode_tokenizer_manager() -> TokenizerManager:
+    manager = get_global_state().tokenizer_manager
+    if not isinstance(manager, TokenizerManager):
+        raise DecodeReservationSchedulerError(
+            "DecodeReservationUnavailableError",
+            "decoder reservations require a single tokenizer manager",
+        )
+    return manager
+
+
+install_decode_reservation_routes(app, _get_decode_tokenizer_manager)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -756,21 +778,27 @@ async def server_info():
         _global_state.scheduler_info
     )
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
+    server_info_values = {
+        **dataclasses.asdict(server_args),
+        **_global_state.scheduler_info,
+    }
     return msgspec_to_builtins(
-        {
-            **dataclasses.asdict(server_args),
-            **_global_state.scheduler_info,
-            "internal_states": internal_states,
-            "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
-            # Capability presence is implementation-owned; configuration cannot
-            # synthesize transfer or control protocols.
-            "pd_process": server_args.pd_process_advertisement(runtime_capabilities),
-        }
+        server_args.public_server_args_dict(
+            {
+                **server_info_values,
+                "internal_states": internal_states,
+                "version": __version__,
+                # Structured KV-event publisher descriptor for KV-aware routers.
+                # `None` when publishing is disabled or misconfigured; see
+                # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+                "kv_events": server_args.describe_kv_events_publisher(),
+                # Capability presence is implementation-owned; configuration cannot
+                # synthesize transfer or control protocols.
+                "pd_process": server_args.pd_process_advertisement(
+                    runtime_capabilities
+                ),
+            }
+        )
     )
 
 
@@ -841,7 +869,15 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
+    obj = await attach_native_generate_request(
+        _global_state.tokenizer_manager,
+        request,
+        obj,
+    )
+    if (
+        obj.decode_reservation_grant_id is None
+        and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+    ):
         apply_header_overrides(obj, request.headers)
     if obj.stream:
 
@@ -1660,9 +1696,16 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.openai_serving_completion
+    attached, response = await handle_attached_openai_request(
+        serving,
+        request,
+        raw_request,
+        "/v1/completions",
     )
+    if attached:
+        return response
+    return await serving.handle_request(request, raw_request)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
@@ -1670,9 +1713,16 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.openai_serving_chat
+    attached, response = await handle_attached_openai_request(
+        serving,
+        request,
+        raw_request,
+        "/v1/chat/completions",
     )
+    if attached:
+        return response
+    return await serving.handle_request(request, raw_request)
 
 
 @app.post(

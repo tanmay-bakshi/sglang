@@ -161,6 +161,7 @@ class SchedulerMetricsReporter:
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
+        self._forward_execution_reporter = None
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
@@ -171,6 +172,7 @@ class SchedulerMetricsReporter:
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
+            self._forward_execution_reporter = _wrap_execution_reporter
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
@@ -186,6 +188,21 @@ class SchedulerMetricsReporter:
             return
         timer = self.forward_pass_device_timer
         self.scheduler.tp_worker.model_runner.device_timer = timer
+        if self.scheduler.spec_algorithm.is_dflash():
+            if self.scheduler.draft_worker is None:
+                raise RuntimeError("DFlash device timing requires a draft worker")
+            if self._forward_execution_reporter is None:
+                raise RuntimeError("DFlash device timing reporter was not initialized")
+
+            def _dflash_draft_reporter(t: float, **_kwargs) -> None:
+                self._forward_execution_reporter(
+                    t=t,
+                    category="dflash_draft",
+                )
+
+            self.scheduler.draft_worker.draft_model_runner.device_timer = DeviceTimer(
+                reporter=_dflash_draft_reporter
+            )
         if self.scheduler.draft_worker is not None:
             dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
             if dw is not None:

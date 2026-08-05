@@ -549,8 +549,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         cache.writing_check(write_back=True)
 
     def _load_back_node(self, cache, node):
-        loaded = cache.load_back(node.id)
-        self.assertTrue(loaded)
+        load_result = cache.load_back(node.id)
+        self.assertIsNotNone(load_result)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
         for ack in list(cache.cache_controller.ack_load_queue):
@@ -2934,8 +2934,8 @@ class UnifiedRadixCacheSuite:
                 self._backup_node(cache, node)
 
     def _load_back_node(self, cache, node):
-        loaded = cache.load_back(node.id)
-        self.assertTrue(loaded)
+        load_result = cache.load_back(node.id)
+        self.assertIsNotNone(load_result)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
         for ack in list(cache.cache_controller.ack_load_queue):
@@ -3354,7 +3354,8 @@ class UnifiedRadixCacheSuite:
             m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
             anchor = cache.resolve_node_handle(m.best_match_node)
             if anchor is not cache.root_node and anchor.evicted:
-                if cache.load_back(anchor.id):
+                load_result = cache.load_back(anchor.id)
+                if load_result is not None:
                     self._finish_pending_loads(cache)
                     self._release_ongoing_load_back_locks(cache)
             cache.sanity_check()
@@ -3876,7 +3877,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        load_result = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3884,8 +3885,13 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertIs(cache.resolve_node_handle(new_node), leaf)
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIs(cache.resolve_node_handle(load_result.restored_node), leaf)
+        self.assertTrue(load_result.queued_any_component)
+        self.assertGreater(load_result.full_tokens, 0)
+        self.assertEqual(
+            len(torch.cat([req.prefix_indices, load_result.new_full_device_indices])),
+            len(tokens),
+        )
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].value)
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
@@ -3917,7 +3923,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        load_result = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3925,9 +3931,14 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertIs(cache.resolve_node_handle(new_node), leaf)
-        self.assertEqual(new_indices.tolist(), leaf_full.tolist())
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIs(cache.resolve_node_handle(load_result.restored_node), leaf)
+        self.assertTrue(load_result.queued_any_component)
+        self.assertEqual(load_result.new_full_device_indices.numel(), 0)
+        self.assertEqual(load_result.full_tokens, 0)
+        if aux == ComponentType.SWA:
+            self.assertGreater(load_result.swa_tokens, 0)
+        else:
+            self.assertEqual(load_result.swa_tokens, 0)
         self.assertEqual(
             leaf.component_data[ComponentType.FULL].value.tolist(),
             leaf_full.tolist(),
@@ -3959,7 +3970,7 @@ class UnifiedRadixCacheSuite:
         # (that allocation is what a called-off load-back must free + not publish).
         req.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        new_indices, new_node = cache.init_load_back(
+        load_result = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3968,9 +3979,10 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(load_result.new_full_device_indices.numel(), 0)
+        self.assertFalse(load_result.queued_any_component)
         self.assertIs(
-            cache.resolve_node_handle(new_node),
+            cache.resolve_node_handle(load_result.restored_node),
             cache.resolve_node_handle(match.last_device_node),
         )
         self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
@@ -4005,7 +4017,7 @@ class UnifiedRadixCacheSuite:
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            new_indices, _ = cache.init_load_back(
+            load_result = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -4014,7 +4026,8 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(load_result.new_full_device_indices.numel(), 0)
+        self.assertFalse(load_result.queued_any_component)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -4052,7 +4065,7 @@ class UnifiedRadixCacheSuite:
                 cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
             ),
         ):
-            new_indices, _ = cache.init_load_back(
+            load_result = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -4061,7 +4074,8 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(load_result.new_full_device_indices.numel(), 0)
+        self.assertFalse(load_result.queued_any_component)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -4088,9 +4102,9 @@ class UnifiedRadixCacheSuite:
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         # Impossible quota -> load_back aborts after building the transfers.
-        loaded = cache.load_back(leaf.id, mem_quota=-(10**9), req=req)
+        load_result = cache.load_back(leaf.id, mem_quota=-(10**9), req=req)
 
-        self.assertFalse(loaded)
+        self.assertIsNone(load_result)
         # the aborted call must return its slot and not leave req pointing at it
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
@@ -4119,9 +4133,9 @@ class UnifiedRadixCacheSuite:
         # cache_controller.load() failing (device alloc / transfer resolution)
         # must also return the slot this call allocated.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            loaded = cache.load_back(leaf.id, req=req)
+            load_result = cache.load_back(leaf.id, req=req)
 
-        self.assertFalse(loaded)
+        self.assertIsNone(load_result)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
@@ -4147,9 +4161,9 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(preexisting_slot)
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
-        loaded = cache.load_back(leaf.id, mem_quota=-(10**9), req=req)
+        load_result = cache.load_back(leaf.id, mem_quota=-(10**9), req=req)
 
-        self.assertFalse(loaded)
+        self.assertIsNone(load_result)
         self.assertIs(req.mamba_pool_idx, preexisting_slot)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
@@ -4174,9 +4188,9 @@ class UnifiedRadixCacheSuite:
         req.mamba_pool_idx = None
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
-        loaded = cache.load_back(leaf.id, req=req)
+        load_result = cache.load_back(leaf.id, req=req)
 
-        self.assertTrue(loaded)
+        self.assertIsNotNone(load_result)
         # the successful load must keep the freshly allocated slot published
         self.assertIsNotNone(req.mamba_pool_idx)
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].value)
@@ -4211,8 +4225,8 @@ class UnifiedRadixCacheSuite:
         req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
         req.mamba_pool_idx = None
 
-        loaded = cache.load_back(leaf.id, req=req)
-        self.assertTrue(loaded)
+        load_result = cache.load_back(leaf.id, req=req)
+        self.assertIsNotNone(load_result)
         self.assertIsNotNone(req.mamba_pool_idx)
         self._finish_pending_loads(cache)
 
@@ -4755,7 +4769,8 @@ class UnifiedRadixCacheSuite:
         )
 
         with mock.patch.object(cache, "evict", wraps=cache.evict) as evict_mock:
-            self.assertTrue(cache.load_back(leaf.id))
+            load_result = cache.load_back(leaf.id)
+            self.assertIsNotNone(load_result)
 
         # Full pre-eviction must not be triggered by SWA pool pressure.
         full_pre_evict_calls = [

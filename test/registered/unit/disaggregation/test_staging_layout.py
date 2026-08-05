@@ -10,6 +10,9 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
     build_staging_chunk_layout,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 MEBIBYTE: int = 1024 * 1024
 MAIN_KV: StagingComponentId = StagingComponentId(None, None)

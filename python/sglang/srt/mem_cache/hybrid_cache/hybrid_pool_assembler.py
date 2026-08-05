@@ -186,6 +186,7 @@ def build_hybrid_swa_stack(
     server_args: ServerArgs,
     full_kv_pool: Any,
     swa_kv_pool: Any,
+    draft_kv_pool: Any = None,
     full_layer_mapping: dict[int, int],
     swa_layer_mapping: dict[int, int],
     load_cache_event,
@@ -199,11 +200,18 @@ def build_hybrid_swa_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
-    kv_host_size = swa_host_size = None
+    kv_host_size = swa_host_size = draft_host_size = None
     if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+        fixed_size_pools = (full_kv_pool, swa_kv_pool)
+        if draft_kv_pool is not None:
+            fixed_size_pools = (*fixed_size_pools, draft_kv_pool)
+        fixed_pool_sizes = _split_hicache_size(
+            server_args.hicache_size,
+            fixed_size_pools,
         )
+        kv_host_size, swa_host_size = fixed_pool_sizes[:2]
+        if draft_kv_pool is not None:
+            draft_host_size = fixed_pool_sizes[2]
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=params.page_size,
@@ -218,6 +226,21 @@ def build_hybrid_swa_stack(
         use_mla=use_mla,
         host_size=swa_host_size,
     )
+    draft_host_pool = None
+    if draft_kv_pool is not None:
+        if draft_kv_pool.layer_num > transfer_layer_num:
+            raise ValueError(
+                "Draft HiCache has more layers than the target transfer lifecycle: "
+                f"draft_layers={draft_kv_pool.layer_num}, "
+                f"target_transfer_layers={transfer_layer_num}"
+            )
+        draft_host_pool = build_kv_host_pool(
+            kv_pool=draft_kv_pool,
+            page_size=params.page_size,
+            server_args=server_args,
+            use_mla=False,
+            host_size=draft_host_size,
+        )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -243,6 +266,23 @@ def build_hybrid_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
+    if draft_host_pool is not None:
+        draft_layer_mapping = {
+            layer_id: layer_id - draft_kv_pool.start_layer
+            for layer_id in range(
+                draft_kv_pool.start_layer,
+                draft_kv_pool.start_layer + draft_kv_pool.layer_num,
+            )
+        }
+        host_pool_group.register_index_aligned_pool(
+            build_pool_entry(
+                name=PoolName.DRAFT,
+                host_pool=draft_host_pool,
+                device_pool=draft_kv_pool,
+                layer_mapping=draft_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+            )
+        )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
@@ -996,6 +1036,7 @@ class _SwaStrategy(StackStrategy):
             server_args=server_args,
             full_kv_pool=kvcache.full_kv_pool,
             swa_kv_pool=kvcache.swa_kv_pool,
+            draft_kv_pool=params.draft_token_to_kv_pool,
             full_layer_mapping=full_layer_mapping,
             swa_layer_mapping=swa_layer_mapping,
             load_cache_event=load_cache_event,
@@ -1008,6 +1049,7 @@ class _SwaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        has_draft = params.draft_token_to_kv_pool is not None
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1015,8 +1057,19 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
+            sidecars=(
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.DRAFT,
+                        indices_from_pool=PoolName.KV,
+                        hit_policy=PoolHitPolicy.ALL_PAGES,
+                    )
+                ]
+                if has_draft
+                else []
+            ),
             transfer_layer_num=len(full_layer_mapping | swa_layer_mapping),
-            pools_desc="KV + SWA",
+            pools_desc="KV + SWA + DRAFT" if has_draft else "KV + SWA",
         )
 
 

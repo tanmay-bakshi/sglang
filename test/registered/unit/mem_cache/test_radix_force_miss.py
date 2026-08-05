@@ -78,6 +78,20 @@ class TestZeroMatchResult(unittest.TestCase):
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
+    def test_page_aligned_exact_match_preserves_extend_tail(self):
+        """Keep the final page writable when an exact prompt is cached."""
+
+        tree = RadixCache.create_simulated(page_size=64)
+        token_ids = array("q", range(512))
+        tree.insert(InsertParams(key=RadixKey(token_ids=token_ids)))
+        req = _StubReq(token_ids)
+
+        with envs.SGLANG_RADIX_FORCE_MISS.override(False):
+            match_prefix_for_req(tree, req)
+
+        self.assertEqual(int(req.prefix_indices.numel()), 448)
+        self.assertEqual(req.num_matched_prefix_tokens, 448)
+
     def test_force_miss_zeros_req_prefix(self):
         tree = RadixCache.create_simulated()
         tree.insert(

@@ -4,13 +4,13 @@ use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     model_card::ModelCard,
     model_type::ModelType,
-    pd_process::PdProcessMetadata,
+    pd_process::PdProcessRegistration,
     worker::{
         parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
         RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
+use crate::routers::grpc::client::GrpcClient;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -23,8 +23,10 @@ pub struct BasicWorkerBuilder {
     models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    circuit_breaker: Option<CircuitBreaker>,
     grpc_client: Option<GrpcClient>,
-    pd_process: Option<PdProcessMetadata>,
+    pd_process: Option<PdProcessRegistration>,
+    initially_healthy: bool,
 }
 
 impl BasicWorkerBuilder {
@@ -40,8 +42,10 @@ impl BasicWorkerBuilder {
             models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            circuit_breaker: None,
             grpc_client: None,
             pd_process: None,
+            initially_healthy: true,
         }
     }
 
@@ -57,8 +61,10 @@ impl BasicWorkerBuilder {
             models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            circuit_breaker: None,
             grpc_client: None,
             pd_process: None,
+            initially_healthy: true,
         }
     }
 
@@ -110,14 +116,27 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Reuse an existing circuit breaker's generation-local state.
+    pub fn circuit_breaker(mut self, circuit_breaker: CircuitBreaker) -> Self {
+        self.circuit_breaker = Some(circuit_breaker);
+        self
+    }
+
     /// Set gRPC client for gRPC workers
     pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
         self
     }
 
-    pub fn pd_process(mut self, metadata: PdProcessMetadata) -> Self {
-        self.pd_process = Some(metadata);
+    pub fn pd_process(mut self, registration: PdProcessRegistration) -> Self {
+        self.url = registration.origin().as_str().to_string();
+        self.pd_process = Some(registration);
+        self
+    }
+
+    /// Set whether the worker is admission-ready when construction completes.
+    pub fn initially_healthy(mut self, initially_healthy: bool) -> Self {
+        self.initially_healthy = initially_healthy;
         self
     }
 
@@ -176,21 +195,17 @@ impl BasicWorkerBuilder {
             None => OnceCell::new(),
         });
 
-        let healthy = true;
-        Metrics::set_worker_health(&self.url, healthy);
-
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
             worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
-            healthy: Arc::new(AtomicBool::new(healthy)),
+            healthy: Arc::new(AtomicBool::new(self.initially_healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: CircuitBreaker::with_config_and_label(
-                self.circuit_breaker_config,
-                self.url.clone(),
-            ),
+            circuit_breaker: self.circuit_breaker.unwrap_or_else(|| {
+                CircuitBreaker::with_config_and_label(self.circuit_breaker_config, self.url.clone())
+            }),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
         }
@@ -210,8 +225,9 @@ pub struct DPAwareWorkerBuilder {
     models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    circuit_breaker: Option<CircuitBreaker>,
     grpc_client: Option<GrpcClient>,
-    pd_process: Option<PdProcessMetadata>,
+    initially_healthy: bool,
 }
 
 impl DPAwareWorkerBuilder {
@@ -229,8 +245,9 @@ impl DPAwareWorkerBuilder {
             models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            circuit_breaker: None,
             grpc_client: None,
-            pd_process: None,
+            initially_healthy: true,
         }
     }
 
@@ -253,8 +270,9 @@ impl DPAwareWorkerBuilder {
             models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            circuit_breaker: None,
             grpc_client: None,
-            pd_process: None,
+            initially_healthy: true,
         }
     }
 
@@ -306,14 +324,21 @@ impl DPAwareWorkerBuilder {
         self
     }
 
-    /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
-        self.grpc_client = Some(client);
+    /// Reuse an existing circuit breaker's generation-local state.
+    pub fn circuit_breaker(mut self, circuit_breaker: CircuitBreaker) -> Self {
+        self.circuit_breaker = Some(circuit_breaker);
         self
     }
 
-    pub fn pd_process(mut self, metadata: PdProcessMetadata) -> Self {
-        self.pd_process = Some(metadata);
+    /// Set whether each DP rank is admission-ready when construction completes.
+    pub fn initially_healthy(mut self, initially_healthy: bool) -> Self {
+        self.initially_healthy = initially_healthy;
+        self
+    }
+
+    /// Set gRPC client for gRPC workers
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
+        self.grpc_client = Some(client);
         self
     }
 
@@ -339,16 +364,17 @@ impl DPAwareWorkerBuilder {
             .runtime_type(self.runtime_type)
             .labels(self.labels)
             .health_config(self.health_config)
-            .circuit_breaker_config(self.circuit_breaker_config);
+            .circuit_breaker_config(self.circuit_breaker_config)
+            .initially_healthy(self.initially_healthy);
 
+        if let Some(circuit_breaker) = self.circuit_breaker {
+            builder = builder.circuit_breaker(circuit_breaker);
+        }
         if let Some(client) = self.grpc_client {
             builder = builder.grpc_client(client);
         }
         if let Some(api_key) = self.api_key {
             builder = builder.api_key(api_key);
-        }
-        if let Some(metadata) = self.pd_process {
-            builder = builder.pd_process(metadata);
         }
 
         let base_worker = builder.build();

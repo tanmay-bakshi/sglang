@@ -10,7 +10,14 @@ from sglang.srt.disaggregation.common.utils import (
     TensorParallelShard,
     compute_tensor_parallel_shard,
 )
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    NIXL_RMA_MAX_COHORT_DESCRIPTORS,
+    NIXL_RMA_MAX_DESCRIPTORS,
+    NixlKVManager,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class RecordingNixlAgent:
@@ -18,11 +25,15 @@ class RecordingNixlAgent:
 
     descriptor_requests: list[tuple[np.ndarray, str]]
     initialize_calls: list[tuple[object, ...]]
+    remote_handle: object
+    release_xfer_handle_calls: list[object]
     transfer_calls: list[object]
 
     def __init__(self) -> None:
         self.descriptor_requests = []
         self.initialize_calls = []
+        self.remote_handle = object()
+        self.release_xfer_handle_calls = []
         self.transfer_calls = []
 
     def get_xfer_descs(self, requests: np.ndarray, memory_kind: str) -> tuple[str, int]:
@@ -36,7 +47,13 @@ class RecordingNixlAgent:
 
     def transfer(self, handle: object) -> str:
         self.transfer_calls.append(handle)
-        return "POSTED"
+        return "PROC"
+
+    def check_xfer_state(self, handle: object) -> str:
+        return "DONE"
+
+    def release_xfer_handle(self, handle: object) -> None:
+        self.release_xfer_handle_calls.append(handle)
 
 
 class TestComputeTensorParallelShard(unittest.TestCase):
@@ -142,6 +159,9 @@ class TestNixlTensorParallelStateTransfer(unittest.TestCase):
             gpu_id=3,
             page_size=page_size,
         )
+        manager.decode_kv_args_table = {
+            "decode-peer": SimpleNamespace(remote_handle=agent.remote_handle)
+        }
         return manager, agent
 
     @staticmethod
@@ -256,9 +276,100 @@ class TestNixlTensorParallelStateTransfer(unittest.TestCase):
         self.assertEqual(initialize_call[0], "WRITE")
         self.assertEqual(initialize_call[1], ("descriptors", 1))
         self.assertEqual(initialize_call[2], ("descriptors", 2))
-        self.assertEqual(initialize_call[3], "decode-peer")
+        self.assertIs(initialize_call[3], agent.remote_handle)
         self.assertEqual(initialize_call[4], b"room_state_0")
         self.assertEqual(agent.transfer_calls, [handle])
+
+    def test_tp_two_state_uses_independently_progressed_bounded_handles(self) -> None:
+        """TP2 SWA retains the per-handle bound and notifies only at the end."""
+
+        manager, agent = self._make_manager(
+            source_tp_size=2,
+            source_engine_rank=1,
+            page_size=1,
+        )
+        descriptor_count = NIXL_RMA_MAX_DESCRIPTORS + 3
+        indices = list(range(descriptor_count))
+
+        final_handle = self._call_transfer(
+            manager,
+            source_indices=indices,
+            source_data_ptrs=[0x100000000],
+            source_item_lens=[2048],
+            destination_indices=indices,
+            destination_data_ptrs=[0x200000000],
+            destination_item_lens=[4096],
+            destination_tp_size=1,
+            destination_engine_rank=0,
+        )
+
+        self.assertEqual(len(agent.descriptor_requests), 4)
+        self.assertEqual(
+            [requests.shape for requests, _ in agent.descriptor_requests],
+            [
+                (NIXL_RMA_MAX_DESCRIPTORS, 3),
+                (NIXL_RMA_MAX_DESCRIPTORS, 3),
+                (3, 3),
+                (3, 3),
+            ],
+        )
+        self.assertEqual(len(agent.initialize_calls), 2)
+        self.assertEqual(
+            [call[4] for call in agent.initialize_calls],
+            [b"", b"room_state_0"],
+        )
+        self.assertEqual(len(agent.transfer_calls), 2)
+        self.assertEqual(
+            agent.release_xfer_handle_calls,
+            [agent.transfer_calls[0]],
+        )
+        self.assertIs(final_handle, agent.transfer_calls[1])
+
+    def test_tp_four_state_uses_cohort_bounded_handles(self) -> None:
+        """TP4 SWA divides the cohort descriptor budget equally across writers."""
+
+        manager, agent = self._make_manager(
+            source_tp_size=4,
+            source_engine_rank=3,
+            page_size=1,
+        )
+        per_writer_limit = NIXL_RMA_MAX_COHORT_DESCRIPTORS // 4
+        descriptor_count = per_writer_limit + 3
+        indices = list(range(descriptor_count))
+
+        final_handle = self._call_transfer(
+            manager,
+            source_indices=indices,
+            source_data_ptrs=[0x100000000],
+            source_item_lens=[1024],
+            destination_indices=indices,
+            destination_data_ptrs=[0x200000000],
+            destination_item_lens=[4096],
+            destination_tp_size=1,
+            destination_engine_rank=0,
+        )
+
+        self.assertEqual(len(agent.descriptor_requests), 4)
+        self.assertEqual(
+            [requests.shape for requests, _ in agent.descriptor_requests],
+            [
+                (per_writer_limit, 3),
+                (per_writer_limit, 3),
+                (3, 3),
+                (3, 3),
+            ],
+        )
+        self.assertEqual(len(agent.initialize_calls), 2)
+        self.assertEqual(
+            [call[4] for call in agent.initialize_calls],
+            [b"", b"room_state_0"],
+        )
+        self.assertEqual(len(agent.transfer_calls), 2)
+        self.assertEqual(
+            agent.release_xfer_handle_calls,
+            [agent.transfer_calls[0]],
+        )
+        self.assertIs(final_handle, agent.transfer_calls[1])
 
     def test_tp_four_to_two_routes_only_connected_source_halves(self) -> None:
         """Source ranks two and three fill ordered halves of decode rank one."""

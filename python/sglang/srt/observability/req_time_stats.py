@@ -134,6 +134,7 @@ class RequestStage:
     DECODE_LOOP = RequestStageConfig(
         "decode_loop",
         level=3,
+        metrics_is_observed=True,
     )
     PREFILL_FORWARD = RequestStageConfig(
         "prefill_forward",
@@ -609,6 +610,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
     last_decode_finish_time: float = 0.0
+    first_decode_finish_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
@@ -827,6 +829,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def set_last_decode_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
+        if self.first_decode_finish_time == 0.0:
+            self.first_decode_finish_time = ts
         last_time = self.last_decode_finish_time
         self.last_decode_finish_time = ts
 
@@ -1052,6 +1056,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             forward_duration = self.duration_between(
                 self.forward_entry_time, self.completion_time
             )
+            compute_duration = self.duration_between(
+                self.forward_entry_time, self.prefill_finished_time
+            )
+            transfer_duration = self.duration_between(
+                self.prefill_transfer_queue_entry_time,
+                self.prefill_kv_transfer_finish_time,
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1084,6 +1095,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
+                f"compute_duration={self.format_duration(compute_duration)}, "
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f} MB"
@@ -1104,6 +1117,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             forward_duration = self.duration_between(
                 self.forward_entry_time,
                 self.completion_time,
+            )
+            first_token_forward_duration = self.duration_between(
+                self.forward_entry_time,
+                self.first_decode_finish_time,
             )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
@@ -1139,6 +1156,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
+                "first_token_forward_duration="
+                f"{self.format_duration(first_token_forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"
             )
         else:

@@ -6,7 +6,11 @@ import threading
 from typing import Protocol
 
 import torch
-from sglang.srt.disaggregation.common.staging_layout import StagingWriterId
+
+from sglang.srt.disaggregation.common.staging_layout import (
+    StagingWriterId,
+    source_tp_ranks_for_destination,
+)
 from sglang.srt.mem_cache.allocation_pin import (
     AllocationPin,
     AllocationPinSnapshot,
@@ -52,6 +56,7 @@ class DecodeAllocationLeaseState(enum.StrEnum):
     """Process-local migration ownership state."""
 
     PREPARED = "prepared"
+    PUBLISHED = "published"
     SUBMITTED = "submitted"
     WRITERS_COMPLETED = "writers_completed"
     SCATTER_COMPLETED = "scatter_completed"
@@ -82,7 +87,7 @@ def _validate_writer_id(writer_id: StagingWriterId) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class DecodeWriterManifest:
-    """Exact ordered source writer membership for one TP1 destination.
+    """Exact ordered source writer membership for one destination rank.
 
     :ivar source_tp_size: Source attention tensor-parallel width.
     :ivar destination_tp_size: Destination attention tensor-parallel width.
@@ -96,18 +101,27 @@ class DecodeWriterManifest:
     writers: tuple[StagingWriterId, ...]
 
     def __post_init__(self) -> None:
-        """Own and validate exact TP2 or TP4 writer membership."""
+        """Own and validate exact destination-local writer membership."""
 
         if self.source_tp_size not in (2, 4):
             raise ValueError("source_tp_size must be 2 or 4")
-        if self.destination_tp_size != 1 or self.destination_tp_rank != 0:
-            raise ValueError("decode allocation manifests require a TP1 destination")
+        if self.source_tp_size < self.destination_tp_size:
+            raise ValueError(
+                "decode allocation manifests do not support destination TP "
+                "wider than source TP"
+            )
+        expected_source_tp_ranks = source_tp_ranks_for_destination(
+            self.source_tp_size,
+            self.destination_tp_size,
+            self.destination_tp_rank,
+        )
         writers = tuple(self.writers)
         object.__setattr__(self, "writers", writers)
-        if len(writers) != self.source_tp_size:
+        writers_per_destination = len(expected_source_tp_ranks)
+        if len(writers) != writers_per_destination:
             raise ValueError(
-                "writer count must equal source_tp_size: "
-                f"{len(writers)} != {self.source_tp_size}"
+                "writer count must equal source_tp_size / destination_tp_size: "
+                f"{len(writers)} != {writers_per_destination}"
             )
         for writer in writers:
             _validate_writer_id(writer)
@@ -115,26 +129,45 @@ class DecodeWriterManifest:
             raise ValueError("writer manifest contains duplicate identities")
         if writers != tuple(sorted(writers)):
             raise ValueError("writer manifest must use canonical ordering")
-        source_tp_ranks = tuple(
-            writer.source_attn_tp_rank for writer in writers
-        )
-        if source_tp_ranks != tuple(range(self.source_tp_size)):
+        source_tp_ranks = tuple(writer.source_attn_tp_rank for writer in writers)
+        if source_tp_ranks != expected_source_tp_ranks:
             raise ValueError(
-                "writer manifest must contain each source TP rank exactly once"
+                "writer manifest does not match destination topology: "
+                f"expected source ranks {expected_source_tp_ranks}, "
+                f"got {source_tp_ranks}"
             )
 
     @classmethod
-    def for_tensor_parallel(cls, source_tp_size: int) -> "DecodeWriterManifest":
-        """Build the canonical single-replica TP writer manifest.
+    def for_tensor_parallel(
+        cls,
+        source_tp_size: int,
+        destination_tp_size: int = 1,
+        destination_tp_rank: int = 0,
+    ) -> "DecodeWriterManifest":
+        """Build the canonical destination-local TP writer manifest.
 
         :param source_tp_size: Source TP2 or TP4 width.
-        :returns: Exact ordered TP1-destination writer manifest.
+        :param destination_tp_size: Destination attention TP width.
+        :param destination_tp_rank: Destination attention TP rank.
+        :returns: Exact ordered destination-local writer manifest.
         """
 
+        if source_tp_size not in (2, 4):
+            raise ValueError("source_tp_size must be 2 or 4")
+        if source_tp_size < destination_tp_size:
+            raise ValueError(
+                "decode allocation manifests do not support destination TP "
+                "wider than source TP"
+            )
+        source_tp_ranks = source_tp_ranks_for_destination(
+            source_tp_size,
+            destination_tp_size,
+            destination_tp_rank,
+        )
         return cls(
             source_tp_size=source_tp_size,
-            destination_tp_size=1,
-            destination_tp_rank=0,
+            destination_tp_size=destination_tp_size,
+            destination_tp_rank=destination_tp_rank,
             writers=tuple(
                 StagingWriterId(
                     transfer_source_rank=rank,
@@ -142,7 +175,7 @@ class DecodeWriterManifest:
                     source_pp_rank=0,
                     source_cp_rank=0,
                 )
-                for rank in range(source_tp_size)
+                for rank in source_tp_ranks
             ),
         )
 
@@ -204,14 +237,10 @@ class DecodeAllocationComponentClaim:
             raise ValueError("logical_length must be a non-negative integer")
         if self.logical_length == 0:
             if self.allocator is not None or self.indices is not None:
-                raise ValueError(
-                    "zero-work component must omit allocator and indices"
-                )
+                raise ValueError("zero-work component must omit allocator and indices")
             return
         if self.allocator is None or self.indices is None:
-            raise ValueError(
-                "nonzero component must provide allocator and indices"
-            )
+            raise ValueError("nonzero component must provide allocator and indices")
         if not isinstance(self.indices, torch.Tensor):
             raise TypeError("component indices must be a torch.Tensor")
         if self.indices.ndim != 1:
@@ -231,8 +260,9 @@ class DecodeAllocationComponentReceipt:
     :ivar logical_start: Request-local logical start position.
     :ivar logical_length: Exact logical work length.
     :ivar page_size: Tokens represented by one allocator page.
-    :ivar virtual_pages: Exact pinned allocator-visible pages.
-    :ivar physical_pages: Corresponding immutable physical pages.
+    :ivar virtual_pages: Allocator-visible pages in request-logical order.
+    :ivar physical_pages: Corresponding immutable physical pages in the same
+        request-logical order.
     """
 
     component: DecodeAllocationComponent
@@ -528,9 +558,7 @@ class DecodeAllocationLeaseAuthority:
                 pin = allocator.acquire_allocation_pin(indices, self._pin_owner)
                 held_pins.append(_HeldAllocationPin(allocator=allocator, pin=pin))
                 pin_snapshot = allocator.allocation_pin_snapshot(pin)
-                component_receipts.append(
-                    self._component_receipt(claim, pin_snapshot)
-                )
+                component_receipts.append(self._component_receipt(claim, pin_snapshot))
 
             owned_receipts = tuple(component_receipts)
             writer_participation = tuple(
@@ -600,12 +628,17 @@ class DecodeAllocationLeaseAuthority:
             self._release_pins_locked(record)
             record.state = DecodeAllocationLeaseState.ROLLED_BACK_TO_REQUEST
 
-    def record_submission(
+    def record_publication(
         self,
         lease: DecodeAllocationLease,
         lifecycle_authority: object,
     ) -> None:
-        """Bind trusted exact-handle submission to the local allocation.
+        """Make peer-visible transfer authorization irreversible locally.
+
+        Once metadata carrying this allocation generation is visible, a source
+        writer may act on it asynchronously. The allocation can no longer use
+        the pre-publication rollback path, even if no exact native submission
+        has been observed yet.
 
         :param lease: Exact prepared allocation lease.
         :param lifecycle_authority: Exact configured transport lifecycle owner.
@@ -617,6 +650,26 @@ class DecodeAllocationLeaseAuthority:
             self._transition_locked(
                 record,
                 DecodeAllocationLeaseState.PREPARED,
+                DecodeAllocationLeaseState.PUBLISHED,
+            )
+
+    def record_submission(
+        self,
+        lease: DecodeAllocationLease,
+        lifecycle_authority: object,
+    ) -> None:
+        """Bind trusted exact-handle submission to the local allocation.
+
+        :param lease: Exact published allocation lease.
+        :param lifecycle_authority: Exact configured transport lifecycle owner.
+        """
+
+        with self._lock:
+            record = self._validate_locked(lease)
+            self._require_lifecycle_authority(lifecycle_authority)
+            self._transition_locked(
+                record,
+                DecodeAllocationLeaseState.PUBLISHED,
                 DecodeAllocationLeaseState.SUBMITTED,
             )
 
@@ -730,6 +783,64 @@ class DecodeAllocationLeaseAuthority:
                 )
             self._release_pins_locked(record)
             record.state = DecodeAllocationLeaseState.COMMITTED_TO_REQUEST
+
+    def commit_legacy_to_request_after_consumption(
+        self,
+        lease: DecodeAllocationLease,
+        lifecycle_authority: object,
+    ) -> None:
+        """Return a consumed legacy staging allocation to its live request.
+
+        Legacy staging has no prepared-transaction teardown exchange. Its
+        collective successful poll is authoritative only after every source
+        writer completed, every destination scatter event completed, and the
+        metadata gate converged. This transition is therefore restricted to a
+        published lease presented by the exact bound transport authority.
+        Prepared-transaction allocations must use authenticated teardown.
+
+        This removes migration pins only. It never frees allocator pages or the
+        request slot.
+
+        :param lease: Exact consumed legacy allocation lease.
+        :param lifecycle_authority: Exact configured transport lifecycle owner.
+        """
+
+        with self._lock:
+            record = self._validate_locked(lease)
+            self._require_lifecycle_authority(lifecycle_authority)
+            if record.state is not DecodeAllocationLeaseState.PUBLISHED:
+                raise DecodeAllocationLeaseError(
+                    "legacy request commit requires a consumed published transfer"
+                )
+            self._release_pins_locked(record)
+            record.state = DecodeAllocationLeaseState.COMMITTED_TO_REQUEST
+
+    def authorize_legacy_abort_after_terminal_failure(
+        self,
+        lease: DecodeAllocationLease,
+        lifecycle_authority: object,
+    ) -> DecodeAllocationAbortPermit:
+        """Permit cleanup after a terminal legacy transfer failure.
+
+        Legacy staging does not exchange packed teardown receipts. A collective
+        failed poll may authorize cleanup only after the bound transport owner
+        has established that the receiver is terminal and all local staging
+        work is quiescent. The caller must consume the returned permit before
+        freeing request or KV storage.
+
+        :param lease: Exact failed legacy allocation lease.
+        :param lifecycle_authority: Exact configured transport lifecycle owner.
+        :returns: One-shot abort-cleanup permit.
+        """
+
+        with self._lock:
+            record = self._validate_locked(lease)
+            self._require_lifecycle_authority(lifecycle_authority)
+            if record.state is not DecodeAllocationLeaseState.PUBLISHED:
+                raise DecodeAllocationLeaseError(
+                    "legacy terminal failure abort requires a published transfer"
+                )
+            return self._authorize_abort_locked(record)
 
     def authorize_pre_submission_abort(
         self,
@@ -1013,13 +1124,37 @@ class DecodeAllocationLeaseAuthority:
             raise DecodeAllocationLeaseError(
                 "allocator pin virtual and physical page counts differ"
             )
+        indices = claim.indices
+        if indices is None:
+            raise RuntimeError("nonzero component claim lost its indices")
+        page_size = pin_snapshot.page_size
+        ordered_virtual_pages = tuple(
+            dict.fromkeys(
+                int(index) // page_size
+                for index in indices.detach().to(dtype=torch.int64).cpu().tolist()
+            )
+        )
+        if set(ordered_virtual_pages) != set(pin_snapshot.virtual_pages):
+            raise DecodeAllocationLeaseError(
+                "component claim pages differ from the allocator pin snapshot"
+            )
+        physical_by_virtual = dict(
+            zip(
+                pin_snapshot.virtual_pages,
+                pin_snapshot.physical_pages,
+                strict=True,
+            )
+        )
+        ordered_physical_pages = tuple(
+            physical_by_virtual[page] for page in ordered_virtual_pages
+        )
         return DecodeAllocationComponentReceipt(
             component=claim.component,
             logical_start=claim.logical_start,
             logical_length=claim.logical_length,
-            page_size=pin_snapshot.page_size,
-            virtual_pages=pin_snapshot.virtual_pages,
-            physical_pages=pin_snapshot.physical_pages,
+            page_size=page_size,
+            virtual_pages=ordered_virtual_pages,
+            physical_pages=ordered_physical_pages,
         )
 
     @staticmethod

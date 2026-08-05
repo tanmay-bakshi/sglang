@@ -176,6 +176,14 @@ class SpeculativeAlgorithm(Enum):
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
+        if self.is_dflash():
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_disagg_draft_input,
+            )
+
+            return build_dflash_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
+            )
         if self.is_eagle():
             from sglang.srt.speculative.eagle_disaggregation import (
                 build_eagle_disagg_draft_input,

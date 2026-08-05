@@ -29,15 +29,15 @@ use uuid::Uuid;
 
 use super::pd_decoder_grant::{
     AbortReconciliationGrant, BindReconciliationGrant, BoundPreparedGrant,
-    CompletionReconciliationGrant, DecoderAllocationKey, DecoderGrantBinding,
-    DecoderGrantControlClient, DecoderGrantDigest, DecoderGrantReservation, DecoderId,
-    DecoderRequestTemplate, DecoderReserveAttemptDigest, DecoderReserveRefusalDisposition,
-    DecoderReserveRefusalReceipt, DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError,
-    EngineQuarantineReceipt, EngineReleaseKind, EngineReleaseReceipt, PrefillId,
-    PreparedCancellationReconciliationGrant, PreparedGrantCancellationReceipt,
-    PreparedGrantCancellationTarget, PromotionReconciliationGrant, QuarantineReconciliationGrant,
-    ReserveReconciliationGrant, RetainedEngineGrant, UnboundCancellationReconciliationGrant,
-    UnboundPreparedGrant,
+    CompletionReconciliationGrant, DecoderAllocationKey, DecoderControlAuthorization,
+    DecoderGrantBinding, DecoderGrantControlClient, DecoderGrantDigest, DecoderGrantReservation,
+    DecoderId, DecoderRequestTemplate, DecoderReserveAttemptDigest,
+    DecoderReserveRefusalDisposition, DecoderReserveRefusalReceipt, DecoderSlotGeneration,
+    EngineAbortOutcome, EngineCompletionOutcome, EngineGrantError, EngineQuarantineReceipt,
+    EngineReleaseKind, EngineReleaseReceipt, PrefillId, PreparedCancellationReconciliationGrant,
+    PreparedGrantCancellationReceipt, PreparedGrantCancellationTarget,
+    PromotionReconciliationGrant, QuarantineReconciliationGrant, ReserveReconciliationGrant,
+    RetainedEngineGrant, UnboundCancellationReconciliationGrant, UnboundPreparedGrant,
 };
 use crate::core::PrefillBootstrapEndpoint;
 
@@ -136,7 +136,7 @@ impl DecoderSchedulingHints {
     }
 }
 
-/// Engine-declared metadata and advisory scheduling scales for one TP1 decoder.
+/// Engine-declared metadata and advisory scheduling scales for one decoder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecoderReplicaMetadata {
     id: DecoderId,
@@ -386,11 +386,12 @@ impl PendingAdmission {
     pub fn begin_reserve(
         &mut self,
         client: &DecoderGrantControlClient,
+        authorization: DecoderControlAuthorization,
     ) -> Result<PendingReserveReconciliation<'_>, DecoderPoolError> {
         let operation_id = Uuid::new_v4();
-        let engine = self
-            .inner
-            .checkout_initial_reserve(self, operation_id, client)?;
+        let engine =
+            self.inner
+                .checkout_initial_reserve(self, operation_id, client, authorization)?;
         Ok(PendingReserveReconciliation {
             pending: self,
             operation_id,
@@ -1083,8 +1084,8 @@ impl PoolCompletionReconciliation<'_> {
                 if assignment_id == self.cohort.assignment_id => {}
             Err(error) => return Err(error.into()),
         }
-        let receipt = self.engine.reconcile_completion().await?;
-        self.pool.install_completion_proof(self.cohort, receipt)?;
+        let outcome = self.engine.reconcile_completion().await?;
+        self.pool.install_completion_proof(self.cohort, outcome)?;
         self.pool.resume_terminal_reconciliation(self.cohort)?;
         self.complete = true;
         Ok(())
@@ -1281,7 +1282,7 @@ enum TerminalReconciliationRecord {
         proof: Option<EngineReleaseReceipt>,
     },
     Completion {
-        proof: Option<EngineReleaseReceipt>,
+        proof: Option<EngineCompletionOutcome>,
     },
     Abort {
         disposition: RetryDisposition,
@@ -1318,6 +1319,7 @@ struct PoolState {
     declared_prefill_tp_size: NonZeroUsize,
     compatibility: EngineCompatibilityMetadata,
     accepting_requests: bool,
+    last_scheduled_decoder: Option<DecoderId>,
     replicas: HashMap<DecoderId, ReplicaState>,
     request_chains: HashMap<Uuid, RequestChainRecord>,
     active_request_ids: HashMap<Arc<str>, Uuid>,
@@ -1338,6 +1340,7 @@ impl DecoderPoolInner {
         pending: &PendingAdmission,
         operation_id: Uuid,
         client: &DecoderGrantControlClient,
+        authorization: DecoderControlAuthorization,
     ) -> Result<ReserveReconciliationGrant, DecoderPoolError> {
         let mut state = self.state.lock();
         let record = pending_record_mut(&mut state, pending)?;
@@ -1353,7 +1356,7 @@ impl DecoderPoolInner {
             }
         })?);
         record.authority = PendingAdmissionAuthority::ReserveCheckedOut { operation_id };
-        Ok(client.begin_reserve(reservation))
+        Ok(client.begin_authorized_reserve(reservation, authorization))
     }
 
     fn checkout_reserve_retry(
@@ -1644,7 +1647,7 @@ impl ActiveEngineGrant for RetainedEngineGrant {
 
 impl DecoderPool {
     /// Construct an empty pool from declared prefill metadata.
-    pub fn new(
+    pub(super) fn new(
         prefill_id: PrefillId,
         declared_prefill_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
@@ -1664,6 +1667,7 @@ impl DecoderPool {
                     declared_prefill_tp_size,
                     compatibility,
                     accepting_requests: true,
+                    last_scheduled_decoder: None,
                     replicas: HashMap::new(),
                     request_chains: HashMap::new(),
                     active_request_ids: HashMap::new(),
@@ -1676,12 +1680,15 @@ impl DecoderPool {
     }
 
     /// Register declared metadata for a decoder process generation.
-    pub fn register(&self, metadata: DecoderReplicaMetadata) -> Result<(), DecoderPoolError> {
+    pub(super) fn register(
+        &self,
+        metadata: DecoderReplicaMetadata,
+    ) -> Result<(), DecoderPoolError> {
         self.register_with_availability(metadata, DecoderAvailability::Ready)
     }
 
     /// Install a decoder generation without making it admission-selectable.
-    pub(crate) fn register_unavailable(
+    pub(super) fn register_unavailable(
         &self,
         metadata: DecoderReplicaMetadata,
     ) -> Result<(), DecoderPoolError> {
@@ -1697,11 +1704,11 @@ impl DecoderPool {
         if state.replicas.contains_key(&metadata.id) {
             return Err(DecoderPoolError::DuplicateDecoder(metadata.id));
         }
-        if metadata.declared_decode_tp_size.get() != 1 {
+        if !matches!(metadata.declared_decode_tp_size.get(), 1 | 2) {
             return Err(DecoderPoolError::IneligibleDecoderMetadata {
                 decoder_id: metadata.id,
                 reason: format!(
-                    "this pool requires declared TP1 decoders, received TP{}",
+                    "this pool supports declared TP1 or TP2 decoders, received TP{}",
                     metadata.declared_decode_tp_size
                 ),
             });
@@ -1862,7 +1869,7 @@ impl DecoderPool {
     }
 
     /// Change whether a registered decoder accepts new cohorts.
-    pub fn set_availability(
+    pub(super) fn set_availability(
         &self,
         decoder_id: &DecoderId,
         availability: DecoderAvailability,
@@ -1929,7 +1936,7 @@ impl DecoderPool {
     }
 
     /// Remove a draining process generation after every cohort is terminal.
-    pub fn remove(&self, decoder_id: &DecoderId) -> Result<(), DecoderPoolError> {
+    pub(super) fn remove(&self, decoder_id: &DecoderId) -> Result<(), DecoderPoolError> {
         let mut state = self.inner.state.lock();
         let replica = state
             .replicas
@@ -1954,9 +1961,10 @@ impl DecoderPool {
 
     /// Atomically select, construct, and charge one exact reservation attempt.
     #[allow(clippy::too_many_arguments)]
-    pub fn begin_admission(
+    pub(super) fn begin_admission(
         &self,
         request: &LogicalRequestOwner,
+        eligible_decoders: &HashSet<DecoderId>,
         template: &DecoderRequestTemplate,
         prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
         prepared_ttl: Duration,
@@ -1971,9 +1979,6 @@ impl DecoderPool {
         }
 
         let mut state = self.inner.state.lock();
-        if !state.accepting_requests {
-            return Err(DecoderPoolError::PrefillPoolDraining);
-        }
         let (retry_constraint, failed_decoders) = {
             let chain = state
                 .request_chains
@@ -2004,15 +2009,19 @@ impl DecoderPool {
         };
 
         let decoder_id = match &retry_constraint {
-            AdmissionRetryConstraint::AnyEligible => {
-                select_decoders(&state.replicas, &failed_decoders)?
-                    .into_iter()
-                    .next()
-                    .expect("successful decoder selection cannot be empty")
-            }
+            AdmissionRetryConstraint::AnyEligible => select_decoders(
+                &state.replicas,
+                &failed_decoders,
+                eligible_decoders,
+                state.last_scheduled_decoder.as_ref(),
+            )?
+            .into_iter()
+            .next()
+            .expect("successful decoder selection cannot be empty"),
             AdmissionRetryConstraint::SameDecoder(decoder_id) => {
                 let ready = state.replicas.get(decoder_id).is_some_and(|replica| {
-                    replica.availability == DecoderAvailability::Ready
+                    eligible_decoders.contains(decoder_id)
+                        && replica.availability == DecoderAvailability::Ready
                         && !failed_decoders.contains(decoder_id)
                 });
                 if !ready {
@@ -3005,9 +3014,16 @@ impl DecoderPool {
     fn install_completion_proof(
         &self,
         cohort: &DecoderAssignmentCohort,
-        receipt: EngineReleaseReceipt,
+        outcome: EngineCompletionOutcome,
     ) -> Result<(), DecoderPoolError> {
-        validate_engine_release_receipt(cohort, &receipt, EngineReleaseKind::Completed)?;
+        match &outcome {
+            EngineCompletionOutcome::Completed(receipt) => {
+                validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Completed)?;
+            }
+            EngineCompletionOutcome::Quarantined(receipt) => {
+                validate_engine_quarantine_receipt(cohort, receipt)?;
+            }
+        }
         self.validate_assignment_pool(cohort)?;
         let mut state = self.inner.state.lock();
         let record = state
@@ -3024,7 +3040,7 @@ impl DecoderPool {
         }
         match record.terminal_reconciliation.as_mut() {
             Some(TerminalReconciliationRecord::Completion { proof }) => {
-                install_proof_once(proof, receipt, cohort.assignment_id)
+                install_proof_once(proof, outcome, cohort.assignment_id)
             }
             _ => Err(DecoderPoolError::InconsistentAssignment {
                 assignment_id: cohort.assignment_id,
@@ -3120,7 +3136,7 @@ impl DecoderPool {
         cohort: &mut DecoderAssignmentCohort,
         receipt: &EngineReleaseReceipt,
     ) -> Result<(), DecoderPoolError> {
-        self.install_completion_proof(cohort, receipt.clone())?;
+        self.install_completion_proof(cohort, EngineCompletionOutcome::Completed(receipt.clone()))?;
         self.resume_terminal_reconciliation(cohort)
     }
 
@@ -3191,12 +3207,20 @@ impl DecoderPool {
                     }
                 }
                 Some(TerminalReconciliationRecord::Completion {
-                    proof: Some(receipt),
+                    proof: Some(EngineCompletionOutcome::Completed(receipt)),
                 }) => {
                     validate_engine_release_receipt(cohort, receipt, EngineReleaseKind::Completed)?;
                     TerminalApplication::Release {
                         expected_phase: CohortPhase::Completing,
                         disposition: RetryDisposition::Terminal,
+                    }
+                }
+                Some(TerminalReconciliationRecord::Completion {
+                    proof: Some(EngineCompletionOutcome::Quarantined(receipt)),
+                }) => {
+                    validate_engine_quarantine_receipt(cohort, receipt)?;
+                    TerminalApplication::Quarantine {
+                        expected_phase: CohortPhase::Completing,
                     }
                 }
                 Some(TerminalReconciliationRecord::Abort {
@@ -3255,8 +3279,8 @@ impl DecoderPool {
             TerminalApplication::Release { disposition, .. } => {
                 release_assignment(&mut state, cohort, ledger, expected_phase, disposition)
             }
-            TerminalApplication::Quarantine { .. } => {
-                quarantine_assignment(&mut state, cohort, ledger)
+            TerminalApplication::Quarantine { expected_phase } => {
+                quarantine_assignment(&mut state, cohort, ledger, expected_phase)
             }
         }
     }
@@ -3274,7 +3298,10 @@ impl DecoderPool {
             .ok_or(DecoderPoolError::UnknownAssignment(cohort.assignment_id))?;
         validate_assignment_record(record, cohort)?;
         let receipt = match record.terminal_reconciliation.as_ref() {
-            Some(TerminalReconciliationRecord::Abort {
+            Some(TerminalReconciliationRecord::Completion {
+                proof: Some(EngineCompletionOutcome::Quarantined(receipt)),
+            })
+            | Some(TerminalReconciliationRecord::Abort {
                 proof: Some(EngineAbortOutcome::Quarantined(receipt)),
                 ..
             })
@@ -3284,6 +3311,15 @@ impl DecoderPool {
             _ => None,
         };
         Ok(receipt)
+    }
+
+    /// Report whether terminal reconciliation retained this exact cohort.
+    pub(crate) fn cohort_remains_quarantined(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+    ) -> Result<bool, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        Ok(cohort.phase == CohortPhase::Quarantined)
     }
 
     /// Return immutable accounting suitable for metrics and tests.
@@ -3374,10 +3410,15 @@ pub(crate) fn begin_test_pending_for_grant(
         };
         (retry_constraint.clone(), chain.failed_decoders.clone())
     };
+    let eligible_decoders: HashSet<DecoderId> = state.replicas.keys().cloned().collect();
     let selected = match &retry_constraint {
-        AdmissionRetryConstraint::AnyEligible => {
-            select_decoders(&state.replicas, &failed_decoders)?.remove(0)
-        }
+        AdmissionRetryConstraint::AnyEligible => select_decoders(
+            &state.replicas,
+            &failed_decoders,
+            &eligible_decoders,
+            state.last_scheduled_decoder.as_ref(),
+        )?
+        .remove(0),
         AdmissionRetryConstraint::SameDecoder(decoder_id) => decoder_id.clone(),
     };
     if binding.decoder_id() != &selected {
@@ -3473,12 +3514,15 @@ fn quarantine_assignment(
     state: &mut PoolState,
     cohort: &mut DecoderAssignmentCohort,
     ledger: LiveAssignmentLedger,
+    expected_phase: CohortPhase,
 ) -> Result<(), DecoderPoolError> {
     let replica = state
         .replicas
         .get_mut(&ledger.decoder_id)
         .expect("assigned decoder was preflighted under the same pool lock");
-    replica.quiescing_cohorts -= 1;
+    if phase_is_quiescing(expected_phase) {
+        replica.quiescing_cohorts -= 1;
+    }
     replica.quarantined_cohorts += 1;
     state
         .assignments
@@ -3498,6 +3542,8 @@ fn quarantine_assignment(
 fn select_decoders(
     replicas: &HashMap<DecoderId, ReplicaState>,
     failed_decoders: &HashSet<DecoderId>,
+    eligible_decoders: &HashSet<DecoderId>,
+    last_scheduled_decoder: Option<&DecoderId>,
 ) -> Result<Vec<DecoderId>, DecoderPoolError> {
     let unfailed: Vec<&ReplicaState> = replicas
         .values()
@@ -3508,12 +3554,23 @@ fn select_decoders(
     }
     let mut ready: Vec<&ReplicaState> = unfailed
         .into_iter()
-        .filter(|replica| replica.availability == DecoderAvailability::Ready)
+        .filter(|replica| {
+            replica.availability == DecoderAvailability::Ready
+                && eligible_decoders.contains(&replica.metadata.id)
+        })
         .collect();
     if ready.is_empty() {
         return Err(DecoderPoolError::NoReadyDecoder);
     }
-    ready.sort_by(|left, right| compare_current_load(left, right));
+    ready.sort_by(|left, right| {
+        compare_current_load(left, right).then_with(|| {
+            compare_round_robin(
+                &left.metadata.id,
+                &right.metadata.id,
+                last_scheduled_decoder,
+            )
+        })
+    });
     Ok(ready
         .into_iter()
         .map(|replica| replica.metadata.id.clone())
@@ -3533,6 +3590,7 @@ fn install_pending_attempt(
     claim_id: Uuid,
     authority: PendingAdmissionAuthority,
 ) -> Result<(), DecoderPoolError> {
+    let advances_round_robin = matches!(retry_constraint, AdmissionRetryConstraint::AnyEligible);
     let replica = state
         .replicas
         .get(&decoder_id)
@@ -3578,7 +3636,7 @@ fn install_pending_attempt(
         .get_mut(&chain_id)
         .expect("request chain disappeared while pool lock was held")
         .state = RequestChainState::Reserving(Box::new(PendingAdmissionRecord {
-        decoder_id,
+        decoder_id: decoder_id.clone(),
         reservation_attempt_id,
         reserve_attempt_digest,
         charge,
@@ -3588,6 +3646,9 @@ fn install_pending_attempt(
         authority,
         reconciliation: None,
     }));
+    if advances_round_robin {
+        state.last_scheduled_decoder = Some(decoder_id);
+    }
     Ok(())
 }
 
@@ -3676,7 +3737,10 @@ fn validate_completed_quarantine(
         ));
     }
     let proof_receipt = match record.terminal_reconciliation.as_ref() {
-        Some(TerminalReconciliationRecord::Abort {
+        Some(TerminalReconciliationRecord::Completion {
+            proof: Some(EngineCompletionOutcome::Quarantined(receipt)),
+        })
+        | Some(TerminalReconciliationRecord::Abort {
             proof: Some(EngineAbortOutcome::Quarantined(receipt)),
             ..
         })
@@ -3720,6 +3784,12 @@ fn validate_terminal_reconciliation_phase(
                 Some(TerminalReconciliationRecord::Abort {
                     proof: Some(EngineAbortOutcome::Quarantined(_)),
                     ..
+                }),
+                CohortPhase::Quarantined,
+            )
+            | (
+                Some(TerminalReconciliationRecord::Completion {
+                    proof: Some(EngineCompletionOutcome::Quarantined(_)),
                 }),
                 CohortPhase::Quarantined,
             )
@@ -4611,7 +4681,24 @@ fn compare_current_load(left: &ReplicaState, right: &ReplicaState) -> Ordering {
             right.metadata.scheduling.child_request_scale.get(),
         )
     })
-    .then_with(|| left.metadata.id.cmp(&right.metadata.id))
+}
+
+fn compare_round_robin(
+    left: &DecoderId,
+    right: &DecoderId,
+    last_scheduled_decoder: Option<&DecoderId>,
+) -> Ordering {
+    let Some(last_scheduled_decoder) = last_scheduled_decoder else {
+        return left.cmp(right);
+    };
+    match (
+        left > last_scheduled_decoder,
+        right > last_scheduled_decoder,
+    ) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => left.cmp(right),
+    }
 }
 
 fn compare_ratio(
@@ -4705,12 +4792,15 @@ mod tests {
     use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
     use super::*;
-    use crate::core::pd_decoder_grant::{
-        issue_test_grant, issue_test_grant_at_control_url,
-        issue_test_prepared_cancellation_receipt, issue_test_quarantine_receipt,
-        issue_test_release_receipt, issue_test_reserve_refusal_receipt,
-        issue_test_unbound_cancellation_target, DecoderGrantChildAccounting, DecoderInferenceRoute,
-        TestEngineReceiptBinding,
+    use crate::core::{
+        pd_decoder_grant::{
+            issue_test_grant, issue_test_grant_at_control_url,
+            issue_test_prepared_cancellation_receipt, issue_test_quarantine_receipt,
+            issue_test_release_receipt, issue_test_reserve_refusal_receipt,
+            issue_test_unbound_cancellation_target, DecoderGrantChildAccounting,
+            DecoderInferenceRoute, TestEngineReceiptBinding,
+        },
+        HttpOrigin,
     };
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
@@ -4825,11 +4915,19 @@ mod tests {
     }
 
     fn prefill_id(name: &str) -> PrefillId {
-        PrefillId::new("http://prefill.test:30000", stable_instance_id(name)).unwrap()
+        PrefillId::new(
+            HttpOrigin::parse("http://prefill.test:30000").unwrap(),
+            stable_instance_id(name),
+        )
+        .unwrap()
     }
 
     fn decoder_id(name: &str) -> DecoderId {
-        DecoderId::new("http://decode.test:30001", stable_instance_id(name)).unwrap()
+        DecoderId::new(
+            HttpOrigin::parse("http://decode.test:30001").unwrap(),
+            stable_instance_id(name),
+        )
+        .unwrap()
     }
 
     fn compatibility(protocol: &str) -> EngineCompatibilityMetadata {
@@ -4860,7 +4958,29 @@ mod tests {
     }
 
     fn replica_with_id(id: DecoderId, protocol: &str) -> DecoderReplicaMetadata {
-        DecoderReplicaMetadata::new(id, 1, compatibility(protocol), scheduling(32, 32_000)).unwrap()
+        replica_with_tp_and_id(id, 1, protocol)
+    }
+
+    fn replica_with_tp(
+        name: &str,
+        declared_decode_tp_size: usize,
+        protocol: &str,
+    ) -> DecoderReplicaMetadata {
+        replica_with_tp_and_id(decoder_id(name), declared_decode_tp_size, protocol)
+    }
+
+    fn replica_with_tp_and_id(
+        id: DecoderId,
+        declared_decode_tp_size: usize,
+        protocol: &str,
+    ) -> DecoderReplicaMetadata {
+        DecoderReplicaMetadata::new(
+            id,
+            declared_decode_tp_size,
+            compatibility(protocol),
+            scheduling(32, 32_000),
+        )
+        .unwrap()
     }
 
     fn pool_for_prefill(prefill_name: &str, declared_prefill_tp_size: usize) -> DecoderPool {
@@ -4912,8 +5032,15 @@ mod tests {
         owner: &LogicalRequestOwner,
         accounting: DecoderGrantChildAccounting,
     ) -> Result<PendingAdmission, DecoderPoolError> {
+        let eligible_decoders: HashSet<DecoderId> = pool
+            .snapshot()
+            .replicas
+            .into_iter()
+            .map(|replica| replica.id)
+            .collect();
         pool.begin_admission(
             owner,
+            &eligible_decoders,
             &scalar_template(),
             PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000).unwrap(),
             Duration::from_secs(2),
@@ -4954,7 +5081,15 @@ mod tests {
         };
         match constraint {
             AdmissionRetryConstraint::AnyEligible => {
-                Ok(select_decoders(&state.replicas, &chain.failed_decoders)?.remove(0))
+                let eligible_decoders: HashSet<DecoderId> =
+                    state.replicas.keys().cloned().collect();
+                Ok(select_decoders(
+                    &state.replicas,
+                    &chain.failed_decoders,
+                    &eligible_decoders,
+                    state.last_scheduled_decoder.as_ref(),
+                )?
+                .remove(0))
             }
             AdmissionRetryConstraint::SameDecoder(decoder_id) => Ok(decoder_id.clone()),
         }
@@ -5142,11 +5277,15 @@ mod tests {
     fn registers_declared_tp_metadata_without_claiming_transport_correctness() {
         for declared_prefill_tp_size in [2, 4] {
             let pool = pool(declared_prefill_tp_size);
-            pool.register(replica("decode-0", "packed-v1")).unwrap();
+            pool.register(replica_with_tp("decode-tp1", 1, "packed-v1"))
+                .unwrap();
+            pool.register(replica_with_tp("decode-tp2", 2, "packed-v1"))
+                .unwrap();
             assert_eq!(
                 pool.snapshot().declared_prefill_tp_size,
                 declared_prefill_tp_size
             );
+            assert_eq!(pool.snapshot().replicas.len(), 2);
         }
     }
 
@@ -5180,15 +5319,15 @@ mod tests {
     #[test]
     fn rejects_ineligible_declared_decoder_metadata() {
         let pool = pool(4);
-        let tp2 = DecoderReplicaMetadata::new(
-            decoder_id("decode-tp2"),
-            2,
+        let tp3 = DecoderReplicaMetadata::new(
+            decoder_id("decode-tp3"),
+            3,
             compatibility("packed-v1"),
             scheduling(32, 32_000),
         )
         .unwrap();
         assert!(matches!(
-            pool.register(tp2),
+            pool.register(tp3),
             Err(DecoderPoolError::IneligibleDecoderMetadata { .. })
         ));
         assert!(matches!(
@@ -5252,7 +5391,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_drain_rejects_new_and_existing_request_admission() {
+    fn prefill_drain_rejects_new_owners_but_allows_existing_request_admission() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let existing = pool.begin_request("existing").unwrap();
@@ -5263,10 +5402,8 @@ mod tests {
             pool.begin_request("new").unwrap_err(),
             DecoderPoolError::PrefillPoolDraining
         );
-        assert_eq!(
-            begin_scalar_admission(&pool, &existing, child_accounting()).unwrap_err(),
-            DecoderPoolError::PrefillPoolDraining
-        );
+        let pending = begin_scalar_admission(&pool, &existing, child_accounting()).unwrap();
+        drop(pending);
     }
 
     #[test]
@@ -5332,6 +5469,43 @@ mod tests {
                     release_before_activation(&pool, &mut cohort, RetryDisposition::Terminal)
                         .unwrap();
                     pool.finalize_request(&mut request).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_robins_serial_completions_across_arbitrary_replica_counts() {
+        for prefill_tp_size in [2, 4] {
+            for replica_count in [1, 2, 3, 5] {
+                let pool = pool(prefill_tp_size);
+                for index in 0..replica_count {
+                    pool.register(replica(&format!("decode-{index}"), "packed-v1"))
+                        .unwrap();
+                }
+                let expected_round: Vec<DecoderId> = pool
+                    .snapshot()
+                    .replicas
+                    .into_iter()
+                    .map(|replica| replica.id)
+                    .collect();
+                let mut observed = Vec::new();
+
+                for index in 0..(replica_count * 3) {
+                    let mut request = pool
+                        .begin_request(format!(
+                            "serial-tp{prefill_tp_size}-n{replica_count}-{index}"
+                        ))
+                        .unwrap();
+                    let mut cohort = bind_next(&pool, &request, scalar_accounting()).unwrap();
+                    observed.push(cohort.decoder_id().clone());
+                    let mut retained = retain_after_promotion(&pool, &mut cohort);
+                    release_after_completion(&pool, &mut cohort, &mut retained).unwrap();
+                    pool.finalize_request(&mut request).unwrap();
+                }
+
+                for round in observed.chunks(replica_count) {
+                    assert_eq!(round, expected_round.as_slice());
                 }
             }
         }
@@ -5473,7 +5647,12 @@ mod tests {
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let reconciliation = pending.begin_reserve(&client).unwrap();
+        let reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
 
         drop(reconciliation);
         assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
@@ -5488,7 +5667,12 @@ mod tests {
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        let mut reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
         reconciliation.mark_test_polled();
         drop(reconciliation);
 
@@ -5503,15 +5687,23 @@ mod tests {
     async fn dropped_reserve_future_resumes_the_exact_engine_attempt() {
         let (decoder_url, server, server_task) = start_reserve_recovery_server().await;
         let pool = pool(2);
-        let decoder_id =
-            DecoderId::new(decoder_url, stable_instance_id("decode-0@generation-1")).unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse(&decoder_url).unwrap(),
+            stable_instance_id("decode-0@generation-1"),
+        )
+        .unwrap();
         pool.register(replica_with_id(decoder_id, "packed-v1"))
             .unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let reservation_attempt_id = pending.reservation_attempt_id();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        let mut reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             reconciliation.reservation_attempt_id().unwrap(),
             reservation_attempt_id
@@ -5560,7 +5752,7 @@ mod tests {
         let (decoder_url, server, server_task) = start_cancellation_recovery_server().await;
         let pool = pool(4);
         let decoder_id = DecoderId::new(
-            decoder_url.clone(),
+            HttpOrigin::parse(&decoder_url).unwrap(),
             stable_instance_id("decode-0@generation-1"),
         )
         .unwrap();
@@ -5791,6 +5983,43 @@ mod tests {
             .unwrap();
         let retry = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         assert_eq!(retry.decoder_id(), &replacement_generation);
+    }
+
+    #[test]
+    fn retry_another_refusal_visits_each_ready_decoder_once_before_exhaustion() {
+        let pool = pool(4);
+        for index in 0..7 {
+            pool.register(replica(&format!("decode-{index}"), "packed-v1"))
+                .unwrap();
+        }
+        let owner = pool.begin_request("request").unwrap();
+        let mut attempted_decoders = HashSet::new();
+
+        for _ in 0..7 {
+            let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
+            assert!(attempted_decoders.insert(pending.decoder_id().clone()));
+            let refusal = refusal_receipt(
+                &pool,
+                &pending,
+                DecoderReserveRefusalDisposition::RetryAnotherDecoder,
+            );
+            assert_eq!(
+                pool.install_reserve_refusal_proof(&mut pending, &refusal)
+                    .unwrap(),
+                PendingAdmissionDisposition::RetryAnotherDecoder
+            );
+        }
+
+        assert_eq!(attempted_decoders.len(), 7);
+        assert!(pool
+            .snapshot()
+            .replicas
+            .iter()
+            .all(|replica| replica.availability == DecoderAvailability::Ready));
+        assert_eq!(
+            begin_scalar_admission(&pool, &owner, child_accounting()).unwrap_err(),
+            DecoderPoolError::RetryAlternativesExhausted
+        );
     }
 
     #[test]
@@ -7321,7 +7550,10 @@ mod tests {
         reconciliation.engine.assume_test_reconciled().unwrap();
         reconciliation
             .pool
-            .install_completion_proof(reconciliation.cohort, receipt)
+            .install_completion_proof(
+                reconciliation.cohort,
+                EngineCompletionOutcome::Completed(receipt),
+            )
             .unwrap();
 
         reconciliation.reconcile().await.unwrap();
@@ -7333,6 +7565,50 @@ mod tests {
         ));
         drop(reconciliation);
         assert_eq!(pool.snapshot().replicas[0].active_cohorts, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_completion_terminalizes_an_authoritative_quarantine() {
+        let pool = pool(2);
+        pool.register(replica("decode-0", "packed-v1")).unwrap();
+        let owner = pool.begin_request("request").unwrap();
+        let chain_id = owner.chain_id();
+        let mut cohort = bind_next(&pool, &owner, scalar_accounting()).unwrap();
+        let assignment_id = cohort.assignment_id();
+        let mut retained = retain_after_promotion(&pool, &mut cohort);
+        let receipt = quarantine_receipt(&cohort);
+        let mut reconciliation = pool.begin_completion(&mut cohort, &mut retained).unwrap();
+        reconciliation.engine.assume_test_reconciled().unwrap();
+        reconciliation
+            .pool
+            .install_completion_proof(
+                reconciliation.cohort,
+                EngineCompletionOutcome::Quarantined(receipt.clone()),
+            )
+            .unwrap();
+
+        reconciliation.reconcile().await.unwrap();
+        assert!(matches!(
+            reconciliation.reconcile().await,
+            Err(DecoderAssignmentReconciliationError::AlreadyComplete(
+                "completion"
+            ))
+        ));
+        drop(reconciliation);
+        drop(owner);
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.replicas[0].active_cohorts, 1);
+        assert_eq!(snapshot.replicas[0].quiescing_cohorts, 0);
+        assert_eq!(snapshot.replicas[0].quarantined_cohorts, 1);
+        assert_eq!(pool.quarantine_receipt(&cohort).unwrap(), Some(receipt));
+        let state = pool.inner.state.lock();
+        let chain = state.request_chains.get(&chain_id).unwrap();
+        assert!(!chain.owner_alive);
+        assert!(matches!(
+            &chain.state,
+            RequestChainState::Quarantined(value) if *value == assignment_id
+        ));
     }
 
     #[tokio::test]
@@ -7675,6 +7951,10 @@ mod tests {
         let mut first = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
         let failed_decoder = first.decoder_id().clone();
         release_before_activation(&pool, &mut first, RetryDisposition::DecoderFailed).unwrap();
+
+        let mut retry = bind_next(&pool, &first_owner, scalar_accounting()).unwrap();
+        assert_ne!(retry.decoder_id(), &failed_decoder);
+        release_before_activation(&pool, &mut retry, RetryDisposition::DecoderFailed).unwrap();
         pool.finalize_request(&mut first_owner).unwrap();
 
         let second_owner = pool.begin_request("reused-id").unwrap();

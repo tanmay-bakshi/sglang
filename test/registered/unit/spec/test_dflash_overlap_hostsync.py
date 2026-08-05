@@ -5,6 +5,7 @@ keep-list."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import torch
 
@@ -32,6 +33,141 @@ def _compact_lens_host(seq_lens, window, page):
 
     DFlashWorkerV2._compute_compact_draft_seq_lens_host(fake_self, seq_lens, out)
     return out
+
+
+class TestDFlashCudaGraphProfile(CustomTestCase):
+    @staticmethod
+    def _runner(runner_type, capture_batch_sizes):
+        runner = object.__new__(runner_type)
+        if capture_batch_sizes is not None:
+            runner.capture_bs = capture_batch_sizes
+        return runner
+
+    def test_reports_target_and_draft_capture_tiers(self) -> None:
+        """Server-info evidence distinguishes target and draft graph coverage."""
+
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        fake_worker = object.__new__(DFlashWorkerV2)
+        fake_worker.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=self._runner(
+                DecodeCudaGraphRunner,
+                [1, 2, 4, 8],
+            )
+        )
+        fake_worker.draft_model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=self._runner(
+                DecodeCudaGraphRunner,
+                [1, 4, 16],
+            )
+        )
+        fake_worker._draft_sampler = object()
+
+        profile = fake_worker.cuda_graph_profile()
+
+        self.assertEqual(
+            profile["speculative_target_cuda_graph_capture_batch_sizes"],
+            [1, 2, 4, 8],
+        )
+        self.assertEqual(
+            profile["speculative_draft_cuda_graph_capture_batch_sizes"],
+            [1, 4, 16],
+        )
+        self.assertTrue(profile["speculative_dflash_draft_sampler_in_graph"])
+
+    def test_reports_empty_capture_tiers_for_disabled_prefill_runners(self) -> None:
+        """Prefill profiling accepts both disabled-runner representations."""
+
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        fake_worker = object.__new__(DFlashWorkerV2)
+        fake_worker.model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=None
+        )
+        fake_worker.draft_model_runner = SimpleNamespace(
+            decode_cuda_graph_runner=self._runner(EagerRunner, None)
+        )
+        fake_worker._draft_sampler = None
+
+        profile = fake_worker.cuda_graph_profile()
+
+        self.assertEqual(
+            profile["speculative_target_cuda_graph_capture_batch_sizes"],
+            [],
+        )
+        self.assertEqual(
+            profile["speculative_draft_cuda_graph_capture_batch_sizes"],
+            [],
+        )
+        self.assertFalse(profile["speculative_dflash_draft_sampler_in_graph"])
+
+
+class TestDFlashProfilingMetrics(CustomTestCase):
+    def test_graph_pass_labels_distinguish_draft_and_verify(self) -> None:
+        """Graph-pass counters retain both DFlash stages and execution modes."""
+
+        from sglang.srt.observability.metrics_collector import (
+            SchedulerMetricsCollector,
+        )
+
+        counter = Mock()
+        collector = SimpleNamespace(
+            cuda_graph_passes_total=counter,
+            labels={"model_name": "gemma"},
+        )
+
+        SchedulerMetricsCollector.increment_speculative_cuda_graph_pass(
+            collector,
+            stage="dflash_draft",
+            value=True,
+        )
+        SchedulerMetricsCollector.increment_speculative_cuda_graph_pass(
+            collector,
+            stage="dflash_verify",
+            value=False,
+        )
+
+        self.assertEqual(
+            counter.labels.call_args_list,
+            [
+                call(model_name="gemma", mode="dflash_draft_cuda_graph"),
+                call(model_name="gemma", mode="dflash_verify_none"),
+            ],
+        )
+        self.assertEqual(counter.labels.return_value.inc.call_count, 2)
+
+    def test_draft_timer_reports_separate_gpu_category(self) -> None:
+        """The DFlash runner receives a timer that forces the draft category."""
+
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            SchedulerMetricsReporter,
+        )
+        from sglang.srt.utils.device_timer import DeviceTimer
+
+        reports: list[dict[str, object]] = []
+        target_timer = DeviceTimer(reporter=Mock())
+        target_runner = SimpleNamespace(device_timer=None)
+        draft_runner = SimpleNamespace(device_timer=None)
+        reporter = SimpleNamespace(
+            forward_pass_device_timer=target_timer,
+            _forward_execution_reporter=lambda **values: reports.append(values),
+            scheduler=SimpleNamespace(
+                tp_worker=SimpleNamespace(model_runner=target_runner),
+                spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
+                draft_worker=SimpleNamespace(draft_model_runner=draft_runner),
+            ),
+        )
+
+        SchedulerMetricsReporter._install_device_timer_on_runners(reporter)
+
+        self.assertIs(target_runner.device_timer, target_timer)
+        self.assertIsInstance(draft_runner.device_timer, DeviceTimer)
+        draft_runner.device_timer._reporters[0](t=0.25, category="ignored")
+        self.assertEqual(reports, [{"t": 0.25, "category": "dflash_draft"}])
 
 
 class TestCompactSeqLensHostBound(CustomTestCase):
@@ -216,6 +352,111 @@ class TestRebuildCompactDraftReqToToken(CustomTestCase):
                 self.assertTrue(
                     bool((draft_b[req_idx[i], total:] == -1).all()),
                     "kernel wrote past the verify block",
+                )
+
+
+@unittest.skipUnless(_HAS_CUDA, "triton kernel requires CUDA")
+class TestDFlashAcceptBonusKernel(CustomTestCase):
+    def test_matches_eager_reference(self) -> None:
+        from sglang.kernels.ops.speculative.dflash import (
+            _compute_dflash_accept_bonus_triton_unchecked,
+        )
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_correct_drafts_and_bonus,
+        )
+
+        device = torch.device("cuda")
+        block_size = 16
+        vocabulary_size = 240_000
+        prefix_boundaries = torch.tensor(
+            [47, 48, 63, 64, 65, 1023, 1024],
+            dtype=torch.int64,
+            device=device,
+        )
+        generator = torch.Generator(device=device).manual_seed(20260802)
+
+        for batch_size in (1, 2, 3, 8, 48):
+            for trial in range(20):
+                candidates = torch.randint(
+                    0,
+                    vocabulary_size,
+                    (batch_size, block_size),
+                    dtype=torch.int64,
+                    device=device,
+                    generator=generator,
+                )
+                target_top1 = torch.randint(
+                    0,
+                    vocabulary_size,
+                    (batch_size, block_size),
+                    dtype=torch.int64,
+                    device=device,
+                    generator=generator,
+                )
+                for row in range(batch_size):
+                    forced_accept_len = (trial + row) % block_size
+                    if forced_accept_len > 0:
+                        target_top1[row, :forced_accept_len].copy_(
+                            candidates[row, 1 : forced_accept_len + 1]
+                        )
+                    if forced_accept_len < block_size - 1:
+                        candidate_id = candidates[row, forced_accept_len + 1]
+                        target_top1[row, forced_accept_len] = (
+                            candidate_id + 1
+                        ) % vocabulary_size
+
+                expected_accept_lens, expected_bonus_ids = (
+                    compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_top1,
+                    )
+                )
+                expected_commit_lens = expected_accept_lens + 1
+                expected_out_tokens = torch.empty_like(candidates)
+                expected_out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+                expected_out_tokens[:, block_size - 1].fill_(0)
+                expected_out_tokens.scatter_(
+                    1,
+                    expected_accept_lens.to(torch.int64).unsqueeze(1),
+                    expected_bonus_ids.unsqueeze(1),
+                )
+                prefix_lens = prefix_boundaries[
+                    torch.arange(batch_size, device=device) % prefix_boundaries.numel()
+                ]
+
+                accept_lens = torch.empty_like(expected_accept_lens)
+                commit_lens = torch.empty_like(expected_commit_lens)
+                bonus_ids = torch.empty_like(expected_bonus_ids)
+                out_tokens = torch.empty_like(expected_out_tokens)
+                new_seq_lens = torch.empty_like(prefix_lens)
+                _compute_dflash_accept_bonus_triton_unchecked(
+                    candidates=candidates,
+                    target_top1=target_top1,
+                    accept_lens_out=accept_lens,
+                    commit_lens_out=commit_lens,
+                    bonus_ids_out=bonus_ids,
+                    out_tokens_out=out_tokens,
+                    prefix_lens=prefix_lens,
+                    new_seq_lens_out=new_seq_lens,
+                )
+
+                torch.testing.assert_close(
+                    accept_lens, expected_accept_lens, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    commit_lens, expected_commit_lens, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    bonus_ids, expected_bonus_ids, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    out_tokens, expected_out_tokens, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    new_seq_lens,
+                    prefix_lens + expected_commit_lens,
+                    rtol=0,
+                    atol=0,
                 )
 
 

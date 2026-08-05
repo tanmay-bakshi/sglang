@@ -378,7 +378,7 @@ def _pair_entries(
     return tuple(pairs)
 
 
-def _expected_source_tp_ranks(
+def source_tp_ranks_for_destination(
     source_tp_size: int,
     destination_tp_size: int,
     destination_tp_rank: int,
@@ -653,7 +653,7 @@ def build_staging_chunk_layout(
         span.component_id: destination_by_component[span.component_id]
         for span in ordered_spans
     }
-    expected_source_ranks = _expected_source_tp_ranks(
+    expected_source_ranks = source_tp_ranks_for_destination(
         source_tp_size,
         destination_tp_size,
         destination_tp_rank,
