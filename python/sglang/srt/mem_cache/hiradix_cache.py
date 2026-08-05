@@ -24,8 +24,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     InsertResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
+    StoragePrefixCoverage,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -56,6 +58,7 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -1046,14 +1049,18 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete."""
+        """Return whether every rank has completed one load-back event."""
         if consumer_index < 0:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
+        globally_ready = torch.tensor(
+            int(finish_event.query()), dtype=torch.int32, device="cpu"
+        )
+        self._all_reduce(globally_ready, torch.distributed.ReduceOp.MIN)
+        if not bool(globally_ready.item()):
             return False
 
         self.loading_check()
@@ -1370,7 +1377,7 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ):
+    ) -> LoadBackTicket:
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
@@ -1379,25 +1386,32 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                return LoadBackTicket(
+                    new_full_device_indices=loading_values,
+                    restored_node=last_node,
+                    queued_components=frozenset({ComponentType.FULL}),
+                    full_tokens=len(loading_values),
+                )
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return (
-            self._empty_match_result.device_indices,
-            last_node,
+        return LoadBackTicket(
+            new_full_device_indices=self._empty_match_result.device_indices,
+            restored_node=last_node,
         )
 
-    def query_storage_hit_length(
+    def query_storage_prefix_coverage(
         self,
         last_host_node: TreeNode,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> int:
+        *,
+        matched_prefix_tokens: int,
+    ) -> StoragePrefixCoverage:
         if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
-            return 0
+            return StoragePrefixCoverage()
 
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1405,7 +1419,7 @@ class HiRadixCache(RadixCache):
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
-            return 0
+            return StoragePrefixCoverage()
 
         prefetch_op_cls = (
             HybridPrefetchOperation
@@ -1422,16 +1436,25 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **extra_kwargs,
         )
-        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
-            operation
-        )
-        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-        )
-        storage_hit_count = storage_hit_count_tensor.item()
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
-        return storage_hit_count
+        if storage_hit_count == 0:
+            return StoragePrefixCoverage()
+        if isinstance(operation, HybridPrefetchOperation):
+            usable_pages = storage_hit_count // self.page_size
+            component_boundaries = (
+                operation.pool_storage_result.extra_pool_hit_pages
+            )
+            for transfer in operation.pool_transfers or ():
+                if (
+                    transfer.name not in component_boundaries
+                    or component_boundaries[transfer.name] < usable_pages
+                ):
+                    return StoragePrefixCoverage()
+        return StoragePrefixCoverage(
+            prefix_tokens=storage_hit_count,
+            full_tokens=storage_hit_count,
+        )
 
     def ready_to_load_host_cache(self) -> int:
         """

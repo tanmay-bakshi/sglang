@@ -158,7 +158,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         self.assertFalse(leaf.swa_tombstone)
         self.assertTrue(tree.swa_lru_list.in_list(leaf))
 
-        tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
+        tree.dec_swa_lock_only(leaf, inc_res.to_dec_params())
 
         self.assertTrue(leaf.swa_tombstone)
         self.assertFalse(tree.swa_lru_list.in_list(leaf))
@@ -196,7 +196,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         swa_evictable_before = tree.swa_evictable_size_
         swa_avail_before = allocator.swa_available_size()
 
-        tree.dec_swa_lock_only(leaf_a, swa_uuid_for_lock=swa_uuid)
+        tree.dec_swa_lock_only(leaf_a, inc_res.to_dec_params())
 
         self.assertFalse(internal.swa_tombstone)
         self.assertTrue(tree.swa_lru_list.in_list(internal))
@@ -214,6 +214,25 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         )
         tree.sanity_check()
 
+    def test_dec_swa_lock_only_without_boundary_releases_to_root(self):
+        """A prefix shorter than the window still owns an early-release lock."""
+        tree, allocator, _ = _build_tree(sliding_window_size=64)
+        leaf = _insert_chain(tree, allocator, [1, 2, 3, 4])
+
+        inc_res = tree.inc_lock_ref(leaf)
+        self.assertIsNone(inc_res.swa_uuid_for_lock)
+        self.assertEqual(leaf.swa_lock_ref, 1)
+        self.assertEqual(leaf.full_lock_ref, 1)
+
+        tree.dec_swa_lock_only(leaf, inc_res.to_dec_params())
+
+        self.assertTrue(leaf.swa_tombstone)
+        self.assertEqual(leaf.swa_lock_ref, 0)
+        self.assertEqual(leaf.full_lock_ref, 1)
+
+        tree.dec_lock_ref(leaf, inc_res.to_dec_params(), skip_swa=True)
+        tree.sanity_check()
+
     def test_dec_lock_ref_skip_swa_true_drops_full_only(self):
         tree, allocator, _ = _build_tree(sliding_window_size=4)
         leaf = _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
@@ -221,7 +240,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         inc_res = tree.inc_lock_ref(leaf)
         swa_uuid = inc_res.swa_uuid_for_lock
 
-        tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
+        tree.dec_swa_lock_only(leaf, inc_res.to_dec_params())
         self.assertTrue(leaf.swa_tombstone)
         self.assertEqual(leaf.full_lock_ref, 1)
 
@@ -308,7 +327,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         inc_res = tree.inc_lock_ref(leaf)
         swa_uuid = inc_res.swa_uuid_for_lock
 
-        tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
+        tree.dec_swa_lock_only(leaf, inc_res.to_dec_params())
         self.assertTrue(leaf.swa_tombstone)
 
         swa_evictable_before_delete = tree.swa_evictable_size_
@@ -354,7 +373,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
                 swa_avail_before = allocator.swa_available_size()
                 full_avail_before = allocator.full_available_size()
 
-                tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=swa_uuid)
+                tree.dec_swa_lock_only(leaf, inc_res.to_dec_params())
 
                 self.assertTrue(leaf.swa_tombstone)
                 self.assertFalse(tree.swa_lru_list.in_list(leaf))
@@ -406,7 +425,7 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         swa_evictable_before = tree.swa_evictable_size_
         swa_avail_before = allocator.swa_available_size()
 
-        tree.dec_swa_lock_only(leaf_a, swa_uuid_for_lock=swa_uuid)
+        tree.dec_swa_lock_only(leaf_a, inc_res.to_dec_params())
 
         # Leaf side: tombstoned and pages freed.
         self.assertTrue(leaf_a.swa_tombstone)

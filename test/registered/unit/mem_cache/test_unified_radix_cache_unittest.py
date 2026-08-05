@@ -1392,7 +1392,7 @@ class UnifiedRadixCacheSuite:
         # the later SWA-eviction cascade never meets a legitimately-locked Mamba.
         lock_result = cache.inc_lock_ref(node_a.id)
         self.assertGreaterEqual(mamba_cd.lock_ref, 1, "Mamba locked before release")
-        cache.dec_swa_lock_only(node_a.id, lock_result.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
         self.assertEqual(swa_cd.lock_ref, 0)
         self.assertEqual(
             mamba_cd.lock_ref, 0, "dec_swa_lock_only drops the lower-tier Mamba lock"
@@ -1454,7 +1454,7 @@ class UnifiedRadixCacheSuite:
         # Early SWA release (decode advanced past the window), via the public
         # path the scheduler calls. The leaf's SWA is tombstoned and the
         # co-located lower-tier Mamba lock must drop in the same release.
-        cache.dec_swa_lock_only(node_a.id, lock_result.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
         self.assertEqual(swa_cd.lock_ref, 0, "SWA early-released")
         self.assertEqual(
             mamba_cd.lock_ref,
@@ -1462,6 +1462,54 @@ class UnifiedRadixCacheSuite:
             "Mamba lock must drop on early SWA release",
         )
         self.assertGreaterEqual(full_cd.lock_ref, 1, "Full stays locked")
+
+    def test_swa_early_release_final_cleanup_preserves_new_mamba_owner(self):
+        """Final Full cleanup must not repeat the transferred Mamba release."""
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq = self._make_seq(1, self.cfg.sliding_window_size + self.cfg.page_size)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        node = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+        )
+        full_cd = node.component_data[ComponentType.FULL]
+        swa_cd = node.component_data[ComponentType.SWA]
+        mamba_cd = node.component_data[ComponentType.MAMBA]
+
+        early_release_lock = cache.inc_lock_ref(node.id)
+        early_release_params = early_release_lock.to_dec_params()
+        cache.dec_swa_lock_only(node.id, early_release_params)
+        self.assertEqual(full_cd.lock_ref, 1)
+        self.assertEqual(swa_cd.lock_ref, 0)
+        self.assertEqual(mamba_cd.lock_ref, 0)
+
+        new_owner_lock = cache.inc_lock_ref(node.id)
+        self.assertEqual(full_cd.lock_ref, 2)
+        self.assertEqual(swa_cd.lock_ref, 1)
+        self.assertEqual(mamba_cd.lock_ref, 1)
+
+        cache.dec_lock_ref(node.id, early_release_params, skip_swa=True)
+        self.assertEqual(full_cd.lock_ref, 1)
+        self.assertEqual(
+            swa_cd.lock_ref,
+            1,
+            "final cleanup must not repeat the early SWA release",
+        )
+        self.assertEqual(
+            mamba_cd.lock_ref,
+            1,
+            "final cleanup must not consume the new Mamba owner's lock",
+        )
+
+        cache.dec_lock_ref(node.id, new_owner_lock.to_dec_params())
+        self.assertEqual(full_cd.lock_ref, 0)
+        self.assertEqual(swa_cd.lock_ref, 0)
+        self.assertEqual(mamba_cd.lock_ref, 0)
+        cache.sanity_check()
 
     def test_cascade_evict_asserts_on_locked_internal_mamba(self):
         if not self.cfg.has_swa or not self.cfg.has_mamba:
@@ -1638,7 +1686,7 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(mamba_cd.lock_ref, 1)
         self.assertGreaterEqual(full_cd.lock_ref, 1)
 
-        cache.dec_swa_lock_only(node_a.id, lock_result.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
         self.assertEqual(swa_cd.lock_ref, 0, "SWA released")
         self.assertEqual(mamba_cd.lock_ref, 0, "Mamba dropped by dec_swa_lock_only")
         self.assertGreaterEqual(full_cd.lock_ref, 1, "Full kept by contract")
@@ -3876,7 +3924,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        ticket = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3884,8 +3932,11 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertIs(cache.resolve_node_handle(new_node), leaf)
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIs(cache.resolve_node_handle(ticket.restored_node), leaf)
+        self.assertEqual(
+            len(torch.cat([req.prefix_indices, ticket.new_full_device_indices])),
+            len(tokens),
+        )
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].value)
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
@@ -3917,7 +3968,7 @@ class UnifiedRadixCacheSuite:
         )
         self._apply_match_to_req(req, match)
 
-        new_indices, new_node = cache.init_load_back(
+        ticket = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3925,9 +3976,12 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertIs(cache.resolve_node_handle(new_node), leaf)
-        self.assertEqual(new_indices.tolist(), leaf_full.tolist())
-        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIs(cache.resolve_node_handle(ticket.restored_node), leaf)
+        self.assertEqual(ticket.new_full_device_indices.tolist(), leaf_full.tolist())
+        self.assertEqual(
+            len(torch.cat([req.prefix_indices, ticket.new_full_device_indices])),
+            len(tokens),
+        )
         self.assertEqual(
             leaf.component_data[ComponentType.FULL].value.tolist(),
             leaf_full.tolist(),
@@ -3959,7 +4013,7 @@ class UnifiedRadixCacheSuite:
         # (that allocation is what a called-off load-back must free + not publish).
         req.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        new_indices, new_node = cache.init_load_back(
+        ticket = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=req.best_match_node,
                 host_hit_length=req.host_hit_length,
@@ -3968,9 +4022,9 @@ class UnifiedRadixCacheSuite:
             )
         )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(len(ticket.new_full_device_indices), 0)
         self.assertIs(
-            cache.resolve_node_handle(new_node),
+            cache.resolve_node_handle(ticket.restored_node),
             cache.resolve_node_handle(match.last_device_node),
         )
         self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
@@ -4005,7 +4059,7 @@ class UnifiedRadixCacheSuite:
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            new_indices, _ = cache.init_load_back(
+            ticket = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -4014,7 +4068,7 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(len(ticket.new_full_device_indices), 0)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -4052,7 +4106,7 @@ class UnifiedRadixCacheSuite:
                 cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
             ),
         ):
-            new_indices, _ = cache.init_load_back(
+            ticket = cache.init_load_back(
                 InitLoadBackParams(
                     best_match_node=req.best_match_node,
                     host_hit_length=req.host_hit_length,
@@ -4061,7 +4115,7 @@ class UnifiedRadixCacheSuite:
                 )
             )
 
-        self.assertEqual(len(new_indices), 0)
+        self.assertEqual(len(ticket.new_full_device_indices), 0)
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
@@ -4692,6 +4746,75 @@ class UnifiedRadixCacheSuite:
         cache.dec_lock_ref(leaf.id, load_back_lock.to_dec_params())
         cache.dec_lock_ref(leaf.id, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_swa_early_release_preserves_restored_tombstone_lock(self):
+        """Early SWA release must replay the acquisition's tombstone skips."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path isolates window-lock ownership")
+
+        cache, allocator, _, chain, _ = self._swa_finalize_setup()
+        leaf = chain[-1]
+        swa_cd = leaf.component_data[ComponentType.SWA]
+        full_cd = leaf.component_data[ComponentType.FULL]
+        old_swa = swa_cd.value
+        self.assertIsNotNone(old_swa)
+
+        swa_cd.value = None
+        cache.tree_core.lru_lists[ComponentType.SWA].remove_node(leaf)
+        cache.tree_core.host_lru_lists[ComponentType.SWA].insert_mru(leaf)
+        cache.tree_core.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        early_release_lock = cache.inc_lock_ref(leaf.id)
+        early_release_params = early_release_lock.to_dec_params()
+        self.assertIn(
+            leaf.id,
+            early_release_params.skip_lock_node_ids[ComponentType.SWA],
+        )
+        self.assertEqual(swa_cd.lock_ref, 0)
+        self.assertEqual(full_cd.lock_ref, 1)
+
+        transfer = cache.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        restored_swa = allocator.swa_attn_allocator.alloc(
+            int(transfer.host_indices.numel())
+        )
+        self.assertIsNotNone(restored_swa)
+        transfer.device_indices = restored_swa
+        load_actions = []
+        cache.components[ComponentType.SWA].commit_hicache_transfer(
+            leaf,
+            CacheTransferPhase.LOAD_BACK,
+            transfers=[transfer],
+            cache_actions=load_actions,
+        )
+        cache._apply_cache_actions(load_actions)
+
+        restored_lock = cache.inc_lock_ref(leaf.id)
+        self.assertEqual(swa_cd.lock_ref, 1)
+        self.assertEqual(full_cd.lock_ref, 2)
+
+        cache.dec_swa_lock_only(leaf.id, early_release_params)
+        self.assertEqual(
+            swa_cd.lock_ref,
+            1,
+            "early release must not consume the restored request's SWA lock",
+        )
+        self.assertEqual(
+            full_cd.lock_ref,
+            2,
+            "early SWA release must leave both Full lock owners intact",
+        )
+
+        cache.dec_lock_ref(leaf.id, early_release_params, skip_swa=True)
+        self.assertEqual(full_cd.lock_ref, 1)
+        self.assertEqual(swa_cd.lock_ref, 1)
+
+        cache.dec_lock_ref(leaf.id, restored_lock.to_dec_params())
+        self.assertEqual(full_cd.lock_ref, 0)
+        self.assertEqual(swa_cd.lock_ref, 0)
 
     def test_hicache_swa_load_back_uses_full_pool_capacity(self):
         """load_back should gate Full KV load on Full pool capacity only."""
@@ -5869,7 +5992,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
 
         lock_result = cache.inc_lock_ref(node.id)
         self.assertGreaterEqual(swa_cd.lock_ref, 1)
-        cache.dec_swa_lock_only(node.id, lock_result.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node.id, lock_result.to_dec_params())
         self.assertEqual(swa_cd.lock_ref, 0)
         self.assertGreaterEqual(full_cd.lock_ref, 1)
 
@@ -5990,7 +6113,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             (
                 "dec_swa_lock_only",
                 lambda: make(DecSwaLockOnlyResult),
-                lambda: cache.dec_swa_lock_only(node.id),
+                lambda: cache.dec_swa_lock_only(node.id, DecLockRefParams()),
                 None,
             ),
         ]

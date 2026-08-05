@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -277,20 +278,20 @@ class FlexKVRadixCache(RadixCache):
     def init_load_back(  # type: ignore[override]
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
-        """MP RETRIEVE. Allocates uncached slots and fires the FlexKV
-        load; inserts the resulting TreeNode."""
+    ) -> LoadBackTicket:
+        """Allocate uncached slots and start one FlexKV retrieval."""
+
         req = params.req
+        assert req is not None
         last_node: TreeNode = params.best_match_node
         marker = self._load_markers.pop(req.rid, None)
         if marker is None:
-            # ``match_prefix`` decided there was no work to do, but the
-            # scheduler still called us. Release any held task and
-            # return an empty load.
             self.flexkv_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackTicket(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
             )
 
         result = self._allocate_and_load(
@@ -303,16 +304,20 @@ class FlexKVRadixCache(RadixCache):
             ),
         )
         if result is None:
-            # Allocation failed or load returned zero. ``retrieve_kv``
-            # already cancels/cleans up on failure paths; release_pending
-            # is idempotent for the case where allocation failed before
-            # we even popped the held task.
             self.flexkv_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackTicket(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
             )
-        return result
+
+        new_indices, restored_node = result
+        return LoadBackTicket(
+            new_full_device_indices=new_indices,
+            restored_node=restored_node,
+            full_tokens=len(new_indices),
+        )
 
     def _allocate_and_load(
         self,

@@ -820,6 +820,7 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
+        req.last_node_lock_params = result.to_dec_params()
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -1154,14 +1155,17 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                load_back_ticket = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                req.last_node = load_back_ticket.restored_node
+                req.prefix_indices = torch.cat(
+                    [req.prefix_indices, load_back_ticket.new_full_device_indices]
+                )
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 

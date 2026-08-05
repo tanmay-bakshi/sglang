@@ -20,8 +20,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     InsertResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
+    StoragePrefixCoverage,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -71,9 +74,6 @@ from sglang.srt.session.streaming_session import StreamingSession
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        PrefetchOperation,
-    )
     from sglang.srt.server_args import ServerArgs
 
 
@@ -104,6 +104,17 @@ class _OngoingLoadBack(NamedTuple):
     node_id: NodeId
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+
+
+class _QueuedLoadBack(NamedTuple):
+    """Rank-local controller work prepared for one load-back."""
+
+    device_indices: torch.Tensor
+    queued_components: frozenset[ComponentType]
+    full_tokens: int
+    swa_tokens: int
+    mamba_slots: int
+    mamba_device_slots: int
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -559,11 +570,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int] = None,
+        params: DecLockRefParams,
     ) -> None:
         if self.disable:
             return
-        result = self.tree_core.dec_swa_lock_only(node_id, swa_uuid_for_lock)
+        result = self.tree_core.dec_swa_lock_only(node_id, params)
         self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
@@ -589,6 +600,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
+            req.last_node_lock_params = None
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -641,11 +653,14 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        if req.last_node_lock_params is None:
+            raise RuntimeError("Request has no owned unified-cache lock")
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            req.last_node_lock_params,
+            skip_swa=req.swa_prefix_lock_released,
         )
+        req.last_node_lock_params = None
 
         # cleanup
         for comp in self._components_tuple:
@@ -731,10 +746,13 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
+        if req.last_node_lock_params is None:
+            raise RuntimeError("Request has no owned unified-cache lock")
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            req.last_node_lock_params,
         )
+        req.last_node_lock_params = None
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -746,6 +764,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
+        req.last_node_lock_params = lock_result.to_dec_params()
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
@@ -915,27 +934,34 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node_id: NodeId,
         mem_quota: Optional[int] = None,
-        req=None,
+        req: Optional[Req] = None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+
+        return self._queue_load_back(node_id, mem_quota, req=req) is not None
+
+    def _queue_load_back(
+        self,
+        node_id: NodeId,
+        mem_quota: Optional[int],
+        *,
+        req: Optional[Req],
+    ) -> Optional[_QueuedLoadBack]:
+        """Prepare one atomic rank-consistent load-back."""
+
         if self.cache_controller is None:
-            return False
+            return None
 
         host_anchor_params = self.inc_host_lock_ref(node_id).to_dec_params()
-
-        # Lock the path before building transfers (the aux build can evict).
         result = self.inc_lock_ref(node_id)
         ancestor_lock_params = result.to_dec_params()
-
-        # Let each component pre-allocate per-request state for the load-back;
-        # the finally below lets components recover it unless the load succeeds.
         preps: dict[ComponentType, PrepareLoadBackResult] = {
             comp.component_type: comp.prepare_load_back(node_id, req=req)
             for comp in self._components_tuple
         }
-        success = False
+        queued_load: Optional[_QueuedLoadBack] = None
         try:
-            success = self._load_back_transfers(
+            queued_load = self._load_back_transfers(
                 node_id=node_id,
                 mem_quota=mem_quota,
                 req=req,
@@ -943,78 +969,177 @@ class UnifiedRadixCache(BasePrefixCache):
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
             )
-            return success
+            return queued_load
         finally:
+            success = queued_load is not None
             for comp in self._components_tuple:
                 comp.finalize_load_back(req, preps[comp.component_type], success)
+
+    def _admit_load_back(
+        self,
+        full_tokens: int,
+        swa_tokens: int,
+        mamba_device_slots: int,
+    ) -> bool:
+        """Make one TP-consistent component-capacity decision."""
+
+        allocator = self.token_to_kv_pool_allocator
+        full_available = (
+            allocator.full_available_size()
+            if self.supports_swa()
+            else allocator.available_size()
+        )
+        swa_available = (
+            allocator.swa_available_size() if self.supports_swa() else 0
+        )
+        mamba_available = (
+            self.req_to_token_pool.mamba_allocator.available_size()
+            if self.supports_mamba()
+            else 0
+        )
+        local_available = torch.tensor(
+            [full_available, swa_available, mamba_available],
+            dtype=torch.int64,
+            device="cpu",
+        )
+
+        global_available = local_available.clone()
+        self._all_reduce(global_available, torch.distributed.ReduceOp.MIN)
+        full_to_evict = max(0, full_tokens - int(global_available[0].item()))
+        swa_to_evict = max(0, swa_tokens - int(global_available[1].item()))
+        mamba_to_evict = max(
+            0, mamba_device_slots - int(global_available[2].item())
+        )
+        if full_to_evict > 0 or swa_to_evict > 0 or mamba_to_evict > 0:
+            self.evict(
+                EvictParams(
+                    num_tokens=full_to_evict,
+                    swa_num_tokens=swa_to_evict,
+                    mamba_num=mamba_to_evict,
+                )
+            )
+
+        full_available = (
+            allocator.full_available_size()
+            if self.supports_swa()
+            else allocator.available_size()
+        )
+        swa_available = (
+            allocator.swa_available_size() if self.supports_swa() else 0
+        )
+        mamba_available = (
+            self.req_to_token_pool.mamba_allocator.available_size()
+            if self.supports_mamba()
+            else 0
+        )
+        local_admitted = (
+            full_available >= full_tokens
+            and swa_available >= swa_tokens
+            and mamba_available >= mamba_device_slots
+        )
+        admitted = torch.tensor(int(local_admitted), dtype=torch.int32, device="cpu")
+        self._all_reduce(admitted, torch.distributed.ReduceOp.MIN)
+        return bool(admitted.item())
 
     def _load_back_transfers(
         self,
         *,
         node_id: NodeId,
         mem_quota: Optional[int],
-        req,
+        req: Optional[Req],
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
-    ) -> bool:
-        # Build the KV + per-component aux transfers.
+    ) -> Optional[_QueuedLoadBack]:
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
-        kv_tokens = len(kv_xfer.host_indices)
+        full_tokens = len(kv_xfer.host_indices)
+        swa_tokens = sum(
+            len(transfer.host_indices)
+            for transfer in comp_xfers.get(ComponentType.SWA, ())
+            if transfer.host_indices is not None
+        )
+        mamba_slots = sum(
+            len(transfer.host_indices)
+            for transfer in comp_xfers.get(ComponentType.MAMBA, ())
+            if transfer.host_indices is not None
+        )
+        mamba_device_slots = sum(
+            len(transfer.host_indices)
+            for transfer in comp_xfers.get(ComponentType.MAMBA, ())
+            if transfer.host_indices is not None and transfer.device_indices is None
+        )
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
+        queued_components = {
+            component_type
+            for component_type, transfers in comp_xfers.items()
+            if any(
+                transfer.host_indices is not None and transfer.host_indices.numel() > 0
+                for transfer in transfers
+            )
+        }
+        if full_tokens > 0:
+            queued_components.add(ComponentType.FULL)
 
-        # Skip if there is nothing to load, or if the Full-KV transfer is too
-        # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
+        lock_delta = result.delta if result.delta is not None else 0
+        local_requested = (
+            len(queued_components) > 0
+            and not (
+                full_tokens < self.load_back_threshold
+                and queued_components == {ComponentType.FULL}
+            )
+            and not (mem_quota is not None and full_tokens > mem_quota + lock_delta)
+        )
+        requested = torch.tensor(int(local_requested), dtype=torch.int32, device="cpu")
+        self._all_reduce(requested, torch.distributed.ReduceOp.MIN)
+        if not bool(requested.item()) or not self._admit_load_back(
+            full_tokens,
+            swa_tokens,
+            mamba_device_slots,
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
-            return False
+            return None
 
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
-
-        # Load H→D
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers = [transfer for xfers in comp_xfers.values() for transfer in xfers]
         aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
         )
-
-        self.dec_lock_ref(node_id, ancestor_lock_params)
-        if device_indices is None:
+        local_allocated = device_indices is not None
+        allocated = torch.tensor(int(local_allocated), dtype=torch.int32, device="cpu")
+        self._all_reduce(allocated, torch.distributed.ReduceOp.MIN)
+        if not bool(allocated.item()):
+            if device_indices is not None:
+                self.cache_controller.cancel_pending_load(device_indices)
+            self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
-            return False
+            return None
 
-        # Commit the loaded KV back onto the node + apply its emitted actions.
+        assert device_indices is not None
+        self.dec_lock_ref(node_id, ancestor_lock_params)
         self._apply_cache_actions(
             self.tree_core.commit_load_back(
                 node_id, device_indices, kv_xfer, comp_xfers
             )
         )
-
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
 
-        return True
+        return _QueuedLoadBack(
+            device_indices=device_indices,
+            queued_components=frozenset(queued_components),
+            full_tokens=full_tokens,
+            swa_tokens=swa_tokens,
+            mamba_slots=mamba_slots,
+            mamba_device_slots=mamba_device_slots,
+        )
 
     def _build_sidecar_transfers(
         self,
@@ -1110,6 +1235,124 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def _storage_query_pool_transfers(
+        self,
+        candidate_tokens: int,
+    ) -> list[PoolTransfer]:
+        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
+        candidate_pages = candidate_tokens // self.page_size
+
+        if (
+            ComponentType.SWA in self.tree_components
+            and self.tree_core.has_swa_host_pool
+        ):
+            assert self.sliding_window_size is not None
+            window_pages = (
+                self.sliding_window_size + self.page_size - 1
+            ) // self.page_size
+            swa_pages = min(candidate_pages, window_pages)
+            if swa_pages > 0:
+                component_transfers[ComponentType.SWA] = [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        keys=["__placeholder__"] * swa_pages,
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+
+        if ComponentType.MAMBA in self.tree_components and candidate_pages > 0:
+            component_transfers[ComponentType.MAMBA] = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__placeholder__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+
+        transfers = [
+            transfer
+            for component_group in component_transfers.values()
+            for transfer in component_group
+        ]
+        transfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH,
+                PoolTransfer(name=PoolName.KV),
+                component_transfers,
+            )
+        )
+        return transfers
+
+    def query_storage_prefix_coverage(
+        self,
+        last_host_node: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+        *,
+        matched_prefix_tokens: int,
+    ) -> StoragePrefixCoverage:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return StoragePrefixCoverage()
+
+        extra_key = self.tree_core.prefetch_anchor_info(last_host_node)
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return StoragePrefixCoverage()
+
+        pool_transfers = self._storage_query_pool_transfers(len(prefetch_key))
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            pool_transfers=pool_transfers or None,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count -= storage_hit_count % self.page_size
+        if storage_hit_count == 0:
+            return StoragePrefixCoverage()
+
+        usable_pages = storage_hit_count // self.page_size
+        component_boundaries = (
+            operation.pool_storage_result.extra_pool_hit_pages
+        )
+        for transfer in pool_transfers:
+            if (
+                transfer.name not in component_boundaries
+                or component_boundaries[transfer.name] < usable_pages
+            ):
+                return StoragePrefixCoverage()
+
+        swa_tokens = 0
+        if (
+            ComponentType.SWA in self.tree_components
+            and self.tree_core.has_swa_host_pool
+        ):
+            assert self.sliding_window_size is not None
+            window_tokens = (
+                (self.sliding_window_size + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            swa_tokens = min(
+                matched_prefix_tokens + storage_hit_count,
+                window_tokens,
+            )
+
+        return StoragePrefixCoverage(
+            prefix_tokens=storage_hit_count,
+            full_tokens=storage_hit_count,
+            swa_tokens=swa_tokens,
+            mamba_slots=int(ComponentType.MAMBA in self.tree_components),
+        )
 
     def prefetch_from_storage(
         self,
@@ -1786,7 +2029,7 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return whether a unified component load-back event is complete.
+        """Return whether every rank has completed one load-back event.
 
         :param consumer_index: Layer-done counter slot returned by
             :meth:`ready_to_load_host_cache`.
@@ -1801,7 +2044,11 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
+        globally_ready = torch.tensor(
+            int(finish_event.query()), dtype=torch.int32, device="cpu"
+        )
+        self._all_reduce(globally_ready, torch.distributed.ReduceOp.MIN)
+        if not bool(globally_ready.item()):
             return False
 
         self.loading_check()
@@ -1812,43 +2059,48 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> tuple[torch.Tensor, NodeId]:
-        """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node) tuple."""
+    ) -> LoadBackTicket:
+        """Prepare KV cache loading from host to device."""
+
         best_match_node_id = params.best_match_node
-        mem_quota = params.mem_quota
         req = params.req
         assert req is not None
-        last_best_match_device_node_id = req.last_node
+        last_device_node_id = req.last_node
 
-        if (
+        needs_load = (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
-            or (
-                req is not None
-                and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
+            or req.swa_host_hit_length > 0
+            or req.mamba_host_hit_length > 0
+        )
+        if needs_load:
+            queued_load = self._queue_load_back(
+                best_match_node_id,
+                params.mem_quota,
+                req=req,
             )
-        ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            if queued_load is not None:
                 new_indices = self.tree_core.collect_full_device_indices(
-                    best_match_node_id, last_best_match_device_node_id
+                    best_match_node_id, last_device_node_id
                 )
-                if new_indices.numel() == 0:
-                    return (
-                        self.tree_core.empty_match_result.device_indices,
-                        last_best_match_device_node_id,
-                    )
-
                 logger.debug(
-                    "init_load_back success: loaded %d tokens for node %d",
+                    "init_load_back success: loaded %d full tokens for node %d",
                     len(new_indices),
                     best_match_node_id,
                 )
-                return new_indices, best_match_node_id
+                return LoadBackTicket(
+                    new_full_device_indices=new_indices,
+                    restored_node=best_match_node_id,
+                    queued_components=queued_load.queued_components,
+                    full_tokens=queued_load.full_tokens,
+                    swa_tokens=queued_load.swa_tokens,
+                    mamba_slots=queued_load.mamba_slots,
+                    mamba_device_slots=queued_load.mamba_device_slots,
+                )
 
-        return (
-            self.tree_core.empty_match_result.device_indices,
-            last_best_match_device_node_id,
+        return LoadBackTicket(
+            new_full_device_indices=self.tree_core.empty_match_result.device_indices,
+            restored_node=last_device_node_id,
         )
 
     def check_hicache_events(self) -> None:

@@ -20,8 +20,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
+    StoragePrefixCoverage,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -45,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -351,7 +354,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ):
+    ) -> LoadBackTicket:
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
@@ -361,16 +364,32 @@ class HiMambaRadixCache(MambaRadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                queued_components: set[ComponentType] = set()
+                if len(loading_values) > 0:
+                    queued_components.add(ComponentType.FULL)
+                if req is not None and req.mamba_host_hit_length > 0:
+                    queued_components.add(ComponentType.MAMBA)
+                return LoadBackTicket(
+                    new_full_device_indices=loading_values,
+                    restored_node=last_node,
+                    queued_components=frozenset(queued_components),
+                    full_tokens=len(loading_values),
+                    mamba_slots=int(ComponentType.MAMBA in queued_components),
+                    mamba_device_slots=int(
+                        ComponentType.MAMBA in queued_components
+                    ),
+                )
 
             while last_node is not self.root_node and (
                 last_node.evicted or last_node.mamba_evicted
             ):
                 last_node = last_node.parent
 
-        return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
+        return LoadBackTicket(
+            new_full_device_indices=torch.empty(
+                (0,), dtype=torch.int64, device=self.device
+            ),
+            restored_node=last_node,
         )
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
@@ -465,6 +484,29 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return whether every TP rank has completed one load-back event."""
+        if consumer_index < 0:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        globally_ready = torch.tensor(
+            int(finish_event.query()), dtype=torch.int32, device="cpu"
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                globally_ready,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        if not bool(globally_ready.item()):
+            return False
+
+        self.loading_check()
+        return True
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
@@ -1251,6 +1293,56 @@ class HiMambaRadixCache(MambaRadixCache):
         return DecLockRefResult(delta=delta)
 
     # ---- L3 Support ----
+
+    def query_storage_prefix_coverage(
+        self,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+        *,
+        matched_prefix_tokens: int,
+    ) -> StoragePrefixCoverage:
+        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+            return StoragePrefixCoverage()
+
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return StoragePrefixCoverage()
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["__placeholder__"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count -= storage_hit_count % self.page_size
+        if storage_hit_count == 0:
+            return StoragePrefixCoverage()
+        usable_pages = storage_hit_count // self.page_size
+        component_boundaries = operation.pool_storage_result.extra_pool_hit_pages
+        if (
+            PoolName.MAMBA not in component_boundaries
+            or component_boundaries[PoolName.MAMBA] < usable_pages
+        ):
+            return StoragePrefixCoverage()
+        return StoragePrefixCoverage(
+            prefix_tokens=storage_hit_count,
+            full_tokens=storage_hit_count,
+            mamba_slots=1,
+        )
 
     def shutdown(self):
         try:

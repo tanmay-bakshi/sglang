@@ -35,6 +35,7 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -315,6 +316,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
+        last_device_lock_params = DecLockRefParams(
+            swa_uuid_for_lock=77,
+        )
+
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
@@ -322,7 +327,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
                 l2_host_hit_length=0,
-                l3_storage_hit_length=0,
+                last_device_lock_params=last_device_lock_params,
                 last_device_node=req.last_node,
             )
         )
@@ -348,6 +353,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.running_batch = running_batch
         scheduler.server_args = server_args
         scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
@@ -361,7 +367,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            req.last_node,
+            last_device_lock_params,
+        )
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):

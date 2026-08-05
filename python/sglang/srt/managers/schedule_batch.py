@@ -85,6 +85,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -890,6 +891,8 @@ class Req(ReqDllmMixin):
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
+        # Exact acquisition parameters for the lock owned on last_node.
+        self.last_node_lock_params: DecLockRefParams | None = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1518,6 +1521,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
+        self.last_node_lock_params = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
@@ -3125,12 +3129,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
+                        and req.last_node_lock_params is not None
                         and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node, req.swa_uuid_for_lock
+                            req.last_node, req.last_node_lock_params
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():

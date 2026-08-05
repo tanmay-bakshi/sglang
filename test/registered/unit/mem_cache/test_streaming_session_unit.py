@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, MatchResult
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -34,8 +35,8 @@ class _FakeInnerCache:
             raise AssertionError("Unexpected match_prefix call")
         return self.match_results.pop(0)
 
-    def dec_lock_ref(self, node, *args, **kwargs):
-        self.dec_lock_ref_calls.append(node)
+    def dec_lock_ref(self, node, params=None):
+        self.dec_lock_ref_calls.append((node, params))
 
     def supports_mamba(self):
         return False
@@ -65,6 +66,7 @@ class _FakeReq:
         self.output_ids = []
         self.extra_key = None
         self.last_node = None
+        self.last_node_lock_params = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.mamba_pool_idx = None
@@ -75,6 +77,47 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+
+
+def test_session_slot_preserves_exact_lock_release_parameters():
+    """Session ownership includes component tombstones, not only the SWA UUID."""
+
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+    lock_params = DecLockRefParams(
+        swa_uuid_for_lock=77,
+        swa_uuid_for_host_lock=88,
+        skip_lock_node_ids={
+            ComponentType.FULL: {11},
+            ComponentType.SWA: {12},
+        },
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=8, allocated=8)
+    req.last_node = 42
+    req.last_node_lock_params = lock_params
+    req.swa_uuid_for_lock = lock_params.swa_uuid_for_lock
+    slot = SessionSlot()
+
+    slot.save_from_req(req, is_first=True)
+    restored_req = _FakeReq(
+        "session-a",
+        req_pool_idx=0,
+        committed=0,
+        allocated=0,
+    )
+    slot.restore_to_req(restored_req)
+
+    assert restored_req.last_node_lock_params == lock_params
+    assert restored_req.last_node_lock_params is not lock_params
+    assert restored_req.swa_uuid_for_lock == lock_params.swa_uuid_for_lock
+
+    tree_cache.slots["session-a"] = slot
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [(42, slot.last_node_lock_params)]
 
 
 def test_preabort_detaches_session_and_preserves_slot():

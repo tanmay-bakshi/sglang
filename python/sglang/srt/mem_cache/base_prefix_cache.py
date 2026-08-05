@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -10,7 +11,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Tuple,
     runtime_checkable,
 )
 
@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
@@ -30,9 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
-    )
-    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
-        ComponentType,
     )
 
 
@@ -160,6 +158,98 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class StoragePrefixCoverage:
+    """Component coverage promised by one storage-prefix lookup.
+
+    :ivar prefix_tokens: Protocol-visible prefix extension beyond the current
+        device/host match.
+    :ivar full_tokens: Full-attention device footprint needed to restore that
+        extension.
+    :ivar swa_tokens: Complete trailing sliding-window footprint at the
+        resulting prefix boundary.
+    :ivar mamba_slots: Cached recurrent-state slots needed at the resulting
+        prefix boundary.
+    """
+
+    prefix_tokens: int = 0
+    full_tokens: int = 0
+    swa_tokens: int = 0
+    mamba_slots: int = 0
+
+    def __post_init__(self) -> None:
+        values = (
+            self.prefix_tokens,
+            self.full_tokens,
+            self.swa_tokens,
+            self.mamba_slots,
+        )
+        if any(value < 0 for value in values):
+            raise ValueError("Storage prefix coverage cannot be negative")
+        if self.full_tokens < self.prefix_tokens:
+            raise ValueError(
+                "Full-attention storage coverage cannot be shorter than its "
+                "protocol prefix"
+            )
+        if self.prefix_tokens == 0 and any(value > 0 for value in values[1:]):
+            raise ValueError("Empty storage prefixes cannot reserve component state")
+
+
+class LoadBackTicketState(str, Enum):
+    """Ownership state for one host-to-device load-back operation."""
+
+    PREPARED = "prepared"
+    STARTED = "started"
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+
+
+@dataclasses.dataclass
+class LoadBackTicket:
+    """Explicit ownership record for one cache load-back operation.
+
+    :ivar new_full_device_indices: Newly allocated full-attention device slots.
+    :ivar restored_full_device_indices: Exact full-attention suffix consumed by
+        the request after rematching. This can include indices restored by an
+        earlier request while this ticket was waiting.
+    :ivar restored_node: Device-tree node restored by the operation.
+    :ivar queued_components: Components with queued host-to-device copies.
+    :ivar full_tokens: Full-attention host tokens restored by the ticket.
+    :ivar swa_tokens: Sliding-window host tokens restored by the ticket.
+    :ivar mamba_slots: Recurrent-state host slots restored by the ticket.
+    :ivar mamba_device_slots: Newly allocated cached recurrent-state slots.
+    :ivar restored_lock_params: Exact parameters needed to release the request's
+        restored-node lock.
+    :ivar owns_restored_lock: Whether the ticket still owns that request lock.
+    :ivar consumer_index: Layer-done counter slot after the copy starts.
+    :ivar state: Current ticket ownership state.
+    """
+
+    new_full_device_indices: torch.Tensor
+    restored_node: Any
+    restored_full_device_indices: torch.Tensor | None = None
+    queued_components: frozenset[ComponentType] = dataclasses.field(
+        default_factory=frozenset
+    )
+    full_tokens: int = 0
+    swa_tokens: int = 0
+    mamba_slots: int = 0
+    mamba_device_slots: int = 0
+    restored_lock_params: DecLockRefParams | None = None
+    owns_restored_lock: bool = False
+    consumer_index: int = -1
+    state: LoadBackTicketState = LoadBackTicketState.PREPARED
+
+    @property
+    def queued_any_component(self) -> bool:
+        """Return whether the controller owns any component copy.
+
+        :returns: Whether at least one component was queued.
+        """
+
+        return len(self.queued_components) > 0
 
 
 class MatchResult(NamedTuple):
@@ -334,6 +424,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
+    def mamba_evictable_size(self) -> int:
+        return 0
+
     def protected_size(self):
         return 0
 
@@ -341,6 +434,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def swa_protected_size(self):
+        return 0
+
+    def mamba_protected_size(self) -> int:
         return 0
 
     def total_size(self):
@@ -352,10 +448,42 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> LoadBackTicket:
         """
         Preparing KV cache loading from host to device.
         """
+        raise NotImplementedError()
+
+    def query_storage_prefix_coverage(
+        self,
+        last_host_node: Any,
+        new_input_tokens: list[int],
+        last_hash: str | None = None,
+        prefix_keys: list[str] | None = None,
+        *,
+        matched_prefix_tokens: int,
+    ) -> StoragePrefixCoverage:
+        """Query component-complete storage coverage without allocating pools.
+
+        :param last_host_node: Host-tree anchor for the storage suffix.
+        :param new_input_tokens: Candidate suffix tokens.
+        :param last_hash: Hash immediately preceding the candidate suffix.
+        :param prefix_keys: Optional storage namespace prefix hashes.
+        :param matched_prefix_tokens: Tokens covered before the candidate suffix.
+        :returns: Component-complete storage coverage.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement storage-prefix coverage"
+        )
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        """Return whether a load-back event is complete on every cache rank.
+
+        :param consumer_index: Controller completion-counter slot.
+        :returns: Whether every rank has completed the corresponding load.
+        """
+
         raise NotImplementedError()
 
     def ready_to_load_host_cache(self) -> Any:

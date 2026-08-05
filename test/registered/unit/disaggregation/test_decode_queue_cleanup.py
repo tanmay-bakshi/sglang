@@ -8,6 +8,9 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeRestoreBudget,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -30,6 +33,27 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_memory_release_rejects_inflight_transfer_ownership(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [object()]
+
+        with self.assertRaises(AssertionError):
+            queue.release_memory_occupation()
+
+        self.assertEqual(len(queue.queue), 1)
+
+    def test_memory_release_rejects_preallocation_ownership(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [object()]
+        queue.retracted_queue = []
+        queue.kv_manager = MagicMock()
+
+        with self.assertRaises(AssertionError):
+            queue.release_memory_occupation()
+
+        self.assertEqual(len(queue.queue), 1)
+        queue.kv_manager.deregister_buffer_to_engine.assert_not_called()
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
@@ -47,10 +71,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_budgets = MagicMock(return_value=(0, 0))
+        queue._hicache_pending_restore_budget = MagicMock(
+            return_value=DecodeRestoreBudget()
+        )
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
+        scheduler.enable_decode_hicache = False
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
@@ -93,12 +120,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_budgets = MagicMock(return_value=(0, 0))
+        queue._hicache_pending_restore_budget = MagicMock(
+            return_value=DecodeRestoreBudget()
+        )
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_decode_hicache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 

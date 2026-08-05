@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -283,18 +284,11 @@ class LMCRadixCache(RadixCache):
             best_match_node=new_node,
         )
 
-    def init_load_back(
-        self, params: InitLoadBackParams
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
-        """MP RETRIEVE.
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackTicket:
+        """Allocate uncached slots and start one LMCache retrieval."""
 
-        Called by the scheduler when ``match_prefix`` returned
-        ``host_hit_length > 0``. Uses the cached LOOKUP result to
-        allocate slots and fire RETRIEVE, inserts the resulting
-        TreeNode into the radix tree, and returns
-        ``(new_indices, new_last_node)``.
-        """
         req = params.req
+        assert req is not None
         marker = self._mp_load_back_markers.pop(req.rid)
         last_node: TreeNode = params.best_match_node
 
@@ -303,23 +297,28 @@ class LMCRadixCache(RadixCache):
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
             last_node=last_node,
-            load_fn=lambda sm, pp: self._mp_load_back(
+            load_fn=lambda slot_mapping, prefix_pad: self._mp_load_back(
                 marker=marker,
                 request_id=req.rid,
-                slot_mapping=sm,
-                prefix_pad=pp,
+                slot_mapping=slot_mapping,
+                prefix_pad=prefix_pad,
             ),
         )
         if result is None:
-            # Either alloc failed (locks still held by lookup_kv) or
-            # retrieve returned nothing (locks already released by
-            # retrieve_kv). release_pending is idempotent on locks_held.
             self.lmcache_connector.release_pending(req.rid)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
+            return LoadBackTicket(
+                new_full_device_indices=torch.empty(
+                    (0,), dtype=torch.int64, device=self.device
+                ),
+                restored_node=last_node,
             )
-        return result
+
+        new_indices, restored_node = result
+        return LoadBackTicket(
+            new_full_device_indices=new_indices,
+            restored_node=restored_node,
+            full_tokens=len(new_indices),
+        )
 
     def _load_back(
         self,

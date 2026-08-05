@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
+    DecodeRestoreBudget,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
@@ -69,7 +70,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    LoadBackTicket,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -269,9 +274,7 @@ class DecodeRequest:
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
-    hicache_restored_kv_indices: Optional[torch.Tensor] = None
-    hicache_restored_node: Any = None
-    hicache_load_consumer_index: int = -1
+    hicache_load_back_ticket: LoadBackTicket | None = None
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
@@ -371,6 +374,62 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    def _mamba_prealloc_required_slots(self, req: Req) -> int:
+        """Return recurrent-state slots still needed by request preallocation.
+
+        :param req: Request about to be preallocated.
+        :returns: Main and ping-pong recurrent-state slots not already owned.
+        """
+
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return 0
+
+        required_slots = int(req.mamba_pool_idx is None)
+        if (
+            self.req_to_token_pool.enable_mamba_extra_buffer
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            required_slots += (
+                self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+            )
+        return required_slots
+
+    def _mamba_allocatable_slots(self, reserved_restore_slots: int) -> int:
+        """Return free or evictable recurrent slots after restore reservations.
+
+        :param reserved_restore_slots: Slots promised to pending local restores.
+        :returns: Recurrent slots available to the next request.
+        """
+
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            return 0
+        return (
+            self.req_to_token_pool.mamba_allocator.available_size()
+            + self.tree_cache.mamba_evictable_size()
+            - reserved_restore_slots
+        )
+
+    def _ensure_mamba_prealloc_capacity(self, required_slots: int) -> None:
+        """Evict cached recurrent states needed by ordinary preallocation.
+
+        :param required_slots: Slots the request is about to allocate.
+        :raises RuntimeError: If the admission promise cannot be realized.
+        """
+
+        if required_slots == 0:
+            return
+        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
+            raise RuntimeError("Mamba slot demand requires a hybrid request pool")
+
+        allocator = self.req_to_token_pool.mamba_allocator
+        shortfall = max(0, required_slots - allocator.available_size())
+        if shortfall > 0:
+            self.tree_cache.evict(EvictParams(mamba_num=shortfall))
+        if allocator.available_size() < required_slots:
+            raise RuntimeError(
+                "Recurrent-state admission could not realize its reserved capacity"
+            )
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -550,9 +609,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
-        # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        lock_params = lock_result.to_dec_params()
+        prefix_match.last_device_lock_params = lock_params
+        req.last_node_lock_params = lock_params
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.swa_prefix_lock_released = False
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -667,8 +731,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_retracted=is_retracted)
 
     def release_memory_occupation(self):
-        self.queue.clear()
-        self.retracted_queue.clear()
+        assert len(self.queue) == 0
+        assert len(self.retracted_queue) == 0
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -899,19 +963,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
-        (
-            reserved_full_restore_tokens,
-            reserved_swa_restore_tokens,
-        ) = self._hicache_pending_restore_budgets()
+        reserved_restore_budget = self._hicache_pending_restore_budget()
+        reserved_restore_tokens = (
+            reserved_restore_budget.full_tokens
+            if uses_swa_tail_prealloc
+            else reserved_restore_budget.shared_tokens
+        )
+        full_allocatable_tokens -= reserved_restore_tokens
         if uses_swa_tail_prealloc:
-            reserved_restore_tokens = reserved_full_restore_tokens
-            full_allocatable_tokens -= reserved_full_restore_tokens
-            swa_allocatable_tokens -= reserved_swa_restore_tokens
-        else:
-            reserved_restore_tokens = max(
-                reserved_full_restore_tokens, reserved_swa_restore_tokens
-            )
-            full_allocatable_tokens -= reserved_restore_tokens
+            swa_allocatable_tokens -= reserved_restore_budget.swa_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
@@ -991,10 +1051,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
-                # total_prefix_len: full prefix promised to prefill
-                # (L1 + L2 host hit + L3 storage hit), sent as PD
-                # protocol's `decode_prefix_len`. The [prefix_len, total)
-                # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
 
@@ -1020,28 +1076,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
-
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+            full_required_for_request = max(
+                required_tokens_for_request,
+                origin_input_len
+                - prefix_len
+                + min(
+                    decode_req.req.sampling_params.max_new_tokens,
+                    CLIP_MAX_NEW_TOKEN,
                 )
-                > full_allocatable_tokens
-            ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                break
-            if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                break
+                - retractable_tokens,
+            )
+            local_admitted = full_required_for_request <= full_allocatable_tokens
 
+            swa_required = 0
+            swa_required_for_request = 0
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
@@ -1049,28 +1097,75 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.sampling_params.max_new_tokens,
                     CLIP_MAX_NEW_TOKEN,
                 )
-                if (
-                    max(
-                        swa_required,
-                        swa_len + max_new_tokens - retractable_swa_tokens,
+                swa_required_for_request = max(
+                    swa_required,
+                    swa_len + max_new_tokens - retractable_swa_tokens,
+                )
+                local_admitted = (
+                    local_admitted
+                    and swa_required_for_request <= swa_allocatable_tokens
+                )
+
+            mamba_required_slots = self._mamba_prealloc_required_slots(
+                decode_req.req
+            )
+            mamba_allocatable_slots = self._mamba_allocatable_slots(
+                reserved_restore_budget.mamba_slots
+            )
+            local_admitted = (
+                local_admitted
+                and mamba_required_slots <= mamba_allocatable_slots
+            )
+
+            if self.scheduler.enable_decode_hicache and prefix_match is not None:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                admitted, restore_budget = self._agree_hicache_admission(
+                    decode_req.req,
+                    prefix_match,
+                    uses_separate_swa_allocator=uses_swa_tail_prealloc,
+                    full_required_tokens=full_required_for_request,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                    swa_required_tokens=swa_required_for_request,
+                    swa_allocatable_tokens=swa_allocatable_tokens,
+                    mamba_required_slots=mamba_required_slots,
+                    mamba_allocatable_slots=mamba_allocatable_slots,
+                )
+                total_prefix_len = prefix_match.decode_prefix_len
+            else:
+                restore_budget = DecodeRestoreBudget()
+                admitted = local_admitted
+
+            if not admitted:
+                if prefix_match is not None:
+                    if prefix_match.prefetch_registered:
+                        self._cancel_hicache_prefetch(decode_req.req, prefix_match)
+                    self.tree_cache.dec_lock_ref(
+                        prefix_match.last_device_node,
+                        prefix_match.last_device_lock_params,
                     )
-                    > swa_allocatable_tokens
-                ):
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                    break
+                    decode_req.req.last_node_lock_params = None
+                    decode_req.req.swa_uuid_for_lock = None
+                break
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    if prefix_match.prefetch_registered:
+                        self._cancel_hicache_prefetch(decode_req.req, prefix_match)
+                    self.tree_cache.dec_lock_ref(
+                        prefix_match.last_device_node,
+                        prefix_match.last_device_lock_params,
+                    )
+                    decode_req.req.last_node_lock_params = None
+                    decode_req.req.swa_uuid_for_lock = None
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
                     "for PD + chunked prefill."
                 )
 
+            self._ensure_mamba_prealloc_capacity(mamba_required_slots)
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1078,21 +1173,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
-                reserved_full_restore_tokens += prefix_match.full_restore_token_count
-                reserved_swa_restore_tokens += prefix_match.swa_restore_token_count
+                reserved_restore_budget += restore_budget
                 reserved_restore_tokens = (
-                    reserved_full_restore_tokens
+                    reserved_restore_budget.full_tokens
                     if uses_swa_tail_prealloc
-                    else max(
-                        reserved_full_restore_tokens,
-                        reserved_swa_restore_tokens,
-                    )
+                    else reserved_restore_budget.shared_tokens
                 )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
@@ -1103,7 +1192,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
-                swa_allocatable_tokens -= swa_required
+                swa_allocatable_tokens -= swa_required + restore_budget.swa_tokens
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -1937,13 +2026,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return []
 
         if self.scheduler.enable_decode_hicache:
-            self._process_hicache_local_restores(
-                [
-                    decode_req
-                    for decode_req in self.queue
-                    if rids_to_check is None or decode_req.req.rid in rids_to_check
-                ]
-            )
+            self._process_hicache_local_restores(self.queue)
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -2051,8 +2134,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
+        """Verify that no in-flight transfer owns resources."""
+        assert len(self.queue) == 0
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

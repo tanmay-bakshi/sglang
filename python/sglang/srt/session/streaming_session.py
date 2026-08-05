@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -50,8 +51,8 @@ class SessionSlot:
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
+    last_node_lock_params: DecLockRefParams | None = None
     cache_protected_len: int = 0
-    swa_uuid_for_lock: Optional[str] = None
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -73,8 +74,8 @@ class SessionSlot:
 
         if is_first:
             self.last_node = req.last_node
+            self.last_node_lock_params = copy.deepcopy(req.last_node_lock_params)
             self.cache_protected_len = req.cache_protected_len
-            self.swa_uuid_for_lock = req.swa_uuid_for_lock
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -103,7 +104,12 @@ class SessionSlot:
         req.req_pool_idx = self.req_pool_idx
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
-        req.swa_uuid_for_lock = self.swa_uuid_for_lock
+        req.last_node_lock_params = copy.deepcopy(self.last_node_lock_params)
+        req.swa_uuid_for_lock = (
+            self.last_node_lock_params.swa_uuid_for_lock
+            if self.last_node_lock_params is not None
+            else None
+        )
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
@@ -304,8 +310,8 @@ class StreamingSession(BasePrefixCache):
                     req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
                     last_node=req.last_node,
+                    last_node_lock_params=copy.deepcopy(req.last_node_lock_params),
                     cache_protected_len=req.cache_protected_len,
-                    swa_uuid_for_lock=req.swa_uuid_for_lock,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -418,13 +424,7 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            self.inner.dec_lock_ref(lock_node, slot.last_node_lock_params)
 
         if slot.is_holding_kv:
             start = protected_len
@@ -590,8 +590,11 @@ class StreamingSession(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, params: InitLoadBackParams):
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackTicket:
         return self.inner.init_load_back(params)
+
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        return self.inner.is_load_back_event_done(consumer_index)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()

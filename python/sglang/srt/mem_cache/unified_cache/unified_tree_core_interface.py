@@ -182,7 +182,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""

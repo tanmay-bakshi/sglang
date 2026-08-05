@@ -450,6 +450,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         return result
 
+    def _components_released_with_swa(self) -> tuple[TreeComponent, ...]:
+        """Return the exact component set transferred by early SWA release."""
+        swa_component = self.components_by_type.get(ComponentType.SWA)
+        if swa_component is None:
+            return ()
+
+        swa_priority = swa_component.eviction_priority(is_leaf=False)
+        return tuple(
+            component
+            for component in self.components
+            if component is swa_component
+            or component.eviction_priority(is_leaf=False) < swa_priority
+        )
+
     def dec_lock_ref(
         self,
         node_id: NodeId,
@@ -457,8 +471,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
+        released_components = self._components_released_with_swa() if skip_swa else ()
         for component in self.components:
-            if skip_swa and component.component_type == ComponentType.SWA:
+            if component in released_components:
                 continue
             component.release_component_lock(node=node, params=params)
         self._update_evictable_leaf_sets(node)
@@ -466,7 +481,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return DecLockRefResult()
 
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecSwaLockOnlyResult:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on the node."""
@@ -475,16 +490,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         swa_component = self.components_by_type.get(ComponentType.SWA)
         if swa_component is None:
             return result
-        swa_component.release_window_lock(
-            node, swa_uuid_for_lock, result.device_frees, result.host_frees
-        )
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node.
-        swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
-        for comp in self.components:
-            if comp.eviction_priority(is_leaf=False) < swa_priority:
-                comp.release_component_lock(node, dec_params)
+        for component in self._components_released_with_swa():
+            if component is swa_component:
+                swa_component.release_window_lock(
+                    node, params, result.device_frees, result.host_frees
+                )
+                continue
+            component.release_component_lock(node, params)
         return result
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:

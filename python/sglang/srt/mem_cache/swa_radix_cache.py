@@ -779,9 +779,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return DecLockRefResult()
 
-    def dec_swa_lock_only(
-        self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None
-    ):
+    def dec_swa_lock_only(self, node: TreeNode, params: DecLockRefParams):
         """
         Decrement only the swa_lock_ref (and swa_protected_size_) along the chain
         [node, swa_uuid_for_lock], inclusive. The full_lock_ref is left untouched
@@ -799,14 +797,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         as `swa_tombstone=True`. The full kv stays alive until the full-side
         lock drops; future prefix-matches stop before this tombstoned leaf.
 
-        Caller must ensure this is invoked at most once per (node, swa_uuid_for_lock)
-        pair (track via e.g. `Req.swa_prefix_lock_released`). When the request
-        finally releases its full lock via `dec_lock_ref`, pass `skip_swa=True`
-        to avoid touching SWA state again.
+        Caller must ensure this is invoked at most once for each acquired lock
+        (track via e.g. `Req.swa_prefix_lock_released`). When the request finally
+        releases its full lock via `dec_lock_ref`, pass `skip_swa=True` to avoid
+        touching SWA state again.
         """
         if self.disable:
             return
 
+        swa_uuid_for_lock = params.swa_uuid_for_lock
         while node != self.root_node:
             assert (
                 not node.swa_tombstone

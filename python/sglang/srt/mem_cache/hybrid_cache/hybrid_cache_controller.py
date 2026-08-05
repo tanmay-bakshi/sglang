@@ -51,9 +51,11 @@ class CacheOperation(BaseCacheOperation):
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
-    ):
+        auto_allocated_device_transfers: tuple[PoolTransfer, ...] = (),
+    ) -> None:
         super().__init__(host_indices, device_indices, node_id, priority)
         self.pool_transfers = pool_transfers
+        self.auto_allocated_device_transfers = auto_allocated_device_transfers
 
     @staticmethod
     def merge_pool_transfers(
@@ -460,11 +462,13 @@ class HybridCacheController(BaseHiCacheController):
             if device_indices is None:
                 return None
 
+        auto_allocated_device_transfers: list[PoolTransfer] = []
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
             alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=host_indices,
+            newly_allocated_out=auto_allocated_device_transfers,
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
@@ -478,9 +482,47 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                auto_allocated_device_transfers=tuple(auto_allocated_device_transfers),
             )
         )
         return device_indices
+
+    def cancel_pending_load(self, device_indices: torch.Tensor) -> None:
+        """Cancel one unstarted load and return its controller allocations.
+
+        :param device_indices: Exact tensor returned by :meth:`load`.
+        :raises ValueError: If the operation has already started or is unknown.
+        """
+
+        operation_index = next(
+            (
+                index
+                for index in range(len(self.load_queue) - 1, -1, -1)
+                if self.load_queue[index].device_indices is device_indices
+            ),
+            None,
+        )
+        if operation_index is None:
+            raise ValueError("Cannot cancel an unknown or started HiCache load")
+
+        operation = self.load_queue.pop(operation_index)
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+        if operation.device_indices.numel() > 0:
+            full_allocator.free(operation.device_indices)
+
+        for transfer in operation.auto_allocated_device_transfers:
+            entry = self.mem_pool_host.entry_map[transfer.name]
+            free_fn = entry.device_free_fn or entry.device_pool.free
+            assert transfer.device_indices is not None
+            free_fn(transfer.device_indices)
+            transfer.device_indices = None
+        for transfer in operation.pool_transfers or ():
+            if transfer.indices_from_pool is not None:
+                transfer.device_indices = None
 
     def start_loading(self) -> int:
         if not self.load_queue:
@@ -611,7 +653,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
-        operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result = hit_result
 
         return (
             hash_value[:kv_hit_pages],
@@ -730,6 +772,7 @@ class HybridCacheController(BaseHiCacheController):
         alloc_host: bool,
         kv_device_indices: Optional[torch.Tensor] = None,
         kv_host_indices: Optional[torch.Tensor] = None,
+        newly_allocated_out: Optional[list[PoolTransfer]] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
@@ -745,6 +788,11 @@ class HybridCacheController(BaseHiCacheController):
                     prev_pool.host_indices = None
                 else:
                     prev_pool.device_indices = None
+            for derived_pool in derived_transfers:
+                if alloc_host:
+                    derived_pool.host_indices = None
+                else:
+                    derived_pool.device_indices = None
 
         for pool in extra_pools:
             if pool.indices_from_pool is not None:
@@ -805,4 +853,6 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             pool.host_indices = source.host_indices
             pool.device_indices = source.device_indices
+        if newly_allocated_out is not None:
+            newly_allocated_out.extend(pool for pool, _, _ in newly_allocated)
         return extra_pools

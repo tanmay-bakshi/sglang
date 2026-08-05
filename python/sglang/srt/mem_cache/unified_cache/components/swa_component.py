@@ -574,7 +574,7 @@ class SWAComponent(TreeComponent):
     def release_window_lock(
         self,
         node: UnifiedTreeNode,
-        swa_uuid_for_lock: Optional[int],
+        params: DecLockRefParams,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
@@ -586,14 +586,19 @@ class SWAComponent(TreeComponent):
         Full lock must stay so the request's prefix is protected.
 
         Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
-        invoked at most once per (node, swa_uuid_for_lock) pair.
+        invoked at most once for each acquired lock.
         """
         ct = self.component_type
         root = self.tree_core.root_node
+        swa_uuid_for_lock = params.swa_uuid_for_lock
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ())
 
         cur = node
         while cur is not root:
             cd = cur.component_data[ct]
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
             # Acquire skips tombstoned nodes; release must skip them too. Same
             # for nodes with lock_ref == 0 — acquire never credited them.
             if cd.value is None or cd.lock_ref == 0:
@@ -657,10 +662,12 @@ class SWAComponent(TreeComponent):
         # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
-        sw_pages = (
+        window_pages = (
             self.cache.sliding_window_size + self.cache.page_size - 1
         ) // self.cache.page_size
-        if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
+        candidate_pages = prefetch_tokens // self.cache.page_size
+        sw_pages = min(candidate_pages, window_pages)
+        if sw_pages == 0:
             return PreparePrefetchResult()
         num_tokens = sw_pages * self.cache.page_size
         host_indices = self._swa_kv_pool_host.alloc(num_tokens)
