@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    compute_tensor_parallel_shard,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -1862,6 +1863,221 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def _send_tp_sharded_state(
+        self,
+        peer_name: str,
+        source_indices: list[int],
+        source_data_ptrs: list[int],
+        source_item_lens: list[int],
+        destination_indices: list[int],
+        destination_data_ptrs: list[int],
+        destination_item_lens: list[int],
+        destination_gpu_id: int,
+        destination_tp_size: int,
+        destination_engine_rank: int,
+        notification: str,
+        source_layer_ids: list[int] | None = None,
+        destination_layer_ids: list[int] | None = None,
+    ) -> Any | None:
+        """Transfer a page-indexed state whose token payload is TP-sharded.
+
+        :param peer_name: NIXL peer receiving the state.
+        :param source_indices: Source page indices.
+        :param source_data_ptrs: Source state-buffer base addresses.
+        :param source_item_lens: Source bytes per page for each state buffer.
+        :param destination_indices: Destination page indices.
+        :param destination_data_ptrs: Destination state-buffer base addresses.
+        :param destination_item_lens: Destination bytes per page for each buffer.
+        :param destination_gpu_id: Destination GPU identifier used by NIXL.
+        :param destination_tp_size: Destination attention TP width.
+        :param destination_engine_rank: Destination global engine rank.
+        :param notification: Transfer completion notification.
+        :param source_layer_ids: Optional source layer identifiers.
+        :param destination_layer_ids: Optional destination layer identifiers.
+        :returns: The NIXL transfer handle, or ``None`` when no buffers are paired.
+        :raises ValueError: If page indices or TP-sharded buffer geometries differ.
+        """
+
+        source_indices_signed = np.asarray(source_indices, dtype=np.int64).reshape(-1)
+        destination_indices_signed = np.asarray(
+            destination_indices, dtype=np.int64
+        ).reshape(-1)
+        if np.any(source_indices_signed < 0):
+            raise ValueError(
+                "Source TP-sharded state page indices must be non-negative"
+            )
+        if np.any(destination_indices_signed < 0):
+            raise ValueError(
+                "Destination TP-sharded state page indices must be non-negative"
+            )
+
+        source_indices_array = source_indices_signed.astype(np.uint64, copy=False)
+        destination_indices_array = destination_indices_signed.astype(
+            np.uint64, copy=False
+        )
+        if source_indices_array.size != destination_indices_array.size:
+            raise ValueError(
+                "TP-sharded state index count mismatch: "
+                f"source={source_indices_array.size}, "
+                f"destination={destination_indices_array.size}"
+            )
+        if source_indices_array.size == 0:
+            return None
+
+        if len(source_data_ptrs) != len(source_item_lens):
+            raise ValueError(
+                "Source state pointer/item-length count mismatch: "
+                f"{len(source_data_ptrs)} pointers and "
+                f"{len(source_item_lens)} item lengths"
+            )
+        if len(destination_data_ptrs) != len(destination_item_lens):
+            raise ValueError(
+                "Destination state pointer/item-length count mismatch: "
+                f"{len(destination_data_ptrs)} pointers and "
+                f"{len(destination_item_lens)} item lengths"
+            )
+
+        pairs = build_transfer_entry_pairs(
+            source_layer_ids if source_layer_ids is not None else [],
+            destination_layer_ids if destination_layer_ids is not None else [],
+            len(source_data_ptrs),
+            len(destination_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        if len(pairs) == 0:
+            return None
+
+        page_size = self.kv_args.page_size
+        if page_size <= 0:
+            raise ValueError(f"KV page size must be positive, got {page_size}")
+
+        source_tp_size = self.attn_tp_size
+        if source_tp_size <= 0:
+            raise ValueError(
+                f"Source attention TP size must be positive, got {source_tp_size}"
+            )
+        if destination_tp_size <= 0:
+            raise ValueError(
+                "Destination attention TP size must be positive, got "
+                f"{destination_tp_size}"
+            )
+        if self.kv_args.engine_rank < 0:
+            raise ValueError(
+                f"Source engine rank must be non-negative, got {self.kv_args.engine_rank}"
+            )
+        if destination_engine_rank < 0:
+            raise ValueError(
+                "Destination engine rank must be non-negative, got "
+                f"{destination_engine_rank}"
+            )
+
+        source_tp_rank = self.kv_args.engine_rank % source_tp_size
+        destination_tp_rank = destination_engine_rank % destination_tp_size
+        token_offsets = np.arange(page_size, dtype=np.uint64)
+        source_address_chunks: list[npt.NDArray[np.uint64]] = []
+        destination_address_chunks: list[npt.NDArray[np.uint64]] = []
+        length_chunks: list[npt.NDArray[np.uint64]] = []
+
+        for source_index, destination_index in pairs:
+            source_item_bytes = source_item_lens[source_index]
+            destination_item_bytes = destination_item_lens[destination_index]
+            if source_item_bytes <= 0 or destination_item_bytes <= 0:
+                raise ValueError(
+                    "TP-sharded state item lengths must be positive, got "
+                    f"{source_item_bytes} and {destination_item_bytes}"
+                )
+            if source_item_bytes % page_size != 0:
+                raise ValueError(
+                    f"Source item length {source_item_bytes} is not divisible by "
+                    f"page size {page_size}"
+                )
+            if destination_item_bytes % page_size != 0:
+                raise ValueError(
+                    f"Destination item length {destination_item_bytes} is not "
+                    f"divisible by page size {page_size}"
+                )
+
+            source_token_bytes = source_item_bytes // page_size
+            destination_token_bytes = destination_item_bytes // page_size
+            shard = compute_tensor_parallel_shard(
+                source_token_bytes=source_token_bytes,
+                destination_token_bytes=destination_token_bytes,
+                source_parallel_size=source_tp_size,
+                destination_parallel_size=destination_tp_size,
+                source_rank=source_tp_rank,
+                destination_rank=destination_tp_rank,
+            )
+
+            source_page_bases = np.uint64(
+                source_data_ptrs[source_index]
+            ) + source_indices_array[:, None] * np.uint64(source_item_bytes)
+            destination_page_bases = np.uint64(
+                destination_data_ptrs[destination_index]
+            ) + destination_indices_array[:, None] * np.uint64(destination_item_bytes)
+            source_addresses = (
+                source_page_bases
+                + token_offsets[None, :] * np.uint64(source_token_bytes)
+                + np.uint64(shard.source_offset_bytes)
+            ).reshape(-1)
+            destination_addresses = (
+                destination_page_bases
+                + token_offsets[None, :] * np.uint64(destination_token_bytes)
+                + np.uint64(shard.destination_offset_bytes)
+            ).reshape(-1)
+            source_address_chunks.append(source_addresses)
+            destination_address_chunks.append(destination_addresses)
+            length_chunks.append(
+                np.full(
+                    source_addresses.size,
+                    shard.length_bytes,
+                    dtype=np.uint64,
+                )
+            )
+
+        source_addresses = np.concatenate(source_address_chunks)
+        destination_addresses = np.concatenate(destination_address_chunks)
+        lengths = np.concatenate(length_chunks)
+        source_requests = np.column_stack(
+            (
+                source_addresses,
+                lengths,
+                np.full(
+                    source_addresses.size,
+                    self.kv_args.gpu_id,
+                    dtype=np.uint64,
+                ),
+            )
+        )
+        destination_requests = np.column_stack(
+            (
+                destination_addresses,
+                lengths,
+                np.full(
+                    destination_addresses.size,
+                    destination_gpu_id,
+                    dtype=np.uint64,
+                ),
+            )
+        )
+
+        source_descriptors = self.agent.get_xfer_descs(source_requests, "VRAM")
+        destination_descriptors = self.agent.get_xfer_descs(
+            destination_requests, "VRAM"
+        )
+        transfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            source_descriptors,
+            destination_descriptors,
+            peer_name,
+            notification.encode("ascii"),
+        )
+        if transfer_handle is None:
+            raise RuntimeError("Failed to create TP-sharded state transfer")
+        state = self.agent.transfer(transfer_handle)
+        if state == "ERR":
+            raise RuntimeError("Failed to post TP-sharded state transfer")
+        return transfer_handle
+
     def _send_mamba_state(
         self,
         peer_name: str,
@@ -2151,6 +2367,30 @@ class NixlKVManager(CommonKVManager):
                 StateType.SWA_RING,
                 StateType.C128_STATE,
             ):
+                if (
+                    st == StateType.SWA
+                    and not self.is_mla_backend
+                    and not self.is_hybrid_mla_backend
+                    and self.attn_tp_size != decode_tp_size
+                ):
+                    h = self._send_tp_sharded_state(
+                        peer_name=peer_name,
+                        source_indices=src_indices,
+                        source_data_ptrs=src_ptrs,
+                        source_item_lens=src_lens,
+                        destination_indices=dst_indices,
+                        destination_data_ptrs=dst_ptrs,
+                        destination_item_lens=dst_lens,
+                        destination_gpu_id=dst_gpu_id,
+                        destination_tp_size=decode_tp_size,
+                        destination_engine_rank=decode_tp_rank,
+                        notification=comp_notif,
+                        source_layer_ids=src_lids,
+                        destination_layer_ids=dst_lids,
+                    )
+                    if h is not None:
+                        handles.append(h)
+                    continue
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."

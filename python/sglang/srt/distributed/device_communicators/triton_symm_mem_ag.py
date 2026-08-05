@@ -447,7 +447,9 @@ class MultimemAllGatherer:
     first eager call, and uses the kernel only when the input fits its
     dtype/shape/alignment contract. Guards use TP-replicated quantities so all
     ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+    only safe when a cross-rank sync sits between consecutive calls. Multimem
+    is an explicit process-wide opt-in through ``--enable-symm-mem``; the local
+    ``enabled`` argument can narrow that policy for an individual caller."""
 
     _UNINIT = object()
 
@@ -469,16 +471,19 @@ class MultimemAllGatherer:
             from sglang.srt.runtime_context import get_server_args
 
             tp_group = get_tp_group()
-            # Only probe node topology when the deployment can actually span
-            # nodes. Check world_size first so a TP=1 gatherer short-circuits
-            # before reading server args (which may be unpublished on offline
-            # paths). On a single node every TP rank is co-located, so skip the
-            # in_the_same_node_as() all-reduce, which can segfault under some
-            # EP/mooncake setups, and keep multimem enabled.
-            if (
-                tp_group.world_size > 1
-                and get_server_args().nnodes > 1
-                and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
+            # A TP=1 gatherer can short-circuit before reading server args,
+            # which may be unpublished on offline paths. For TP>1, honor the
+            # process policy before any topology collective or symmetric-memory
+            # allocation. A single-node deployment skips in_the_same_node_as(),
+            # which can segfault under some EP/mooncake setups.
+            if tp_group.world_size <= 1:
+                return
+
+            server_args = get_server_args()
+            if not server_args.enable_symm_mem:
+                self._state = None
+            elif server_args.nnodes > 1 and not all(
+                in_the_same_node_as(tp_group.cpu_group, source_rank=0)
             ):
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "

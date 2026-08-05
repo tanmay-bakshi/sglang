@@ -1867,7 +1867,9 @@ class ServerArgs:
         NS("exec.comm"),
     ] = False
     enable_symm_mem: A[
-        bool, "Enable NCCL symmetric memory for fast collectives.", NS("exec.comm")
+        bool,
+        "Enable CUDA symmetric memory for fast collectives.",
+        NS("exec.comm"),
     ] = False
     triton_attention_reduce_in_fp32: A[
         bool,
