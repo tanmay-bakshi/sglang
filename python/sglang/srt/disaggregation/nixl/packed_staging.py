@@ -13,6 +13,7 @@ import numpy.typing as npt
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
@@ -1194,6 +1195,49 @@ class PackedDestinationOutcomeCoordinator:
             if policies is not None:
                 for writer_id in policies:
                     self._proofs.pop((key, writer_id), None)
+            self._retiring.remove(key)
+
+    def cancel_unpublished_chunk(self, key: PackedChunkKey) -> None:
+        """Forget one coordinator and protocol registration before publication.
+
+        :param key: Exact request and chunk identity.
+        :raises PackedDestinationVisibilityError: If asynchronous work exists.
+        """
+
+        with self._lock:
+            if key in self._retiring:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility chunk retirement is already in progress"
+                )
+            policies = self._policies.get(key)
+            if policies is None:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility policy is not registered"
+                )
+            if self._active_done_handlers.get(key, 0) != 0:
+                raise PackedDestinationVisibilityError(
+                    "destination visibility DONE handling is still in progress"
+                )
+            if any(attempt_key[0] == key for attempt_key in self._attempts):
+                raise PackedDestinationVisibilityError(
+                    "destination visibility action is still in progress"
+                )
+            if any(proof_key[0] == key for proof_key in self._proofs):
+                raise PackedDestinationVisibilityError(
+                    "unpublished destination chunk contains visibility proofs"
+                )
+            self._retiring.add(key)
+        protocol_cancelled = False
+        try:
+            self._protocol.cancel_unpublished_chunk(key)
+            protocol_cancelled = True
+        finally:
+            if not protocol_cancelled:
+                with self._lock:
+                    self._retiring.remove(key)
+        with self._lock:
+            self._policies.pop(key)
+            self._active_done_handlers.pop(key, None)
             self._retiring.remove(key)
 
 
@@ -3617,6 +3661,7 @@ class PackedStagingArena:
     _copy_executor: PackedCopyExecutor | None
     _gpu_id: int
     _lock: threading.Lock
+    _owns_registration: bool
     _peer: PackedPeerIdentity
     _protocol: PackedDecodeProtocol
     _quarantine: PackedRegistrationQuarantine
@@ -3632,6 +3677,7 @@ class PackedStagingArena:
         gpu_id: int,
         peer: PackedPeerIdentity,
         arena_generation: bytes,
+        registration: object | None = None,
         alignment_bytes: int = DEFAULT_STAGING_ALIGNMENT_BYTES,
         quarantine: PackedRegistrationQuarantine = PACKED_REGISTRATION_QUARANTINE,
     ) -> None:
@@ -3642,6 +3688,8 @@ class PackedStagingArena:
         :param gpu_id: Destination CUDA device identifier.
         :param peer: This exact destination agent process identity.
         :param arena_generation: Generation of this registration.
+        :param registration: Existing registration covering ``tensor``. When
+            supplied, its external owner retains deregistration authority.
         :param alignment_bytes: Lease and writer-projection alignment.
         :param quarantine: Strong-retention owner for ambiguous cleanup.
         """
@@ -3662,7 +3710,9 @@ class PackedStagingArena:
             total_size=tensor.numel(),
             alignment_bytes=alignment_bytes,
         )
-        registration = _register_packed_tensor(agent, tensor, gpu_id)
+        owns_registration = registration is None
+        if registration is None:
+            registration = _register_packed_tensor(agent, tensor, gpu_id)
         self._agent = agent
         self._allocator = allocator
         self._arena_generation = generation
@@ -3670,6 +3720,7 @@ class PackedStagingArena:
         self._copy_executor = None
         self._gpu_id = gpu_id
         self._lock = threading.Lock()
+        self._owns_registration = owns_registration
         self._peer = peer
         self._protocol = PackedDecodeProtocol(allocator)
         self._quarantine = quarantine
@@ -3782,20 +3833,23 @@ class PackedStagingArena:
                     )
                     self._closed = True
                     raise
-            try:
-                self._agent.deregister_memory(registration)
-            except Exception:
-                reason = "packed staging arena deregistration failed"
-                logger.error("%s:\n%s", reason, traceback.format_exc())
-                owners: tuple[object, ...] = (executor,) if executor is not None else ()
-                self._retain_locked(
-                    tensor,
-                    registration,
-                    reason,
-                    owners=owners,
-                )
-                self._closed = True
-                raise
+            if self._owns_registration:
+                try:
+                    self._agent.deregister_memory(registration)
+                except Exception:
+                    reason = "packed staging arena deregistration failed"
+                    logger.error("%s:\n%s", reason, traceback.format_exc())
+                    owners: tuple[object, ...] = (
+                        (executor,) if executor is not None else ()
+                    )
+                    self._retain_locked(
+                        tensor,
+                        registration,
+                        reason,
+                        owners=owners,
+                    )
+                    self._closed = True
+                    raise
             self._registration = None
             self._tensor = None
             self._closed = True

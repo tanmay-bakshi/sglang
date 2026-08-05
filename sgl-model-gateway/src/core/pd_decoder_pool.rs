@@ -29,15 +29,15 @@ use uuid::Uuid;
 
 use super::pd_decoder_grant::{
     AbortReconciliationGrant, BindReconciliationGrant, BoundPreparedGrant,
-    CompletionReconciliationGrant, DecoderAllocationKey, DecoderGrantBinding,
-    DecoderGrantControlClient, DecoderGrantDigest, DecoderGrantReservation, DecoderId,
-    DecoderRequestTemplate, DecoderReserveAttemptDigest, DecoderReserveRefusalDisposition,
-    DecoderReserveRefusalReceipt, DecoderSlotGeneration, EngineAbortOutcome, EngineGrantError,
-    EngineQuarantineReceipt, EngineReleaseKind, EngineReleaseReceipt, PrefillId,
-    PreparedCancellationReconciliationGrant, PreparedGrantCancellationReceipt,
-    PreparedGrantCancellationTarget, PromotionReconciliationGrant, QuarantineReconciliationGrant,
-    ReserveReconciliationGrant, RetainedEngineGrant, UnboundCancellationReconciliationGrant,
-    UnboundPreparedGrant,
+    CompletionReconciliationGrant, DecoderAllocationKey, DecoderControlAuthorization,
+    DecoderGrantBinding, DecoderGrantControlClient, DecoderGrantDigest, DecoderGrantReservation,
+    DecoderId, DecoderRequestTemplate, DecoderReserveAttemptDigest,
+    DecoderReserveRefusalDisposition, DecoderReserveRefusalReceipt, DecoderSlotGeneration,
+    EngineAbortOutcome, EngineGrantError, EngineQuarantineReceipt, EngineReleaseKind,
+    EngineReleaseReceipt, PrefillId, PreparedCancellationReconciliationGrant,
+    PreparedGrantCancellationReceipt, PreparedGrantCancellationTarget,
+    PromotionReconciliationGrant, QuarantineReconciliationGrant, ReserveReconciliationGrant,
+    RetainedEngineGrant, UnboundCancellationReconciliationGrant, UnboundPreparedGrant,
 };
 use crate::core::PrefillBootstrapEndpoint;
 
@@ -386,11 +386,12 @@ impl PendingAdmission {
     pub fn begin_reserve(
         &mut self,
         client: &DecoderGrantControlClient,
+        authorization: DecoderControlAuthorization,
     ) -> Result<PendingReserveReconciliation<'_>, DecoderPoolError> {
         let operation_id = Uuid::new_v4();
-        let engine = self
-            .inner
-            .checkout_initial_reserve(self, operation_id, client)?;
+        let engine =
+            self.inner
+                .checkout_initial_reserve(self, operation_id, client, authorization)?;
         Ok(PendingReserveReconciliation {
             pending: self,
             operation_id,
@@ -1338,6 +1339,7 @@ impl DecoderPoolInner {
         pending: &PendingAdmission,
         operation_id: Uuid,
         client: &DecoderGrantControlClient,
+        authorization: DecoderControlAuthorization,
     ) -> Result<ReserveReconciliationGrant, DecoderPoolError> {
         let mut state = self.state.lock();
         let record = pending_record_mut(&mut state, pending)?;
@@ -1353,7 +1355,7 @@ impl DecoderPoolInner {
             }
         })?);
         record.authority = PendingAdmissionAuthority::ReserveCheckedOut { operation_id };
-        Ok(client.begin_reserve(reservation))
+        Ok(client.begin_authorized_reserve(reservation, authorization))
     }
 
     fn checkout_reserve_retry(
@@ -1644,7 +1646,7 @@ impl ActiveEngineGrant for RetainedEngineGrant {
 
 impl DecoderPool {
     /// Construct an empty pool from declared prefill metadata.
-    pub fn new(
+    pub(super) fn new(
         prefill_id: PrefillId,
         declared_prefill_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
@@ -1676,12 +1678,15 @@ impl DecoderPool {
     }
 
     /// Register declared metadata for a decoder process generation.
-    pub fn register(&self, metadata: DecoderReplicaMetadata) -> Result<(), DecoderPoolError> {
+    pub(super) fn register(
+        &self,
+        metadata: DecoderReplicaMetadata,
+    ) -> Result<(), DecoderPoolError> {
         self.register_with_availability(metadata, DecoderAvailability::Ready)
     }
 
     /// Install a decoder generation without making it admission-selectable.
-    pub(crate) fn register_unavailable(
+    pub(super) fn register_unavailable(
         &self,
         metadata: DecoderReplicaMetadata,
     ) -> Result<(), DecoderPoolError> {
@@ -1862,7 +1867,7 @@ impl DecoderPool {
     }
 
     /// Change whether a registered decoder accepts new cohorts.
-    pub fn set_availability(
+    pub(super) fn set_availability(
         &self,
         decoder_id: &DecoderId,
         availability: DecoderAvailability,
@@ -1929,7 +1934,7 @@ impl DecoderPool {
     }
 
     /// Remove a draining process generation after every cohort is terminal.
-    pub fn remove(&self, decoder_id: &DecoderId) -> Result<(), DecoderPoolError> {
+    pub(super) fn remove(&self, decoder_id: &DecoderId) -> Result<(), DecoderPoolError> {
         let mut state = self.inner.state.lock();
         let replica = state
             .replicas
@@ -1954,9 +1959,10 @@ impl DecoderPool {
 
     /// Atomically select, construct, and charge one exact reservation attempt.
     #[allow(clippy::too_many_arguments)]
-    pub fn begin_admission(
+    pub(super) fn begin_admission(
         &self,
         request: &LogicalRequestOwner,
+        eligible_decoders: &HashSet<DecoderId>,
         template: &DecoderRequestTemplate,
         prefill_bootstrap_endpoint: PrefillBootstrapEndpoint,
         prepared_ttl: Duration,
@@ -1971,9 +1977,6 @@ impl DecoderPool {
         }
 
         let mut state = self.inner.state.lock();
-        if !state.accepting_requests {
-            return Err(DecoderPoolError::PrefillPoolDraining);
-        }
         let (retry_constraint, failed_decoders) = {
             let chain = state
                 .request_chains
@@ -2005,14 +2008,15 @@ impl DecoderPool {
 
         let decoder_id = match &retry_constraint {
             AdmissionRetryConstraint::AnyEligible => {
-                select_decoders(&state.replicas, &failed_decoders)?
+                select_decoders(&state.replicas, &failed_decoders, eligible_decoders)?
                     .into_iter()
                     .next()
                     .expect("successful decoder selection cannot be empty")
             }
             AdmissionRetryConstraint::SameDecoder(decoder_id) => {
                 let ready = state.replicas.get(decoder_id).is_some_and(|replica| {
-                    replica.availability == DecoderAvailability::Ready
+                    eligible_decoders.contains(decoder_id)
+                        && replica.availability == DecoderAvailability::Ready
                         && !failed_decoders.contains(decoder_id)
                 });
                 if !ready {
@@ -3286,6 +3290,15 @@ impl DecoderPool {
         Ok(receipt)
     }
 
+    /// Report whether terminal reconciliation retained this exact cohort.
+    pub(crate) fn cohort_remains_quarantined(
+        &self,
+        cohort: &DecoderAssignmentCohort,
+    ) -> Result<bool, DecoderPoolError> {
+        self.validate_assignment_pool(cohort)?;
+        Ok(cohort.phase == CohortPhase::Quarantined)
+    }
+
     /// Return immutable accounting suitable for metrics and tests.
     pub fn snapshot(&self) -> DecoderPoolSnapshot {
         let state = self.inner.state.lock();
@@ -3374,9 +3387,10 @@ pub(crate) fn begin_test_pending_for_grant(
         };
         (retry_constraint.clone(), chain.failed_decoders.clone())
     };
+    let eligible_decoders: HashSet<DecoderId> = state.replicas.keys().cloned().collect();
     let selected = match &retry_constraint {
         AdmissionRetryConstraint::AnyEligible => {
-            select_decoders(&state.replicas, &failed_decoders)?.remove(0)
+            select_decoders(&state.replicas, &failed_decoders, &eligible_decoders)?.remove(0)
         }
         AdmissionRetryConstraint::SameDecoder(decoder_id) => decoder_id.clone(),
     };
@@ -3498,6 +3512,7 @@ fn quarantine_assignment(
 fn select_decoders(
     replicas: &HashMap<DecoderId, ReplicaState>,
     failed_decoders: &HashSet<DecoderId>,
+    eligible_decoders: &HashSet<DecoderId>,
 ) -> Result<Vec<DecoderId>, DecoderPoolError> {
     let unfailed: Vec<&ReplicaState> = replicas
         .values()
@@ -3508,7 +3523,10 @@ fn select_decoders(
     }
     let mut ready: Vec<&ReplicaState> = unfailed
         .into_iter()
-        .filter(|replica| replica.availability == DecoderAvailability::Ready)
+        .filter(|replica| {
+            replica.availability == DecoderAvailability::Ready
+                && eligible_decoders.contains(&replica.metadata.id)
+        })
         .collect();
     if ready.is_empty() {
         return Err(DecoderPoolError::NoReadyDecoder);
@@ -4705,12 +4723,15 @@ mod tests {
     use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 
     use super::*;
-    use crate::core::pd_decoder_grant::{
-        issue_test_grant, issue_test_grant_at_control_url,
-        issue_test_prepared_cancellation_receipt, issue_test_quarantine_receipt,
-        issue_test_release_receipt, issue_test_reserve_refusal_receipt,
-        issue_test_unbound_cancellation_target, DecoderGrantChildAccounting, DecoderInferenceRoute,
-        TestEngineReceiptBinding,
+    use crate::core::{
+        pd_decoder_grant::{
+            issue_test_grant, issue_test_grant_at_control_url,
+            issue_test_prepared_cancellation_receipt, issue_test_quarantine_receipt,
+            issue_test_release_receipt, issue_test_reserve_refusal_receipt,
+            issue_test_unbound_cancellation_target, DecoderGrantChildAccounting,
+            DecoderInferenceRoute, TestEngineReceiptBinding,
+        },
+        HttpOrigin,
     };
 
     static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
@@ -4825,11 +4846,19 @@ mod tests {
     }
 
     fn prefill_id(name: &str) -> PrefillId {
-        PrefillId::new("http://prefill.test:30000", stable_instance_id(name)).unwrap()
+        PrefillId::new(
+            HttpOrigin::parse("http://prefill.test:30000").unwrap(),
+            stable_instance_id(name),
+        )
+        .unwrap()
     }
 
     fn decoder_id(name: &str) -> DecoderId {
-        DecoderId::new("http://decode.test:30001", stable_instance_id(name)).unwrap()
+        DecoderId::new(
+            HttpOrigin::parse("http://decode.test:30001").unwrap(),
+            stable_instance_id(name),
+        )
+        .unwrap()
     }
 
     fn compatibility(protocol: &str) -> EngineCompatibilityMetadata {
@@ -4912,8 +4941,15 @@ mod tests {
         owner: &LogicalRequestOwner,
         accounting: DecoderGrantChildAccounting,
     ) -> Result<PendingAdmission, DecoderPoolError> {
+        let eligible_decoders: HashSet<DecoderId> = pool
+            .snapshot()
+            .replicas
+            .into_iter()
+            .map(|replica| replica.id)
+            .collect();
         pool.begin_admission(
             owner,
+            &eligible_decoders,
             &scalar_template(),
             PrefillBootstrapEndpoint::new("prefill-bootstrap.test", 5000).unwrap(),
             Duration::from_secs(2),
@@ -4954,7 +4990,12 @@ mod tests {
         };
         match constraint {
             AdmissionRetryConstraint::AnyEligible => {
-                Ok(select_decoders(&state.replicas, &chain.failed_decoders)?.remove(0))
+                let eligible_decoders: HashSet<DecoderId> =
+                    state.replicas.keys().cloned().collect();
+                Ok(
+                    select_decoders(&state.replicas, &chain.failed_decoders, &eligible_decoders)?
+                        .remove(0),
+                )
             }
             AdmissionRetryConstraint::SameDecoder(decoder_id) => Ok(decoder_id.clone()),
         }
@@ -5252,7 +5293,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_drain_rejects_new_and_existing_request_admission() {
+    fn prefill_drain_rejects_new_owners_but_allows_existing_request_admission() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         let existing = pool.begin_request("existing").unwrap();
@@ -5263,10 +5304,8 @@ mod tests {
             pool.begin_request("new").unwrap_err(),
             DecoderPoolError::PrefillPoolDraining
         );
-        assert_eq!(
-            begin_scalar_admission(&pool, &existing, child_accounting()).unwrap_err(),
-            DecoderPoolError::PrefillPoolDraining
-        );
+        let pending = begin_scalar_admission(&pool, &existing, child_accounting()).unwrap();
+        drop(pending);
     }
 
     #[test]
@@ -5473,7 +5512,12 @@ mod tests {
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let reconciliation = pending.begin_reserve(&client).unwrap();
+        let reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
 
         drop(reconciliation);
         assert_eq!(pool.snapshot().replicas[0].pending_admissions, 0);
@@ -5488,7 +5532,12 @@ mod tests {
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        let mut reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
         reconciliation.mark_test_polled();
         drop(reconciliation);
 
@@ -5503,15 +5552,23 @@ mod tests {
     async fn dropped_reserve_future_resumes_the_exact_engine_attempt() {
         let (decoder_url, server, server_task) = start_reserve_recovery_server().await;
         let pool = pool(2);
-        let decoder_id =
-            DecoderId::new(decoder_url, stable_instance_id("decode-0@generation-1")).unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse(&decoder_url).unwrap(),
+            stable_instance_id("decode-0@generation-1"),
+        )
+        .unwrap();
         pool.register(replica_with_id(decoder_id, "packed-v1"))
             .unwrap();
         let owner = pool.begin_request("request").unwrap();
         let mut pending = begin_scalar_admission(&pool, &owner, child_accounting()).unwrap();
         let reservation_attempt_id = pending.reservation_attempt_id();
         let client = DecoderGrantControlClient::from_builder(reqwest::Client::builder()).unwrap();
-        let mut reconciliation = pending.begin_reserve(&client).unwrap();
+        let mut reconciliation = pending
+            .begin_reserve(
+                &client,
+                DecoderControlAuthorization::new("test-decoder-api-key").unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             reconciliation.reservation_attempt_id().unwrap(),
             reservation_attempt_id
@@ -5560,7 +5617,7 @@ mod tests {
         let (decoder_url, server, server_task) = start_cancellation_recovery_server().await;
         let pool = pool(4);
         let decoder_id = DecoderId::new(
-            decoder_url.clone(),
+            HttpOrigin::parse(&decoder_url).unwrap(),
             stable_instance_id("decode-0@generation-1"),
         )
         .unwrap();

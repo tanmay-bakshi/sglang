@@ -8,11 +8,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode, PdProcessAdvertisement},
+    core::{
+        pd_discovery::{discover_pd_process, DiscoveredPdProcess},
+        steps::workflow_data::LocalWorkerWorkflowData,
+        ConnectionMode, HttpOrigin, PdProcessAdvertisement, PdProcessRole,
+    },
     routers::grpc::client::GrpcClient,
 };
 
@@ -132,6 +136,22 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
         .map_err(|e| format!("Failed to parse response from {}: {}", server_info_url, e))?;
 
     serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
+}
+
+/// Perform strict, authenticated process-generation discovery for PD registration.
+async fn discover_registered_pd_process(
+    url: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<DiscoveredPdProcess, String> {
+    let origin =
+        HttpOrigin::parse(url).map_err(|error| format!("invalid PD worker origin: {error}"))?;
+    let api_key = api_key
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "PD process discovery requires a nonempty API key".to_string())?;
+    discover_pd_process(&origin, api_key, Duration::from_secs(timeout_secs))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Get model info from /model_info endpoint.
@@ -268,20 +288,52 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
             context.data.connection_mode.as_ref().ok_or_else(|| {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
+        let is_pd_process = matches!(config.worker_type.as_deref(), Some("prefill" | "decode"));
+        if is_pd_process && !matches!(connection_mode, ConnectionMode::Http) {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("discover_metadata"),
+                message: "PD process discovery requires canonical HTTP transport".to_string(),
+            });
+        }
 
         debug!(
             "Discovering metadata for {} ({:?})",
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime, pd_process_advertisement) = match connection_mode
-        {
+        let discovery_result = match connection_mode {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
                 let mut pd_process_advertisement = None;
 
                 // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
+                if is_pd_process {
+                    let discovery = discover_registered_pd_process(
+                        &config.url,
+                        config.api_key.as_deref(),
+                        config.health_check_timeout_secs,
+                    )
+                    .await
+                    .map_err(|message| WorkflowError::StepFailed {
+                        step_id: StepId::new("discover_metadata"),
+                        message,
+                    })?;
+                    let metadata = discovery.registration.metadata();
+                    labels.insert(
+                        "tp_size".to_string(),
+                        metadata.tensor_parallel_size().to_string(),
+                    );
+                    labels.insert(
+                        "dp_size".to_string(),
+                        metadata.data_parallel_size().to_string(),
+                    );
+                    let role = match metadata.role() {
+                        PdProcessRole::Prefill => "prefill",
+                        PdProcessRole::Decode => "decode",
+                    };
+                    labels.insert("disaggregation_mode".to_string(), role.to_string());
+                    pd_process_advertisement = Some(discovery.advertisement);
+                } else if let Ok(server_info) =
                     get_server_info(&config.url, config.api_key.as_deref()).await
                 {
                     pd_process_advertisement = server_info.pd_process;
@@ -307,31 +359,38 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     }
                 }
 
-                // Fetch from /model_info for model-related metadata
-                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
-                {
-                    if let Some(tokenizer_path) =
-                        model_info.tokenizer_path.filter(|s| !s.is_empty())
+                if !is_pd_process {
+                    // Fetch from /model_info for model-related metadata
+                    if let Ok(model_info) =
+                        get_model_info(&config.url, config.api_key.as_deref()).await
                     {
-                        labels.insert("tokenizer_path".to_string(), tokenizer_path);
-                    }
-                    if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
-                        labels.insert("model_type".to_string(), model_type);
-                    }
-                    if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty())
-                    {
-                        if let Ok(json_str) = serde_json::to_string(&architectures) {
-                            labels.insert("architectures".to_string(), json_str);
+                        if let Some(tokenizer_path) =
+                            model_info.tokenizer_path.filter(|s| !s.is_empty())
+                        {
+                            labels.insert("tokenizer_path".to_string(), tokenizer_path);
+                        }
+                        if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
+                            labels.insert("model_type".to_string(), model_type);
+                        }
+                        if let Some(architectures) =
+                            model_info.architectures.filter(|a| !a.is_empty())
+                        {
+                            if let Ok(json_str) = serde_json::to_string(&architectures) {
+                                labels.insert("architectures".to_string(), json_str);
+                            }
                         }
                     }
-                }
 
-                // If no model name discovered yet, try /v1/models as fallback
-                if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
-                    if let Ok(model_name) =
-                        get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
+                    // If no model name discovered yet, try /v1/models as fallback
+                    if !labels.contains_key("model_path")
+                        && !labels.contains_key("served_model_name")
                     {
-                        labels.insert("served_model_name".to_string(), model_name);
+                        if let Ok(model_name) =
+                            get_model_name_from_v1_models(&config.url, config.api_key.as_deref())
+                                .await
+                        {
+                            labels.insert("served_model_name".to_string(), model_name);
+                        }
                     }
                 }
 
@@ -343,11 +402,21 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     .await
                     .map(|(labels, runtime)| (labels, Some(runtime), None))
             }
-        }
-        .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            (HashMap::new(), None, None)
-        });
+        };
+        let (discovered_labels, detected_runtime, pd_process_advertisement) = match discovery_result
+        {
+            Ok(discovery) => discovery,
+            Err(message) if is_pd_process => {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("discover_metadata"),
+                    message,
+                });
+            }
+            Err(message) => {
+                warn!("Failed to fetch metadata for {}: {}", config.url, message);
+                (HashMap::new(), None, None)
+            }
+        };
 
         let url = config.url.clone();
         debug!(

@@ -672,9 +672,7 @@ class TestStaticSWAAllocationPins(unittest.TestCase):
             allocator.swa_attn_allocator.available_size(),
             swa_available,
         )
-        self.assertTrue(
-            torch.equal(allocator.full_to_swa_index_mapping, mapping)
-        )
+        self.assertTrue(torch.equal(allocator.full_to_swa_index_mapping, mapping))
         self.assertEqual(allocator._size_full, 16)
         self.assertEqual(allocator._size_swa, 16)
 
@@ -867,16 +865,12 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             virtual_indices,
             owner,
         )
-        full_mapping = (
-            allocator.full_attn_allocator.virtual_to_physical[
-                virtual_indices
-            ].clone()
-        )
-        swa_mapping = (
-            allocator.swa_attn_allocator.virtual_to_physical[
-                virtual_indices
-            ].clone()
-        )
+        full_mapping = allocator.full_attn_allocator.virtual_to_physical[
+            virtual_indices
+        ].clone()
+        swa_mapping = allocator.swa_attn_allocator.virtual_to_physical[
+            virtual_indices
+        ].clone()
 
         with self.assertRaises(AllocationPinnedError):
             allocator.free(virtual_indices)
@@ -887,17 +881,13 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
         self.assertTrue(
             torch.equal(
-                allocator.full_attn_allocator.virtual_to_physical[
-                    virtual_indices
-                ],
+                allocator.full_attn_allocator.virtual_to_physical[virtual_indices],
                 full_mapping,
             )
         )
         self.assertTrue(
             torch.equal(
-                allocator.swa_attn_allocator.virtual_to_physical[
-                    virtual_indices
-                ],
+                allocator.swa_attn_allocator.virtual_to_physical[virtual_indices],
                 swa_mapping,
             )
         )
@@ -2430,9 +2420,7 @@ class TestPinAwareCompaction(unittest.TestCase):
         low = _make_mha_spec("low", "up", layer_num=2)
         high = _make_mha_spec("high", "down", layer_num=2)
         pages_per_side = 24
-        total = page_size * pages_per_side * (
-            low.entry_bytes() + high.entry_bytes()
-        )
+        total = page_size * pages_per_side * (low.entry_bytes() + high.entry_bytes())
         pool = UnifiedKVPool(
             total_bytes=total,
             sub_pool_specs=[low, high],
@@ -2509,9 +2497,7 @@ class TestPinAwareCompaction(unittest.TestCase):
         """
 
         if allocator.grow_direction == "up":
-            return set(
-                range(allocator.min_page_index, allocator.watermark_physical)
-            )
+            return set(range(allocator.min_page_index, allocator.watermark_physical))
         return set(range(allocator.watermark_physical + 1, allocator.num_pages))
 
     def _assert_consistent(
@@ -2541,9 +2527,7 @@ class TestPinAwareCompaction(unittest.TestCase):
         free_virtual = set(
             int(virtual) for virtual in allocator.free_virtual_ids.tolist()
         )
-        all_virtual = set(
-            range(allocator.min_page_index, allocator.num_pages)
-        )
+        all_virtual = set(range(allocator.min_page_index, allocator.num_pages))
         self.assertEqual(live_virtual | free_virtual, all_virtual)
         self.assertEqual(live_virtual & free_virtual, set())
 
@@ -2569,9 +2553,7 @@ class TestPinAwareCompaction(unittest.TestCase):
             self.assertEqual(tombstoned_physical, set())
 
         for virtual in live_virtual:
-            physical = int(
-                allocator.virtual_to_physical[virtual].item()
-            )
+            physical = int(allocator.virtual_to_physical[virtual].item())
             self.assertIn(physical, active_band)
             self.assertEqual(
                 int(allocator.physical_to_virtual[physical].item()),
@@ -2673,9 +2655,7 @@ class TestPinAwareCompaction(unittest.TestCase):
                                 replacement[::page_size]
                             ).tolist()
                         )
-                        self.assertTrue(
-                            replacement_pages <= retained_holes
-                        )
+                        self.assertTrue(replacement_pages <= retained_holes)
                         self.assertEqual(
                             allocator.watermark_physical,
                             watermark_before_reuse,
@@ -2837,9 +2817,7 @@ class TestPinAwareCompaction(unittest.TestCase):
                             for virtual in movable[::page_size].tolist()
                         )
                         movable_before = {
-                            virtual: int(
-                                allocator.virtual_to_physical[virtual].item()
-                            )
+                            virtual: int(allocator.virtual_to_physical[virtual].item())
                             for virtual in movable_virtual_pages
                         }
                         owner = object()
@@ -2859,9 +2837,7 @@ class TestPinAwareCompaction(unittest.TestCase):
                             pin_before.physical_pages,
                         )
                         movable_after = {
-                            virtual: int(
-                                allocator.virtual_to_physical[virtual].item()
-                            )
+                            virtual: int(allocator.virtual_to_physical[virtual].item())
                             for virtual in movable_virtual_pages
                         }
                         for virtual in movable_virtual_pages:
@@ -2880,17 +2856,16 @@ class TestPinAwareCompaction(unittest.TestCase):
                             expect_packed=False,
                         )
 
-                        retained_hole = int(
-                            allocator._free_phys_pages[0].item()
-                        )
+                        retained_hole = int(allocator._free_phys_pages[0].item())
                         allocator.release_allocation_pin(pin, owner)
                         watermark_before_reuse = allocator.watermark_physical
                         replacement = allocator.alloc(page_size)
                         self.assertIsNotNone(replacement)
                         self._stamp(allocator, kv, replacement)
-                        replacement_physical = int(
-                            allocator.translate_kv_loc(replacement[:1]).item()
-                        ) // page_size
+                        replacement_physical = (
+                            int(allocator.translate_kv_loc(replacement[:1]).item())
+                            // page_size
+                        )
                         self.assertEqual(replacement_physical, retained_hole)
                         self.assertEqual(
                             allocator.watermark_physical,

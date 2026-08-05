@@ -13,8 +13,8 @@ use crate::{
         model_card::ModelCard,
         steps::workflow_data::LocalWorkerWorkflowData,
         worker::{HealthConfig, RuntimeType, WorkerType},
-        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, PdProcessMetadata, PdProcessRole,
-        Worker, UNKNOWN_MODEL_ID,
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, HttpOrigin, PdProcessMetadata,
+        PdProcessRegistration, PdProcessRole, Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -46,18 +46,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
         let discovered_labels = &context.data.discovered_labels;
-
-        // Check if worker already exists
-        if app_context
-            .worker_registry
-            .get_by_url(&config.url)
-            .is_some()
-        {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("create_worker"),
-                message: format!("Worker {} already exists", config.url),
-            });
-        }
 
         // Build labels from config
         let mut config_labels = config.labels.clone();
@@ -99,17 +87,18 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Parse worker type
         let mut worker_type = parse_worker_type(config);
-        let pd_process = validate_pd_process_contract(
+        let pd_metadata = validate_pd_process_contract(
             &worker_type,
             connection_mode,
             config.api_key.as_deref(),
+            config.dp_aware,
             context.data.pd_process_advertisement.as_ref(),
         )
         .map_err(|message| WorkflowError::StepFailed {
             step_id: StepId::new("create_worker"),
             message,
         })?;
-        if let Some(metadata) = &pd_process {
+        if let Some(metadata) = &pd_metadata {
             if metadata.role() == PdProcessRole::Prefill {
                 worker_type = WorkerType::Prefill {
                     bootstrap_port: Some(
@@ -119,24 +108,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                             .port(),
                     ),
                 };
-            }
-            if config.dp_aware {
-                let discovered_dp_size = context
-                    .data
-                    .dp_info
-                    .as_ref()
-                    .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?
-                    .dp_size;
-                if discovered_dp_size != metadata.data_parallel_size() {
-                    return Err(WorkflowError::StepFailed {
-                        step_id: StepId::new("create_worker"),
-                        message: format!(
-                            "PD process advertised DP{} but worker discovery resolved DP{}",
-                            metadata.data_parallel_size(),
-                            discovered_dp_size
-                        ),
-                    });
-                }
             }
         }
 
@@ -159,6 +130,17 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
             );
         }
 
+        let pd_process = pd_metadata
+            .map(|metadata| {
+                HttpOrigin::parse(&normalized_url)
+                    .map(|origin| PdProcessRegistration::new(origin, metadata))
+            })
+            .transpose()
+            .map_err(|error| WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: error.to_string(),
+            })?;
+
         // Create workers - always output as Vec for unified downstream handling
         let workers = if config.dp_aware {
             create_dp_aware_workers(
@@ -172,7 +154,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
                 health_config,
                 config.api_key.as_deref(),
                 &final_labels,
-                pd_process.as_ref(),
             )?
         } else {
             create_single_worker(
@@ -283,6 +264,7 @@ fn validate_pd_process_contract(
     worker_type: &WorkerType,
     connection_mode: &ConnectionMode,
     api_key: Option<&str>,
+    dp_aware: bool,
     advertisement: Option<&crate::core::PdProcessAdvertisement>,
 ) -> Result<Option<PdProcessMetadata>, String> {
     let configured_role = match worker_type {
@@ -321,6 +303,12 @@ fn validate_pd_process_contract(
             configured_role,
             metadata.role()
         ));
+    }
+    if dp_aware {
+        return Err(
+            "PD worker registration is DP1-only and does not support dp_aware worker expansion"
+                .to_string(),
+        );
     }
     Ok(Some(metadata))
 }
@@ -394,7 +382,6 @@ fn create_dp_aware_workers(
     health_config: HealthConfig,
     api_key: Option<&str>,
     final_labels: &HashMap<String, String>,
-    pd_process: Option<&PdProcessMetadata>,
 ) -> Result<Vec<Arc<dyn Worker>>, WorkflowError> {
     let dp_info = data
         .dp_info
@@ -422,9 +409,6 @@ fn create_dp_aware_workers(
         }
         if !final_labels.is_empty() {
             builder = builder.labels(final_labels.clone());
-        }
-        if let Some(metadata) = pd_process {
-            builder = builder.pd_process(metadata.clone());
         }
 
         let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
@@ -455,17 +439,16 @@ fn create_single_worker(
     health_config: HealthConfig,
     api_key: Option<&str>,
     final_labels: &HashMap<String, String>,
-    pd_process: Option<&PdProcessMetadata>,
+    pd_process: Option<&PdProcessRegistration>,
 ) -> Vec<Arc<dyn Worker>> {
-    let health_check_disabled = health_config.disable_health_check;
-
     let mut builder = BasicWorkerBuilder::new(normalized_url.to_string())
         .model(model_card)
         .worker_type(worker_type)
         .connection_mode(connection_mode.clone())
         .runtime_type(runtime_type)
         .circuit_breaker_config(circuit_breaker_config)
-        .health_config(health_config);
+        .health_config(health_config)
+        .initially_healthy(false);
 
     if let Some(api_key) = api_key {
         builder = builder.api_key(api_key.to_string());
@@ -473,16 +456,11 @@ fn create_single_worker(
     if !final_labels.is_empty() {
         builder = builder.labels(final_labels.clone());
     }
-    if let Some(metadata) = pd_process {
-        builder = builder.pd_process(metadata.clone());
+    if let Some(registration) = pd_process {
+        builder = builder.pd_process(registration.clone());
     }
 
     let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-    if health_check_disabled {
-        worker.set_healthy(true);
-    } else {
-        worker.set_healthy(false);
-    }
 
     debug!(
         "Created worker object for {} ({:?}) with {} labels",
@@ -538,21 +516,24 @@ mod tests {
             &worker_type,
             &ConnectionMode::Http,
             Some("secret"),
-            None
+            false,
+            None,
         )
         .is_err());
         assert!(validate_pd_process_contract(
             &worker_type,
             &ConnectionMode::Http,
             None,
-            Some(&decode)
+            false,
+            Some(&decode),
         )
         .is_err());
         assert!(validate_pd_process_contract(
             &worker_type,
             &ConnectionMode::Grpc { port: Some(50051) },
             Some("secret"),
-            Some(&decode)
+            false,
+            Some(&decode),
         )
         .is_err());
     }
@@ -567,7 +548,8 @@ mod tests {
             },
             &ConnectionMode::Http,
             Some("secret"),
-            Some(&decode)
+            false,
+            Some(&decode),
         )
         .is_err());
     }
@@ -580,14 +562,48 @@ mod tests {
             &WorkerType::Regular,
             &ConnectionMode::Http,
             None,
-            Some(&decode)
+            false,
+            Some(&decode),
         )
         .is_err());
         assert_eq!(
-            validate_pd_process_contract(&WorkerType::Regular, &ConnectionMode::Http, None, None)
-                .unwrap(),
+            validate_pd_process_contract(
+                &WorkerType::Regular,
+                &ConnectionMode::Http,
+                None,
+                false,
+                None,
+            )
+            .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn pd_contract_rejects_dp_aware_worker_expansion() {
+        for (worker_type, role) in [
+            (
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "prefill",
+            ),
+            (WorkerType::Decode, "decode"),
+        ] {
+            let error = validate_pd_process_contract(
+                &worker_type,
+                &ConnectionMode::Http,
+                Some("secret"),
+                true,
+                Some(&advertisement(role)),
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error,
+                "PD worker registration is DP1-only and does not support dp_aware worker expansion"
+            );
+        }
     }
 
     #[test]
@@ -607,8 +623,12 @@ mod tests {
             None,
         )
         .unwrap();
+        let registration = PdProcessRegistration::new(
+            HttpOrigin::parse("http://DECODE.test:80/").unwrap(),
+            metadata.clone(),
+        );
         let workers = create_single_worker(
-            "http://decode.test:30000",
+            "http://ignored.test:30000",
             ModelCard::new("test-model"),
             WorkerType::Decode,
             &ConnectionMode::Http,
@@ -617,9 +637,13 @@ mod tests {
             HealthConfig::default(),
             None,
             &HashMap::new(),
-            Some(&metadata),
+            Some(&registration),
         );
 
-        assert_eq!(workers[0].metadata().pd_process.as_ref(), Some(&metadata));
+        assert_eq!(workers[0].url(), "http://decode.test");
+        assert_eq!(
+            workers[0].metadata().pd_process.as_ref(),
+            Some(&registration)
+        );
     }
 }

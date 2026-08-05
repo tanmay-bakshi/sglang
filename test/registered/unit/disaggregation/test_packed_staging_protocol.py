@@ -1,12 +1,18 @@
 import dataclasses
+import sys
 import weakref
 
 import msgspec
 import numpy as np
 import pytest
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
+    PACKED_REQUEST_DIGEST_BYTES,
+    PackedAuxiliaryDestinationSegment,
+    PackedAuxiliaryOutcome,
+    PackedAuxiliaryPlan,
     PackedChunkKey,
     PackedDecodeProtocol,
     PackedLayoutSpec,
@@ -14,6 +20,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedPrepare,
     PackedProtocolError,
     PackedProtocolState,
+    PackedRequestKey,
     PackedTopology,
     PackedTransportPath,
     PackedWriterCompletionMechanism,
@@ -39,6 +46,9 @@ from sglang.srt.disaggregation.common.staging_runtime import (
     StagingComponentBuffer,
     StagingComponentBufferRegistry,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MAIN_KV = StagingComponentId(state_index=None, state_type=None)
 SWA = StagingComponentId(state_index=0, state_type=StateType.SWA)
@@ -175,6 +185,36 @@ OUTCOME_TICKET_ISSUERS: weakref.WeakKeyDictionary[
     PackedDecodeProtocol,
     _PackedWriterOutcomeTicketIssuer,
 ] = weakref.WeakKeyDictionary()
+
+
+def auxiliary_plan() -> PackedAuxiliaryPlan:
+    """Build one exact plan with intentionally non-address-sorted segments.
+
+    :returns: Deterministic decoder-authored auxiliary plan.
+    """
+
+    return PackedAuxiliaryPlan(
+        key=PackedRequestKey.from_chunk_key(KEY),
+        request_slot_generation=73,
+        metadata_buffer_index=11,
+        metadata_slot_generation=bytes.fromhex("ffeeddccbbaa99887766554433221100"),
+        destination_segments=(
+            PackedAuxiliaryDestinationSegment(
+                address=0xA01000,
+                item_length=64,
+            ),
+            PackedAuxiliaryDestinationSegment(
+                address=0xA00000,
+                item_length=128,
+            ),
+        ),
+        canonical_writer_id=WRITERS[0],
+        destination_process_generation=bytes.fromhex(
+            "102132435465768798a9bacbdcedfe0f"
+        ),
+        native_route_digest=bytes(range(PACKED_REQUEST_DIGEST_BYTES)),
+        runtime_cohort_digest=bytes(reversed(range(PACKED_REQUEST_DIGEST_BYTES))),
+    )
 
 
 def geometry(
@@ -434,9 +474,9 @@ def visibility_evidence(
         completion_mechanism=selected_mechanism,
         writer_action=writer_action,
         native_handle_generation=1 if native_completion else None,
-        native_descriptor_digest=bytes.fromhex("11" * 32)
-        if native_completion
-        else None,
+        native_descriptor_digest=(
+            bytes.fromhex("11" * 32) if native_completion else None
+        ),
         native_evidence_digest=bytes.fromhex("22" * 32) if native_completion else None,
     )
 
@@ -1208,6 +1248,71 @@ def test_received_geometry_must_match_decode_registration() -> None:
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
 
 
+def test_auxiliary_plan_and_outcome_wire_round_trip_are_exact() -> None:
+    """Wire v6 preserves plan order, generations, and terminal evidence."""
+
+    plan = auxiliary_plan()
+    outcome = PackedAuxiliaryOutcome(
+        plan=plan,
+        writer_id=plan.canonical_writer_id,
+        native_dram_handle_generation=47,
+        descriptor_digest=bytes.fromhex("31" * PACKED_REQUEST_DIGEST_BYTES),
+        evidence_digest=bytes.fromhex("42" * PACKED_REQUEST_DIGEST_BYTES),
+    )
+
+    for message in (plan, outcome):
+        payload = encode_packed_message(message)
+        decoded = decode_packed_message(payload)
+        assert decoded == message
+        assert encode_packed_message(decoded) == payload
+    decoded_plan = decode_packed_message(encode_packed_message(plan))
+    assert isinstance(decoded_plan, PackedAuxiliaryPlan)
+    assert decoded_plan.metadata_slot_generation == plan.metadata_slot_generation
+    assert decoded_plan.destination_segments == plan.destination_segments
+
+
+def test_auxiliary_plan_rejects_duplicate_overlap_and_noncanonical_writer() -> None:
+    """Metadata destinations and their sole source writer are unambiguous."""
+
+    plan = auxiliary_plan()
+    segment = plan.destination_segments[0]
+    with pytest.raises(ValueError, match="duplicate"):
+        dataclasses.replace(
+            plan,
+            destination_segments=(segment, segment),
+        )
+    with pytest.raises(ValueError, match="overlapping"):
+        dataclasses.replace(
+            plan,
+            destination_segments=(
+                segment,
+                PackedAuxiliaryDestinationSegment(
+                    address=segment.address + 1,
+                    item_length=segment.item_length,
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="TP0/PP0/CP0"):
+        dataclasses.replace(plan, canonical_writer_id=WRITERS[1])
+    with pytest.raises(ValueError, match="canonical writer"):
+        PackedAuxiliaryOutcome(
+            plan=plan,
+            writer_id=WRITERS[1],
+            native_dram_handle_generation=47,
+            descriptor_digest=bytes.fromhex("31" * PACKED_REQUEST_DIGEST_BYTES),
+            evidence_digest=bytes.fromhex("42" * PACKED_REQUEST_DIGEST_BYTES),
+        )
+
+
+def test_auxiliary_wire_rejects_nested_schema_drift() -> None:
+    """The closed auxiliary envelope rejects unknown nested plan fields."""
+
+    envelope = msgspec.msgpack.decode(encode_packed_message(auxiliary_plan()))
+    envelope["plan"]["unexpected"] = 1
+    with pytest.raises(PackedWireError, match="invalid packed wire"):
+        decode_packed_message(msgspec.msgpack.encode(envelope))
+
+
 @pytest.mark.parametrize(
     "component_ids",
     [
@@ -1406,3 +1511,7 @@ def test_wire_rejects_invalid_domain_values_and_frame_bounds() -> None:
         decode_packed_message(b"")
     with pytest.raises(PackedWireError, match="exceeds"):
         decode_packed_message(b"x" * (MAX_PACKED_WIRE_BYTES + 1))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

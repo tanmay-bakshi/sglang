@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from multiprocessing import resource_tracker
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +91,7 @@ def _create_numactl_executable(
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     quoted_executable = shlex.quote(old_executable)
     script = f'''#!/bin/sh
+/bin/rm -f -- "$0"
 exec numactl {numactl_args} {quoted_executable} "$@"'''
     file_descriptor, temporary_path = tempfile.mkstemp(
         prefix="sglang-numactl-",
@@ -97,13 +99,16 @@ exec numactl {numactl_args} {quoted_executable} "$@"'''
         dir=tempfile.gettempdir(),
     )
     path = Path(temporary_path)
+    child_owns_cleanup = False
     try:
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
             stream.write(script)
         path.chmod(0o700)
         yield str(path), f"{script=}"
+        child_owns_cleanup = True
     finally:
-        path.unlink(missing_ok=True)
+        if not child_owns_cleanup:
+            path.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -111,6 +116,7 @@ def _mp_set_executable(executable: str, debug_str: str):
     start_method = multiprocessing.get_start_method()
     assert start_method == "spawn", f"{start_method=}"
 
+    resource_tracker.ensure_running()
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
     logger.debug(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")

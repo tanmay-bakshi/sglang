@@ -1,9 +1,11 @@
 import dataclasses
+import sys
 from types import SimpleNamespace
 from typing import Never
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
     DecodeAllocationLeaseAuthority,
@@ -80,9 +82,7 @@ def _fixture(
     queue.tp_size = 1
     queue.scheduler = SimpleNamespace(
         sliding_window_size=sliding_window_size,
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="gemma4")
-        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="gemma4")),
     )
     queue.allocation_lease_authority = DecodeAllocationLeaseAuthority()
     return _IssuanceFixture(
@@ -395,3 +395,7 @@ def test_failure_after_publication_boundary_retains_prepared_lease(
         allocator.free(indices)
     with pytest.raises(AllocationPinnedError):
         fixture.request_pool.free(fixture.request)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -19,6 +19,7 @@ import abc
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.mem_cache.allocation_pin import (
     AllocationPin,
     AllocationPinRegistry,
@@ -176,9 +177,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             raise ValueError("allocation pin indices must be one-dimensional")
         if indices.numel() == 0:
             raise ValueError("allocation pin indices must not be empty")
-        pages = torch.unique(
-            indices.detach().to(dtype=torch.int64) // self.page_size
-        )
+        pages = torch.unique(indices.detach().to(dtype=torch.int64) // self.page_size)
         page_ids = tuple(sorted(int(page_id) for page_id in pages.cpu().tolist()))
         if page_ids[0] <= 0:
             raise ValueError("allocation pin indices include reserved page zero")

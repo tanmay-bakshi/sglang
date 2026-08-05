@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -27,12 +28,14 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from array import array
 from collections import deque
+from collections.abc import Mapping
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -46,6 +49,14 @@ from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.decode_reservations import (
+    DecodeInferenceAttachmentRegistry,
+    DecodeReservationAttempt,
+    DecodeReservationConflictError,
+    DecodeReservationNotFoundError,
+    DecodeReservationOperation,
+    DecodeReservationValidationError,
+)
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -65,6 +76,13 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DecodeInferenceAttachReqInput,
+    DecodeReservationBindReqInput,
+    DecodeReservationCancelUnboundReqInput,
+    DecodeReservationControlReqOutput,
+    DecodeReservationExpiryReqOutput,
+    DecodeReservationPrepareReqInput,
+    DecodeReservationTransitionReqInput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FreezeGCReq,
@@ -145,6 +163,22 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+class DecodeReservationSchedulerError(RuntimeError):
+    """Authoritative scheduler control failure returned over IPC."""
+
+    error_type: str
+
+    def __init__(self, error_type: str, message: str) -> None:
+        """Initialize a scheduler control error.
+
+        :param error_type: Scheduler exception type name.
+        :param message: Redacted scheduler diagnostic.
+        """
+
+        super().__init__(message)
+        self.error_type = error_type
 
 
 @lru_cache(maxsize=1)
@@ -499,6 +533,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.decode_control_futures: dict[
+            str,
+            tuple[str, asyncio.Future[dict[str, object]]],
+        ] = {}
+        self.decode_reserve_tasks: dict[
+            uuid.UUID,
+            tuple[bytes, asyncio.Task[dict[str, object]]],
+        ] = {}
+        self.decode_reserve_refusals: dict[
+            uuid.UUID,
+            tuple[bytes, dict[str, object]],
+        ] = {}
+        self.decode_reserve_lock = asyncio.Lock()
+        self.decode_bound_inference_bodies: dict[
+            tuple[str, bytes],
+            uuid.UUID,
+        ] = {}
+        self.decode_consumed_inference_bodies: set[tuple[str, bytes]] = set()
+        self.decode_grant_inference_bodies: dict[
+            uuid.UUID,
+            tuple[str, bytes],
+        ] = {}
+        self.decode_pending_expiry_grants: set[uuid.UUID] = set()
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -579,6 +636,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
+        self.decode_inference_attachments = DecodeInferenceAttachmentRegistry()
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
@@ -674,6 +732,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    DecodeReservationControlReqOutput,
+                    self._handle_decode_reservation_control_output,
+                ),
+                (
+                    DecodeReservationExpiryReqOutput,
+                    self._handle_decode_reservation_expiry_output,
+                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -688,20 +754,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.decode_reservation_grant_id is not None
+        ):
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+            async for response in self._wait_decode_attached_request(obj, request):
+                yield response
+            return
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
 
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
+        self._validate_routed_dp_rank(obj)
 
         self._init_req_state(obj, request)
         try:
@@ -739,6 +805,584 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
+
+    def _validate_routed_dp_rank(
+        self,
+        obj: GenerateReqInput | EmbeddingReqInput,
+    ) -> None:
+        if not isinstance(obj, GenerateReqInput) or obj.routed_dp_rank is None:
+            return
+        dp_size = self.elastic_worker_count
+        if dp_size <= 1 and obj.routed_dp_rank == 0:
+            logger.debug(
+                "routed_dp_rank=%s is ignored because dp_size=%s",
+                obj.routed_dp_rank,
+                dp_size,
+            )
+            return
+        if obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            raise ValueError(
+                f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+            )
+
+    async def reserve_decode_reservation(
+        self,
+        *,
+        attempt: DecodeReservationAttempt,
+        attempt_wire: Mapping[str, object],
+        obj: GenerateReqInput,
+    ) -> dict[str, object]:
+        """Prepare one exact request cohort without publishing inference work.
+
+        :param attempt: Authenticated reserve attempt.
+        :param attempt_wire: Exact JSON-native scheduler transcript.
+        :param obj: Route-normalized request carrying the gateway child IDs.
+        :returns: Authoritative prepared response or refusal receipt.
+        """
+
+        self.auto_create_handle_loop()
+        refusal = self.decode_reserve_refusals.get(attempt.reservation_attempt_id)
+        if refusal is not None:
+            refusal_digest, response = refusal
+            if refusal_digest != attempt.reserve_attempt_digest:
+                raise DecodeReservationConflictError(
+                    "reserve attempt ID was reused with another digest"
+                )
+            return copy.deepcopy(response)
+        retained = self.decode_inference_attachments.find_reserve_attempt(
+            attempt.reservation_attempt_id,
+            attempt.reserve_attempt_digest,
+        )
+        if retained is not None:
+            response = self.decode_inference_attachments.retained_reserve_response(
+                retained.grant_id
+            )
+            if response is None:
+                raise DecodeReservationConflictError(
+                    "reserve attempt has no published response"
+                )
+            return response
+
+        async with self.decode_reserve_lock:
+            pending = self.decode_reserve_tasks.get(attempt.reservation_attempt_id)
+            if pending is not None:
+                pending_digest, task = pending
+                if pending_digest != attempt.reserve_attempt_digest:
+                    raise DecodeReservationConflictError(
+                        "reserve attempt ID was reused with another digest"
+                    )
+            else:
+                task = asyncio.create_task(
+                    self._prepare_decode_reservation(
+                        attempt=attempt,
+                        attempt_wire=dict(attempt_wire),
+                        obj=obj,
+                    )
+                )
+                self.decode_reserve_tasks[attempt.reservation_attempt_id] = (
+                    attempt.reserve_attempt_digest,
+                    task,
+                )
+                task.add_done_callback(
+                    partial(
+                        self._handle_decode_reserve_task_done,
+                        attempt.reservation_attempt_id,
+                    )
+                )
+
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self.decode_reserve_lock:
+                    current = self.decode_reserve_tasks.get(
+                        attempt.reservation_attempt_id
+                    )
+                    if current is not None and current[1] is task:
+                        del self.decode_reserve_tasks[attempt.reservation_attempt_id]
+
+    def _handle_decode_reserve_task_done(
+        self,
+        reservation_attempt_id: uuid.UUID,
+        task: asyncio.Task[dict[str, object]],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        current = self.decode_reserve_tasks.get(reservation_attempt_id)
+        if current is not None and current[1] is task:
+            del self.decode_reserve_tasks[reservation_attempt_id]
+
+    async def _prepare_decode_reservation(
+        self,
+        *,
+        attempt: DecodeReservationAttempt,
+        attempt_wire: dict[str, object],
+        obj: GenerateReqInput,
+    ) -> dict[str, object]:
+        grant_id = uuid.uuid4()
+        preserve_request_states = False
+        try:
+            tokenized_requests = await self._tokenize_decode_reservation_request(
+                attempt,
+                obj,
+            )
+            correlation_id = uuid.uuid4().hex
+            request = DecodeReservationPrepareReqInput(
+                correlation_id=correlation_id,
+                grant_id=str(grant_id),
+                attempt=copy.deepcopy(attempt_wire),
+                tokenized_requests=tokenized_requests,
+            )
+            response = await self._request_decode_control("reserve", request)
+            state = response.get("state")
+            if state == "refused":
+                self.decode_reserve_refusals[attempt.reservation_attempt_id] = (
+                    attempt.reserve_attempt_digest,
+                    copy.deepcopy(response),
+                )
+                return response
+            if state != "prepared":
+                raise DecodeReservationSchedulerError(
+                    "DecodeReservationProtocolError",
+                    "reserve returned neither prepared nor refused",
+                )
+            if response.get("grant_id") != str(grant_id):
+                raise DecodeReservationSchedulerError(
+                    "DecodeReservationProtocolError",
+                    "reserve response changed the grant identity",
+                )
+            self.decode_inference_attachments.register(
+                grant_id=grant_id,
+                reservation_attempt_id=attempt.reservation_attempt_id,
+                reserve_attempt_digest=attempt.reserve_attempt_digest,
+                inference_route=attempt.inference_route,
+                child_request_ids=attempt.child_request_ids,
+                opaque_request=obj,
+            )
+            if grant_id in self.decode_pending_expiry_grants:
+                self._terminalize_decode_attachment(grant_id)
+                self.decode_pending_expiry_grants.remove(grant_id)
+                raise DecodeReservationConflictError(
+                    "decoder reservation expired before local publication"
+                )
+            published = self.decode_inference_attachments.publish_reserve_response(
+                grant_id,
+                response,
+            )
+            preserve_request_states = True
+            return published
+        finally:
+            if not preserve_request_states:
+                self._discard_pending_req_states(obj)
+
+    async def _tokenize_decode_reservation_request(
+        self,
+        attempt: DecodeReservationAttempt,
+        obj: GenerateReqInput,
+    ) -> tuple[TokenizedGenerateReqInput, ...]:
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        self._validate_routed_dp_rank(obj)
+        self._validate_decode_reservation_request_identity(attempt, obj)
+        self._init_req_state(obj)
+
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+        async with self.model_update_lock.reader_lock:
+            await self._validate_and_resolve_lora(obj)
+            if obj.is_single:
+                tokenized_requests = (await self._tokenize_one_request(obj),)
+            elif self._should_use_batch_tokenization(obj.batch_size, obj):
+                tokenized_requests = tuple(
+                    await self._batch_tokenize_and_process(obj.batch_size, obj)
+                )
+            else:
+                tokenized_requests = tuple(
+                    [
+                        await self._tokenize_one_request(obj[index])
+                        for index in range(obj.batch_size)
+                    ]
+                )
+
+        for tokenized_request in tokenized_requests:
+            if not isinstance(tokenized_request, TokenizedGenerateReqInput):
+                raise RuntimeError(
+                    "decoder reservation produced a non-generation request"
+                )
+            state = self.rid_to_state[tokenized_request.rid]
+            if state.obj.return_prompt_token_ids:
+                state.prompt_token_ids = list(tokenized_request.input_ids)
+            if self.tokenizer_ipc_name is not None:
+                tokenized_request.http_worker_ipc = self.tokenizer_ipc_name
+            tokenized_request = wrap_shm_features(tokenized_request)
+            tokenized_request.wrap_pickle_fields()
+
+        return tokenized_requests
+
+    @staticmethod
+    def _validate_decode_reservation_request_identity(
+        attempt: DecodeReservationAttempt,
+        obj: GenerateReqInput,
+    ) -> None:
+        is_scalar = obj.is_single
+        if is_scalar != (attempt.request_shape == "scalar"):
+            raise DecodeReservationValidationError(
+                "normalized request shape differs from reserve transcript"
+            )
+        rid_values = (obj.rid,) if is_scalar else tuple(obj.rid)
+        if any(type(value) is not str for value in rid_values):
+            raise DecodeReservationValidationError(
+                "reserved request IDs must be UUID strings"
+            )
+        try:
+            request_ids = tuple(uuid.UUID(value) for value in rid_values)
+        except ValueError as error:
+            raise DecodeReservationValidationError(
+                "reserved request IDs must be canonical UUIDs"
+            ) from error
+        if request_ids != attempt.child_request_ids:
+            raise DecodeReservationValidationError(
+                "normalized request IDs differ from reserve child IDs"
+            )
+        if getattr(obj, "parallel_sample_num", 1) != 1:
+            raise DecodeReservationValidationError(
+                "decoder reservations do not support parallel sampling"
+            )
+
+    async def bind_decode_reservation(
+        self,
+        grant_id: uuid.UUID,
+        authorization_header: str | None,
+        request_body: bytes,
+    ) -> dict[str, object]:
+        """Bind exact final inference bytes locally and in the scheduler.
+
+        :param grant_id: Exact prepared grant.
+        :param authorization_header: Grant bearer header.
+        :param request_body: Exact final inference body.
+        :returns: Authoritative bind receipt.
+        """
+
+        snapshot = self.decode_inference_attachments.authenticate(
+            grant_id,
+            authorization_header,
+        )
+        owned_body = bytes(request_body)
+        body_key = self._decode_inference_body_key(
+            snapshot.inference_route,
+            owned_body,
+        )
+        existing = self.decode_bound_inference_bodies.get(body_key)
+        if existing is not None and existing != grant_id:
+            raise DecodeReservationConflictError(
+                "another grant owns the same inference route and body"
+            )
+        self.decode_inference_attachments.bind(grant_id, owned_body)
+        self.decode_bound_inference_bodies[body_key] = grant_id
+        self.decode_grant_inference_bodies[grant_id] = body_key
+        return await self._request_decode_control(
+            "bind",
+            DecodeReservationBindReqInput(
+                correlation_id=uuid.uuid4().hex,
+                grant_id=str(grant_id),
+                request_body=owned_body,
+            ),
+        )
+
+    async def transition_decode_reservation(
+        self,
+        grant_id: uuid.UUID,
+        authorization_header: str | None,
+        operation: DecodeReservationOperation,
+        transcript: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Apply one authenticated bound reservation transition.
+
+        :param grant_id: Exact grant identity.
+        :param authorization_header: Grant bearer header.
+        :param operation: Closed lifecycle operation.
+        :param transcript: Exact JSON-native control transcript.
+        :returns: Authoritative scheduler receipt.
+        """
+
+        if operation not in (
+            DecodeReservationOperation.PROMOTE,
+            DecodeReservationOperation.CANCEL,
+            DecodeReservationOperation.COMPLETE,
+            DecodeReservationOperation.ABORT,
+            DecodeReservationOperation.QUARANTINE,
+        ):
+            raise DecodeReservationValidationError(
+                "unsupported bound reservation transition"
+            )
+        self.decode_inference_attachments.authenticate(
+            grant_id,
+            authorization_header,
+        )
+        response = await self._request_decode_control(
+            operation.value,
+            DecodeReservationTransitionReqInput(
+                correlation_id=uuid.uuid4().hex,
+                grant_id=str(grant_id),
+                operation=operation.value,
+                transcript=copy.deepcopy(dict(transcript)),
+            ),
+        )
+        if operation is DecodeReservationOperation.PROMOTE:
+            self.decode_inference_attachments.promote(grant_id)
+            return response
+        self._terminalize_decode_attachment(grant_id)
+        return response
+
+    async def cancel_unbound_decode_reservation(
+        self,
+        grant_id: uuid.UUID,
+        authorization_header: str | None,
+        transcript: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Cancel one authenticated unbound reservation.
+
+        :param grant_id: Exact grant identity.
+        :param authorization_header: Grant bearer header.
+        :param transcript: Exact unbound cancellation transcript.
+        :returns: Authoritative cancellation receipt.
+        """
+
+        self.decode_inference_attachments.authenticate(
+            grant_id,
+            authorization_header,
+        )
+        response = await self._request_decode_control(
+            "cancel_unbound",
+            DecodeReservationCancelUnboundReqInput(
+                correlation_id=uuid.uuid4().hex,
+                grant_id=str(grant_id),
+                transcript=copy.deepcopy(dict(transcript)),
+            ),
+        )
+        self._terminalize_decode_attachment(grant_id)
+        return response
+
+    async def attach_decode_inference(
+        self,
+        inference_route: str,
+        request_body: bytes,
+    ) -> GenerateReqInput | None:
+        """Claim one exact promoted inference request without retokenization.
+
+        :param inference_route: Actual normal inference route.
+        :param request_body: Actual raw HTTP body bytes.
+        :returns: Retained normalized request, or None when it is non-PD.
+        """
+
+        owned_body = bytes(request_body)
+        body_key = self._decode_inference_body_key(inference_route, owned_body)
+        grant_id = self.decode_bound_inference_bodies.get(body_key)
+        if body_key in self.decode_consumed_inference_bodies:
+            raise DecodeReservationConflictError(
+                "reserved inference route and body were already consumed"
+            )
+        snapshot = self.decode_inference_attachments.consume(
+            inference_route,
+            owned_body,
+        )
+        if snapshot is None:
+            if grant_id is not None:
+                raise DecodeReservationConflictError(
+                    "reserved inference request is not promoted"
+                )
+            return None
+        if grant_id is not None and snapshot.grant_id != grant_id:
+            raise RuntimeError("inference body ownership index is inconsistent")
+        self.decode_bound_inference_bodies[body_key] = snapshot.grant_id
+        self.decode_grant_inference_bodies[snapshot.grant_id] = body_key
+        self.decode_consumed_inference_bodies.add(body_key)
+        scheduler_attached = False
+        try:
+            await self._request_decode_control(
+                "inference_attach",
+                DecodeInferenceAttachReqInput(
+                    correlation_id=uuid.uuid4().hex,
+                    grant_id=str(snapshot.grant_id),
+                    inference_route=inference_route,
+                    request_body=owned_body,
+                ),
+            )
+            scheduler_attached = True
+        finally:
+            if not scheduler_attached:
+                self._terminalize_decode_attachment(snapshot.grant_id)
+        if not isinstance(snapshot.opaque_request, GenerateReqInput):
+            raise RuntimeError(
+                "decoder inference attachment lost its generation request"
+            )
+        snapshot.opaque_request.decode_reservation_grant_id = str(snapshot.grant_id)
+        return snapshot.opaque_request
+
+    async def _request_decode_control(
+        self,
+        operation: str,
+        request: (
+            DecodeReservationPrepareReqInput
+            | DecodeReservationBindReqInput
+            | DecodeReservationTransitionReqInput
+            | DecodeReservationCancelUnboundReqInput
+            | DecodeInferenceAttachReqInput
+        ),
+    ) -> dict[str, object]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, object]] = loop.create_future()
+        if request.correlation_id in self.decode_control_futures:
+            raise RuntimeError("duplicate decoder control correlation identity")
+        self.decode_control_futures[request.correlation_id] = (operation, future)
+        try:
+            await self._async_dispatch_to_scheduler(request)
+            return await future
+        finally:
+            self.decode_control_futures.pop(request.correlation_id, None)
+
+    def _handle_decode_reservation_control_output(
+        self,
+        output: DecodeReservationControlReqOutput,
+    ) -> None:
+        pending = self.decode_control_futures.get(output.correlation_id)
+        if pending is None:
+            logger.warning(
+                "Decoder control response arrived after waiter cleanup: %s",
+                output.correlation_id,
+            )
+            return
+        expected_operation, future = pending
+        if future.done():
+            return
+        if output.operation != expected_operation:
+            future.set_exception(
+                DecodeReservationSchedulerError(
+                    "DecodeReservationProtocolError",
+                    "scheduler control response changed the operation",
+                )
+            )
+            return
+        if output.success:
+            if output.response is None:
+                future.set_exception(
+                    DecodeReservationSchedulerError(
+                        "DecodeReservationProtocolError",
+                        "scheduler control response omitted its result",
+                    )
+                )
+                return
+            future.set_result(output.response)
+            return
+        future.set_exception(
+            DecodeReservationSchedulerError(
+                output.error_type or "DecodeReservationSchedulerError",
+                output.error_message or "decoder scheduler control failed",
+            )
+        )
+
+    def _handle_decode_reservation_expiry_output(
+        self,
+        output: DecodeReservationExpiryReqOutput,
+    ) -> None:
+        grant_ids: tuple[str, ...] = (
+            output.cancelled_grant_ids + output.quarantined_grant_ids
+        )
+        for grant_id in grant_ids:
+            parsed_grant_id: uuid.UUID = uuid.UUID(grant_id)
+            try:
+                self._terminalize_decode_attachment(parsed_grant_id)
+            except DecodeReservationNotFoundError:
+                self.decode_pending_expiry_grants.add(parsed_grant_id)
+
+    async def _wait_decode_attached_request(
+        self,
+        obj: GenerateReqInput,
+        request: fastapi.Request | None,
+    ):
+        if obj.is_single:
+            async for response in self._wait_one_response(
+                obj,
+                request,
+                reservation_controlled=True,
+            ):
+                yield response
+            return
+
+        generators = []
+        rids = []
+        for rid in obj.rid:
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                raise DecodeReservationConflictError(
+                    "reserved inference request state is no longer available"
+                )
+            generators.append(
+                self._wait_one_response(
+                    state.obj,
+                    request,
+                    reservation_controlled=True,
+                )
+            )
+            rids.append(rid)
+
+        if not obj.stream:
+            outputs = await asyncio.gather(
+                *(generator.__anext__() for generator in generators)
+            )
+            yield outputs
+            return
+
+        rid_to_index = {rid: index for index, rid in enumerate(rids)}
+        task_map = {
+            asyncio.create_task(generator.__anext__()): generator
+            for generator in generators
+        }
+        while len(task_map) > 0:
+            done, _ = await asyncio.wait(
+                task_map.keys(),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                generator = task_map.pop(task)
+                try:
+                    result = task.result()
+                except StopAsyncIteration:
+                    continue
+                result["index"] = rid_to_index[result["meta_info"]["id"]]
+                yield result
+                task_map[asyncio.create_task(generator.__anext__())] = generator
+
+    def _terminalize_decode_attachment(
+        self,
+        grant_id: uuid.UUID,
+    ) -> None:
+        body_key: tuple[str, bytes] | None = self.decode_grant_inference_bodies.get(
+            grant_id
+        )
+        if body_key is not None:
+            indexed_grant = self.decode_bound_inference_bodies.get(body_key)
+            if indexed_grant is not None and indexed_grant != grant_id:
+                raise RuntimeError("decoder inference body ownership is inconsistent")
+
+        snapshot = self.decode_inference_attachments.terminalize(grant_id)
+        if body_key is not None:
+            self.decode_grant_inference_bodies.pop(grant_id)
+            self.decode_bound_inference_bodies.pop(body_key, None)
+            self.decode_consumed_inference_bodies.add(body_key)
+        if snapshot.opaque_request is None:
+            return
+        if not isinstance(snapshot.opaque_request, GenerateReqInput):
+            raise RuntimeError("decoder attachment lost its generation request")
+        self._discard_pending_req_states(snapshot.opaque_request)
+
+    @staticmethod
+    def _decode_inference_body_key(
+        inference_route: str,
+        request_body: bytes,
+    ) -> tuple[str, bytes]:
+        return inference_route, hashlib.sha256(request_body).digest()
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1560,6 +2204,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
+        *,
+        reservation_controlled: bool = False,
     ):
         """Wait for the response of one request."""
         state = self.rid_to_state[obj.rid]
@@ -1574,6 +2220,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
+                    and not reservation_controlled
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
@@ -1655,6 +2302,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
+                    and not reservation_controlled
                     and await request.is_disconnected()
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
@@ -1920,6 +2568,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
+        if obj.decode_reservation_grant_id is not None:
+            return BackgroundTasks()
+
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)

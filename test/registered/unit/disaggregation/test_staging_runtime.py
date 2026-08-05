@@ -1,4 +1,5 @@
 import dataclasses
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +24,9 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 MAIN_KV = StagingComponentId(state_index=None, state_type=None)
 SWA = StagingComponentId(state_index=0, state_type=StateType.SWA)
@@ -577,3 +581,7 @@ def test_swa_state_registration_propagates_global_layer_ids() -> None:
 
     assert kv_args.state_types == [StateType.SWA]
     assert kv_args.state_layer_ids == [[0, 2, 0, 2]]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

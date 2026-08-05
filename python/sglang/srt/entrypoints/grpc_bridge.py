@@ -385,9 +385,10 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        result: dict[str, Any] = dataclasses.asdict(self.server_args)
         result.update(self.scheduler_info)
-        return json.dumps(msgspec_to_builtins(result), default=str)
+        public_result = self.server_args.public_server_args_dict(result)
+        return json.dumps(msgspec_to_builtins(public_result), default=str)
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus

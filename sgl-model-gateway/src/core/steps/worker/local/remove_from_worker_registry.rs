@@ -34,19 +34,19 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
             worker_urls.len()
         );
 
-        // Collect unique worker configurations before removal for pool size updates
-        let unique_configs: HashSet<_> = worker_urls
-            .iter()
-            .filter_map(|url| app_context.worker_registry.get_by_url(url))
-            .map(|w| {
-                let meta = w.metadata();
-                (
-                    meta.worker_type.clone(),
-                    meta.connection_mode.clone(),
-                    w.model_id().to_string(),
-                )
-            })
-            .collect();
+        let mut unique_configs = HashSet::new();
+        for worker_url in worker_urls {
+            if let Some(worker) = app_context.worker_registry.get_by_url(worker_url) {
+                let metadata = worker.metadata();
+                for model_id in worker.model_ids() {
+                    unique_configs.insert((
+                        metadata.worker_type.clone(),
+                        metadata.connection_mode.clone(),
+                        model_id.to_string(),
+                    ));
+                }
+            }
+        }
 
         let mut removed_count = 0;
         for worker_url in worker_urls.iter() {

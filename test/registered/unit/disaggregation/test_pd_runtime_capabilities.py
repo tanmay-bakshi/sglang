@@ -1,6 +1,8 @@
 import dataclasses
+import sys
 
 import pytest
+
 from sglang.srt.disaggregation.runtime_capabilities import (
     PD_RUNTIME_CAPABILITIES_FIELD,
     PdProcessRuntimeCapabilities,
@@ -90,3 +92,7 @@ def test_scheduler_ranks_must_agree() -> None:
     }
     with pytest.raises(RuntimeError, match="disagree"):
         validate_scheduler_runtime_capabilities(scheduler_infos)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

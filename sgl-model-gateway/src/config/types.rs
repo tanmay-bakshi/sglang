@@ -13,7 +13,7 @@ pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
 /// Main router configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
@@ -26,6 +26,7 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -99,6 +100,49 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+}
+
+impl std::fmt::Debug for RouterConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RouterConfig")
+            .field("mode", &self.mode)
+            .field("connection_mode", &self.connection_mode)
+            .field("policy", &self.policy)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("max_payload_size", &self.max_payload_size)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field(
+                "worker_startup_timeout_secs",
+                &self.worker_startup_timeout_secs,
+            )
+            .field("dp_aware", &self.dp_aware)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("discovery", &self.discovery)
+            .field("metrics", &self.metrics)
+            .field("trace_config", &self.trace_config)
+            .field("log_dir", &self.log_dir)
+            .field("log_level", &self.log_level)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("retry", &self.retry)
+            .field("circuit_breaker", &self.circuit_breaker)
+            .field("health_check", &self.health_check)
+            .field("enable_igw", &self.enable_igw)
+            .field("model_path", &self.model_path)
+            .field("tokenizer_path", &self.tokenizer_path)
+            .field("history_backend", &self.history_backend)
+            .field("oracle_configured", &self.oracle.is_some())
+            .field("postgres_configured", &self.postgres.is_some())
+            .field("redis_configured", &self.redis.is_some())
+            .field("server_cert_configured", &self.server_cert.is_some())
+            .field("server_key_configured", &self.server_key.is_some())
+            .field(
+                "client_identity_configured",
+                &self.client_identity.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// Tokenizer cache configuration
@@ -703,6 +747,32 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_router_config_redacts_api_key_from_debug_and_serialization() {
+        const SECRET: &str = "router-api-key-that-must-not-leak";
+
+        let config = RouterConfig {
+            api_key: Some(SECRET.to_string()),
+            ..RouterConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(debug.contains("api_key_configured: true"));
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains(SECRET));
+        assert!(!serialized.contains("\"api_key\""));
+
+        let mut input = serde_json::to_value(RouterConfig::default()).unwrap();
+        input
+            .as_object_mut()
+            .unwrap()
+            .insert("api_key".to_string(), SECRET.into());
+        let deserialized: RouterConfig = serde_json::from_value(input).unwrap();
+        assert_eq!(deserialized.api_key.as_deref(), Some(SECRET));
     }
 
     #[test]

@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -56,6 +57,16 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
+)
+from sglang.srt.disaggregation.decode_reservation_allocator import (
+    DecodePreallocQueueReservationAllocator,
+)
+from sglang.srt.disaggregation.decode_reservation_scheduler import (
+    DecodeReservationSchedulerControl,
+    DecodeReservationUnavailableControl,
+)
+from sglang.srt.disaggregation.decode_reservation_service import (
+    DecodeReservationSchedulerService,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
@@ -103,6 +114,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DecodeInferenceAttachReqInput,
+    DecodeReservationBindReqInput,
+    DecodeReservationCancelUnboundReqInput,
+    DecodeReservationPrepareReqInput,
+    DecodeReservationTransitionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -574,6 +590,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_decode_reservation_control()
         self.init_pd_runtime_capabilities()
 
         # Init overlap schedule
@@ -1311,6 +1328,36 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def init_decode_reservation_control(self) -> None:
+        """Initialize prepared-grant control for one-GPU decode replicas."""
+
+        self.decode_reservation_control: DecodeReservationSchedulerControl | None = None
+        self.decode_reservation_request_control = DecodeReservationUnavailableControl()
+        if self.disaggregation_mode is not DisaggregationMode.DECODE:
+            return
+        if (
+            self.ps.tp_size != 1
+            or self.ps.pp_size != 1
+            or self.server_args.dp_size != 1
+        ):
+            return
+        if self.disagg_decode_prealloc_queue is None:
+            raise RuntimeError("decode preallocation queue was not initialized")
+
+        allocator = DecodePreallocQueueReservationAllocator(
+            queue=self.disagg_decode_prealloc_queue,
+            build_request=self._build_non_session_generate_request,
+            prepare_request=self._prepare_generate_request,
+        )
+        service = DecodeReservationSchedulerService(
+            expected_decoder_instance_id=uuid.UUID(self.server_args.launch_instance_id),
+            allocator=allocator,
+            wall_clock_unix_ms=lambda: time.time_ns() // 1_000_000,
+            monotonic_clock_ns=time.monotonic_ns,
+        )
+        self.decode_reservation_control = DecodeReservationSchedulerControl(service)
+        self.decode_reservation_request_control = self.decode_reservation_control
+
     def init_pd_runtime_capabilities(self) -> None:
         """Capture PD capabilities from initialized runtime-owned objects."""
 
@@ -1327,11 +1374,21 @@ class Scheduler(
                 raise RuntimeError("decode KV manager was not initialized")
             kv_manager = self.disagg_decode_prealloc_queue.kv_manager
 
+        prepared_grant_protocol = (
+            kv_manager.prepared_grant_protocol()
+            if self.disaggregation_mode is DisaggregationMode.PREFILL
+            else (
+                "control-v1"
+                if self.decode_reservation_control is not None
+                and kv_manager.supports_packed_decode_request_transactions()
+                else None
+            )
+        )
         self.pd_runtime_capabilities = PdProcessRuntimeCapabilities(
             kv_dtype=self.tp_worker.model_runner.kv_cache_dtype_str,
             page_size=self.token_to_kv_pool_allocator.page_size,
             kv_transfer_protocol=kv_manager.kv_transfer_protocol(),
-            prepared_grant_protocol=None,
+            prepared_grant_protocol=prepared_grant_protocol,
         )
 
     def init_overlap(self):
@@ -1511,6 +1568,26 @@ class Scheduler(
                 (
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
+                ),
+                (
+                    DecodeReservationPrepareReqInput,
+                    self.decode_reservation_request_control.handle_prepare,
+                ),
+                (
+                    DecodeReservationBindReqInput,
+                    self.decode_reservation_request_control.handle_bind,
+                ),
+                (
+                    DecodeReservationTransitionReqInput,
+                    self.decode_reservation_request_control.handle_transition,
+                ),
+                (
+                    DecodeReservationCancelUnboundReqInput,
+                    self.decode_reservation_request_control.handle_cancel_unbound,
+                ),
+                (
+                    DecodeInferenceAttachReqInput,
+                    self.decode_reservation_request_control.handle_attach,
                 ),
             ]
         )
@@ -1768,6 +1845,10 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if self.decode_reservation_control is not None:
+            expiry_outputs = self.decode_reservation_control.sweep_expired_if_due(now)
+            for expiry_output in expiry_outputs:
+                self.ipc_channels.send_to_tokenizer.send_output(expiry_output)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -2184,7 +2265,7 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
-    ):
+    ) -> None:
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2196,59 +2277,7 @@ class Scheduler(
         )
 
         if session_id is None or radix_native_session:
-            # Normal non-session request, or a radix-native session request
-            if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                recv_req.input_ids = array("q", [1]) * seq_length
-
-            if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
-                recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
-
-            req = Req(
-                recv_req.rid,
-                recv_req.input_text,
-                recv_req.input_ids,
-                recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
-                token_ids_logprob=recv_req.token_ids_logprob,
-                return_sampling_mask=recv_req.return_sampling_mask,
-                stream=recv_req.stream,
-                lora_id=recv_req.lora_id,
-                session_id=recv_req.session_id,
-                input_embeds=recv_req.input_embeds,
-                positional_embed_overrides=recv_req.positional_embed_overrides,
-                token_type_ids=recv_req.token_type_ids,
-                custom_logit_processor=recv_req.custom_logit_processor,
-                require_reasoning=recv_req.require_reasoning,
-                return_hidden_states=recv_req.return_hidden_states,
-                return_routed_experts=recv_req.return_routed_experts,
-                routed_experts_start_len=recv_req.routed_experts_start_len,
-                return_indexer_topk=recv_req.return_indexer_topk,
-                eos_token_ids=self.model_config.hf_eos_token_id,
-                bootstrap_host=recv_req.bootstrap_host,
-                bootstrap_port=recv_req.bootstrap_port,
-                bootstrap_room=recv_req.bootstrap_room,
-                disagg_mode=self.disaggregation_mode,
-                routed_dp_rank=recv_req.routed_dp_rank,
-                disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
-                vocab_size=self.model_config.vocab_size,
-                priority=recv_req.priority,
-                metrics_collector=(
-                    self.metrics_collector
-                    if self.metrics_reporter.enable_metrics
-                    else None
-                ),
-                routing_key=recv_req.routing_key,
-                extra_key=recv_req.extra_key,
-                http_worker_ipc=recv_req.http_worker_ipc,
-                dllm_config=self.dllm_config,
-                time_stats=recv_req.time_stats,
-                multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
-            )
-            req.tokenizer = self.tokenizer
+            req = self._build_non_session_generate_request(recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2310,6 +2339,24 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if not self._prepare_generate_request(recv_req, req):
+            self._add_request_to_queue(req)
+            return
+
+        self._enqueue_prepared_generate_request(req)
+
+    def _prepare_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        req: Req,
+    ) -> bool:
+        """Validate and initialize one request without publishing queue ownership.
+
+        :param recv_req: Exact tokenizer-produced request.
+        :param req: Canonical scheduler request being prepared.
+        :returns: Whether the request is valid for later publication.
+        """
+
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2317,8 +2364,7 @@ class Scheduler(
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
+                return False
 
         if (
             req.return_sampling_mask
@@ -2331,8 +2377,7 @@ class Scheduler(
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
             error_msg = (
@@ -2342,8 +2387,7 @@ class Scheduler(
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -2354,8 +2398,7 @@ class Scheduler(
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         if req.return_sampling_mask and self.server_args.sampling_backend == "ascend":
             # The ascend backend samples from logits directly and never builds the
@@ -2366,8 +2409,7 @@ class Scheduler(
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2396,8 +2438,7 @@ class Scheduler(
                     )
                 )
                 self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
+                return False
 
         # initialize before returning
         self.init_req_max_new_tokens(req)
@@ -2410,8 +2451,7 @@ class Scheduler(
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -2436,8 +2476,7 @@ class Scheduler(
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
-            self._add_request_to_queue(req)
-            return
+            return False
 
         if recv_req.return_routed_experts:
             error_msg = None
@@ -2457,12 +2496,79 @@ class Scheduler(
             if error_msg is not None:
                 req.routed_experts_start_len = 0
                 req.set_finish_with_abort(error_msg)
-                self._add_request_to_queue(req)
-                return
+                return False
+
+        return True
+
+    def _enqueue_prepared_generate_request(self, req: Req) -> None:
+        """Publish one fully prepared request to grammar or scheduling ownership.
+
+        :param req: Fully initialized scheduler request.
+        """
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _build_non_session_generate_request(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ) -> Req:
+        """Build one canonical non-session scheduler request without publishing it.
+
+        :param recv_req: Exact tokenizer-produced request.
+        :returns: Canonical scheduler request with no queue ownership.
+        """
+
+        if recv_req.input_embeds is not None:
+            seq_length = len(recv_req.input_embeds)
+            recv_req.input_ids = array("q", [1]) * seq_length
+
+        if recv_req.bootstrap_port is None:
+            recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids,
+            recv_req.sampling_params,
+            return_logprob=recv_req.return_logprob,
+            top_logprobs_num=recv_req.top_logprobs_num,
+            token_ids_logprob=recv_req.token_ids_logprob,
+            return_sampling_mask=recv_req.return_sampling_mask,
+            stream=recv_req.stream,
+            lora_id=recv_req.lora_id,
+            session_id=recv_req.session_id,
+            input_embeds=recv_req.input_embeds,
+            positional_embed_overrides=recv_req.positional_embed_overrides,
+            token_type_ids=recv_req.token_type_ids,
+            custom_logit_processor=recv_req.custom_logit_processor,
+            require_reasoning=recv_req.require_reasoning,
+            return_hidden_states=recv_req.return_hidden_states,
+            return_routed_experts=recv_req.return_routed_experts,
+            routed_experts_start_len=recv_req.routed_experts_start_len,
+            return_indexer_topk=recv_req.return_indexer_topk,
+            eos_token_ids=self.model_config.hf_eos_token_id,
+            bootstrap_host=recv_req.bootstrap_host,
+            bootstrap_port=recv_req.bootstrap_port,
+            bootstrap_room=recv_req.bootstrap_room,
+            disagg_mode=self.disaggregation_mode,
+            routed_dp_rank=recv_req.routed_dp_rank,
+            disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+            vocab_size=self.model_config.vocab_size,
+            priority=recv_req.priority,
+            metrics_collector=(
+                self.metrics_collector if self.metrics_reporter.enable_metrics else None
+            ),
+            routing_key=recv_req.routing_key,
+            extra_key=recv_req.extra_key,
+            http_worker_ipc=recv_req.http_worker_ipc,
+            dllm_config=self.dllm_config,
+            time_stats=recv_req.time_stats,
+            multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+        )
+        req.tokenizer = self.tokenizer
+        return req
 
     def handle_batch_generate_request(
         self,
@@ -3865,6 +3971,8 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+                prealloc_queue = self.disagg_decode_prealloc_queue
+                idle &= not prealloc_queue.has_live_preallocated_cohorts()
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0

@@ -1,5 +1,8 @@
 import ctypes
+import multiprocessing
 import os
+import select
+import shlex
 import stat
 import tempfile
 import unittest
@@ -11,6 +14,7 @@ from sglang.srt.utils.numa_utils import (
     _create_numactl_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
+    _mp_set_executable,
     _node_cpus,
     _numactl_cpu_mem_args,
     _probe_numactl_args,
@@ -27,43 +31,52 @@ register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
 register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
 
 
+def _write_fake_numactl(path: Path) -> None:
+    """Write a test executable that strips numactl flags and runs the command.
+
+    :param path: Executable path.
+    """
+
+    path.write_text(
+        """#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --*) shift ;;
+        *) break ;;
+    esac
+done
+printf 'consumed\\n' > "$SGLANG_TEST_NUMA_ACK"
+exec "$@"
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def _write_gated_shell(path: Path, gate_path: Path) -> None:
+    """Write a shell interpreter that waits before opening its script.
+
+    :param path: Interpreter path.
+    :param gate_path: FIFO released by the parent after ``Process.start``.
+    """
+
+    quoted_gate_path = shlex.quote(str(gate_path))
+    path.write_text(
+        f'''#!/bin/sh
+read -r _release < {quoted_gate_path}
+exec /bin/sh "$@"
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
 class TestNumactlExecutable(unittest.TestCase):
     """Tests private launcher placement, permissions, and lifetime."""
 
-    def test_uses_configured_temp_directory_and_removes_launcher(self) -> None:
-        """The wrapper exists only inside its configured spawn context."""
+    def test_uses_private_launcher_and_cleans_up_failed_spawn(self) -> None:
+        """The parent owns and removes a launcher until spawn succeeds."""
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            with patch(
-                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
-                return_value=temporary_directory,
-            ):
-                with _create_numactl_executable(
-                    "--cpunodebind=1 --membind=1"
-                ) as executable_info:
-                    executable, debug_description = executable_info
-                    executable_path = Path(executable)
-
-                    self.assertEqual(
-                        executable_path.parent,
-                        Path(temporary_directory),
-                    )
-                    self.assertEqual(
-                        stat.S_IMODE(executable_path.stat().st_mode),
-                        0o700,
-                    )
-                    self.assertIn(
-                        "exec numactl --cpunodebind=1 --membind=1",
-                        executable_path.read_text(encoding="utf-8"),
-                    )
-                    self.assertIn("script=", debug_description)
-
-                self.assertFalse(executable_path.exists())
-
-    def test_removes_launcher_when_spawn_context_raises(self) -> None:
-        """A failed child launch cannot leak its temporary executable."""
-
-        executable_path: Path | None = None
         with tempfile.TemporaryDirectory() as temporary_directory:
             with patch(
                 "sglang.srt.utils.numa_utils.tempfile.gettempdir",
@@ -71,15 +84,124 @@ class TestNumactlExecutable(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "spawn failed"):
                     with _create_numactl_executable(
-                        "--cpunodebind=1"
+                        "--cpunodebind=1 --membind=1"
                     ) as executable_info:
-                        executable_path = Path(executable_info[0])
+                        executable, debug_description = executable_info
+                        executable_path = Path(executable)
+
+                        self.assertEqual(
+                            executable_path.parent,
+                            Path(temporary_directory),
+                        )
+                        self.assertEqual(
+                            stat.S_IMODE(executable_path.stat().st_mode),
+                            0o700,
+                        )
+                        self.assertIn(
+                            "/bin/rm -f -- \"$0\"",
+                            executable_path.read_text(encoding="utf-8"),
+                        )
+                        self.assertIn(
+                            "exec numactl --cpunodebind=1 --membind=1",
+                            executable_path.read_text(encoding="utf-8"),
+                        )
+                        self.assertIn("script=", debug_description)
                         raise RuntimeError("spawn failed")
 
-                self.assertIsNotNone(executable_path)
-                if executable_path is None:
-                    self.fail("launcher path was not captured")
                 self.assertFalse(executable_path.exists())
+
+    @patch("multiprocessing.get_start_method", return_value="spawn")
+    def test_launcher_survives_until_spawn_child_opens_it(
+        self, _mock_start_method: MagicMock
+    ) -> None:
+        """Cleanup transfers exactly when the gated child consumes the script."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            fake_numactl_path = temporary_path / "numactl"
+            gated_shell_path = temporary_path / "gated-shell"
+            gate_path = temporary_path / "launch-gate"
+            acknowledgment_path = temporary_path / "launch-ack"
+            _write_fake_numactl(fake_numactl_path)
+            os.mkfifo(gate_path, 0o600)
+            os.mkfifo(acknowledgment_path, 0o600)
+            _write_gated_shell(gated_shell_path, gate_path)
+
+            spawn_context = multiprocessing.get_context("spawn")
+            process = spawn_context.Process()
+            executable_path: Path | None = None
+            gate_file_descriptor = os.open(
+                gate_path,
+                os.O_RDWR | os.O_NONBLOCK,
+            )
+            acknowledgment_file_descriptor = os.open(
+                acknowledgment_path,
+                os.O_RDWR | os.O_NONBLOCK,
+            )
+            original_path = os.environ.get("PATH", "")
+            gate_released = False
+            try:
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PATH": (
+                                f"{temporary_directory}{os.pathsep}{original_path}"
+                            ),
+                            "SGLANG_TEST_NUMA_ACK": str(acknowledgment_path),
+                        },
+                    ),
+                    patch(
+                        "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                        return_value=temporary_directory,
+                    ),
+                ):
+                    with _create_numactl_executable(
+                        "--cpunodebind=0"
+                    ) as executable_info:
+                        executable_path = Path(executable_info[0])
+                        launcher = executable_path.read_text(encoding="utf-8")
+                        executable_path.write_text(
+                            launcher.replace(
+                                "#!/bin/sh\n",
+                                f"#!{gated_shell_path}\n",
+                                1,
+                            ),
+                            encoding="utf-8",
+                        )
+                        with _mp_set_executable(
+                            str(executable_path),
+                            executable_info[1],
+                        ):
+                            process.start()
+
+                self.assertTrue(executable_path.exists())
+                os.write(gate_file_descriptor, b"continue\n")
+                gate_released = True
+                readable, _writable, _exceptional = select.select(
+                    [acknowledgment_file_descriptor],
+                    [],
+                    [],
+                    10,
+                )
+                self.assertEqual(readable, [acknowledgment_file_descriptor])
+                self.assertEqual(
+                    os.read(acknowledgment_file_descriptor, 64),
+                    b"consumed\n",
+                )
+                self.assertFalse(executable_path.exists())
+            finally:
+                if not gate_released:
+                    os.write(gate_file_descriptor, b"continue\n")
+                os.close(gate_file_descriptor)
+                os.close(acknowledgment_file_descriptor)
+                if process.pid is not None:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(10)
+                    process.close()
+                if executable_path is not None:
+                    executable_path.unlink(missing_ok=True)
 
 
 class TestIsNumaAvailable(unittest.TestCase):

@@ -29,6 +29,8 @@ from collections.abc import Set as AbstractSet
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+from torch.profiler import record_function
+
 from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_pin import (
@@ -45,7 +47,6 @@ from sglang.srt.mem_cache.allocator.paged import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
-from torch.profiler import record_function
 
 logger = logging.getLogger(__name__)
 
@@ -347,9 +348,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if self.lazy_compaction:
             return self.live_page_count * self.page_size
-        live_pages = self._allocated_pages() - int(
-            self._free_phys_pages.shape[0]
-        )
+        live_pages = self._allocated_pages() - int(self._free_phys_pages.shape[0])
         return live_pages * self.page_size
 
     def is_slot_allocated(self, slot: int) -> bool:
@@ -475,10 +474,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
             num_pages = need_size // self.page_size
 
-            if (
-                not self.lazy_compaction
-                and self._free_phys_pages.numel() == 0
-            ):
+            if not self.lazy_compaction and self._free_phys_pages.numel() == 0:
                 return self._take_physical_eager(num_pages)
 
             # Slice the GPU free list (no D2H). sort ON: take deepest-in-band per
@@ -1046,12 +1042,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        freed_list = [
-            int(page) for page in freed_physical_pages.tolist()
-        ]
-        existing_hole_list = [
-            int(page) for page in self._free_phys_pages.tolist()
-        ]
+        freed_list = [int(page) for page in freed_physical_pages.tolist()]
+        existing_hole_list = [int(page) for page in self._free_phys_pages.tolist()]
         freed = set(freed_list)
         existing_holes = set(existing_hole_list)
         if len(freed) == 0 and len(existing_holes) == 0:
@@ -1099,26 +1091,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             step = 1
 
         for destination in destinations:
-            while (
-                self.min_page_index <= candidate < self.num_pages
-                and (
-                    candidate in hole_set
-                    or candidate in pinned_physical
-                )
+            while self.min_page_index <= candidate < self.num_pages and (
+                candidate in hole_set or candidate in pinned_physical
             ):
                 candidate += step
             if not self.min_page_index <= candidate < self.num_pages:
                 break
-            crossed = (
-                self.grow_direction == "up" and candidate <= destination
-            ) or (
+            crossed = (self.grow_direction == "up" and candidate <= destination) or (
                 self.grow_direction == "down" and candidate >= destination
             )
             if crossed:
                 break
-            moved_virtual = int(
-                self.physical_to_virtual[candidate].item()
-            )
+            moved_virtual = int(self.physical_to_virtual[candidate].item())
             if moved_virtual < 0:
                 raise AssertionError(
                     "pin-aware eager compaction selected a non-live source page"
@@ -1364,15 +1348,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 while j >= 0 and holes_cpu[j] > p:
                     j -= 1
                 is_hole = j >= 0 and holes_cpu[j] == p
-                is_excluded = (
-                    excluded_physical is not None
-                    and p in excluded_physical
-                )
-                if (
-                    is_hole
-                    or p in self._pending_reuse_pages_cpu
-                    or is_excluded
-                ):
+                is_excluded = excluded_physical is not None and p in excluded_physical
+                if is_hole or p in self._pending_reuse_pages_cpu or is_excluded:
                     if is_hole:
                         j -= 1
                     p -= 1
@@ -1389,15 +1366,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 while j < len(holes_cpu) and holes_cpu[j] < p:
                     j += 1
                 is_hole = j < len(holes_cpu) and holes_cpu[j] == p
-                is_excluded = (
-                    excluded_physical is not None
-                    and p in excluded_physical
-                )
-                if (
-                    is_hole
-                    or p in self._pending_reuse_pages_cpu
-                    or is_excluded
-                ):
+                is_excluded = excluded_physical is not None and p in excluded_physical
+                if is_hole or p in self._pending_reuse_pages_cpu or is_excluded:
                     if is_hole:
                         j += 1
                     p += 1
@@ -1491,9 +1461,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # waiting it once settles BOTH hazards; then every src is event-fired
             # and the walk runs race-free (empty write_set, no `_pending_reuse`).
             settle_for_urgent = urgent and len(holes_cpu) > 0
-            single_pass_absorb = (
-                settle_for_urgent and len(pinned_physical) == 0
-            )
+            single_pass_absorb = settle_for_urgent and len(pinned_physical) == 0
             if settle_for_urgent:
                 self._settle_inflight_forward()
                 latest_event = None  # reads/writes settled → srcs are fired
@@ -1645,9 +1613,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     )
                 if urgent and len(pinned_physical) > 0:
                     if self._free_phys_pages.numel() > 1:
-                        self._free_phys_pages, _ = torch.sort(
-                            self._free_phys_pages
-                        )
+                        self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
                     remaining_cpu = self._free_phys_pages.tolist()
                     self._absorb_boundary_holes(remaining_cpu)
             if n_moves > 0:
@@ -2122,9 +2088,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.assert_allocation_resettable(
             "clear composite allocator"
         )
-        self.mamba_allocator.assert_allocation_resettable(
-            "clear composite allocator"
-        )
+        self.mamba_allocator.assert_allocation_resettable("clear composite allocator")
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
         self.is_not_in_free_group = True

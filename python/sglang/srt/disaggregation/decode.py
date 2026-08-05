@@ -20,9 +20,13 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import enum
 import logging
+import secrets
+import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -30,6 +34,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from torch.distributed import ProcessGroup
+
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -41,6 +47,7 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLease,
     DecodeAllocationLeaseAuthority,
     DecodeAllocationLeaseError,
+    DecodeAllocationLeaseState,
     DecodeWriterManifest,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -49,6 +56,17 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+)
+from sglang.srt.disaggregation.decode_reservations import (
+    DecodeReservationAdmissionRefused,
+    DecodeReservationAllocation,
+    DecodeReservationAttempt,
+    DecodeReservationRefusalDisposition,
+    DecodeReservationState,
+)
+from sglang.srt.disaggregation.nixl.packed_staging_request import (
+    PackedDecodeRequestTransaction,
+    PackedRequestPublication,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -70,6 +88,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
+    Req,
     ReqKvInfo,
     ScheduleBatch,
 )
@@ -103,17 +122,21 @@ from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.disaggregation.common.staging_handler import (
+        DecodeStagingHandler,
+    )
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+_PREPARED_COHORT_CONSTRUCTION_SEAL = object()
+_MAX_BOOTSTRAP_ROOM = (1 << 64) - 1
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -286,6 +309,7 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     allocation_lease: DecodeAllocationLease | None = None
+    packed_transaction: PackedDecodeRequestTransaction | None = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -301,6 +325,91 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+class DecodePreparedAllocationCohort:
+    """Opaque queue-owned handle for one exact prepared request cohort."""
+
+    __slots__ = ("_queue_nonce", "_token")
+
+    _queue_nonce: object
+    _token: object
+
+    def __init__(
+        self,
+        queue_nonce: object,
+        token: object,
+        construction_seal: object,
+    ) -> None:
+        """Construct one queue-owned cohort handle.
+
+        :param queue_nonce: Exact issuing queue identity.
+        :param token: Queue-private cohort record key.
+        :param construction_seal: Module-private construction authority.
+        """
+
+        if construction_seal is not _PREPARED_COHORT_CONSTRUCTION_SEAL:
+            raise TypeError("prepared allocation cohorts are queue owned")
+        self._queue_nonce = queue_nonce
+        self._token = token
+
+
+class _DecodePreparedCohortState(enum.StrEnum):
+    """Queue-local ownership state for a decoder reservation cohort."""
+
+    PREPARED = "prepared"
+    PROMOTED = "promoted"
+    ATTACHED = "attached"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+    QUARANTINED = "quarantined"
+
+
+@dataclass
+class _DecodePreparedCohortRecord:
+    """Mutable queue-owned state for one keyed decoder reservation.
+
+    :ivar handle: Opaque handle returned to the reservation authority.
+    :ivar grant_id: Exact tokenizer-issued grant identity.
+    :ivar reservation_attempt_id: Exact reserve-attempt identity.
+    :ivar source_tp_size: Fixed TP2 or TP4 source writer width.
+    :ivar decode_reqs: Ordered exact reserved decode requests.
+    :ivar packed_transactions: Ordered request-scoped packed transfer owners.
+    :ivar allocations: Ordered immutable allocation receipts.
+    :ivar packed_publications: Irreversible transfer publications after promotion.
+    :ivar state: Current queue-local lifecycle state.
+    :ivar metadata_published: Whether the cohort crossed metadata publication.
+    :ivar quarantine_reason: First stable quarantine reason, if any.
+    """
+
+    handle: DecodePreparedAllocationCohort
+    grant_id: uuid.UUID
+    reservation_attempt_id: uuid.UUID
+    source_tp_size: int
+    decode_reqs: tuple[DecodeRequest, ...]
+    packed_transactions: tuple[PackedDecodeRequestTransaction, ...]
+    allocations: tuple[DecodeReservationAllocation, ...]
+    packed_publications: tuple[PackedRequestPublication, ...] | None = None
+    state: _DecodePreparedCohortState = _DecodePreparedCohortState.PREPARED
+    metadata_published: bool = False
+    quarantine_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _DecodePartialPreparationQuarantine:
+    """Process-lifetime owner for a cohort whose rollback became ambiguous.
+
+    :ivar grant_id: Exact grant whose preparation failed.
+    :ivar request_ids: Complete request identity claim retained against reuse.
+    :ivar decode_reqs: Partially prepared request owners.
+    :ivar packed_transactions: Successfully constructed packed transaction prefix.
+    """
+
+    grant_id: uuid.UUID
+    request_ids: tuple[str, ...]
+    decode_reqs: tuple[DecodeRequest, ...]
+    packed_transactions: tuple[PackedDecodeRequestTransaction, ...]
 
 
 @dataclass(frozen=True)
@@ -339,6 +448,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
     """
+
+    _next_reserved_bootstrap_room: int
+    _prepared_cohort_lock: threading.RLock
+    _prepared_cohort_nonce: object
+    _prepared_cohorts: dict[object, _DecodePreparedCohortRecord]
+    _prepared_grant_ids: dict[uuid.UUID, object]
+    _prepared_request_ids: dict[str, object]
+    _partial_preparation_quarantines: list[_DecodePartialPreparationQuarantine]
+    _preparing_grant_ids: set[uuid.UUID]
+    _preparing_request_ids: set[str]
+    allocation_lease_authority: DecodeAllocationLeaseAuthority
+    allocation_lifecycle_authority: CommonKVManager
 
     def __init__(
         self,
@@ -381,7 +502,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
-        self.allocation_lease_authority = DecodeAllocationLeaseAuthority()
+        self._prepared_cohort_nonce = object()
+        self._prepared_cohort_lock = threading.RLock()
+        self._prepared_cohorts: dict[object, _DecodePreparedCohortRecord] = {}
+        self._prepared_grant_ids: dict[uuid.UUID, object] = {}
+        self._prepared_request_ids: dict[str, object] = {}
+        self._partial_preparation_quarantines = []
+        self._preparing_grant_ids: set[uuid.UUID] = set()
+        self._preparing_request_ids: set[str] = set()
+        self._next_reserved_bootstrap_room = (1 << 63) | secrets.randbits(62)
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -404,6 +533,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.allocation_lifecycle_authority = self.kv_manager
+        self.allocation_lease_authority = DecodeAllocationLeaseAuthority(
+            self.allocation_lifecycle_authority
+        )
+        self.transfer_queue.allocation_lease_authority = self.allocation_lease_authority
+        self.transfer_queue.allocation_lifecycle_authority = (
+            self.allocation_lifecycle_authority
+        )
+        self.kv_manager.attach_packed_decode_scheduler(
+            self.req_to_metadata_buffer_idx_allocator,
+            self.transfer_queue,
+        )
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -591,6 +732,831 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
+    def prepare_preallocated(
+        self,
+        *,
+        grant_id: uuid.UUID,
+        attempt: DecodeReservationAttempt,
+        requests: tuple[Req, ...],
+    ) -> tuple[
+        tuple[DecodeReservationAllocation, ...],
+        DecodePreparedAllocationCohort,
+    ]:
+        """Reserve one exact decoder cohort without publishing runnable work.
+
+        :param grant_id: Tokenizer-issued non-secret grant identity.
+        :param attempt: Exact authenticated reserve attempt.
+        :param requests: Ordered canonical scheduler requests.
+        :returns: Immutable child receipts and an opaque retained cohort.
+        """
+
+        owned_requests = tuple(requests)
+        request_ids = self._validate_preallocated_request_cohort(
+            grant_id,
+            attempt,
+            owned_requests,
+        )
+        self._validate_preallocated_capacity(owned_requests)
+
+        with self._prepared_cohort_lock:
+            self._claim_preallocated_request_ids_locked(grant_id, request_ids)
+            rooms = tuple(
+                self._mint_reserved_bootstrap_room_locked() for _ in owned_requests
+            )
+
+        prepared_decode_reqs: list[DecodeRequest] = []
+        prepared_packed_transactions: list[PackedDecodeRequestTransaction] = []
+        allocations: list[DecodeReservationAllocation] = []
+        try:
+            for child_request_id, req, room in zip(
+                attempt.child_request_ids,
+                owned_requests,
+                rooms,
+                strict=True,
+            ):
+                req.bootstrap_host = attempt.prefill_bootstrap_endpoint.host
+                req.bootstrap_port = attempt.prefill_bootstrap_endpoint.port
+                req.bootstrap_room = room
+                decode_req = self._create_receiver(req)
+                prepared_decode_reqs.append(decode_req)
+
+                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+                if metadata_index is None:
+                    raise DecodeReservationAdmissionRefused(
+                        "decode_metadata_capacity",
+                        DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+                    )
+                decode_req.metadata_buffer_index = metadata_index
+                migration_end = self._rebootstrap_prefill_len(req)
+                self._pre_alloc(
+                    req,
+                    decode_req=decode_req,
+                    migration_end=migration_end,
+                    source_tp_size=attempt.source_tp_size,
+                )
+                lease = decode_req.allocation_lease
+                if lease is None:
+                    raise DecodeAllocationLeaseError(
+                        "reserved asymmetric request acquired no migration lease"
+                    )
+                snapshot = self.allocation_lease_authority.snapshot(lease)
+                packed_transaction = (
+                    self.kv_manager.prepare_packed_decode_request_transaction(
+                        room_id=room,
+                        request_owner=decode_req,
+                        metadata_buffer_index=metadata_index,
+                        allocation_lease=lease,
+                        allocation_authority=self.allocation_lease_authority,
+                        lifecycle_authority=self.allocation_lifecycle_authority,
+                        source_tp_size=attempt.source_tp_size,
+                    )
+                )
+                if packed_transaction is None:
+                    raise RuntimeError(
+                        "packed decode runtime accepted admission but returned no "
+                        "request transaction"
+                    )
+                prepared_packed_transactions.append(packed_transaction)
+                slot_generation = uuid.UUID(bytes=snapshot.lease_id)
+                allocations.append(
+                    DecodeReservationAllocation(
+                        child_request_id=child_request_id,
+                        decoder_slot_generation=slot_generation,
+                        bootstrap_room=room,
+                        request_slot=snapshot.request_slot,
+                        request_generation=snapshot.request_generation,
+                        writer_manifest_digest=snapshot.writer_manifest.digest,
+                        allocation_digest=snapshot.allocation_digest,
+                        reserved_kv_tokens=(
+                            self._required_alloc_tokens(
+                                fill_len=self._pre_alloc_fill_len(req),
+                                prefix_len=0,
+                            )
+                            + self.num_reserved_decode_tokens
+                        ),
+                        remaining_decode_tokens=min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        ),
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            preparation_traceback = traceback.format_exc()
+            try:
+                self._rollback_preallocated_decode_reqs(
+                    prepared_decode_reqs,
+                    prepared_packed_transactions,
+                )
+            except Exception as rollback_error:  # noqa: BLE001
+                rollback_traceback = traceback.format_exc()
+                with self._prepared_cohort_lock:
+                    self._partial_preparation_quarantines.append(
+                        _DecodePartialPreparationQuarantine(
+                            grant_id=grant_id,
+                            request_ids=request_ids,
+                            decode_reqs=tuple(prepared_decode_reqs),
+                            packed_transactions=tuple(prepared_packed_transactions),
+                        )
+                    )
+                logger.critical(
+                    "Reserved decode cohort preparation and rollback both failed. "
+                    "Preparation traceback:\n%s\nRollback traceback:\n%s",
+                    preparation_traceback,
+                    rollback_traceback,
+                )
+                raise DecodeAllocationLeaseError(
+                    "reserved decode cohort rollback failed; partial ownership "
+                    "was quarantined"
+                ) from rollback_error
+            with self._prepared_cohort_lock:
+                self._release_preallocated_claim_locked(grant_id, request_ids)
+            raise
+
+        token = object()
+        handle = DecodePreparedAllocationCohort(
+            self._prepared_cohort_nonce,
+            token,
+            _PREPARED_COHORT_CONSTRUCTION_SEAL,
+        )
+        record = _DecodePreparedCohortRecord(
+            handle=handle,
+            grant_id=grant_id,
+            reservation_attempt_id=attempt.reservation_attempt_id,
+            source_tp_size=attempt.source_tp_size,
+            decode_reqs=tuple(prepared_decode_reqs),
+            packed_transactions=tuple(prepared_packed_transactions),
+            allocations=tuple(allocations),
+        )
+        with self._prepared_cohort_lock:
+            if grant_id not in self._preparing_grant_ids:
+                raise RuntimeError("prepared cohort lost its grant claim")
+            if any(
+                request_id not in self._preparing_request_ids
+                for request_id in request_ids
+            ):
+                raise RuntimeError("prepared cohort lost a request claim")
+            self._preparing_grant_ids.remove(grant_id)
+            for request_id in request_ids:
+                self._preparing_request_ids.remove(request_id)
+                self._prepared_request_ids[request_id] = token
+            self._prepared_grant_ids[grant_id] = token
+            self._prepared_cohorts[token] = record
+        return record.allocations, handle
+
+    def has_live_preallocated_cohorts(self) -> bool:
+        """Return whether keyed reservation ownership blocks destructive idleness.
+
+        Quarantined cohorts remain live because their request, metadata, and KV
+        resources intentionally stay process-owned.
+
+        :returns: Whether any complete cohort or ambiguous partial preparation
+            remains process-owned.
+        """
+
+        with self._prepared_cohort_lock:
+            return (
+                len(self._prepared_cohorts) > 0
+                or len(self._partial_preparation_quarantines) > 0
+            )
+
+    def promote_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+    ) -> None:
+        """Authorize one prepared cohort without enqueuing its requests.
+
+        :param cohort: Exact queue-owned prepared cohort.
+        """
+
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            if record.state is not _DecodePreparedCohortState.PREPARED:
+                raise DecodeAllocationLeaseError(
+                    f"cohort promotion is invalid in state {record.state.value}"
+                )
+            publications: list[PackedRequestPublication] = []
+            try:
+                for transaction in record.packed_transactions:
+                    publications.append(transaction.publish())
+            except Exception:  # noqa: BLE001
+                promotion_traceback = traceback.format_exc()
+                self._quarantine_preallocated_record_locked(
+                    record,
+                    "cohort promotion failed after publication may have begun",
+                )
+                logger.error(
+                    "Reserved decode cohort promotion failed and was quarantined:\n%s",
+                    promotion_traceback,
+                )
+                raise
+            record.packed_publications = tuple(publications)
+            record.state = _DecodePreparedCohortState.PROMOTED
+
+    def attach_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+    ) -> None:
+        """Take ownership of one promoted cohort in runnable queue state.
+
+        :param cohort: Exact queue-owned promoted cohort.
+        """
+
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            if record.state is not _DecodePreparedCohortState.PROMOTED:
+                raise DecodeAllocationLeaseError(
+                    f"cohort attachment is invalid in state {record.state.value}"
+                )
+            if any(
+                any(entry is decode_req for entry in self.queue)
+                or any(entry is decode_req for entry in self.pending_reqs)
+                for decode_req in record.decode_reqs
+            ):
+                self._quarantine_preallocated_record_locked(
+                    record,
+                    "cohort attachment found duplicate queue ownership",
+                )
+                raise DecodeAllocationLeaseError(
+                    "prepared cohort is already present in a decode queue"
+                )
+
+            for decode_req, transaction in zip(
+                record.decode_reqs,
+                record.packed_transactions,
+                strict=True,
+            ):
+                if decode_req.packed_transaction is not None:
+                    self._quarantine_preallocated_record_locked(
+                        record,
+                        "cohort attachment found existing packed ownership",
+                    )
+                    raise DecodeAllocationLeaseError(
+                        "prepared request already owns a packed transaction"
+                    )
+                if transaction.request_owner is not decode_req:
+                    self._quarantine_preallocated_record_locked(
+                        record,
+                        "cohort attachment found another packed request owner",
+                    )
+                    raise DecodeAllocationLeaseError(
+                        "packed transaction retained another decode request"
+                    )
+                decode_req.packed_transaction = transaction
+
+            self.queue.extend(record.decode_reqs)
+            try:
+                for decode_req in record.decode_reqs:
+                    if _is_fake_transfer(
+                        decode_req.req,
+                        self.scheduler.server_args,
+                    ):
+                        decode_req.kv_receiver.init(0)
+                        continue
+                    prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
+                    if prefill_dp_rank is None:
+                        self.pending_reqs.append(decode_req)
+                        continue
+                    decode_req.kv_receiver.init(prefill_dp_rank)
+            except Exception:  # noqa: BLE001
+                attachment_traceback = traceback.format_exc()
+                self.queue = [
+                    entry
+                    for entry in self.queue
+                    if all(entry is not owned for owned in record.decode_reqs)
+                ]
+                self.pending_reqs = [
+                    entry
+                    for entry in self.pending_reqs
+                    if all(entry is not owned for owned in record.decode_reqs)
+                ]
+                self._quarantine_preallocated_record_locked(
+                    record,
+                    "cohort attachment failed after receiver activation may have begun",
+                )
+                logger.error(
+                    "Reserved decode cohort attachment failed and was quarantined:\n%s",
+                    attachment_traceback,
+                )
+                raise
+            record.state = _DecodePreparedCohortState.ATTACHED
+
+    def cancel_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+    ) -> DecodeReservationState:
+        """Release one exact cohort before promotion.
+
+        :param cohort: Exact queue-owned prepared cohort.
+        :returns: Authoritative cancelled state.
+        """
+
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            if record.state is not _DecodePreparedCohortState.PREPARED:
+                raise DecodeAllocationLeaseError(
+                    f"cohort cancellation is invalid in state {record.state.value}"
+                )
+            self._rollback_preallocated_decode_reqs(
+                list(record.decode_reqs),
+                list(record.packed_transactions),
+            )
+            record.state = _DecodePreparedCohortState.CANCELLED
+            self._retire_preallocated_record_locked(record)
+        return DecodeReservationState.CANCELLED
+
+    def complete_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+    ) -> DecodeReservationState:
+        """Reconcile normal completion after transport relinquishes every lease.
+
+        :param cohort: Exact queue-owned attached cohort.
+        :returns: Completed or conservatively quarantined state.
+        """
+
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            if record.state is not _DecodePreparedCohortState.ATTACHED:
+                raise DecodeAllocationLeaseError(
+                    f"cohort completion is invalid in state {record.state.value}"
+                )
+            if any(
+                decode_req.allocation_lease is not None
+                for decode_req in record.decode_reqs
+            ):
+                self._quarantine_preallocated_record_locked(
+                    record,
+                    "normal completion preceded packed allocation teardown",
+                )
+                return DecodeReservationState.QUARANTINED
+            record.state = _DecodePreparedCohortState.COMPLETED
+            self._retire_preallocated_record_locked(record)
+            return DecodeReservationState.COMPLETED
+
+    def abort_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+        reason_code: str,
+        diagnostic: str | None,
+    ) -> DecodeReservationState:
+        """Reconcile a promoted abort without releasing live migration owners.
+
+        :param cohort: Exact queue-owned promoted or attached cohort.
+        :param reason_code: Stable machine-readable failure reason.
+        :param diagnostic: Optional bounded diagnostic.
+        :returns: Aborted after prior teardown, otherwise quarantined.
+        """
+
+        del diagnostic
+        if len(reason_code) == 0:
+            raise ValueError("abort reason_code must not be empty")
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            if record.state not in (
+                _DecodePreparedCohortState.PROMOTED,
+                _DecodePreparedCohortState.ATTACHED,
+            ):
+                raise DecodeAllocationLeaseError(
+                    f"cohort abort is invalid in state {record.state.value}"
+                )
+            if any(
+                decode_req.allocation_lease is not None
+                for decode_req in record.decode_reqs
+            ):
+                self._quarantine_preallocated_record_locked(record, reason_code)
+                return DecodeReservationState.QUARANTINED
+            record.state = _DecodePreparedCohortState.ABORTED
+            self._retire_preallocated_record_locked(record)
+            return DecodeReservationState.ABORTED
+
+    def quarantine_preallocated(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+        reason_code: str,
+        diagnostic: str | None,
+    ) -> DecodeReservationState:
+        """Retain every ambiguous cohort owner for the process lifetime.
+
+        :param cohort: Exact queue-owned live cohort.
+        :param reason_code: Stable machine-readable failure reason.
+        :param diagnostic: Optional bounded diagnostic.
+        :returns: Authoritative quarantined state.
+        """
+
+        del diagnostic
+        if len(reason_code) == 0:
+            raise ValueError("quarantine reason_code must not be empty")
+        with self._prepared_cohort_lock:
+            record = self._require_preallocated_cohort_locked(cohort)
+            self._quarantine_preallocated_record_locked(record, reason_code)
+        return DecodeReservationState.QUARANTINED
+
+    def _validate_preallocated_request_cohort(
+        self,
+        grant_id: uuid.UUID,
+        attempt: DecodeReservationAttempt,
+        requests: tuple[Req, ...],
+    ) -> tuple[str, ...]:
+        """Validate one canonical request cohort before allocator mutation.
+
+        :param grant_id: Candidate grant identity.
+        :param attempt: Candidate authenticated reserve attempt.
+        :param requests: Candidate ordered scheduler requests.
+        :returns: Exact ordered string request identities.
+        """
+
+        if type(grant_id) is not uuid.UUID or grant_id.int == 0:
+            raise ValueError("grant_id must be a non-nil UUID")
+        if type(attempt) is not DecodeReservationAttempt:
+            raise TypeError("attempt must be DecodeReservationAttempt")
+        if self.tp_size != 1:
+            raise DecodeReservationAdmissionRefused(
+                "decode_tp_not_supported",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+                "reserved asymmetric decode requires a TP1 destination",
+            )
+        if not self.enable_staging or self.transfer_backend is not TransferBackend.NIXL:
+            raise DecodeReservationAdmissionRefused(
+                "packed_staging_unavailable",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+        if not self.kv_manager.supports_packed_decode_request_transactions():
+            raise DecodeReservationAdmissionRefused(
+                "packed_runtime_unavailable",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+        if len(requests) == 0 or len(requests) != len(attempt.child_request_ids):
+            raise ValueError("request count differs from reserve child count")
+        if any(not isinstance(req, Req) for req in requests):
+            raise TypeError("requests must contain canonical Req objects")
+
+        request_ids = tuple(req.rid for req in requests)
+        expected_ids = tuple(str(value) for value in attempt.child_request_ids)
+        if request_ids != expected_ids:
+            raise ValueError("request identities differ from reserve child order")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("prepared request identities must be unique")
+        for req in requests:
+            if req.req_pool_idx is not None or req.kv is not None:
+                raise ValueError("prepared request already owns decoder allocation")
+            if req.bootstrap_room is not None:
+                raise ValueError("decoder reservation requires an unassigned room")
+            if req.bootstrap_host not in (
+                None,
+                attempt.prefill_bootstrap_endpoint.host,
+            ):
+                raise ValueError("request bootstrap host differs from reserve attempt")
+            if req.bootstrap_port not in (
+                None,
+                attempt.prefill_bootstrap_endpoint.port,
+            ):
+                raise ValueError("request bootstrap port differs from reserve attempt")
+        return request_ids
+
+    def _validate_preallocated_capacity(self, requests: tuple[Req, ...]) -> None:
+        """Refuse a cohort without mutating or streaming on insufficient capacity.
+
+        :param requests: Exact validated canonical request cohort.
+        """
+
+        request_count = len(requests)
+        if self.req_to_token_pool.available_size() < request_count:
+            raise DecodeReservationAdmissionRefused(
+                "decode_request_slot_capacity",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+        if self.req_to_metadata_buffer_idx_allocator.available_size() < request_count:
+            raise DecodeReservationAdmissionRefused(
+                "decode_metadata_capacity",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+        for req in requests:
+            input_len = self._rebootstrap_prefill_len(req)
+            if input_len > self.max_total_num_tokens:
+                raise DecodeReservationAdmissionRefused(
+                    "request_exceeds_decode_capacity",
+                    DecodeReservationRefusalDisposition.TERMINAL,
+                )
+
+        pending_reserved = self._unpublished_preallocated_child_count()
+        full_required = sum(
+            self._required_alloc_tokens(
+                fill_len=self._pre_alloc_fill_len(req),
+                prefix_len=0,
+            )
+            for req in requests
+        )
+        full_allocatable = self._allocatable_token_budgets(
+            count_retracted=True,
+            extra_reserved_reqs=pending_reserved + request_count,
+            hicache_reserved_tokens=self._hicache_pending_restore_tokens(),
+        )
+        if full_required > full_allocatable:
+            raise DecodeReservationAdmissionRefused(
+                "decode_kv_capacity",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+
+        if not self._uses_swa_tail_prealloc():
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        swa_required = sum(
+            ((self._prealloc_kv_lens(req)[1] + page_size - 1) // page_size * page_size)
+            for req in requests
+        )
+        active_count = self._active_req_count(
+            extra_reserved_reqs=pending_reserved + request_count
+        )
+        swa_reserve = self.num_reserved_decode_tokens * active_count
+        if self.scheduler.server_args.disable_radix_cache:
+            swa_reserve = 0
+        swa_available = self.token_to_kv_pool_allocator.swa_available_size()
+        if swa_required + swa_reserve > swa_available:
+            raise DecodeReservationAdmissionRefused(
+                "decode_swa_kv_capacity",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+
+    def _claim_preallocated_request_ids_locked(
+        self,
+        grant_id: uuid.UUID,
+        request_ids: tuple[str, ...],
+    ) -> None:
+        """Claim unique grant and request keys during out-of-lock allocation.
+
+        :param grant_id: Exact grant identity.
+        :param request_ids: Exact ordered child identities.
+        """
+
+        if (
+            grant_id in self._prepared_grant_ids
+            or grant_id in self._preparing_grant_ids
+        ):
+            raise DecodeAllocationLeaseError("grant already owns a prepared cohort")
+        if any(
+            request_id in self._prepared_request_ids
+            or request_id in self._preparing_request_ids
+            for request_id in request_ids
+        ):
+            raise DecodeAllocationLeaseError(
+                "request already belongs to a prepared cohort"
+            )
+        self._preparing_grant_ids.add(grant_id)
+        self._preparing_request_ids.update(request_ids)
+
+    def _release_preallocated_claim_locked(
+        self,
+        grant_id: uuid.UUID,
+        request_ids: tuple[str, ...],
+    ) -> None:
+        """Release temporary preparation claims after allocator rollback.
+
+        :param grant_id: Exact claimed grant.
+        :param request_ids: Exact claimed request identities.
+        """
+
+        self._preparing_grant_ids.discard(grant_id)
+        for request_id in request_ids:
+            self._preparing_request_ids.discard(request_id)
+
+    def _mint_reserved_bootstrap_room_locked(self) -> int:
+        """Mint one process-lifetime non-recycled unsigned 64-bit room.
+
+        :returns: Fresh decoder-owned bootstrap room.
+        """
+
+        room = self._next_reserved_bootstrap_room
+        if room > _MAX_BOOTSTRAP_ROOM:
+            raise DecodeReservationAdmissionRefused(
+                "decode_bootstrap_room_exhausted",
+                DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+            )
+        self._next_reserved_bootstrap_room += 1
+        return room
+
+    def _require_preallocated_cohort_locked(
+        self,
+        cohort: DecodePreparedAllocationCohort,
+    ) -> _DecodePreparedCohortRecord:
+        """Resolve an exact live handle owned by this queue.
+
+        :param cohort: Candidate opaque cohort.
+        :returns: Exact queue-owned cohort record.
+        """
+
+        if type(cohort) is not DecodePreparedAllocationCohort:
+            raise TypeError("cohort must be DecodePreparedAllocationCohort")
+        if cohort._queue_nonce is not self._prepared_cohort_nonce:
+            raise DecodeAllocationLeaseError("cohort belongs to another decode queue")
+        record = self._prepared_cohorts.get(cohort._token)
+        if record is None or record.handle is not cohort:
+            raise DecodeAllocationLeaseError("prepared cohort is not registered")
+        return record
+
+    def _rollback_preallocated_decode_reqs(
+        self,
+        decode_reqs: list[DecodeRequest],
+        packed_transactions: list[PackedDecodeRequestTransaction],
+    ) -> None:
+        """Release every child allocation, metadata slot, and receiver.
+
+        :param decode_reqs: Exact unpublished children to release.
+        :param packed_transactions: Prepared transaction prefix owned by the
+            children in the same order.
+        """
+
+        if len(packed_transactions) > len(decode_reqs):
+            raise RuntimeError("packed transaction count exceeds prepared children")
+        cleanup_failures: list[str] = []
+        for child_index in range(len(decode_reqs) - 1, -1, -1):
+            decode_req = decode_reqs[child_index]
+            packed_transaction = (
+                packed_transactions[child_index]
+                if child_index < len(packed_transactions)
+                else None
+            )
+            try:
+                self._rollback_preallocated_decode_req(
+                    decode_req,
+                    packed_transaction,
+                )
+            except Exception:  # noqa: BLE001
+                cleanup_failures.append(traceback.format_exc())
+        if len(cleanup_failures) > 0:
+            raise RuntimeError(
+                "prepared cohort rollback failed:\n" + "\n".join(cleanup_failures)
+            )
+
+    def _rollback_preallocated_decode_req(
+        self,
+        decode_req: DecodeRequest,
+        packed_transaction: PackedDecodeRequestTransaction | None,
+    ) -> None:
+        """Release one unpublished reserved child exactly.
+
+        :param decode_req: Exact child to release.
+        :param packed_transaction: Transaction owning the lease publication
+            boundary, when construction completed.
+        """
+
+        lease = decode_req.allocation_lease
+        if packed_transaction is not None:
+            if lease is None:
+                raise DecodeAllocationLeaseError(
+                    "packed transaction child lost its allocation lease"
+                )
+            if packed_transaction.request_owner is not decode_req:
+                raise DecodeAllocationLeaseError(
+                    "packed transaction belongs to another decode request"
+                )
+            retired_owner = (
+                self.kv_manager.cancel_unpublished_packed_decode_request_transaction(
+                    packed_transaction
+                )
+            )
+            if retired_owner is not decode_req:
+                raise DecodeAllocationLeaseError(
+                    "packed cancellation returned another decode request"
+                )
+            decode_req.allocation_lease = None
+            lease = None
+        elif lease is not None:
+            snapshot = self.allocation_lease_authority.snapshot(lease)
+            if snapshot.state is not DecodeAllocationLeaseState.PREPARED:
+                raise DecodeAllocationLeaseError(
+                    "reserved child rollback requires a prepared allocation lease"
+                )
+            self.allocation_lease_authority.rollback_to_request(lease)
+
+        try:
+            if decode_req.req.req_pool_idx is not None:
+                if decode_req.req.kv is None:
+                    if (
+                        isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+                        and decode_req.req.mamba_pool_idx is not None
+                    ):
+                        self.req_to_token_pool.free_mamba_cache(decode_req.req)
+                    self.req_to_token_pool.free(decode_req.req)
+                else:
+                    release_kv_cache(
+                        decode_req.req,
+                        self.tree_cache,
+                        is_insert=False,
+                    )
+        finally:
+            try:
+                if decode_req.metadata_buffer_index != -1:
+                    self.req_to_metadata_buffer_idx_allocator.free(
+                        decode_req.metadata_buffer_index
+                    )
+                    decode_req.metadata_buffer_index = -1
+            finally:
+                if decode_req.kv_receiver is not None:
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
+
+        if lease is not None:
+            self.allocation_lease_authority.retire_terminal(lease)
+            decode_req.allocation_lease = None
+
+    def _quarantine_preallocated_record_locked(
+        self,
+        record: _DecodePreparedCohortRecord,
+        reason: str,
+    ) -> None:
+        """Retain all live child owners and remove runnable queue visibility.
+
+        :param record: Exact live cohort record.
+        :param reason: First stable quarantine reason.
+        """
+
+        if record.state is _DecodePreparedCohortState.QUARANTINED:
+            return
+        if record.state in (
+            _DecodePreparedCohortState.CANCELLED,
+            _DecodePreparedCohortState.COMPLETED,
+            _DecodePreparedCohortState.ABORTED,
+        ):
+            raise DecodeAllocationLeaseError(
+                f"cohort quarantine is invalid in state {record.state.value}"
+            )
+        record.state = _DecodePreparedCohortState.QUARANTINED
+        record.quarantine_reason = reason
+        self.queue = [
+            entry
+            for entry in self.queue
+            if all(entry is not owned for owned in record.decode_reqs)
+        ]
+        self.pending_reqs = [
+            entry
+            for entry in self.pending_reqs
+            if all(entry is not owned for owned in record.decode_reqs)
+        ]
+        for decode_req, packed_transaction in zip(
+            record.decode_reqs,
+            record.packed_transactions,
+            strict=True,
+        ):
+            lease = decode_req.allocation_lease
+            if lease is not None:
+                snapshot = self.allocation_lease_authority.snapshot(lease)
+                releasable_state = snapshot.state in (
+                    DecodeAllocationLeaseState.COMMITTED_TO_REQUEST,
+                    DecodeAllocationLeaseState.ROLLED_BACK_TO_REQUEST,
+                    DecodeAllocationLeaseState.ABORT_AUTHORIZED,
+                )
+                if (
+                    snapshot.state is not DecodeAllocationLeaseState.QUARANTINED
+                    and not releasable_state
+                ):
+                    packed_transaction.quarantine(reason)
+            if decode_req.kv_receiver is not None:
+                decode_req.kv_receiver.abort()
+
+    def _retire_preallocated_record_locked(
+        self,
+        record: _DecodePreparedCohortRecord,
+    ) -> None:
+        """Forget one safely terminal non-quarantined cohort.
+
+        :param record: Exact terminal cohort record.
+        """
+
+        token = record.handle._token
+        if self._prepared_cohorts.get(token) is not record:
+            raise DecodeAllocationLeaseError("prepared cohort record is not live")
+        del self._prepared_cohorts[token]
+        del self._prepared_grant_ids[record.grant_id]
+        for decode_req in record.decode_reqs:
+            owner = self._prepared_request_ids.get(decode_req.req.rid)
+            if owner is not token:
+                raise DecodeAllocationLeaseError(
+                    "prepared request ownership changed before retirement"
+                )
+            del self._prepared_request_ids[decode_req.req.rid]
+
+    def _unpublished_preallocated_child_count(self) -> int:
+        """Return live reserved children not yet represented by transfer queues.
+
+        :returns: Conservative pending child count for decode reserve budgeting.
+        """
+
+        lock = getattr(self, "_prepared_cohort_lock", None)
+        if lock is None:
+            return 0
+        with lock:
+            return sum(
+                len(record.decode_reqs)
+                for record in self._prepared_cohorts.values()
+                if record.state
+                in (
+                    _DecodePreparedCohortState.PREPARED,
+                    _DecodePreparedCohortState.PROMOTED,
+                    _DecodePreparedCohortState.ATTACHED,
+                )
+                and not record.metadata_published
+            )
+
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
@@ -627,9 +1593,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return None
 
-    def _create_receiver_and_enqueue(
-        self, req: Req, is_rebootstrap: bool = False
+    def _create_receiver(
+        self,
+        req: Req,
+        *,
+        is_rebootstrap: bool = False,
     ) -> DecodeRequest:
+        """Create one decode receiver without publishing queue ownership.
+
+        :param req: Exact canonical scheduler request.
+        :param is_rebootstrap: Whether prefill recomputes a retracted request.
+        :returns: Unenqueued decode request and receiver.
+        """
+
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -643,8 +1619,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_room=req.bootstrap_room,
         )
 
-        decode_req = DecodeRequest(
+        return DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+        )
+
+    def _create_receiver_and_enqueue(
+        self, req: Req, is_rebootstrap: bool = False
+    ) -> DecodeRequest:
+        decode_req = self._create_receiver(
+            req,
+            is_rebootstrap=is_rebootstrap,
         )
         self.queue.append(decode_req)
         return decode_req
@@ -1067,6 +2051,55 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
+            prepared_record = self._attached_preallocated_record(decode_req)
+            if prepared_record is not None:
+                preparation.publication_started = True
+                try:
+                    actual_source_tp_size = (
+                        decode_req.kv_receiver.prefill_info.attn_tp_size
+                    )
+                    if actual_source_tp_size != prepared_record.source_tp_size:
+                        raise DecodeAllocationLeaseError(
+                            "handshake source TP width differs from reservation"
+                        )
+                    lease = decode_req.allocation_lease
+                    if lease is None:
+                        raise DecodeAllocationLeaseError(
+                            "attached reserved child lost its allocation lease"
+                        )
+                    lease_snapshot = self.allocation_lease_authority.snapshot(lease)
+                    if lease_snapshot.state is not DecodeAllocationLeaseState.PUBLISHED:
+                        raise DecodeAllocationLeaseError(
+                            "attached reserved allocation was not promoted"
+                        )
+                    origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+                    decode_req.req.cache_protected_len = 0
+                    metadata_submissions.append(
+                        self._build_decode_metadata_submission(
+                            decode_req,
+                            origin_input_len=origin_input_len,
+                            prefix_len=0,
+                            total_prefix_len=0,
+                            dst_kv_indices=None,
+                            allocate_metadata_index=False,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    metadata_traceback = traceback.format_exc()
+                    with self._prepared_cohort_lock:
+                        self._quarantine_preallocated_record_locked(
+                            prepared_record,
+                            "reserved metadata preparation failed",
+                        )
+                    logger.error(
+                        "Reserved metadata preparation failed and was quarantined:\n%s",
+                        metadata_traceback,
+                    )
+                    raise
+                preallocated_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
+
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -1198,136 +2231,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
-            page_size = self.token_to_kv_pool_allocator.page_size
-            kv_transfer_page_size = page_size
-            if self.scheduler.enable_hisparse:
-                # Direct-to-host sends host/C4 rows; keep allocator.page_size
-                # logical and use the compressed page size only for these indices.
-                kv_transfer_page_size = getattr(
-                    self.token_to_kv_pool_allocator,
-                    "hisparse_page_size",
-                    page_size,
-                )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
-            else:
-                # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][total_prefix_len:origin_input_len]
-
-            seq_len = origin_input_len
-
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
-
-            def _swa_ring_payload():
-                # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
-                # Same window positions and order -> positional match with prefill.
-                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
-                window_size = self.token_to_kv_pool.unified_swa_window
-                window_start = max(0, seq_len - window_size)
-                positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(decode_req.req.req_pool_idx)
-                ring_rows = state_slot * ring_stride + (positions % ring_stride)
-                return ring_rows.astype(np.int32)
-
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
-                    int(decode_req.req.req_pool_idx),
-                    seq_len,
-                    online=online,
-                    ring_size=ring_size,
-                )
-
-            state_types = self.kv_manager.kv_args.state_types
-            if StateType.C128_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
-                )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
-            payloads = {
-                StateType.MAMBA: _mamba_payload,
-                StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
-                StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
-            }
-            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
-                # DSV4 on NPU: per-pool dst page indices, produced by the same
-                # shared builder prefill uses so src/dst line up positionally.
-                if total_prefix_len != 0:
-                    raise RuntimeError(
-                        "DSV4 NPU PD disaggregation does not support decode-side "
-                        "prefix cache yet; disable disaggregation decode radix/HiCache "
-                        "for PD + chunked prefill."
-                    )
-            if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                    dsv4_state_payloads,
-                )
-
-                payloads.update(
-                    dsv4_state_payloads(
-                        self.req_to_token_pool,
-                        decode_req.req.req_pool_idx,
-                        seq_len,
-                        self.token_to_kv_pool_allocator.page_size,
-                        self.scheduler.sliding_window_size,
-                        prefix_len=total_prefix_len,
-                    )
-                )
-            state_indices: Optional[List] = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
-
-            decode_req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert decode_req.metadata_buffer_index is not None
-            # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
             metadata_submissions.append(
-                _DecodeMetadataSubmission(
-                    decode_req=decode_req,
-                    page_indices=page_indices,
-                    state_indices=state_indices,
-                    decode_prefix_len=total_prefix_len,
+                self._build_decode_metadata_submission(
+                    decode_req,
+                    origin_input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
+                    dst_kv_indices=dst_kv_indices,
+                    allocate_metadata_index=True,
                 )
             )
             preallocated_reqs.append(decode_req)
@@ -1335,33 +2246,321 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for submission in metadata_submissions:
             decode_req = submission.decode_req
-            # Registration exposes the room to the background staging thread.
-            preparation.publication_started = True
-            if (
-                self.transfer_queue.enable_staging
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
-                )
-            decode_req.kv_receiver.send_metadata(
-                submission.page_indices,
-                decode_req.metadata_buffer_index,
-                submission.state_indices,
-                decode_prefix_len=submission.decode_prefix_len,
-            )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
-                )
-            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            prepared_record = self._attached_preallocated_record(decode_req)
+            try:
+                packed_child: (
+                    tuple[PackedDecodeRequestTransaction, PackedRequestPublication]
+                    | None
+                ) = None
+                if prepared_record is None:
+                    self._record_legacy_decode_allocation_publication(decode_req)
+                else:
+                    packed_child = self._packed_preallocated_child(
+                        prepared_record,
+                        decode_req,
+                    )
+                preparation.publication_started = True
+                if (
+                    packed_child is None
+                    and self.transfer_queue.enable_staging
+                    and decode_req.kv_receiver.require_staging
+                ):
+                    self.transfer_queue.staging_handler.register_decode_req(
+                        decode_req.req.bootstrap_room, decode_req
+                    )
+                if packed_child is None:
+                    decode_req.kv_receiver.send_metadata(
+                        submission.page_indices,
+                        decode_req.metadata_buffer_index,
+                        submission.state_indices,
+                        decode_prefix_len=submission.decode_prefix_len,
+                    )
+                else:
+                    self.kv_manager.send_packed_decode_request_metadata(
+                        transaction=packed_child[0],
+                        publication=packed_child[1],
+                        receiver=decode_req.kv_receiver,
+                        page_indices=submission.page_indices,
+                        metadata_buffer_index=decode_req.metadata_buffer_index,
+                        state_indices=submission.state_indices,
+                        decode_prefix_len=submission.decode_prefix_len,
+                    )
+                if decode_req.is_rebootstrap:
+                    self.kv_manager.submit_prefill_recompute(
+                        decode_req.kv_receiver,
+                        decode_req.req.build_rebootstrap_payload(),
+                    )
+                decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            except Exception:  # noqa: BLE001
+                publication_traceback = traceback.format_exc()
+                if prepared_record is not None:
+                    with self._prepared_cohort_lock:
+                        self._quarantine_preallocated_record_locked(
+                            prepared_record,
+                            "reserved metadata publication failed",
+                        )
+                    logger.error(
+                        "Reserved metadata publication failed and was quarantined:\n%s",
+                        publication_traceback,
+                    )
+                raise
+            if prepared_record is not None:
+                with self._prepared_cohort_lock:
+                    prepared_record.metadata_published = True
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _build_decode_metadata_submission(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        origin_input_len: int,
+        prefix_len: int,
+        total_prefix_len: int,
+        dst_kv_indices: torch.Tensor | None,
+        allocate_metadata_index: bool,
+    ) -> _DecodeMetadataSubmission:
+        """Build one destination metadata payload from an exact allocation.
+
+        :param decode_req: Exact allocated decode request.
+        :param origin_input_len: Prompt length transferred by prefill.
+        :param prefix_len: L1-resident prefix length.
+        :param total_prefix_len: Full decoder-reused prefix length.
+        :param dst_kv_indices: Direct-to-host destination rows, when applicable.
+        :param allocate_metadata_index: Whether this path must reserve a slot.
+        :returns: Complete deferred metadata submission.
+        """
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kv_transfer_page_size = page_size
+        if self.scheduler.enable_hisparse:
+            if dst_kv_indices is None:
+                raise RuntimeError("HiSparse metadata requires destination indices")
+            kv_transfer_page_size = getattr(
+                self.token_to_kv_pool_allocator,
+                "hisparse_page_size",
+                page_size,
+            )
+            kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+        else:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx
+            ][total_prefix_len:origin_input_len]
+
+        seq_len = origin_input_len
+
+        def _mamba_payload() -> list[np.ndarray]:
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    decode_req.req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload() -> np.ndarray:
+            window_size = self.scheduler.sliding_window_size
+            window_start = max(0, seq_len - window_size)
+            window_start = page_align_floor(window_start, page_size)
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa, page_size)
+
+        def _dsa_payload() -> np.ndarray:
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, :seq_len
+            ]
+            device_page_size = self.token_to_kv_pool.page_size
+            return kv_to_page_indices(kv_indices_full, device_page_size)
+
+        def _swa_ring_payload() -> np.ndarray:
+            ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+            window_size = self.token_to_kv_pool.unified_swa_window
+            window_start = max(0, seq_len - window_size)
+            positions = np.arange(window_start, seq_len, dtype=np.int64)
+            state_slot = int(decode_req.req.req_pool_idx)
+            ring_rows = state_slot * ring_stride + (positions % ring_stride)
+            return ring_rows.astype(np.int32)
+
+        def _c128_state_payload() -> np.ndarray:
+            online = is_dsv4_c128_online_enabled()
+            ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+            return get_dsv4_c128_state_indices(
+                int(decode_req.req.req_pool_idx),
+                seq_len,
+                online=online,
+                ring_size=ring_size,
+            )
+
+        state_types = self.kv_manager.kv_args.state_types
+        if StateType.C128_STATE in state_types:
+            clear_c128_state = getattr(
+                self.token_to_kv_pool,
+                "clear_c128_req_state",
+                None,
+            )
+            if clear_c128_state is not None:
+                clear_c128_state(int(decode_req.req.req_pool_idx))
+        payloads = {
+            StateType.MAMBA: _mamba_payload,
+            StateType.SWA: _swa_payload,
+            StateType.DSA: _dsa_payload,
+            StateType.MINIMAX_INDEX_K: _dsa_payload,
+            StateType.SWA_RING: _swa_ring_payload,
+            StateType.C128_STATE: _c128_state_payload,
+        }
+        if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+            if total_prefix_len != 0:
+                raise RuntimeError(
+                    "DSV4 NPU PD disaggregation does not support decode-side "
+                    "prefix cache yet; disable disaggregation decode radix/HiCache "
+                    "for PD + chunked prefill."
+                )
+        if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                dsv4_state_payloads,
+            )
+
+            payloads.update(
+                dsv4_state_payloads(
+                    self.req_to_token_pool,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    self.token_to_kv_pool_allocator.page_size,
+                    self.scheduler.sliding_window_size,
+                    prefix_len=total_prefix_len,
+                )
+            )
+        state_indices: list[Any] | None = [
+            payloads[st]() if st in payloads else None for st in state_types
+        ]
+
+        if allocate_metadata_index:
+            decode_req.metadata_buffer_index = (
+                self.req_to_metadata_buffer_idx_allocator.alloc()
+            )
+            if decode_req.metadata_buffer_index is None:
+                raise RuntimeError("decode metadata allocator returned no slot")
+        elif decode_req.metadata_buffer_index < 0:
+            raise DecodeAllocationLeaseError(
+                "reserved decode request lost its metadata slot"
+            )
+        page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+            np.int32
+        )
+        return _DecodeMetadataSubmission(
+            decode_req=decode_req,
+            page_indices=page_indices,
+            state_indices=state_indices,
+            decode_prefix_len=total_prefix_len,
+        )
+
+    def _attached_preallocated_record(
+        self,
+        decode_req: DecodeRequest,
+    ) -> _DecodePreparedCohortRecord | None:
+        """Resolve attached reserved ownership for one exact queue child.
+
+        :param decode_req: Candidate decode queue entry.
+        :returns: Exact attached cohort, otherwise ``None``.
+        """
+
+        lock = getattr(self, "_prepared_cohort_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            token = self._prepared_request_ids.get(decode_req.req.rid)
+            if token is None:
+                return None
+            record = self._prepared_cohorts.get(token)
+            if record is None:
+                raise DecodeAllocationLeaseError(
+                    "prepared request points to a missing cohort"
+                )
+            if all(owned is not decode_req for owned in record.decode_reqs):
+                raise DecodeAllocationLeaseError(
+                    "prepared request identity differs from its cohort child"
+                )
+            if record.state is not _DecodePreparedCohortState.ATTACHED:
+                raise DecodeAllocationLeaseError(
+                    f"prepared request entered the queue in state {record.state.value}"
+                )
+            return record
+
+    @staticmethod
+    def _packed_preallocated_child(
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+    ) -> tuple[PackedDecodeRequestTransaction, PackedRequestPublication]:
+        """Resolve exact packed transfer ownership for an attached child.
+
+        :param record: Attached prepared cohort.
+        :param decode_req: Exact child entering metadata transfer.
+        :returns: Matching request transaction and irreversible publication.
+        """
+
+        publications = record.packed_publications
+        if publications is None:
+            raise DecodeAllocationLeaseError(
+                "attached prepared cohort has no packed publications"
+            )
+        if len(publications) != len(record.decode_reqs):
+            raise DecodeAllocationLeaseError(
+                "prepared cohort publication count differs from its children"
+            )
+        for owned_req, transaction, publication in zip(
+            record.decode_reqs,
+            record.packed_transactions,
+            publications,
+            strict=True,
+        ):
+            if owned_req is not decode_req:
+                continue
+            if transaction.request_owner is not decode_req:
+                raise DecodeAllocationLeaseError(
+                    "packed transaction retained another decode request"
+                )
+            return transaction, publication
+        raise DecodeAllocationLeaseError(
+            "prepared cohort does not own the metadata transfer child"
+        )
+
+    def _record_legacy_decode_allocation_publication(
+        self,
+        decode_req: DecodeRequest,
+    ) -> None:
+        """Publish an allocation owned by the legacy transfer path.
+
+        Prepared-grant allocations never enter this method. Their packed
+        transaction crossed the publication boundary during promotion.
+
+        :param decode_req: Legacy decode request about to publish metadata.
+        """
+
+        lease = decode_req.allocation_lease
+        if lease is None:
+            return
+        snapshot = self.allocation_lease_authority.snapshot(lease)
+        if snapshot.state is DecodeAllocationLeaseState.PUBLISHED:
+            return
+        if snapshot.state is not DecodeAllocationLeaseState.PREPARED:
+            raise DecodeAllocationLeaseError(
+                f"metadata publication is invalid in state {snapshot.state.value}"
+            )
+        self.allocation_lease_authority.record_publication(
+            lease,
+            self.allocation_lifecycle_authority,
+        )
 
     @property
     def num_tokens_pre_allocated(self):
@@ -1578,9 +2777,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "decode request has no request-pool allocation"
             )
         if prefix_len < 0 or migration_end < prefix_len:
-            raise DecodeAllocationLeaseError(
-                "invalid migration-owned logical range"
-            )
+            raise DecodeAllocationLeaseError("invalid migration-owned logical range")
 
         full_indices = self.req_to_token_pool.req_to_token[
             request_slot, prefix_len:migration_end
@@ -1605,9 +2802,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
                 swa_indices = swa_full_indices
             else:
-                swa_indices = allocator.translate_loc_from_full_to_swa(
-                    swa_full_indices
-                )
+                swa_indices = allocator.translate_loc_from_full_to_swa(swa_full_indices)
             if swa_indices.numel() > 0 and bool((swa_indices <= 0).any().item()):
                 raise DecodeAllocationLeaseError(
                     "migration-owned SWA mapping is incomplete"
@@ -1617,9 +2812,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 logical_start=swa_start,
                 logical_length=int(swa_indices.numel()),
                 allocator=(
-                    allocator.swa_attn_allocator
-                    if swa_indices.numel() > 0
-                    else None
+                    allocator.swa_attn_allocator if swa_indices.numel() > 0 else None
                 ),
                 indices=swa_indices if swa_indices.numel() > 0 else None,
             )
@@ -1679,12 +2872,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         *,
         prefix_len: int,
         migration_end: int,
+        source_tp_size: int | None = None,
     ) -> None:
         """Acquire the process-local lease for one asymmetric TP transfer.
 
         :param decode_req: Exact live decode request.
         :param prefix_len: L1-resident prefix boundary.
         :param migration_end: End of the transferred prompt.
+        :param source_tp_size: Decoder-authorized source width before handshake.
         """
 
         if not decode_req.kv_receiver.require_staging:
@@ -1698,7 +2893,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "asymmetric decode allocation leases require TP1 destination"
             )
 
-        source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
+        if source_tp_size is None:
+            source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
         if source_tp_size not in (2, 4):
             raise DecodeAllocationLeaseError(
                 "asymmetric decode allocation leases require TP2 or TP4 source"
@@ -1715,9 +2911,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             request_pool=self.req_to_token_pool,
             request_slot=request_slot,
             expected_request_generation=request_generation,
-            writer_manifest=DecodeWriterManifest.for_tensor_parallel(
-                source_tp_size
-            ),
+            writer_manifest=DecodeWriterManifest.for_tensor_parallel(source_tp_size),
             component_claims=self._migration_component_claims(
                 decode_req,
                 prefix_len=prefix_len,
@@ -1751,6 +2945,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         *,
         decode_req: DecodeRequest | None = None,
         migration_end: int | None = None,
+        source_tp_size: int | None = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -1759,6 +2954,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix committed to prefill as ``decode_prefix_len`` (L1 + L2 + L3);
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
         loadback.
+
+        :param req: Exact canonical scheduler request.
+        :param prefix_indices: Existing L1 prefix destinations.
+        :param prefix_len: Existing L1 prefix length.
+        :param total_prefix_len: Full promised decode prefix length.
+        :param decode_req: Optional migration-owning decode request.
+        :param migration_end: Exact transferred prompt end.
+        :param source_tp_size: Decoder-authorized source width before handshake.
+        :returns: Newly allocated transfer destination indices.
         """
         if prefix_len is None:
             prefix_len = 0
@@ -1889,6 +3093,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req,
                 prefix_len=prefix_len,
                 migration_end=migration_end,
+                source_tp_size=source_tp_size,
             )
 
         # Return the transfer destination indices:
@@ -2015,6 +3220,62 @@ def alloc_for_decode_prealloc(
     return kv_loc
 
 
+@dataclass(frozen=True)
+class _PackedDecodeTransactionPoller:
+    """Expose one packed transaction through the collective poller surface."""
+
+    manager: CommonKVManager
+    transaction: PackedDecodeRequestTransaction
+
+    def poll(self) -> KVPoll:
+        """Advance the exact packed actor transaction.
+
+        :returns: Current packed transfer state.
+        """
+
+        return self.manager.poll_packed_decode_request_transaction(self.transaction)
+
+
+@dataclass(frozen=True)
+class _LegacyStagingTransactionPoller:
+    """Preserve legacy staging scatter gating in a mixed packed queue."""
+
+    decode_req: DecodeRequest
+    metadata_buffers: MetadataBuffers
+    server_args: object
+    staging_handler: DecodeStagingHandler
+
+    def poll(self) -> KVPoll:
+        """Advance legacy staging scatter and poll its receiver.
+
+        :returns: Receiver state gated by local scatter completion.
+        """
+
+        receiver = self.decode_req.kv_receiver
+        requires_staging = receiver.require_staging
+        if requires_staging and not self.staging_handler.is_done(self.decode_req):
+            self.staging_handler.advance_scatter(self.decode_req)
+        poll = receiver.poll()
+        if (
+            poll == KVPoll.Success
+            and requires_staging
+            and not self.staging_handler.is_done(self.decode_req)
+        ):
+            return KVPoll.Transferring
+        if poll != KVPoll.Success or _is_fake_transfer(
+            self.decode_req.req,
+            self.server_args,
+        ):
+            return poll
+        actual_room = self.metadata_buffers.bootstrap_room[
+            self.decode_req.metadata_buffer_index,
+            0,
+        ].item()
+        if actual_room == 0:
+            return KVPoll.Transferring
+        return poll
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -2039,12 +3300,178 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.allocation_lease_authority: DecodeAllocationLeaseAuthority | None = None
+        self.allocation_lifecycle_authority: CommonKVManager | None = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
+
+    def _commit_consumed_allocation(self, decode_req: DecodeRequest) -> None:
+        """Release a legacy migration lease after metadata consumption.
+
+        :param decode_req: Exact request whose transferred metadata was consumed.
+        """
+
+        lease = decode_req.allocation_lease
+        if lease is None or decode_req.packed_transaction is not None:
+            return
+        authority = self.allocation_lease_authority
+        lifecycle = self.allocation_lifecycle_authority
+        if authority is None or lifecycle is None:
+            raise DecodeAllocationLeaseError(
+                "decode transfer allocation ownership is unavailable"
+            )
+        authority.commit_legacy_to_request_after_consumption(lease, lifecycle)
+        authority.retire_terminal(lease)
+        decode_req.allocation_lease = None
+
+    def _complete_packed_metadata_consumption(
+        self,
+        decode_req: DecodeRequest,
+    ) -> None:
+        """Release packed metadata only after its contents are copied.
+
+        :param decode_req: Exact request whose metadata was consumed.
+        """
+
+        transaction = decode_req.packed_transaction
+        if transaction is None:
+            return
+        manager = self.allocation_lifecycle_authority
+        if manager is None:
+            raise DecodeAllocationLeaseError(
+                "packed metadata consumption authority is unavailable"
+            )
+        metadata_index = decode_req.metadata_buffer_index
+        if metadata_index < 0:
+            raise DecodeAllocationLeaseError(
+                "packed request lost its metadata row before consumption"
+            )
+        self.metadata_buffers.bootstrap_room[metadata_index] = 0
+        manager.complete_packed_decode_request_metadata_consumption(transaction)
+        decode_req.metadata_buffer_index = -1
+        decode_req.allocation_lease = None
+        decode_req.packed_transaction = None
+
+    def _quarantine_packed_transaction(
+        self,
+        decode_req: DecodeRequest,
+        reason: str,
+    ) -> bool:
+        """Quarantine packed ownership without permitting legacy cleanup.
+
+        :param decode_req: Exact request retaining packed ownership.
+        :param reason: Stable failure reason.
+        :returns: Whether the request retained a packed transaction.
+        """
+
+        transaction = decode_req.packed_transaction
+        if transaction is None:
+            return False
+        manager = self.allocation_lifecycle_authority
+        if manager is None:
+            logger.error(
+                "Packed transaction lost its quarantine authority for %s",
+                decode_req.req.rid,
+            )
+            return True
+        try:
+            manager.quarantine_packed_decode_request_transaction(
+                transaction,
+                reason,
+            )
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "Packed transaction quarantine failed for %s:\n%s",
+                decode_req.req.rid,
+                traceback.format_exc(),
+            )
+        return True
+
+    def _reconcile_failed_allocation(
+        self,
+        decode_req: DecodeRequest,
+        *,
+        terminal_receiver_failure: bool,
+    ) -> bool:
+        """Resolve legacy migration ownership before failed-request cleanup.
+
+        A failed collective is not enough by itself. The receiver must also
+        expose its terminal failure, and the staging handler must drain every
+        local scatter before migration pins can be returned. Any ambiguity
+        quarantines the allocation and prevents request or metadata reuse.
+
+        :param decode_req: Exact failed transfer request.
+        :param terminal_receiver_failure: Whether the receiver exposed its
+            terminal failure after the collective failed poll.
+        :returns: Whether normal request and KV cleanup is authorized.
+        """
+
+        lease = decode_req.allocation_lease
+        if lease is None:
+            return True
+        if decode_req.packed_transaction is not None:
+            return False
+
+        authority = self.allocation_lease_authority
+        lifecycle = self.allocation_lifecycle_authority
+        if authority is None or lifecycle is None:
+            raise DecodeAllocationLeaseError(
+                "decode transfer allocation ownership is unavailable"
+            )
+        if not terminal_receiver_failure:
+            authority.quarantine(
+                lease,
+                "legacy transfer failure was not terminal at the receiver",
+            )
+            return False
+        if not self.enable_staging or self.staging_handler is None:
+            authority.quarantine(
+                lease,
+                "legacy transfer failure has no staging lifecycle owner",
+            )
+            return False
+
+        bootstrap_room = decode_req.req.bootstrap_room
+        if not self.staging_handler.is_staging_room(bootstrap_room):
+            authority.quarantine(
+                lease,
+                "legacy transfer failure lost its staging room",
+            )
+            return False
+        try:
+            self.staging_handler.unregister_decode_req(bootstrap_room)
+        except Exception:
+            logger.critical(
+                "Failed to quiesce legacy staging room %s; quarantining its "
+                "decode allocation:\n%s",
+                bootstrap_room,
+                traceback.format_exc(),
+            )
+            authority.quarantine(
+                lease,
+                "legacy staging quiescence failed after terminal transfer failure",
+            )
+            return False
+
+        try:
+            permit = authority.authorize_legacy_abort_after_terminal_failure(
+                lease,
+                lifecycle,
+            )
+        except DecodeAllocationLeaseError:
+            authority.quarantine(
+                lease,
+                "legacy terminal failure could not authorize request cleanup",
+            )
+            return False
+        authority.consume_abort_permit(lease, permit)
+        authority.retire_terminal(lease)
+        decode_req.allocation_lease = None
+        return True
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2090,8 +3517,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "(bootstrap_room=0)",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            retained = self._quarantine_packed_transaction(
+                decode_req,
+                "packed metadata was absent after transfer commit",
+            )
+            if not retained:
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -2109,8 +3541,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "Metadata corruption detected - bootstrap_room mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            decode_req.kv_receiver.clear()
-            decode_req.kv_receiver = None
+            retained = self._quarantine_packed_transaction(
+                decode_req,
+                "packed metadata bootstrap room differed from its request",
+            )
+            if not retained:
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -2195,6 +3632,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        try:
+            self._complete_packed_metadata_consumption(decode_req)
+        except Exception:  # noqa: BLE001
+            reason = "packed metadata consumption completion failed"
+            logger.error("%s:\n%s", reason, traceback.format_exc())
+            self._quarantine_packed_transaction(decode_req, reason)
+            prepare_abort(
+                decode_req.req,
+                reason,
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        self._commit_consumed_allocation(decode_req)
+
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2223,6 +3674,38 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             server_args=self.scheduler.server_args,
         )
 
+    def _poll_with_packed_transactions(self) -> list:
+        """Poll packed actors and any colocated legacy staging requests.
+
+        :returns: Collectively reduced request transfer states.
+        """
+
+        manager = self.allocation_lifecycle_authority
+        if manager is None:
+            raise DecodeAllocationLeaseError(
+                "packed decode progress authority is unavailable"
+            )
+        pollers: list[
+            _PackedDecodeTransactionPoller | _LegacyStagingTransactionPoller
+        ] = []
+        for decode_req in self.queue:
+            transaction = decode_req.packed_transaction
+            if transaction is None:
+                pollers.append(
+                    _LegacyStagingTransactionPoller(
+                        decode_req,
+                        self.metadata_buffers,
+                        self.scheduler.server_args,
+                        self.staging_handler,
+                    )
+                )
+                continue
+            pollers.append(_PackedDecodeTransactionPoller(manager, transaction))
+        return poll_and_all_reduce(
+            pollers,
+            self.gloo_group,
+        )
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2247,13 +3730,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if any(decode_req.packed_transaction is not None for decode_req in self.queue):
+            polls = self._poll_with_packed_transactions()
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
 
         transferred_reqs = []
         indices_to_remove = set()
+        quarantined_indices: set[int] = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2268,12 +3754,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                terminal_receiver_failure: bool = False
                 if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    if decode_req.packed_transaction is not None:
+                        error_message += " with terminal packed actor failure"
+                    else:
+                        try:
+                            decode_req.kv_receiver.failure_exception()
+                        except Exception as e:
+                            terminal_receiver_failure = True
+                            error_message += f" with exception {e}"
+                            is_propagated = getattr(
+                                e,
+                                "is_from_another_rank",
+                                False,
+                            )
+                            logger.debug(
+                                "Terminal decode transfer failure traceback:\n%s",
+                                traceback.format_exc(),
+                            )
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2291,10 +3790,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                self._quarantine_packed_transaction(
+                    decode_req,
+                    "packed decode transfer failed before metadata consumption",
+                )
+                cleanup_authorized: bool = self._reconcile_failed_allocation(
+                    decode_req,
+                    terminal_receiver_failure=terminal_receiver_failure,
+                )
+                if cleanup_authorized:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    decode_req.kv_receiver.clear()
+                    decode_req.kv_receiver = None
+                else:
+                    quarantined_indices.add(i)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2307,6 +3816,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                packed_retained = decode_req.packed_transaction is not None
+                if packed_retained:
+                    quarantined_indices.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2318,10 +3830,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             decode_req.req
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    if not packed_retained:
+                        release_kv_cache(
+                            decode_req.req,
+                            self.tree_cache,
+                            is_insert=False,
+                        )
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
+                    if packed_retained:
+                        raise DecodeAllocationLeaseError(
+                            "packed metadata failure did not abort its request"
+                        )
                     transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -2333,6 +3854,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if i in quarantined_indices:
+                continue
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
             ):
@@ -2340,11 +3863,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.queue[i].req.bootstrap_room
                 )
             idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
+            if idx == -1:
+                continue
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
+            self.queue[i].metadata_buffer_index = -1
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

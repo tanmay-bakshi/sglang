@@ -26,6 +26,7 @@ import math
 import os
 import random
 import socket
+import stat
 import tempfile
 import uuid
 from functools import cached_property
@@ -1276,7 +1277,7 @@ class ServerArgs:
     ssl_ca_certs: A[Optional[str], "The CA certificates file.", NS("serving")] = None
     ssl_keyfile_password: A[
         Optional[str], "The password to decrypt the SSL keyfile.", NS("serving")
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     enable_ssl_refresh: A[
         bool,
         "Enable automatic SSL certificate hot-reloading when cert/key files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
@@ -1295,12 +1296,18 @@ class ServerArgs:
         Optional[str],
         "Set API key of the server. It is also used in the OpenAI API compatible server.",
         NS("serving"),
+    ] = dataclasses.field(default=None, repr=False)
+    api_key_file: A[
+        str | None,
+        "Read the server API key from a mode-0600 regular file. "
+        "Cannot be combined with --api-key.",
+        NS("serving"),
     ] = None
     admin_api_key: A[
         Optional[str],
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
         NS("serving"),
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",
@@ -3442,6 +3449,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
         self._handle_launch_instance_id()
+        self._handle_api_key_configuration()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -3850,6 +3858,70 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    @staticmethod
+    def _read_api_key_file(path: str) -> str:
+        """Read an API key from a securely permissioned regular file.
+
+        :param path: Secret file path.
+        :returns: API key with a conventional trailing newline removed.
+        :raises ValueError: If the path is unsafe, unreadable, or empty.
+        """
+        try:
+            path_status = os.lstat(path)
+        except OSError as error:
+            raise ValueError(f"Cannot inspect API key file {path!r}.") from error
+
+        if stat.S_ISLNK(path_status.st_mode):
+            raise ValueError("--api-key-file must not be a symbolic link.")
+
+        open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        open_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            file_descriptor = os.open(path, open_flags)
+        except OSError as error:
+            raise ValueError(f"Cannot open API key file {path!r}.") from error
+
+        try:
+            file_status = os.fstat(file_descriptor)
+            if not stat.S_ISREG(file_status.st_mode):
+                raise ValueError("--api-key-file must reference a regular file.")
+            if (
+                file_status.st_dev != path_status.st_dev
+                or file_status.st_ino != path_status.st_ino
+            ):
+                raise ValueError("--api-key-file changed while it was being opened.")
+            if file_status.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ValueError(
+                    "--api-key-file must not grant permissions to group or other users."
+                )
+
+            try:
+                with os.fdopen(file_descriptor, "r", encoding="utf-8") as secret_file:
+                    file_descriptor = -1
+                    api_key = secret_file.read(65_537)
+            except UnicodeDecodeError as error:
+                raise ValueError("--api-key-file must contain UTF-8 text.") from error
+        finally:
+            if file_descriptor >= 0:
+                os.close(file_descriptor)
+
+        if len(api_key) > 65_536:
+            raise ValueError("--api-key-file exceeds the 64 KiB size limit.")
+        api_key = api_key.rstrip("\r\n")
+        if len(api_key) == 0:
+            raise ValueError("--api-key-file must not be empty.")
+        if "\r" in api_key or "\n" in api_key:
+            raise ValueError("--api-key-file must contain exactly one line.")
+        return api_key
+
+    def _handle_api_key_configuration(self) -> None:
+        """Resolve mutually exclusive inline and file-backed API keys."""
+        if self.api_key is not None and self.api_key_file is not None:
+            raise ValueError("--api-key and --api-key-file cannot be combined.")
+        if self.api_key_file is None:
+            return
+        self.api_key = self._read_api_key_file(self.api_key_file)
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -8136,6 +8208,33 @@ class ServerArgs:
         from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
 
         return TokenizerWorker
+
+    def public_server_args_dict(
+        self, values: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Return server arguments safe for diagnostics and reporting.
+
+        Secret values are replaced with ``None``. Separate booleans retain the
+        useful fact that authentication or key decryption is configured without
+        disclosing the corresponding credential.
+
+        :param values: Optional resolved argument mapping to sanitize.
+        :returns: A detached public argument mapping.
+        """
+        public_values = dataclasses.asdict(self) if values is None else dict(values)
+        secret_fields = (
+            "api_key",
+            "admin_api_key",
+            "ssl_keyfile_password",
+        )
+        configured = {
+            secret_field: public_values.get(secret_field) is not None
+            for secret_field in secret_fields
+        }
+        for secret_field in secret_fields:
+            public_values[secret_field] = None
+            public_values[f"{secret_field}_configured"] = configured[secret_field]
+        return public_values
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"

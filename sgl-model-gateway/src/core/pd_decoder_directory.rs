@@ -1,19 +1,24 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use parking_lot::RwLock;
 use thiserror::Error;
 
 use super::{
-    pd_decoder_grant::{DecoderId, PrefillId, ProcessIdentityError},
+    pd_decoder_grant::{DecoderId, DecoderRequestTemplate, PrefillId, ProcessIdentityError},
     pd_decoder_pool::{
         DecoderAvailability, DecoderPool, DecoderPoolError, DecoderReplicaMetadata,
-        DecoderSchedulingHints, EngineCompatibilityMetadata, LogicalRequestOwner,
+        DecoderSchedulingHints, EngineCompatibilityMetadata, LogicalRequestOwner, PendingAdmission,
+        PendingSchedulingCharge,
     },
 };
-use crate::core::{PdProcessMetadata, PdProcessRole, PrefillBootstrapEndpoint, Worker, WorkerType};
+use crate::core::{
+    ConnectionMode, HttpOrigin, PdProcessMetadata, PdProcessRegistration, PdProcessRole,
+    PrefillBootstrapEndpoint, Worker, WorkerType,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessAvailability {
@@ -69,7 +74,7 @@ impl PrefillDirectoryEntry {
         &self.bootstrap_endpoint
     }
 
-    pub fn pool(&self) -> &DecoderPool {
+    pub(super) fn pool(&self) -> &DecoderPool {
         &self.pool
     }
 }
@@ -90,9 +95,9 @@ struct DecoderRecord {
 #[derive(Debug, Default)]
 struct DirectoryState {
     prefills: HashMap<PrefillId, PrefillRecord>,
-    current_prefill_by_url: HashMap<String, PrefillId>,
+    current_prefill_by_origin: HashMap<HttpOrigin, PrefillId>,
     decoders: HashMap<DecoderId, DecoderRecord>,
-    current_decoder_by_url: HashMap<String, DecoderId>,
+    current_decoder_by_origin: HashMap<HttpOrigin, DecoderId>,
 }
 
 #[derive(Debug)]
@@ -109,11 +114,11 @@ pub struct PdProcessDirectory {
 impl PdProcessDirectory {
     /// All directory mutations take this lock before touching a pool. Pool code
     /// never calls back into the directory, which keeps the lock order acyclic.
-    pub fn admit_prefill(
+    pub(super) fn admit_prefill(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
-        let metadata = required_metadata(&worker, PdProcessRole::Prefill)?.clone();
+        let (origin, metadata) = required_process(&worker, PdProcessRole::Prefill)?;
         if !matches!(metadata.tensor_parallel_size(), 2 | 4) {
             return Err(PdDirectoryError::UnsupportedPrefillTp(
                 metadata.tensor_parallel_size(),
@@ -123,7 +128,7 @@ impl PdProcessDirectory {
             .prefill_bootstrap_endpoint()
             .expect("validated prefill metadata contains an endpoint")
             .clone();
-        let id = PrefillId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let id = PrefillId::new(origin, metadata.launch_instance_id())?;
         let compatibility = engine_compatibility(&metadata)?;
         let pool = DecoderPool::new(id.clone(), metadata.tensor_parallel_size(), compatibility)?;
 
@@ -145,13 +150,13 @@ impl PdProcessDirectory {
             pool.register(pool_metadata(decoder)?)?;
         }
 
-        if let Some(previous_id) = state.current_prefill_by_url.get(id.url()).cloned() {
+        if let Some(previous_id) = state.current_prefill_by_origin.get(id.origin()).cloned() {
             if let Some(previous) = state.prefills.get_mut(&previous_id) {
                 previous.entry.pool().begin_draining();
                 previous.availability = ProcessAvailability::Draining;
             }
         }
-        if let Some(previous_id) = state.current_decoder_by_url.get(id.url()).cloned() {
+        if let Some(previous_id) = state.current_decoder_by_origin.get(id.origin()).cloned() {
             drain_decoder_locked(&mut state, &previous_id)?;
         }
 
@@ -163,8 +168,8 @@ impl PdProcessDirectory {
             pool,
         });
         state
-            .current_prefill_by_url
-            .insert(id.url().to_string(), id.clone());
+            .current_prefill_by_origin
+            .insert(id.origin().clone(), id.clone());
         state.prefills.insert(
             id.clone(),
             PrefillRecord {
@@ -183,17 +188,17 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub fn admit_decoder(
+    pub(super) fn admit_decoder(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
-        let metadata = required_metadata(&worker, PdProcessRole::Decode)?.clone();
+        let (origin, metadata) = required_process(&worker, PdProcessRole::Decode)?;
         if metadata.tensor_parallel_size() != 1 {
             return Err(PdDirectoryError::UnsupportedDecodeTp(
                 metadata.tensor_parallel_size(),
             ));
         }
-        let id = DecoderId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let id = DecoderId::new(origin, metadata.launch_instance_id())?;
         let mut state = self.state.write();
         if state.decoders.contains_key(&id) {
             return Err(PdDirectoryError::DuplicateDecoder(id));
@@ -223,7 +228,7 @@ impl PdProcessDirectory {
             installed_pools.push((prefill_id.clone(), pool.clone()));
         }
 
-        let previous_id = state.current_decoder_by_url.get(id.url()).cloned();
+        let previous_id = state.current_decoder_by_origin.get(id.origin()).cloned();
         let previous_memberships = previous_id
             .as_ref()
             .and_then(|previous_id| state.decoders.get(previous_id))
@@ -233,7 +238,8 @@ impl PdProcessDirectory {
             .iter()
             .map(|(prefill_id, _)| prefill_id.clone())
             .collect();
-        if let Some(previous_prefill_id) = state.current_prefill_by_url.get(id.url()).cloned() {
+        if let Some(previous_prefill_id) = state.current_prefill_by_origin.get(id.origin()).cloned()
+        {
             let previous = state
                 .prefills
                 .get_mut(&previous_prefill_id)
@@ -242,8 +248,8 @@ impl PdProcessDirectory {
             previous.availability = ProcessAvailability::Draining;
         }
         state
-            .current_decoder_by_url
-            .insert(id.url().to_string(), id.clone());
+            .current_decoder_by_origin
+            .insert(id.origin().clone(), id.clone());
         state.decoders.insert(
             id.clone(),
             DecoderRecord {
@@ -290,14 +296,14 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub fn refresh_prefill(
+    pub(super) fn refresh_prefill(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
-        let metadata = required_metadata(&worker, PdProcessRole::Prefill)?.clone();
-        let id = PrefillId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let (origin, metadata) = required_process(&worker, PdProcessRole::Prefill)?;
+        let id = PrefillId::new(origin, metadata.launch_instance_id())?;
         let mut state = self.state.write();
-        if state.current_prefill_by_url.get(id.url()) != Some(&id) {
+        if state.current_prefill_by_origin.get(id.origin()) != Some(&id) {
             return Err(PdDirectoryError::ProcessNotCurrent);
         }
         let record = state
@@ -322,14 +328,14 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub fn refresh_decoder(
+    pub(super) fn refresh_decoder(
         &self,
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
-        let metadata = required_metadata(&worker, PdProcessRole::Decode)?.clone();
-        let id = DecoderId::new(worker.base_url(), metadata.launch_instance_id())?;
+        let (origin, metadata) = required_process(&worker, PdProcessRole::Decode)?;
+        let id = DecoderId::new(origin, metadata.launch_instance_id())?;
         let mut state = self.state.write();
-        if state.current_decoder_by_url.get(id.url()) != Some(&id) {
+        if state.current_decoder_by_origin.get(id.origin()) != Some(&id) {
             return Err(PdDirectoryError::ProcessNotCurrent);
         }
         let record = state
@@ -352,7 +358,7 @@ impl PdProcessDirectory {
         Ok(entry)
     }
 
-    pub fn drain_prefill(&self, id: &PrefillId) -> Result<(), PdDirectoryError> {
+    pub(super) fn drain_prefill(&self, id: &PrefillId) -> Result<(), PdDirectoryError> {
         let mut state = self.state.write();
         let record = state
             .prefills
@@ -363,18 +369,18 @@ impl PdProcessDirectory {
         Ok(())
     }
 
-    pub fn remove_drained_prefill(
+    pub(super) fn remove_drained_prefill(
         &self,
         id: &PrefillId,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
         remove_drained_prefill_locked(&mut self.state.write(), id)
     }
 
-    pub fn drain_decoder(&self, id: &DecoderId) -> Result<(), PdDirectoryError> {
+    pub(super) fn drain_decoder(&self, id: &DecoderId) -> Result<(), PdDirectoryError> {
         drain_decoder_locked(&mut self.state.write(), id)
     }
 
-    pub fn remove_drained_decoder(
+    pub(super) fn remove_drained_decoder(
         &self,
         id: &DecoderId,
     ) -> Result<Arc<DecoderDirectoryEntry>, PdDirectoryError> {
@@ -438,8 +444,53 @@ impl PdProcessDirectory {
         if record.availability != ProcessAvailability::Ready {
             return Err(PdDirectoryError::ProcessNotReady);
         }
+        ensure_worker_available(record.entry.worker())?;
         let owner = record.entry.pool().begin_request(request_id)?;
         Ok((Arc::clone(&record.entry), owner))
+    }
+
+    pub(crate) fn begin_admission(
+        &self,
+        prefill_id: &PrefillId,
+        request: &LogicalRequestOwner,
+        template: &DecoderRequestTemplate,
+        prepared_ttl: Duration,
+        charge: PendingSchedulingCharge,
+    ) -> Result<PendingAdmission, PdDirectoryError> {
+        let state = self.state.read();
+        let prefill = state
+            .prefills
+            .get(prefill_id)
+            .ok_or_else(|| PdDirectoryError::UnknownPrefill(prefill_id.clone()))?;
+        if !matches!(
+            prefill.availability,
+            ProcessAvailability::Ready | ProcessAvailability::Draining
+        ) {
+            return Err(PdDirectoryError::ProcessNotReady);
+        }
+
+        let eligible_decoders: HashSet<DecoderId> = state
+            .decoders
+            .iter()
+            .filter(|(_, decoder)| {
+                decoder.availability == ProcessAvailability::Ready
+                    && decoder.pool_memberships.contains(prefill_id)
+                    && decoder.entry.worker().is_available()
+            })
+            .map(|(decoder_id, _)| decoder_id.clone())
+            .collect();
+        prefill
+            .entry
+            .pool()
+            .begin_admission(
+                request,
+                &eligible_decoders,
+                template,
+                prefill.entry.bootstrap_endpoint().clone(),
+                prepared_ttl,
+                charge,
+            )
+            .map_err(Into::into)
     }
 
     pub fn decoder(&self, id: &DecoderId) -> Option<Arc<DecoderDirectoryEntry>> {
@@ -467,12 +518,25 @@ impl PdProcessDirectory {
     }
 
     pub fn ready_prefills(&self) -> Vec<Arc<PrefillDirectoryEntry>> {
+        self.ready_prefills_for_model(None)
+    }
+
+    pub(crate) fn ready_prefills_for_model(
+        &self,
+        model_id: Option<&str>,
+    ) -> Vec<Arc<PrefillDirectoryEntry>> {
         let mut entries: Vec<Arc<PrefillDirectoryEntry>> = self
             .state
             .read()
             .prefills
             .values()
-            .filter(|record| record.availability == ProcessAvailability::Ready)
+            .filter(|record| {
+                record.availability == ProcessAvailability::Ready
+                    && record.entry.worker().is_available()
+                    && model_id
+                        .map(|model_id| record.entry.worker().supports_model(model_id))
+                        .unwrap_or(true)
+            })
             .map(|record| Arc::clone(&record.entry))
             .collect();
         entries.sort_by(|left, right| left.id().cmp(right.id()));
@@ -506,8 +570,8 @@ fn remove_drained_prefill_locked(
         .prefills
         .remove(id)
         .expect("prefill was retained while retirement was proven");
-    if state.current_prefill_by_url.get(id.url()) == Some(id) {
-        state.current_prefill_by_url.remove(id.url());
+    if state.current_prefill_by_origin.get(id.origin()) == Some(id) {
+        state.current_prefill_by_origin.remove(id.origin());
     }
     for decoder in state.decoders.values_mut() {
         decoder.pool_memberships.remove(id);
@@ -561,8 +625,8 @@ fn remove_drained_decoder_locked(
         .decoders
         .remove(id)
         .expect("decoder was retained while memberships were released");
-    if state.current_decoder_by_url.get(id.url()) == Some(id) {
-        state.current_decoder_by_url.remove(id.url());
+    if state.current_decoder_by_origin.get(id.origin()) == Some(id) {
+        state.current_decoder_by_origin.remove(id.origin());
     }
     Ok(record.entry)
 }
@@ -596,10 +660,17 @@ fn drain_decoder_locked(
     Ok(())
 }
 
-fn required_metadata(
+fn ensure_worker_available(worker: &Arc<dyn Worker>) -> Result<(), PdDirectoryError> {
+    if worker.is_available() {
+        return Ok(());
+    }
+    Err(PdDirectoryError::ProcessUnavailable)
+}
+
+fn required_process(
     worker: &Arc<dyn Worker>,
     role: PdProcessRole,
-) -> Result<&PdProcessMetadata, PdDirectoryError> {
+) -> Result<(HttpOrigin, PdProcessMetadata), PdDirectoryError> {
     let worker_role_matches = match role {
         PdProcessRole::Prefill => matches!(worker.worker_type(), WorkerType::Prefill { .. }),
         PdProcessRole::Decode => worker.worker_type() == &WorkerType::Decode,
@@ -607,15 +678,24 @@ fn required_metadata(
     if !worker_role_matches {
         return Err(PdDirectoryError::WorkerRoleMismatch);
     }
-    let metadata = worker
+    let registration: &PdProcessRegistration = worker
         .metadata()
         .pd_process
         .as_ref()
         .ok_or(PdDirectoryError::MissingProcessMetadata)?;
+    if worker.connection_mode() != &ConnectionMode::Http {
+        return Err(PdDirectoryError::UnsupportedProcessTransport);
+    }
+    if worker.url() != registration.origin().as_str()
+        || worker.base_url() != registration.origin().as_str()
+    {
+        return Err(PdDirectoryError::ProcessOriginMismatch);
+    }
+    let metadata = registration.metadata();
     if metadata.role() != role {
         return Err(PdDirectoryError::WorkerRoleMismatch);
     }
-    Ok(metadata)
+    Ok((registration.origin().clone(), metadata.clone()))
 }
 
 fn engine_compatibility(
@@ -648,6 +728,10 @@ pub enum PdDirectoryError {
     MissingProcessMetadata,
     #[error("worker role and typed PD role differ")]
     WorkerRoleMismatch,
+    #[error("PD process registration requires canonical HTTP transport")]
+    UnsupportedProcessTransport,
+    #[error("PD worker transport and registered process origin differ")]
+    ProcessOriginMismatch,
     #[error("prefill directory supports TP2 or TP4, received TP{0}")]
     UnsupportedPrefillTp(usize),
     #[error("decoder directory supports TP1, received TP{0}")]
@@ -664,6 +748,8 @@ pub enum PdDirectoryError {
     ProcessNotDraining,
     #[error("process generation is not ready for new admissions")]
     ProcessNotReady,
+    #[error("process generation is not healthy and circuit-breaker available")]
+    ProcessUnavailable,
     #[error("process generation is not the current generation for its URL")]
     ProcessNotCurrent,
     #[error("process-generation metadata changed without a new launch identity")]
@@ -679,17 +765,23 @@ mod tests {
     use std::{
         sync::{Arc, Barrier},
         thread,
+        time::Duration,
     };
 
+    use bytes::Bytes;
     use uuid::Uuid;
 
     use super::*;
-    use crate::core::pd_decoder_grant::{
-        issue_test_grant, issue_test_release_receipt, DecoderGrantChildAccounting,
-        DecoderSlotGeneration, EngineReleaseKind,
-    };
-    use crate::core::pd_decoder_pool::RetryDisposition;
     use crate::core::{
+        pd_decoder_grant::{
+            issue_test_grant, issue_test_reserve_refusal_receipt, DecoderGrantChildAccounting,
+            DecoderInferenceRoute, DecoderRequestTemplate, DecoderReserveRefusalDisposition,
+            DecoderSlotGeneration,
+        },
+        pd_decoder_pool::{
+            begin_test_pending_for_grant, PendingAdmission, PendingAdmissionDisposition,
+            PendingSchedulingCharge,
+        },
         BasicWorkerBuilder, KvTransferProtocol, PdMetadataSchema, PreparedGrantProtocol,
     };
 
@@ -763,15 +855,96 @@ mod tests {
                     },
                     PdProcessRole::Decode => WorkerType::Decode,
                 })
-                .pd_process(metadata(
-                    role,
-                    tp_size,
-                    instance_id,
-                    model_fingerprint,
-                    kv_layout_fingerprint,
+                .pd_process(PdProcessRegistration::new(
+                    HttpOrigin::parse(url).unwrap(),
+                    metadata(
+                        role,
+                        tp_size,
+                        instance_id,
+                        model_fingerprint,
+                        kv_layout_fingerprint,
+                    ),
                 ))
                 .build(),
         )
+    }
+
+    fn scalar_template() -> DecoderRequestTemplate {
+        DecoderRequestTemplate::new(
+            DecoderInferenceRoute::Generate,
+            Bytes::from_static(br#"{"text":"test"}"#),
+        )
+        .unwrap()
+    }
+
+    fn begin_scalar_admission(
+        directory: &PdProcessDirectory,
+        prefill: &PrefillDirectoryEntry,
+        owner: &LogicalRequestOwner,
+    ) -> Result<PendingAdmission, PdDirectoryError> {
+        directory.begin_admission(
+            prefill.id(),
+            owner,
+            &scalar_template(),
+            Duration::from_secs(2),
+            PendingSchedulingCharge::new(1, 64, 16).unwrap(),
+        )
+    }
+
+    #[test]
+    fn rejects_non_http_pd_transport_before_directory_mutation() {
+        let url = "http://decode.test:30001";
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc { port: Some(50_051) })
+                .pd_process(PdProcessRegistration::new(
+                    HttpOrigin::parse(url).unwrap(),
+                    metadata(
+                        PdProcessRole::Decode,
+                        1,
+                        instance(1),
+                        MODEL_FINGERPRINT,
+                        KV_LAYOUT_FINGERPRINT,
+                    ),
+                ))
+                .build(),
+        );
+        let directory = PdProcessDirectory::default();
+
+        assert!(matches!(
+            directory.admit_decoder(worker),
+            Err(PdDirectoryError::UnsupportedProcessTransport)
+        ));
+        assert!(directory.ready_prefills().is_empty());
+    }
+
+    #[test]
+    fn rejects_pd_transport_origin_divergence_before_directory_mutation() {
+        let registered_origin = HttpOrigin::parse("http://decode.test:30001").unwrap();
+        let mut worker = BasicWorkerBuilder::new(registered_origin.as_str())
+            .worker_type(WorkerType::Decode)
+            .pd_process(PdProcessRegistration::new(
+                registered_origin.clone(),
+                metadata(
+                    PdProcessRole::Decode,
+                    1,
+                    instance(1),
+                    MODEL_FINGERPRINT,
+                    KV_LAYOUT_FINGERPRINT,
+                ),
+            ))
+            .build();
+        worker.metadata.url = "http://other-decode.test:30001".to_string();
+        let directory = PdProcessDirectory::default();
+
+        assert!(matches!(
+            directory.admit_decoder(Arc::new(worker)),
+            Err(PdDirectoryError::ProcessOriginMismatch)
+        ));
+        assert!(directory
+            .decoder(&DecoderId::new(registered_origin, instance(1)).unwrap())
+            .is_none());
     }
 
     #[test]
@@ -897,6 +1070,64 @@ mod tests {
     }
 
     #[test]
+    fn admission_boundary_excludes_unavailable_processes() {
+        let directory = PdProcessDirectory::default();
+        let prefill_worker = worker(
+            "http://prefill-health.test:30000",
+            PdProcessRole::Prefill,
+            2,
+            instance(1),
+        );
+        let prefill = directory
+            .admit_prefill(Arc::clone(&prefill_worker))
+            .unwrap();
+        let unavailable_worker = worker(
+            "http://decode-unavailable.test:30001",
+            PdProcessRole::Decode,
+            1,
+            instance(2),
+        );
+        let unavailable = directory
+            .admit_decoder(Arc::clone(&unavailable_worker))
+            .unwrap();
+        let ready_worker = worker(
+            "http://decode-ready.test:30001",
+            PdProcessRole::Decode,
+            1,
+            instance(3),
+        );
+        let ready = directory.admit_decoder(Arc::clone(&ready_worker)).unwrap();
+
+        unavailable_worker.set_healthy(false);
+        let (_, mut owner) = directory
+            .begin_prefill_request(prefill.id(), "healthy-selection")
+            .unwrap();
+        let pending = begin_scalar_admission(&directory, &prefill, &owner).unwrap();
+        assert_eq!(pending.decoder_id(), ready.id());
+        assert_ne!(pending.decoder_id(), unavailable.id());
+        drop(pending);
+        prefill.pool().finalize_request(&mut owner).unwrap();
+
+        prefill_worker.set_healthy(false);
+        assert!(directory.ready_prefills().is_empty());
+        assert!(matches!(
+            directory.begin_prefill_request(prefill.id(), "unavailable-prefill"),
+            Err(PdDirectoryError::ProcessUnavailable)
+        ));
+
+        prefill_worker.set_healthy(true);
+        ready_worker.set_healthy(false);
+        let (_, mut owner) = directory
+            .begin_prefill_request(prefill.id(), "no-ready-decode")
+            .unwrap();
+        assert!(matches!(
+            begin_scalar_admission(&directory, &prefill, &owner),
+            Err(PdDirectoryError::Pool(DecoderPoolError::NoReadyDecoder))
+        ));
+        prefill.pool().finalize_request(&mut owner).unwrap();
+    }
+
+    #[test]
     fn same_url_decoder_replacement_drains_old_in_every_pool_and_preserves_arcs() {
         let directory = PdProcessDirectory::default();
         let prefills = [
@@ -960,13 +1191,13 @@ mod tests {
                     .availability,
                 DecoderAvailability::Draining
             );
-            let (_, owner) = directory
+            let (_, mut owner) = directory
                 .begin_prefill_request(prefill.id(), "replacement-visible")
                 .unwrap();
-            assert_eq!(
-                prefill.pool().admission_candidates(&owner).unwrap(),
-                vec![replacement.id().clone()]
-            );
+            let pending = begin_scalar_admission(&directory, prefill, &owner).unwrap();
+            assert_eq!(pending.decoder_id(), replacement.id());
+            drop(pending);
+            prefill.pool().finalize_request(&mut owner).unwrap();
         }
 
         let removed = directory.remove_drained_decoder(old.id()).unwrap();
@@ -1023,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_retirement_waits_for_owned_cohorts_and_closes_new_requests() {
+    fn drain_rejects_new_owners_but_allows_owned_request_retry_and_reconciliation() {
         let directory = PdProcessDirectory::default();
         let prefill_worker = worker(
             "http://prefill.test:30000",
@@ -1042,60 +1273,121 @@ mod tests {
                 instance(2),
             ))
             .unwrap();
-        let (_, mut owner) = directory
-            .begin_prefill_request(prefill.id(), "active-request")
+        let (_, mut pending_owner) = directory
+            .begin_prefill_request(prefill.id(), "pending-request")
             .unwrap();
-        let grant = issue_test_grant(
-            prefill.id().clone(),
-            owner.chain_id(),
-            4,
-            decoder.id().clone(),
-            instance(3),
-            vec![DecoderSlotGeneration::new(instance(4))],
-            vec![1],
-            vec![DecoderGrantChildAccounting::new(64, 16)],
-        )
-        .unwrap();
-        let mut cohort = prefill.pool().bind_grant(&owner, &grant).unwrap();
+        let mut pending = begin_scalar_admission(&directory, &prefill, &pending_owner).unwrap();
+        let (_, mut late_owner) = directory
+            .begin_prefill_request(prefill.id(), "late-request")
+            .unwrap();
 
         directory.drain_prefill(prefill.id()).unwrap();
         assert!(matches!(
             prefill.pool().begin_request("too-late"),
             Err(DecoderPoolError::PrefillPoolDraining)
         ));
+        let retry_pending = begin_scalar_admission(&directory, &prefill, &late_owner).unwrap();
+        drop(retry_pending);
+        prefill.pool().finalize_request(&mut late_owner).unwrap();
+
+        directory.drain_decoder(decoder.id()).unwrap();
         assert!(matches!(
             directory.remove_drained_prefill(prefill.id()),
             Err(PdDirectoryError::Pool(
                 DecoderPoolError::PrefillPoolInUse { .. }
             ))
         ));
+        assert!(matches!(
+            directory.remove_drained_decoder(decoder.id()),
+            Err(PdDirectoryError::Pool(DecoderPoolError::DecoderInUse {
+                active_cohorts: 0,
+                pending_admissions: 1,
+                ..
+            }))
+        ));
 
-        let receipt = issue_test_release_receipt(
-            cohort.assignment_id(),
-            cohort.decoder_id().clone(),
-            grant.binding().child_request_ids().collect(),
-            grant.binding().prefill_bootstrap_endpoint().clone(),
-            cohort.slot_generations().to_vec(),
-            cohort.bootstrap_rooms().to_vec(),
-            cohort.grant_digest(),
-            EngineReleaseKind::PreparedCancelled,
+        let snapshot = prefill.pool().snapshot();
+        let receipt = issue_test_reserve_refusal_receipt(
+            snapshot.prefill_id,
+            pending.decoder_id().clone(),
+            pending_owner.chain_id(),
+            pending.reservation_attempt_id(),
+            pending.reserve_attempt_digest(),
+            DecoderReserveRefusalDisposition::Terminal,
             true,
         );
-        prefill
-            .pool()
-            .finish_before_activation(&mut cohort, &receipt, RetryDisposition::Terminal)
-            .unwrap();
-        prefill.pool().finalize_request(&mut owner).unwrap();
+        assert_eq!(
+            prefill
+                .pool()
+                .install_reserve_refusal_proof(&mut pending, &receipt)
+                .unwrap(),
+            PendingAdmissionDisposition::Terminal
+        );
+        assert_eq!(prefill.pool().snapshot().replicas[0].pending_admissions, 0);
+        prefill.pool().finalize_request(&mut pending_owner).unwrap();
 
         let removed = directory.remove_drained_prefill(prefill.id()).unwrap();
         assert!(Arc::ptr_eq(removed.worker(), &prefill_worker));
         assert!(directory.prefill(prefill.id()).is_none());
-        directory.drain_decoder(decoder.id()).unwrap();
         directory.remove_drained_decoder(decoder.id()).unwrap();
     }
 
     #[test]
-    fn prefill_replacement_serializes_against_new_chain_admission() {
+    fn active_assignment_blocks_prefill_and_decoder_retirement() {
+        let directory = PdProcessDirectory::default();
+        let prefill = directory
+            .admit_prefill(worker(
+                "http://prefill-active.test:30000",
+                PdProcessRole::Prefill,
+                4,
+                instance(20),
+            ))
+            .unwrap();
+        let decoder = directory
+            .admit_decoder(worker(
+                "http://decode-active.test:30001",
+                PdProcessRole::Decode,
+                1,
+                instance(21),
+            ))
+            .unwrap();
+        let (_, owner) = directory
+            .begin_prefill_request(prefill.id(), "active-request")
+            .unwrap();
+        let mut grant = issue_test_grant(
+            prefill.id().clone(),
+            owner.chain_id(),
+            4,
+            decoder.id().clone(),
+            instance(22),
+            vec![DecoderSlotGeneration::new(instance(23))],
+            vec![1],
+            vec![DecoderGrantChildAccounting::new(64, 16)],
+        )
+        .unwrap();
+        let mut pending = begin_test_pending_for_grant(prefill.pool(), &owner, &grant).unwrap();
+        let _cohort = prefill.pool().bind_grant(&mut pending, &mut grant).unwrap();
+
+        directory.drain_prefill(prefill.id()).unwrap();
+        directory.drain_decoder(decoder.id()).unwrap();
+        assert!(matches!(
+            directory.remove_drained_prefill(prefill.id()),
+            Err(PdDirectoryError::Pool(
+                DecoderPoolError::PrefillPoolInUse { .. }
+            ))
+        ));
+        assert!(matches!(
+            directory.remove_drained_decoder(decoder.id()),
+            Err(PdDirectoryError::Pool(DecoderPoolError::DecoderInUse {
+                active_cohorts: 1,
+                pending_admissions: 0,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefill_replacement_serializes_against_atomic_admission() {
         for iteration in 0..64 {
             let directory = Arc::new(PdProcessDirectory::default());
             let old = directory
@@ -1106,22 +1398,35 @@ mod tests {
                     instance(iteration * 2 + 1),
                 ))
                 .unwrap();
+            directory
+                .admit_decoder(worker(
+                    &format!("http://decode-race-{iteration}.test:30001"),
+                    PdProcessRole::Decode,
+                    1,
+                    instance(10_000 + iteration),
+                ))
+                .unwrap();
+            let (_, mut owner) = directory
+                .begin_prefill_request(old.id(), format!("request-{iteration}"))
+                .unwrap();
             let barrier = Arc::new(Barrier::new(2));
 
             let admission_directory = Arc::clone(&directory);
             let admission_barrier = Arc::clone(&barrier);
-            let old_id = old.id().clone();
+            let admission_prefill = Arc::clone(&old);
             let admission = thread::spawn(move || {
                 admission_barrier.wait();
-                match admission_directory
-                    .begin_prefill_request(&old_id, format!("request-{iteration}"))
-                {
-                    Ok((entry, mut owner)) => {
-                        entry.pool().finalize_request(&mut owner).unwrap();
+                match begin_scalar_admission(&admission_directory, &admission_prefill, &owner) {
+                    Ok(pending) => {
+                        drop(pending);
                     }
                     Err(PdDirectoryError::ProcessNotReady) => {}
                     Err(error) => panic!("unexpected admission result: {error}"),
                 }
+                admission_prefill
+                    .pool()
+                    .finalize_request(&mut owner)
+                    .unwrap();
             });
 
             let replacement_directory = Arc::clone(&directory);
@@ -1170,12 +1475,15 @@ mod tests {
         let wrong_role: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://decode.test:30001")
                 .worker_type(WorkerType::Decode)
-                .pd_process(metadata(
-                    PdProcessRole::Prefill,
-                    2,
-                    instance(8),
-                    MODEL_FINGERPRINT,
-                    KV_LAYOUT_FINGERPRINT,
+                .pd_process(PdProcessRegistration::new(
+                    HttpOrigin::parse("http://decode.test:30001").unwrap(),
+                    metadata(
+                        PdProcessRole::Prefill,
+                        2,
+                        instance(8),
+                        MODEL_FINGERPRINT,
+                        KV_LAYOUT_FINGERPRINT,
+                    ),
                 ))
                 .build(),
         );

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+exact_nixl_prefix="${GEMMA4_EXACT_NIXL_PREFIX:-/workspace/build/nixl-handle-attestation/prefix}"
+exact_nixl_metadata_root="${GEMMA4_EXACT_NIXL_METADATA_ROOT:-/workspace/build/nixl-handle-attestation/src/bindings/python/nixl-meta}"
+exact_ucx_runtime="${GEMMA4_EXACT_NIXL_UCX_RUNTIME:-/workspace/build/nixl-ucx-cohorts/c3fca0b90f18936e77deeffdc393aace19ea05c5b6c12b50e8814d29fd4a2b35/install/nixl-ucx-runtime}"
+rdma_library_root="${GEMMA4_NIXL_SYSTEM_LIBRARY_DIRECTORY:-/workspace/runtime/system-library-overlays/rdma-core-54-b300-host}"
+sglang_source_root="${GEMMA4_SOURCE_CONTAINER_PATH:-$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
+
+required_paths=(
+    "${exact_nixl_metadata_root}/nixl/__init__.py"
+    "${exact_nixl_prefix}/lib/python3/dist-packages/nixl_cu13/_api.py"
+    "${exact_nixl_prefix}/lib/x86_64-linux-gnu/libnixl.so"
+    "${exact_nixl_prefix}/lib/x86_64-linux-gnu/plugins/libplugin_UCX.so"
+    "${exact_ucx_runtime}/lib/libucp.so.0"
+    "${exact_ucx_runtime}/lib/ucx"
+    "${rdma_library_root}/libibverbs.so.1"
+    "${sglang_source_root}/python/sglang/__init__.py"
+)
+for required_path in "${required_paths[@]}"; do
+    if [[ ! -e "${required_path}" ]]; then
+        printf 'error: exact NIXL runtime asset is missing: %s\n' "${required_path}" >&2
+        exit 1
+    fi
+done
+
+export PYTHONPATH="${exact_nixl_metadata_root}:${exact_nixl_prefix}/lib/python3/dist-packages:${sglang_source_root}/python"
+export LD_LIBRARY_PATH="${exact_ucx_runtime}/lib:${exact_nixl_prefix}/lib/x86_64-linux-gnu:${exact_nixl_prefix}/lib:${rdma_library_root}"
+export NIXL_PLUGIN_DIR="${exact_nixl_prefix}/lib/x86_64-linux-gnu/plugins"
+export UCX_MODULE_DIR="${exact_ucx_runtime}/lib/ucx"
+
+if [[ "${1-}" == "--check" ]]; then
+    shift
+    python -c 'import json; import nixl; import nixl_cu13._api as api; import nixl_cu13._bindings as bindings; from nixl._bindings import nixlNotReadyError; from sglang.srt.disaggregation.nixl.conn import NixlKVManager; print(json.dumps({"api": api.__file__, "bindings": bindings.__file__, "manager": f"{NixlKVManager.__module__}.{NixlKVManager.__name__}", "metadata": nixl.__file__, "not_ready_exception": nixlNotReadyError.__name__}, sort_keys=True))'
+fi
+
+if [[ "$#" -eq 0 ]]; then
+    exit 0
+fi
+exec "$@"

@@ -310,6 +310,40 @@ class TestServerInfoPdRuntimeCapabilities(CustomTestCase):
         )
 
 
+class TestServerInfoCredentialRedaction(CustomTestCase):
+    """The HTTP introspection surface never serializes credentials."""
+
+    def test_secret_fields_are_redacted(self) -> None:
+        args = ServerArgs(model_path="dummy")
+        args.api_key = "api-secret"
+        args.admin_api_key = "admin-secret"
+        args.ssl_keyfile_password = "tls-secret"
+
+        info = _call_server_info_with(args)
+
+        for field_name in ("api_key", "admin_api_key", "ssl_keyfile_password"):
+            self.assertIsNone(info[field_name])
+            self.assertTrue(info[f"{field_name}_configured"])
+        serialized = json.dumps(info)
+        self.assertNotIn("api-secret", serialized)
+        self.assertNotIn("admin-secret", serialized)
+        self.assertNotIn("tls-secret", serialized)
+
+    def test_scheduler_metadata_cannot_replace_redacted_credentials(self) -> None:
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(
+            args,
+            scheduler_info={
+                "api_key": "scheduler-secret",
+                "pd_runtime_capabilities": None,
+            },
+        )
+
+        self.assertIsNone(info["api_key"])
+        self.assertNotIn("scheduler-secret", json.dumps(info))
+
+
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):
     """Regression guard: the new `kv_events` field is additive — none of
     the fields existing consumers depend on may be silently dropped.

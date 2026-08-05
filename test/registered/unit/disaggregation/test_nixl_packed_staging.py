@@ -2,12 +2,14 @@ import concurrent.futures
 import dataclasses
 import enum
 import gc
+import sys
 import threading
 import weakref
 
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
@@ -73,6 +75,9 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     derive_nixl_ucx_runtime_artifact_components,
     writer_layout_for,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 SWA_COMPONENT = StagingComponentId(state_index=0, state_type=StateType.SWA)
 REQUEST_GENERATION = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -639,9 +644,9 @@ def _visibility_evidence(
         completion_mechanism=policy.completion_mechanism,
         writer_action=policy.expected_writer_action,
         native_handle_generation=1 if native_completion else None,
-        native_descriptor_digest=bytes.fromhex("11" * 32)
-        if native_completion
-        else None,
+        native_descriptor_digest=(
+            bytes.fromhex("11" * 32) if native_completion else None
+        ),
         native_evidence_digest=bytes.fromhex("22" * 32) if native_completion else None,
     )
 
@@ -899,16 +904,20 @@ def _decode_spec(
 def _destination_outcome_fixture(
     action_executor: PackedDestinationVisibilityActionExecutor,
     *,
-    policies: dict[
-        StagingWriterId,
-        PackedDestinationVisibilityPolicy,
-    ]
-    | None = None,
-    coordinator_policies: dict[
-        StagingWriterId,
-        PackedDestinationVisibilityPolicy,
-    ]
-    | None = None,
+    policies: (
+        dict[
+            StagingWriterId,
+            PackedDestinationVisibilityPolicy,
+        ]
+        | None
+    ) = None,
+    coordinator_policies: (
+        dict[
+            StagingWriterId,
+            PackedDestinationVisibilityPolicy,
+        ]
+        | None
+    ) = None,
     protocol_type: type[PackedDecodeProtocol] = PackedDecodeProtocol,
 ) -> tuple[
     PackedDecodeProtocol,
@@ -2096,6 +2105,30 @@ def test_staging_arena_owns_registration_allocator_protocol_and_capability() -> 
     assert len(agent.deregistrations) == 1
 
 
+def test_staging_arena_preserves_adopted_registration_ownership() -> None:
+    """An adopted registration remains owned by the legacy staging pool."""
+
+    agent = RecordingMemoryAgent()
+    tensor = _aligned_cpu_byte_tensor(4096)
+    registration = object()
+    arena = PackedStagingArena(
+        agent=agent,
+        tensor=tensor,
+        gpu_id=6,
+        peer=_peer(),
+        arena_generation=ARENA_GENERATION,
+        registration=registration,
+        alignment_bytes=256,
+    )
+
+    assert agent.registrations == []
+
+    arena.close()
+    arena.close()
+
+    assert agent.deregistrations == []
+
+
 def test_staging_arena_cleanup_failure_is_strongly_retained() -> None:
     """Arena deregistration failure follows the same leak-safe terminal policy."""
 
@@ -2755,3 +2788,7 @@ def test_cuda_ipc_visibility_fails_without_imported_writer_event() -> None:
             completed_action=(PackedDestinationVisibilityAction.CUDA_STREAM_DEPENDENCY),
             _action_receipt=object(),
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

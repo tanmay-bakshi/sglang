@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Job types for control plane operations
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Job {
     AddWorker {
         config: Box<WorkerConfigRequest>,
@@ -63,6 +63,15 @@ pub enum Job {
     RemoveTokenizer {
         request: Box<TokenizerRemovalRequest>,
     },
+}
+
+impl std::fmt::Debug for Job {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Job")
+            .field("job_type", &self.job_type())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Job {
