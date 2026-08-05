@@ -1,13 +1,13 @@
 import dataclasses
+import weakref
 
 import msgspec
 import numpy as np
 import pytest
-
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
     PackedChunkKey,
-    PackedCommit,
     PackedDecodeProtocol,
     PackedLayoutSpec,
     PackedLease,
@@ -15,6 +15,13 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedProtocolError,
     PackedProtocolState,
     PackedTopology,
+    PackedTransportPath,
+    PackedWriterCompletionMechanism,
+    PackedWriterOutcome,
+    PackedWriterOutcomeStatus,
+    PackedWriterVisibilityAction,
+    PackedWriterVisibilityEvidence,
+    _PackedWriterOutcomeTicketIssuer,
 )
 from sglang.srt.disaggregation.common.packed_staging_wire import (
     MAX_PACKED_WIRE_BYTES,
@@ -35,7 +42,12 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 
 MAIN_KV = StagingComponentId(state_index=None, state_type=None)
 SWA = StagingComponentId(state_index=0, state_type=StateType.SWA)
-KEY = PackedChunkKey(room_id=17, chunk_id=3)
+REQUEST_GENERATION = bytes.fromhex("00112233445566778899aabbccddeeff")
+KEY = PackedChunkKey(
+    room_id=17,
+    chunk_id=3,
+    request_generation=REQUEST_GENERATION,
+)
 
 
 class RecordingAllocator:
@@ -155,6 +167,14 @@ def writer(rank: int) -> StagingWriterId:
 
 
 WRITERS = (writer(0), writer(1))
+POLICY_DIGESTS = {
+    WRITERS[0]: bytes.fromhex("10" * 32),
+    WRITERS[1]: bytes.fromhex("20" * 32),
+}
+OUTCOME_TICKET_ISSUERS: weakref.WeakKeyDictionary[
+    PackedDecodeProtocol,
+    _PackedWriterOutcomeTicketIssuer,
+] = weakref.WeakKeyDictionary()
 
 
 def geometry(
@@ -274,8 +294,37 @@ def protocol_fixture(
     )
     selected_allocator = RecordingAllocator() if allocator is None else allocator
     protocol = PackedDecodeProtocol(selected_allocator)
-    protocol.register_chunk(KEY, spec, registry)
+    OUTCOME_TICKET_ISSUERS[protocol] = protocol._claim_writer_outcome_ticket_issuer()
+    protocol.register_chunk(KEY, spec, registry, POLICY_DIGESTS)
     return protocol, selected_allocator, spec
+
+
+def admit_writer_outcome(
+    protocol: PackedDecodeProtocol,
+    message: PackedWriterOutcome,
+    authenticated_writer_id: StagingWriterId,
+) -> bool:
+    """Admit protocol-unit-test DONE with its exact destination ticket.
+
+    :param protocol: Protocol under test.
+    :param message: Terminal writer outcome.
+    :param authenticated_writer_id: Transport-authenticated writer.
+    :returns: Whether this outcome newly made scatter eligible.
+    """
+
+    ticket = (
+        OUTCOME_TICKET_ISSUERS[protocol]._issue(
+            message,
+            authenticated_writer_id,
+        )
+        if message.status is PackedWriterOutcomeStatus.DONE
+        else None
+    )
+    return protocol.handle_writer_outcome(
+        message,
+        authenticated_writer_id,
+        ticket,
+    )
 
 
 def prepare(
@@ -301,20 +350,84 @@ def prepare(
     )
 
 
-def commit(writer_id: StagingWriterId, digest: bytes, lease_id: int) -> PackedCommit:
-    """Build one terminal-DMA COMMIT message.
+def outcome(
+    writer_id: StagingWriterId,
+    digest: bytes,
+    lease_id: int,
+    *,
+    status: PackedWriterOutcomeStatus = PackedWriterOutcomeStatus.DONE,
+    visibility: PackedWriterVisibilityEvidence | None = None,
+    reason: str | None = None,
+) -> PackedWriterOutcome:
+    """Build one terminal-DMA writer outcome message.
 
     :param writer_id: Claimed writer.
     :param digest: READY layout digest.
     :param lease_id: READY allocation identity.
-    :returns: COMMIT payload.
+    :param status: Proven terminal status.
+    :param visibility: Successful source visibility evidence override.
+    :param reason: Failure reason for an error status.
+    :returns: writer outcome payload.
     """
 
-    return PackedCommit(
+    selected_visibility = visibility
+    if status is PackedWriterOutcomeStatus.DONE and selected_visibility is None:
+        selected_visibility = visibility_evidence(writer_id)
+    return PackedWriterOutcome(
         key=KEY,
         writer_id=writer_id,
         digest=digest,
         lease_id=lease_id,
+        status=status,
+        visibility=selected_visibility,
+        reason=reason,
+    )
+
+
+def visibility_evidence(
+    writer_id: StagingWriterId,
+    *,
+    policy_digest: bytes | None = None,
+    transport_path: PackedTransportPath = PackedTransportPath.NIC_RDMA,
+    lane_identifier: str | None = None,
+    completion_mechanism: PackedWriterCompletionMechanism | None = None,
+) -> PackedWriterVisibilityEvidence:
+    """Build exact bounded writer evidence for one policy route.
+
+    :param writer_id: Canonical writer owning the route.
+    :param policy_digest: Route-policy digest override.
+    :param transport_path: Selected CUDA IPC or NIC path.
+    :param lane_identifier: Pinned lane override.
+    :param completion_mechanism: Exact source completion primitive.
+    :returns: Validated writer evidence.
+    """
+
+    selected_digest = (
+        POLICY_DIGESTS[writer_id] if policy_digest is None else policy_digest
+    )
+    selected_lane = (
+        f"mlx5_{writer_id.transfer_source_rank}/1:ucx-rc"
+        if lane_identifier is None
+        else lane_identifier
+    )
+    writer_action = (
+        PackedWriterVisibilityAction.CUDA_EVENT_RECORDED
+        if transport_path is PackedTransportPath.CUDA_IPC
+        else PackedWriterVisibilityAction.TRANSPORT_HANDLE_TERMINAL
+    )
+    selected_mechanism = completion_mechanism
+    if selected_mechanism is None:
+        selected_mechanism = (
+            PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+            if transport_path is PackedTransportPath.CUDA_IPC
+            else PackedWriterCompletionMechanism.NIXL_TRANSFER_HANDLE_TERMINAL
+        )
+    return PackedWriterVisibilityEvidence(
+        policy_digest=selected_digest,
+        transport_path=transport_path,
+        lane_identifier=selected_lane,
+        completion_mechanism=selected_mechanism,
+        writer_action=writer_action,
     )
 
 
@@ -335,6 +448,9 @@ def reach_ready(
         WRITERS[1],
     )
     assert len(ready_messages) == 2
+    assert tuple(
+        message.visibility_policy_digest for message in ready_messages
+    ) == tuple(POLICY_DIGESTS[writer_id] for writer_id in WRITERS)
     return ready_messages[0].digest, ready_messages[0].lease_id
 
 
@@ -342,7 +458,7 @@ def reach_scatter_ready(
     protocol: PackedDecodeProtocol,
     spec: PackedLayoutSpec,
 ) -> tuple[bytes, int]:
-    """Submit complete PREPARE and COMMIT consensus.
+    """Submit complete PREPARE and writer outcome consensus.
 
     :param protocol: Registered decode protocol.
     :param spec: Canonical spec.
@@ -350,12 +466,14 @@ def reach_scatter_ready(
     """
 
     digest, lease_id = reach_ready(protocol, spec)
-    assert not protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    assert not admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
-    assert protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    assert admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     return digest, lease_id
@@ -397,20 +515,22 @@ def test_complete_prepare_consensus_allocates_once_and_projects_ready() -> None:
 
 
 def test_duplicate_prepare_never_reexposes_a_ready_lease() -> None:
-    """READY is emitted once even after COMMIT consensus and begun scatter."""
+    """READY is emitted once even after writer outcome consensus and begun scatter."""
 
     protocol, allocator, spec = protocol_fixture()
     first_prepare = prepare(WRITERS[0], spec)
     digest, lease_id = reach_ready(protocol, spec)
 
     assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
-    protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
     assert protocol.handle_prepare(first_prepare, WRITERS[0]) == ()
-    protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     protocol.begin_scatter(KEY)
@@ -480,81 +600,117 @@ def test_conflicting_prepare_after_ready_quarantines_until_dma_terminal() -> Non
 
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
     assert allocator.releases == []
-    protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
-    protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     assert allocator.releases == [lease_id]
 
 
-def test_commit_before_ready_fails_without_allocating() -> None:
-    """A COMMIT cannot manufacture a lease or imply PREPARE consensus."""
+def test_writer_outcome_before_ready_fails_without_allocating() -> None:
+    """A writer outcome cannot manufacture a lease or imply PREPARE consensus."""
 
     protocol, allocator, spec = protocol_fixture()
     digest = spec.build().digest
 
     with pytest.raises(PackedProtocolError, match="before READY"):
-        protocol.handle_commit(commit(WRITERS[0], digest, 41), WRITERS[0])
+        admit_writer_outcome(protocol, outcome(WRITERS[0], digest, 41), WRITERS[0])
 
     assert allocator.allocations == []
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
 
 
-def test_duplicate_commit_does_not_advance_consensus() -> None:
+def test_duplicate_writer_outcome_does_not_advance_consensus() -> None:
     """An identical terminal-DMA report counts for one writer exactly once."""
 
     protocol, _, spec = protocol_fixture()
     digest, lease_id = reach_ready(protocol, spec)
-    first_commit = commit(WRITERS[0], digest, lease_id)
+    first_outcome = outcome(WRITERS[0], digest, lease_id)
 
-    assert not protocol.handle_commit(first_commit, WRITERS[0])
-    assert not protocol.handle_commit(first_commit, WRITERS[0])
+    assert not admit_writer_outcome(protocol, first_outcome, WRITERS[0])
+    assert not admit_writer_outcome(protocol, first_outcome, WRITERS[0])
     assert protocol.snapshot(KEY).state is PackedProtocolState.READY
-    assert protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    assert admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     assert protocol.snapshot(KEY).state is PackedProtocolState.SCATTER_READY
 
 
-def test_conflicting_duplicate_commit_quarantines_remaining_dma_owners() -> None:
+def test_conflicting_duplicate_writer_outcome_quarantines_remaining_dma_owners() -> (
+    None
+):
     """A writer cannot replace its accepted terminal transfer identity."""
 
     protocol, allocator, spec = protocol_fixture()
     digest, lease_id = reach_ready(protocol, spec)
-    protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
 
     with pytest.raises(PackedProtocolError, match="digest"):
-        protocol.handle_commit(
-            commit(WRITERS[0], b"x" * 32, lease_id),
+        admit_writer_outcome(
+            protocol,
+            outcome(WRITERS[0], b"x" * 32, lease_id),
             WRITERS[0],
         )
 
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
     assert allocator.releases == []
-    protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     assert allocator.releases == [lease_id]
 
 
-def test_commit_claim_cannot_spoof_authenticated_writer() -> None:
-    """COMMIT coverage is keyed by the authenticated transport peer."""
+def test_writer_outcome_policy_digest_must_match_issued_ready() -> None:
+    """A terminal writer cannot substitute a different route policy."""
+
+    protocol, allocator, spec = protocol_fixture()
+    digest, lease_id = reach_ready(protocol, spec)
+    forged_visibility = visibility_evidence(
+        WRITERS[0],
+        policy_digest=b"\xee" * 32,
+    )
+
+    with pytest.raises(PackedProtocolError, match="visibility policy"):
+        admit_writer_outcome(
+            protocol,
+            outcome(
+                WRITERS[0],
+                digest,
+                lease_id,
+                visibility=forged_visibility,
+            ),
+            WRITERS[0],
+        )
+
+    snapshot = protocol.snapshot(KEY)
+    assert snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.quarantines == [(lease_id, snapshot.failure_reason)]
+    assert allocator.releases == []
+
+
+def test_writer_outcome_claim_cannot_spoof_authenticated_writer() -> None:
+    """writer outcome coverage is keyed by the authenticated transport peer."""
 
     protocol, allocator, spec = protocol_fixture()
     digest, lease_id = reach_ready(protocol, spec)
 
     with pytest.raises(PackedProtocolError, match="authenticated peer"):
-        protocol.handle_commit(
-            commit(WRITERS[0], digest, lease_id),
+        protocol.handle_writer_outcome(
+            outcome(WRITERS[0], digest, lease_id),
             WRITERS[1],
         )
 
@@ -564,7 +720,99 @@ def test_commit_claim_cannot_spoof_authenticated_writer() -> None:
     assert allocator.releases == []
 
 
-def test_late_commits_release_failed_ready_lease() -> None:
+def test_writer_outcome_ticket_issuer_has_one_coordinator_owner() -> None:
+    """A protocol cannot hand DONE-admission authority to two coordinators."""
+
+    protocol = PackedDecodeProtocol(RecordingAllocator())
+
+    issuer = protocol._claim_writer_outcome_ticket_issuer()
+
+    assert "claim_writer_outcome_ticket_issuer" not in dir(protocol)
+    assert "issue" not in dir(issuer)
+
+    with pytest.raises(RuntimeError, match="already been claimed"):
+        protocol._claim_writer_outcome_ticket_issuer()
+
+
+def test_new_done_requires_a_protocol_bound_visibility_ticket() -> None:
+    """Direct DONE ingress cannot bypass destination CUDA visibility."""
+
+    protocol, allocator, spec = protocol_fixture()
+    digest, lease_id = reach_ready(protocol, spec)
+
+    with pytest.raises(PackedProtocolError, match="visibility ticket"):
+        protocol.handle_writer_outcome(
+            outcome(WRITERS[0], digest, lease_id),
+            WRITERS[0],
+        )
+
+    snapshot = protocol.snapshot(KEY)
+    assert snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.quarantines == [(lease_id, snapshot.failure_reason)]
+
+
+def test_done_ticket_is_exact_message_and_protocol_bound() -> None:
+    """A visibility ticket cannot admit another message or protocol instance."""
+
+    first, _, first_spec = protocol_fixture()
+    second, second_allocator, second_spec = protocol_fixture()
+    first_digest, first_lease_id = reach_ready(first, first_spec)
+    second_digest, second_lease_id = reach_ready(second, second_spec)
+    first_message = outcome(WRITERS[0], first_digest, first_lease_id)
+    first_ticket = OUTCOME_TICKET_ISSUERS[first]._issue(
+        first_message,
+        WRITERS[0],
+    )
+
+    with pytest.raises(PackedProtocolError, match="another protocol"):
+        second.handle_writer_outcome(
+            outcome(WRITERS[0], second_digest, second_lease_id),
+            WRITERS[0],
+            first_ticket,
+        )
+
+    second_snapshot = second.snapshot(KEY)
+    assert second_snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert second_allocator.quarantines == [
+        (second_lease_id, second_snapshot.failure_reason)
+    ]
+
+    third, third_allocator, third_spec = protocol_fixture()
+    third_digest, third_lease_id = reach_ready(third, third_spec)
+    writer_zero_message = outcome(WRITERS[0], third_digest, third_lease_id)
+    writer_zero_ticket = OUTCOME_TICKET_ISSUERS[third]._issue(
+        writer_zero_message,
+        WRITERS[0],
+    )
+
+    with pytest.raises(PackedProtocolError, match="another message"):
+        third.handle_writer_outcome(
+            outcome(WRITERS[1], third_digest, third_lease_id),
+            WRITERS[1],
+            writer_zero_ticket,
+        )
+
+    third_snapshot = third.snapshot(KEY)
+    assert third_snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert third_allocator.quarantines == [
+        (third_lease_id, third_snapshot.failure_reason)
+    ]
+
+
+def test_duplicate_done_is_idempotent_without_reusing_its_ticket() -> None:
+    """An admitted duplicate neither needs nor consumes another ticket."""
+
+    protocol, _, spec = protocol_fixture()
+    digest, lease_id = reach_ready(protocol, spec)
+    message = outcome(WRITERS[0], digest, lease_id)
+    ticket = OUTCOME_TICKET_ISSUERS[protocol]._issue(message, WRITERS[0])
+
+    assert not protocol.handle_writer_outcome(message, WRITERS[0], ticket)
+    assert not protocol.handle_writer_outcome(message, WRITERS[0])
+    assert protocol.snapshot(KEY).writer_outcomes == (message,)
+
+
+def test_late_writer_outcomes_release_failed_ready_lease() -> None:
     """A failed lease remains quarantined until every possible DMA completes."""
 
     protocol, allocator, spec = protocol_fixture()
@@ -575,28 +823,95 @@ def test_late_commits_release_failed_ready_lease() -> None:
     assert allocator.quarantines == [(lease_id, "READY delivery failed")]
     assert allocator.releases == []
 
-    first_commit = commit(WRITERS[0], digest, lease_id)
-    assert not protocol.handle_commit(first_commit, WRITERS[0])
-    assert not protocol.handle_commit(first_commit, WRITERS[0])
+    first_outcome = outcome(WRITERS[0], digest, lease_id)
+    assert not admit_writer_outcome(protocol, first_outcome, WRITERS[0])
+    assert not admit_writer_outcome(protocol, first_outcome, WRITERS[0])
     assert allocator.releases == []
 
-    assert not protocol.handle_commit(
-        commit(WRITERS[1], digest, lease_id),
+    assert not admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
         WRITERS[1],
     )
     assert allocator.releases == [lease_id]
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
 
 
-def test_ready_delivery_failure_requires_commit_or_trusted_quiescence() -> None:
+def test_terminal_writer_error_quarantines_exact_lease_until_all_writers_terminal() -> (
+    None
+):
+    """A typed ERR proves one writer terminal without covering another writer."""
+
+    protocol, allocator, spec = protocol_fixture()
+    digest, lease_id = reach_ready(protocol, spec)
+    error_outcome = outcome(
+        WRITERS[0],
+        digest,
+        lease_id,
+        status=PackedWriterOutcomeStatus.ERROR,
+        reason="terminal NIXL transport error",
+    )
+
+    assert not admit_writer_outcome(protocol, error_outcome, WRITERS[0])
+
+    snapshot = protocol.snapshot(KEY)
+    assert snapshot.state is PackedProtocolState.FAILED_QUARANTINED
+    assert snapshot.writer_outcomes == (error_outcome,)
+    assert allocator.quarantines == [
+        (lease_id, f"writer {WRITERS[0]} failed: terminal NIXL transport error")
+    ]
+    assert allocator.releases == []
+
+    assert not admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
+        WRITERS[1],
+    )
+    assert allocator.releases == [lease_id]
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
+
+
+def test_writer_outcome_status_and_reason_are_one_exact_identity() -> None:
+    """Conflicting duplicate terminal status cannot replace accepted proof."""
+
+    protocol, allocator, spec = protocol_fixture()
+    digest, lease_id = reach_ready(protocol, spec)
+    done = outcome(WRITERS[0], digest, lease_id)
+    admit_writer_outcome(protocol, done, WRITERS[0])
+
+    with pytest.raises(PackedProtocolError, match="conflicting duplicate"):
+        admit_writer_outcome(
+            protocol,
+            outcome(
+                WRITERS[0],
+                digest,
+                lease_id,
+                status=PackedWriterOutcomeStatus.ERROR,
+                reason="late conflicting error",
+            ),
+            WRITERS[0],
+        )
+
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.releases == []
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[1], digest, lease_id),
+        WRITERS[1],
+    )
+    assert allocator.releases == [lease_id]
+
+
+def test_ready_delivery_failure_requires_outcome_or_trusted_quiescence() -> None:
     """A writer whose READY reply failed still remains a possible DMA owner."""
 
     protocol, allocator, spec = protocol_fixture()
     digest, lease_id = reach_ready(protocol, spec)
     protocol.fail_chunk(KEY, "one READY reply failed")
 
-    protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
     assert allocator.releases == []
@@ -606,13 +921,14 @@ def test_ready_delivery_failure_requires_commit_or_trusted_quiescence() -> None:
     assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
 
 
-def test_scatter_cannot_begin_before_all_unique_commits() -> None:
-    """Scatter ownership remains unavailable during partial COMMIT consensus."""
+def test_scatter_cannot_begin_before_all_unique_writer_outcomes() -> None:
+    """Scatter ownership remains unavailable during partial writer outcome consensus."""
 
     protocol, _, spec = protocol_fixture()
     digest, lease_id = reach_ready(protocol, spec)
-    protocol.handle_commit(
-        commit(WRITERS[0], digest, lease_id),
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
         WRITERS[0],
     )
 
@@ -712,6 +1028,32 @@ def test_release_callback_failure_is_transactionally_retryable() -> None:
     assert protocol.snapshot(KEY).state is PackedProtocolState.RELEASED
 
 
+def test_duplicate_terminal_outcome_retries_failed_quarantine_release() -> None:
+    """An idempotent duplicate can finish the final transactional release."""
+
+    allocator = FaultInjectingAllocator()
+    protocol, _, spec = protocol_fixture(allocator=allocator)
+    digest, lease_id = reach_ready(protocol, spec)
+    protocol.fail_chunk(KEY, "transport failed")
+    admit_writer_outcome(
+        protocol,
+        outcome(WRITERS[0], digest, lease_id),
+        WRITERS[0],
+    )
+    final_outcome = outcome(WRITERS[1], digest, lease_id)
+    allocator.release_failures = 1
+
+    with pytest.raises(RuntimeError, match="injected release failure"):
+        admit_writer_outcome(protocol, final_outcome, WRITERS[1])
+
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_QUARANTINED
+    assert allocator.releases == []
+
+    assert not protocol.handle_writer_outcome(final_outcome, WRITERS[1])
+    assert allocator.releases == [lease_id]
+    assert protocol.snapshot(KEY).state is PackedProtocolState.FAILED_RELEASED
+
+
 def test_allocator_reentry_is_rejected_before_protocol_mutation() -> None:
     """Allocator callbacks cannot recursively observe or mutate chunk state."""
 
@@ -801,9 +1143,30 @@ def test_destination_page_bounds_rejected_before_prepare() -> None:
     protocol = PackedDecodeProtocol(allocator)
 
     with pytest.raises(ValueError, match="bounds overflow"):
-        protocol.register_chunk(KEY, spec, registry)
+        protocol.register_chunk(KEY, spec, registry, POLICY_DIGESTS)
 
     assert allocator.allocations == []
+
+
+def test_registration_requires_one_policy_digest_per_canonical_writer() -> None:
+    """READY cannot be issued without a pinned policy for every writer route."""
+
+    spec = layout_spec()
+    registry = StagingComponentBufferRegistry(
+        tuple(
+            buffer(component_geometry)
+            for component_geometry in spec.destination_components
+        )
+    )
+    protocol = PackedDecodeProtocol(RecordingAllocator())
+
+    with pytest.raises(ValueError, match="exactly cover canonical writers"):
+        protocol.register_chunk(
+            KEY,
+            spec,
+            registry,
+            {WRITERS[0]: POLICY_DIGESTS[WRITERS[0]]},
+        )
 
 
 def test_received_geometry_must_match_decode_registration() -> None:
@@ -858,8 +1221,29 @@ def test_prepare_wire_round_trip_is_deterministic(
     assert encode_packed_message(decoded) == payload
 
 
-def test_ready_and_commit_wire_round_trip() -> None:
-    """READY projections and terminal COMMIT identities round-trip exactly."""
+@pytest.mark.parametrize(
+    "visibility",
+    [
+        visibility_evidence(
+            WRITERS[0],
+            transport_path=PackedTransportPath.CUDA_IPC,
+            lane_identifier="cuda-ipc:gpu3->gpu6",
+        ),
+        visibility_evidence(
+            WRITERS[0],
+            lane_identifier="mlx5_0/1:ucx-ordered",
+        ),
+        visibility_evidence(
+            WRITERS[0],
+            lane_identifier="mlx5_1/1:ucx-unordered",
+        ),
+    ],
+    ids=["cuda-ipc", "ordered-nic", "host-flushed-nic"],
+)
+def test_ready_and_writer_outcome_wire_round_trip(
+    visibility: PackedWriterVisibilityEvidence,
+) -> None:
+    """READY and every successful visibility-evidence shape round-trip exactly."""
 
     protocol, _, spec = protocol_fixture()
     protocol.handle_prepare(prepare(WRITERS[0], spec), WRITERS[0])
@@ -867,16 +1251,80 @@ def test_ready_and_commit_wire_round_trip() -> None:
         prepare(WRITERS[1], spec),
         WRITERS[1],
     )
-    commit_message = commit(
+    outcome_message = outcome(
         WRITERS[0],
         ready_messages[0].digest,
         ready_messages[0].lease_id,
+        visibility=visibility,
+    )
+    error_message = outcome(
+        WRITERS[1],
+        ready_messages[1].digest,
+        ready_messages[1].lease_id,
+        status=PackedWriterOutcomeStatus.ERROR,
+        reason="terminal transport error",
     )
 
-    for message in (*ready_messages, commit_message):
+    for message in (*ready_messages, outcome_message, error_message):
         payload = encode_packed_message(message)
         assert decode_packed_message(payload) == message
         assert encode_packed_message(decode_packed_message(payload)) == payload
+
+
+def test_request_generation_and_outcome_reason_are_strict_domain_values() -> None:
+    """Replay identity and terminal status cannot be represented ambiguously."""
+
+    with pytest.raises(ValueError, match="request_generation"):
+        PackedChunkKey(
+            room_id=KEY.room_id,
+            chunk_id=KEY.chunk_id,
+            request_generation=b"short",
+        )
+    with pytest.raises(ValueError, match="must not contain a reason"):
+        outcome(
+            WRITERS[0],
+            layout_spec().build().digest,
+            41,
+            reason="success cannot carry an error",
+        )
+    with pytest.raises(ValueError, match="non-empty reason"):
+        outcome(
+            WRITERS[0],
+            layout_spec().build().digest,
+            41,
+            status=PackedWriterOutcomeStatus.ERROR,
+        )
+    with pytest.raises(TypeError, match="visibility evidence"):
+        PackedWriterOutcome(
+            key=KEY,
+            writer_id=WRITERS[0],
+            digest=layout_spec().build().digest,
+            lease_id=41,
+            status=PackedWriterOutcomeStatus.DONE,
+            visibility=None,
+        )
+    with pytest.raises(ValueError, match="lane_identifier exceeds"):
+        dataclasses.replace(
+            visibility_evidence(WRITERS[0]),
+            lane_identifier="x" * (MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES + 1),
+        )
+    with pytest.raises(TypeError, match="PackedWriterCompletionMechanism"):
+        dataclasses.replace(
+            visibility_evidence(WRITERS[0]),
+            completion_mechanism="free-form completion text",
+        )
+    with pytest.raises(ValueError, match="does not match its transport path"):
+        dataclasses.replace(
+            visibility_evidence(WRITERS[0]),
+            writer_action=PackedWriterVisibilityAction.CUDA_EVENT_RECORDED,
+        )
+    with pytest.raises(ValueError, match="does not match its transport path"):
+        dataclasses.replace(
+            visibility_evidence(WRITERS[0]),
+            completion_mechanism=(
+                PackedWriterCompletionMechanism.EXPORTED_CUDA_EVENT_RECORDED
+            ),
+        )
 
 
 def test_wire_rejects_unknown_kind_version_and_fields() -> None:
