@@ -14,6 +14,7 @@ import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     is_full_nvlink,
     is_weak_contiguous,
+    resolve_physical_device_id,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
@@ -138,12 +139,10 @@ class QuickAllReduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            device_ids = list(range(torch.cuda.device_count()))
-        physical_device_id = device_ids[device.index]
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        physical_device_id = resolve_physical_device_id(device_index)
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
         gather_list = [
             torch.tensor([0], dtype=torch.int, device="cpu")

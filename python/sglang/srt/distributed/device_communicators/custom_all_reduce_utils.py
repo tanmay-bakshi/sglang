@@ -58,6 +58,51 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
+def resolve_physical_device_id(logical_device_id: int) -> int:
+    """Resolve one CUDA logical device to its NVML physical index.
+
+    ``CUDA_VISIBLE_DEVICES`` accepts physical ordinals and GPU UUIDs. CUDA and
+    PyTorch remap either representation to dense logical indices, while NVML
+    topology APIs require the physical index.
+
+    :param logical_device_id: CUDA logical device index visible to the process.
+    :returns: NVML physical device index.
+    :raises ValueError: If the logical index or visible-device identity is
+        invalid.
+    """
+
+    if logical_device_id < 0:
+        raise ValueError("logical CUDA device index must be nonnegative")
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is None:
+        return logical_device_id
+    visible_devices = cuda_visible_devices.split(",")
+    if visible_devices == [""] or logical_device_id >= len(visible_devices):
+        raise ValueError(
+            f"logical CUDA device {logical_device_id} is not present in "
+            f"CUDA_VISIBLE_DEVICES={cuda_visible_devices!r}"
+        )
+    visible_device = visible_devices[logical_device_id].strip()
+    try:
+        physical_device_id = int(visible_device)
+    except ValueError as error:
+        if not _is_cuda or not visible_device.startswith(("GPU-", "MIG-")):
+            raise ValueError(
+                f"unsupported CUDA_VISIBLE_DEVICES identity: {visible_device!r}"
+            ) from error
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(visible_device)
+            return int(pynvml.nvmlDeviceGetIndex(handle))
+        finally:
+            pynvml.nvmlShutdown()
+    if physical_device_id < 0:
+        raise ValueError(
+            f"unsupported CUDA_VISIBLE_DEVICES identity: {visible_device!r}"
+        )
+    return physical_device_id
+
+
 def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
@@ -398,12 +443,10 @@ _NVML_GPU_FABRIC_STATE_COMPLETED = 3
 def _gpu_fabric_clique(device: torch.device):
     """(cluster_uuid, clique_id) of the local GPU's NVLink fabric clique, or None if
     the GPU has not joined a fabric (single-node box / fabric init incomplete)."""
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(resolve_physical_device_id(device_index))
     fabric = pynvml.c_nvmlGpuFabricInfo_v3_t()
     fabric.version = pynvml.nvmlGpuFabricInfo_v3
     pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric))
@@ -492,12 +535,10 @@ def can_use_custom_all_reduce_with_nvlink(
         )
         return
 
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    physical_device_id = device_ids[device.index]
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    physical_device_id = resolve_physical_device_id(device_index)
     tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
     gather_list = [
         torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
