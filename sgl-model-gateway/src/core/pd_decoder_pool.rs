@@ -41,6 +41,8 @@ use super::pd_decoder_grant::{
 };
 use crate::core::PrefillBootstrapEndpoint;
 
+const PACK_BEFORE_SPREAD_TARGET: usize = 2;
+
 /// Engine-declared fields used to reject obviously incompatible PD pairings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineCompatibilityMetadata {
@@ -2014,6 +2016,7 @@ impl DecoderPool {
                 &failed_decoders,
                 eligible_decoders,
                 state.last_scheduled_decoder.as_ref(),
+                charge.child_requests(),
             )?
             .into_iter()
             .next()
@@ -3417,6 +3420,7 @@ pub(crate) fn begin_test_pending_for_grant(
             &failed_decoders,
             &eligible_decoders,
             state.last_scheduled_decoder.as_ref(),
+            charge.child_requests(),
         )?
         .remove(0),
         AdmissionRetryConstraint::SameDecoder(decoder_id) => decoder_id.clone(),
@@ -3544,6 +3548,7 @@ fn select_decoders(
     failed_decoders: &HashSet<DecoderId>,
     eligible_decoders: &HashSet<DecoderId>,
     last_scheduled_decoder: Option<&DecoderId>,
+    incoming_child_requests: usize,
 ) -> Result<Vec<DecoderId>, DecoderPoolError> {
     let unfailed: Vec<&ReplicaState> = replicas
         .values()
@@ -3563,13 +3568,16 @@ fn select_decoders(
         return Err(DecoderPoolError::NoReadyDecoder);
     }
     ready.sort_by(|left, right| {
-        compare_current_load(left, right).then_with(|| {
-            compare_round_robin(
-                &left.metadata.id,
-                &right.metadata.id,
-                last_scheduled_decoder,
-            )
-        })
+        packing_tier(left, incoming_child_requests)
+            .cmp(&packing_tier(right, incoming_child_requests))
+            .then_with(|| compare_current_load(left, right))
+            .then_with(|| {
+                compare_round_robin(
+                    &left.metadata.id,
+                    &right.metadata.id,
+                    last_scheduled_decoder,
+                )
+            })
     });
     Ok(ready
         .into_iter()
@@ -4658,6 +4666,30 @@ fn validate_engine_quarantine_receipt(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DecoderPackingTier {
+    CompletePartialPack,
+    StartPack,
+    LeastLoaded,
+}
+
+fn packing_tier(replica: &ReplicaState, incoming_child_requests: usize) -> DecoderPackingTier {
+    debug_assert!(incoming_child_requests > 0);
+    let occupancy = replica
+        .active_child_requests
+        .checked_add(replica.pending_child_requests)
+        .expect("authoritative child-request occupancy must fit usize");
+    let projected_occupancy = occupancy.checked_add(incoming_child_requests);
+    if occupancy > 0 && projected_occupancy.is_some_and(|value| value <= PACK_BEFORE_SPREAD_TARGET)
+    {
+        return DecoderPackingTier::CompletePartialPack;
+    }
+    if projected_occupancy.is_some_and(|value| value <= PACK_BEFORE_SPREAD_TARGET) {
+        return DecoderPackingTier::StartPack;
+    }
+    DecoderPackingTier::LeastLoaded
+}
+
 fn compare_current_load(left: &ReplicaState, right: &ReplicaState) -> Ordering {
     compare_ratio(
         left.remaining_decode_tokens as u128 + left.pending_remaining_decode_tokens as u128,
@@ -5048,9 +5080,10 @@ mod tests {
         )
     }
 
-    fn test_selected_decoder(
+    fn test_selected_decoder_for_children(
         pool: &DecoderPool,
         owner: &LogicalRequestOwner,
+        incoming_child_requests: usize,
     ) -> Result<DecoderId, DecoderPoolError> {
         pool.validate_request_owner(owner)?;
         let state = pool.inner.state.lock();
@@ -5088,11 +5121,19 @@ mod tests {
                     &chain.failed_decoders,
                     &eligible_decoders,
                     state.last_scheduled_decoder.as_ref(),
+                    incoming_child_requests,
                 )?
                 .remove(0))
             }
             AdmissionRetryConstraint::SameDecoder(decoder_id) => Ok(decoder_id.clone()),
         }
+    }
+
+    fn test_selected_decoder(
+        pool: &DecoderPool,
+        owner: &LogicalRequestOwner,
+    ) -> Result<DecoderId, DecoderPoolError> {
+        test_selected_decoder_for_children(pool, owner, 1)
     }
 
     fn issue_grant(
@@ -5235,8 +5276,8 @@ mod tests {
         owner: &LogicalRequestOwner,
         accounting: Vec<DecoderGrantChildAccounting>,
     ) -> Result<BoundPreparedGrant, DecoderPoolError> {
-        let decoder_id = test_selected_decoder(pool, owner)?;
         let child_count = accounting.len();
+        let decoder_id = test_selected_decoder_for_children(pool, owner, child_count)?;
         let first_room = NEXT_ROOM.fetch_add(child_count as u64, AtomicOrdering::Relaxed);
         let rooms = (0..child_count)
             .map(|offset| first_room + offset as u64)
@@ -5582,24 +5623,61 @@ mod tests {
     }
 
     #[test]
-    fn pending_load_changes_the_next_decoder_selection() {
+    fn pending_scalar_admissions_form_a_pair_before_spreading() {
         let pool = pool(2);
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         pool.register(replica("decode-1", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
+        let third_owner = pool.begin_request("third").unwrap();
 
         let first = begin_scalar_admission(&pool, &first_owner, child_accounting()).unwrap();
         let second = begin_scalar_admission(&pool, &second_owner, child_accounting()).unwrap();
-        assert_ne!(first.decoder_id(), second.decoder_id());
-        assert_eq!(
-            pool.snapshot()
-                .replicas
-                .iter()
-                .map(|replica| replica.pending_admissions)
-                .collect::<Vec<_>>(),
-            vec![1, 1]
-        );
+        assert_eq!(first.decoder_id(), second.decoder_id());
+        let third = begin_scalar_admission(&pool, &third_owner, child_accounting()).unwrap();
+        assert_ne!(first.decoder_id(), third.decoder_id());
+        let mut pending_admissions = pool
+            .snapshot()
+            .replicas
+            .iter()
+            .map(|replica| replica.pending_admissions)
+            .collect::<Vec<_>>();
+        pending_admissions.sort_unstable();
+        assert_eq!(pending_admissions, vec![1, 2]);
+    }
+
+    #[test]
+    fn all_full_packs_fall_back_to_authoritative_least_load() {
+        let pool = pool(2);
+        for index in 0..3 {
+            pool.register(replica(&format!("decode-{index}"), "packed-v1"))
+                .unwrap();
+        }
+        let decoder_order = pool
+            .snapshot()
+            .replicas
+            .into_iter()
+            .map(|replica| replica.id)
+            .collect::<Vec<_>>();
+        let remaining_decode_tokens = [100, 100, 10, 10, 50, 50];
+        let mut owners = Vec::new();
+        let mut pending = Vec::new();
+        for (index, remaining) in remaining_decode_tokens.into_iter().enumerate() {
+            let owner = pool.begin_request(format!("fill-{index}")).unwrap();
+            let admission = begin_scalar_admission(
+                &pool,
+                &owner,
+                DecoderGrantChildAccounting::new(1_024, remaining),
+            )
+            .unwrap();
+            assert_eq!(admission.decoder_id(), &decoder_order[index / 2]);
+            owners.push(owner);
+            pending.push(admission);
+        }
+
+        let next_owner = pool.begin_request("least-loaded").unwrap();
+        let next = begin_scalar_admission(&pool, &next_owner, child_accounting()).unwrap();
+        assert_eq!(next.decoder_id(), &decoder_order[1]);
     }
 
     #[test]
@@ -7910,6 +7988,7 @@ mod tests {
         pool.register(replica("decode-0", "packed-v1")).unwrap();
         pool.register(replica("decode-1", "packed-v1")).unwrap();
         let first_owner = pool.begin_request("first").unwrap();
+        let padding_owner = pool.begin_request("padding").unwrap();
         let second_owner = pool.begin_request("second").unwrap();
         let first_decoder = test_selected_decoder(&pool, &first_owner).unwrap();
         let mut first_grant = issue_grant(
@@ -7922,6 +8001,18 @@ mod tests {
             scalar_accounting(),
         );
         let mut first = bind_issued_grant(&pool, &first_owner, &mut first_grant).unwrap();
+        let padding_decoder = test_selected_decoder(&pool, &padding_owner).unwrap();
+        let mut padding_grant = issue_grant(
+            &pool,
+            &padding_owner,
+            padding_decoder.clone(),
+            Uuid::new_v4(),
+            vec![DecoderSlotGeneration::new(Uuid::new_v4())],
+            vec![701],
+            scalar_accounting(),
+        );
+        let mut padding = bind_issued_grant(&pool, &padding_owner, &mut padding_grant).unwrap();
+        assert_eq!(padding_decoder, first_decoder);
         let second_decoder = test_selected_decoder(&pool, &second_owner).unwrap();
         let mut second_grant = issue_grant(
             &pool,
@@ -7938,6 +8029,7 @@ mod tests {
         assert_eq!(first.decoder_id(), &first_decoder);
         assert_eq!(second.decoder_id(), &second_decoder);
         release_before_activation(&pool, &mut first, RetryDisposition::Terminal).unwrap();
+        release_before_activation(&pool, &mut padding, RetryDisposition::Terminal).unwrap();
         release_before_activation(&pool, &mut second, RetryDisposition::Terminal).unwrap();
     }
 
