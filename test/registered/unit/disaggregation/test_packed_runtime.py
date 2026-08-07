@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import uuid
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -870,6 +871,82 @@ def _unvalidated_prepare(key: PackedChunkKey, writer: StagingWriterId) -> Packed
     object.__setattr__(prepare, "spec", None)
     object.__setattr__(prepare, "digest", b"d" * 32)
     return prepare
+
+
+def test_main_transfer_initialization_failure_logs_native_traceback(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve native diagnostics without changing pre-submit recovery."""
+
+    native_error = RuntimeError("NIXL_ERR_BACKEND: injected initialization failure")
+    source_descriptors = object()
+    destination_descriptors = object()
+    agent = Mock()
+    agent.get_xfer_descs.side_effect = (
+        source_descriptors,
+        destination_descriptors,
+    )
+    agent.initialize_xfer.side_effect = native_error
+    manager = Mock()
+    manager.agent = agent
+    manager.kv_args.gpu_id = 0
+    runtime = object.__new__(PackedPrefillRuntime)
+    runtime._manager = manager
+    outcome = Mock(reason="packed main transfer initialization failed")
+    lane = Mock(data_ptr=0x100000)
+    lane.abort_before_submit.return_value = outcome
+    executor = Mock()
+    producer_stream = object()
+    record = Mock()
+    record.submission.producer_stream = producer_stream
+    transfer = Mock(
+        destination_address=0x200000,
+        length_bytes=4096,
+    )
+    transfer.destination.route.destination_gpu_id = 1
+    remote_handle = object()
+    record.submission.control.remote_handle = remote_handle
+    monkeypatch.setattr(runtime, "_acquire_lane", lambda _transfer: lane)
+    monkeypatch.setattr(runtime, "_source_copy_executor", lambda: executor)
+    caplog.set_level(logging.ERROR, logger=runtime_module.__name__)
+
+    with pytest.raises(runtime_module.PackedGatherError) as raised:
+        runtime._post_main_transfer(record, transfer)
+
+    assert raised.value.__cause__ is native_error
+    assert str(raised.value.__cause__) == (
+        "NIXL_ERR_BACKEND: injected initialization failure"
+    )
+    assert raised.value.outcome is outcome
+    diagnostic = "\n".join(caplog.messages)
+    assert "Packed main transfer initialization failed:\nTraceback" in diagnostic
+    assert (
+        "RuntimeError: NIXL_ERR_BACKEND: injected initialization failure" in diagnostic
+    )
+    assert agent.get_xfer_descs.call_count == 2
+    assert [call.args[1] for call in agent.get_xfer_descs.call_args_list] == [
+        "VRAM",
+        "VRAM",
+    ]
+    agent.initialize_xfer.assert_called_once_with(
+        "WRITE",
+        source_descriptors,
+        destination_descriptors,
+        remote_handle,
+        b"",
+    )
+    executor.gather.assert_called_once_with(
+        transfer=transfer,
+        source_lane=lane,
+        producer_stream=producer_stream,
+    )
+    lane.abort_before_submit.assert_called_once_with(
+        "packed main transfer initialization failed"
+    )
+    lane.arm_submission.assert_not_called()
+    lane.mark_submission_ambiguous.assert_not_called()
+    manager._post_transfer_when_ready.assert_not_called()
 
 
 def test_control_envelope_round_trips_generation_bound_ready() -> None:

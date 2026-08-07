@@ -1048,6 +1048,10 @@ class PackedPrefillRuntime:
             if handle is None:
                 raise RuntimeError("NIXL returned no packed main transfer handle")
         except Exception as error:
+            logger.error(
+                "Packed main transfer initialization failed:\n%s",
+                traceback.format_exc(),
+            )
             outcome = lane.abort_before_submit(
                 "packed main transfer initialization failed"
             )
