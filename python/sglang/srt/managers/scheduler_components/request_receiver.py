@@ -12,8 +12,6 @@ from typing import (
 )
 
 import zmq
-from torch.distributed import barrier
-
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
@@ -27,11 +25,9 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.utils import (
-    broadcast_pyobj,
-    point_to_point_pyobj,
-)
+from sglang.srt.utils import point_to_point_pyobj
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -148,20 +144,10 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
+                work_reqs = self.attn_tp_group.broadcast_object(work_reqs, src=0)
 
             if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+                work_reqs = self.attn_cp_group.broadcast_object(work_reqs, src=0)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -174,34 +160,18 @@ class SchedulerRequestReceiver:
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
+                    control_reqs = self.attn_tp_group.broadcast_object(
+                        control_reqs, src=0
                     )
                 if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
+                    control_reqs = self.attn_cp_group.broadcast_object(
+                        control_reqs, src=0
                     )
             elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                control_reqs = self.tp_group.broadcast_object(control_reqs, src=0)
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+            recv_reqs = self.tp_group.broadcast_object(recv_reqs, src=0)
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
