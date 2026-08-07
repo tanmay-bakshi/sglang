@@ -1185,7 +1185,7 @@ mod cache_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_flush_cache() {
+    async fn test_flush_cache_returns_complete_worker_roster() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18501,
             worker_type: WorkerType::Regular,
@@ -1206,17 +1206,63 @@ mod cache_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The response might be empty or contain a message
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        if !body_bytes.is_empty() {
-            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                // Check that we got a successful response with expected fields
-                assert!(body.is_object());
-                assert!(body.get("message").is_some() || body.get("status").is_some());
-            }
-        }
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["workers_flushed"], 1);
+        assert_eq!(body["total_http_workers"], 1);
+        assert_eq!(body["total_workers"], 1);
+        assert_eq!(body["successful"], json!(["http://127.0.0.1:18501"]));
+        assert_eq!(body["failed"], json!([]));
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_flush_cache_returns_partial_worker_roster() {
+        let mut ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18504,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18505,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+        ctx.workers[1].stop().await;
+
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/flush_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "partial_success");
+        assert_eq!(body["workers_flushed"], 1);
+        assert_eq!(body["total_http_workers"], 2);
+        assert_eq!(body["total_workers"], 2);
+        assert_eq!(body["successful"], json!(["http://127.0.0.1:18504"]));
+        assert_eq!(body["failed"].as_array().unwrap().len(), 1);
+        assert_eq!(body["failed"][0]["worker"], "http://127.0.0.1:18505");
+        assert!(!body["failed"][0]["error"].as_str().unwrap().is_empty());
 
         ctx.shutdown().await;
     }

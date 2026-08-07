@@ -4,13 +4,16 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::response::{IntoResponse, Response};
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
 use futures::{
     future,
     stream::{self, StreamExt},
 };
 use http::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
@@ -20,7 +23,7 @@ use tracing::{debug, info, warn};
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
-    protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
+    protocols::worker_spec::{WorkerLoadInfo, WorkerLoadsResult},
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +81,47 @@ impl IntoResponse for EngineMetricsResult {
             Self::Ok(text) => (StatusCode::OK, text).into_response(),
             Self::Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         }
+    }
+}
+
+/// Complete result of a cache-flush fan-out.
+pub struct FlushCacheResult {
+    successful: Vec<String>,
+    failed: Vec<(String, String)>,
+    total_workers: usize,
+    http_workers: usize,
+    message: String,
+}
+
+impl IntoResponse for FlushCacheResult {
+    fn into_response(self) -> Response {
+        let Self {
+            successful,
+            failed,
+            total_workers,
+            http_workers,
+            message,
+        } = self;
+        let status = if failed.is_empty() {
+            StatusCode::OK
+        } else {
+            StatusCode::PARTIAL_CONTENT
+        };
+        let workers_flushed = successful.len();
+        let failed_workers = failed
+            .into_iter()
+            .map(|(worker, error)| json!({"worker": worker, "error": error}))
+            .collect::<Vec<_>>();
+        let body = json!({
+            "status": if failed_workers.is_empty() { "success" } else { "partial_success" },
+            "message": message,
+            "workers_flushed": workers_flushed,
+            "total_http_workers": http_workers,
+            "total_workers": total_workers,
+            "successful": successful,
+            "failed": failed_workers,
+        });
+        (status, Json(body)).into_response()
     }
 }
 
