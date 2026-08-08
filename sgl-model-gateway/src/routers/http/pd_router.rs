@@ -75,6 +75,23 @@ struct PDRequestContext<'a> {
     headers: Option<HeaderMap>,
 }
 
+#[derive(Debug)]
+enum PrefillDispatchOutcome {
+    Confirmed(reqwest::Response),
+    DefinitiveFailure(reqwest::Response),
+    AmbiguousTransport(reqwest::Error),
+}
+
+impl PrefillDispatchOutcome {
+    fn classify(result: Result<reqwest::Response, reqwest::Error>) -> Self {
+        match result {
+            Ok(response) if response.status().is_success() => Self::Confirmed(response),
+            Ok(response) => Self::DefinitiveFailure(response),
+            Err(error) => Self::AmbiguousTransport(error),
+        }
+    }
+}
+
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
@@ -366,57 +383,78 @@ impl PDRouter {
             },
         };
 
-        let prefill_failed = match &prefill_result {
-            Ok(response) => !response.status().is_success(),
-            Err(_) => true,
-        };
-        if prefill_failed {
-            drop(decode_fut);
-            prefill.record_outcome(
-                prefill_result
-                    .as_ref()
-                    .is_ok_and(|response| response.status().is_client_error()),
-            );
-            if let Err(error) = session.abort("prefill_dispatch_failed").await {
-                error!(error = %error, "Failed to terminalize PD session after prefill failure");
-                return error::bad_gateway(
-                    "pd_session_abort_failed",
-                    "Failed to terminalize decoder reservation",
-                );
+        let (prefill_response, prefill_transport_error) = match PrefillDispatchOutcome::classify(
+            prefill_result,
+        ) {
+            PrefillDispatchOutcome::Confirmed(response) => (Some(response), None),
+            PrefillDispatchOutcome::DefinitiveFailure(response) => {
+                drop(decode_fut);
+                prefill.record_outcome(response.status().is_client_error());
+                if let Err(error) = session.abort("prefill_dispatch_failed").await {
+                    error!(
+                        error = %error,
+                        "Failed to terminalize PD session after definitive prefill failure"
+                    );
+                    return error::bad_gateway(
+                        "pd_session_abort_failed",
+                        "Failed to terminalize decoder reservation",
+                    );
+                }
+                return match self
+                    .process_prefill_response(response, prefill.url(), false)
+                    .await
+                {
+                    Err(response) => response,
+                    Ok(_) => error::bad_gateway(
+                        "prefill_server_error",
+                        "Prefill reported failure but returned a success response",
+                    ),
+                };
             }
-            return match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(response) => response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response",
-                ),
-            };
-        }
+            PrefillDispatchOutcome::AmbiguousTransport(error_value) => {
+                prefill.record_outcome(false);
+                error!(
+                    prefill_url = prefill.url(),
+                    error = ?error_value,
+                    "Prefill response transport failed after dispatch; awaiting decode authority"
+                );
+                (None, Some(error_value))
+            }
+        };
 
         let decode_result = match decode_early {
             Some(result) => result,
             None => decode_fut.await,
         };
         events::RequestReceivedEvent {}.emit();
-        let prefill_body = match self
-            .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
-            .await
-        {
-            Ok((_, body)) => body,
-            Err(response) => {
-                let _ = session.abort("prefill_response_failed").await;
-                return response;
-            }
+        let prefill_body = match prefill_response {
+            Some(response) => match self
+                .process_prefill_response(response, prefill.url(), context.return_logprob)
+                .await
+            {
+                Ok((_, body)) => {
+                    prefill.record_outcome(true);
+                    body
+                }
+                Err(response) => {
+                    let _ = session.abort("prefill_response_failed").await;
+                    return response;
+                }
+            },
+            None => None,
         };
-        prefill.record_outcome(true);
 
         let response = match decode_result {
             Ok(response) => response,
             Err(error_value) => {
                 decode.record_outcome(false);
+                if let Some(prefill_error) = prefill_transport_error.as_ref() {
+                    error!(
+                        prefill_error = ?prefill_error,
+                        decode_error = ?error_value,
+                        "Prefill response transport was ambiguous and decode dispatch also failed"
+                    );
+                }
                 if let Err(error) = session.abort("decode_dispatch_failed").await {
                     error!(error = %error, "Failed to terminalize PD session after decode failure");
                     return error::bad_gateway(
@@ -443,9 +481,24 @@ impl PDRouter {
                     "Failed to terminalize decoder reservation",
                 );
             }
+            if let Some(prefill_error) = prefill_transport_error.as_ref() {
+                error!(
+                    prefill_error = ?prefill_error,
+                    decode_status = %status,
+                    "Prefill response transport was ambiguous and decode returned a failure status"
+                );
+            }
             return self
                 .handle_decode_error_response(response, &context, prefill, decode)
                 .await;
+        }
+
+        if let Some(prefill_error) = prefill_transport_error.as_ref() {
+            warn!(
+                prefill_error = ?prefill_error,
+                decode_status = %status,
+                "Recovered ambiguous prefill response transport from successful decode"
+            );
         }
 
         if context.is_stream {
@@ -1101,31 +1154,10 @@ impl PDRouter {
     // Helper to process non-streaming decode response with logprob merging
     async fn process_prefill_response(
         &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_response: reqwest::Response,
         prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
-        // Check prefill result first - it's critical for disaggregated mode
-        let prefill_response = match prefill_result {
-            Ok(response) => response,
-            Err(e) => {
-                error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
-                );
-
-                // Return error immediately - don't wait for decode to timeout
-                return Err(error::bad_gateway(
-                    "prefill_server_error",
-                    format!(
-                        "Prefill server error: {}. This will cause decode timeout.",
-                        e
-                    ),
-                ));
-            }
-        };
-
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -1585,6 +1617,10 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
     use uuid::Uuid;
 
     use super::*;
@@ -1608,6 +1644,170 @@ mod tests {
             enable_igw: false,
             max_response_bytes: 1024 * 1024,
         }
+    }
+
+    fn reqwest_response(status: StatusCode) -> reqwest::Response {
+        http::Response::builder()
+            .status(status)
+            .body(reqwest::Body::from(bytes::Bytes::new()))
+            .expect("test response must be valid")
+            .into()
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_length = None;
+        loop {
+            let bytes_read = stream
+                .read(&mut buffer)
+                .await
+                .expect("test server must read the request");
+            assert!(
+                bytes_read > 0,
+                "client closed before sending a complete request"
+            );
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if expected_length.is_none() {
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .expect("test request headers must be UTF-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .expect("test request must include Content-Length");
+                expected_length = Some(header_end + 4 + content_length);
+            }
+
+            if request.len() >= expected_length.expect("request length must be known") {
+                return request;
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_dispatch_classifies_successful_http_response_as_confirmed() {
+        let outcome = PrefillDispatchOutcome::classify(Ok(reqwest_response(StatusCode::OK)));
+        assert!(matches!(outcome, PrefillDispatchOutcome::Confirmed(_)));
+    }
+
+    #[test]
+    fn prefill_dispatch_classifies_http_error_as_definitive_failure() {
+        let outcome =
+            PrefillDispatchOutcome::classify(Ok(reqwest_response(StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(matches!(
+            outcome,
+            PrefillDispatchOutcome::DefinitiveFailure(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn prefill_dispatch_classifies_missing_http_response_as_ambiguous() {
+        let error = Client::new()
+            .get("not a valid URL")
+            .send()
+            .await
+            .expect_err("invalid URL must fail before producing an HTTP response");
+        let outcome = PrefillDispatchOutcome::classify(Err(error));
+        assert!(matches!(
+            outcome,
+            PrefillDispatchOutcome::AmbiguousTransport(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_decode_recovers_prefill_response_transport_loss() {
+        let prefill_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("prefill test listener must bind");
+        let prefill_address = prefill_listener
+            .local_addr()
+            .expect("prefill test listener must have an address");
+        let prefill_server = tokio::spawn(async move {
+            let (mut stream, _) = prefill_listener
+                .accept()
+                .await
+                .expect("prefill test listener must accept");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with(b"POST /generate HTTP/1.1\r\n"));
+        });
+
+        let decode_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("decode test listener must bind");
+        let decode_address = decode_listener
+            .local_addr()
+            .expect("decode test listener must have an address");
+        let decode_body = br#"{"text":"decoder retained authority"}"#;
+        let decode_server = tokio::spawn(async move {
+            let (mut stream, _) = decode_listener
+                .accept()
+                .await
+                .expect("decode test listener must accept");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with(b"POST /generate HTTP/1.1\r\n"));
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                decode_body.len()
+            );
+            stream
+                .write_all(response_headers.as_bytes())
+                .await
+                .expect("decode test server must write response headers");
+            stream
+                .write_all(decode_body)
+                .await
+                .expect("decode test server must write the response body");
+        });
+
+        let prefill_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{prefill_address}"),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode_worker: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{decode_address}"),
+            WorkerType::Decode,
+            true,
+        ));
+        let request_body = bytes::Bytes::from_static(br#"{"prompt":"test"}"#);
+        let session =
+            PdReservedRequestSession::from_test_parts(prefill_worker, decode_worker, request_body);
+        let router = create_test_pd_router();
+        let context = PDRequestContext {
+            route: "/generate",
+            is_stream: false,
+            return_logprob: false,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        };
+
+        let response = router
+            .execute_pd_session_internal(None, context, session)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), router.max_response_bytes)
+            .await
+            .expect("gateway response body must be readable");
+        assert_eq!(response_body.as_ref(), decode_body);
+        prefill_server
+            .await
+            .expect("prefill test server task must complete");
+        decode_server
+            .await
+            .expect("decode test server task must complete");
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {

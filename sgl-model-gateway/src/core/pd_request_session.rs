@@ -195,6 +195,37 @@ impl PdReservedRequestSession {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        prefill_worker: Arc<dyn Worker>,
+        decoder_worker: Arc<dyn Worker>,
+        request_body: Bytes,
+    ) -> Self {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    SessionCommand::Promote(response) | SessionCommand::Complete(response) => {
+                        let _ = response.send(Ok(()));
+                    }
+                    SessionCommand::Abort { response, .. } => {
+                        if let Some(response) = response {
+                            let _ = response.send(Ok(()));
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            handle: PdSessionHandle {
+                prefill_worker,
+                decoder_worker,
+                request_body,
+                command_tx,
+            },
+        }
+    }
+
     /// Selected prefill worker generation.
     pub fn prefill_worker(&self) -> &Arc<dyn Worker> {
         &self.handle.prefill_worker
