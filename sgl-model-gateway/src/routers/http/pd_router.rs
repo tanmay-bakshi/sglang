@@ -413,6 +413,11 @@ impl PDRouter {
             }
             PrefillDispatchOutcome::AmbiguousTransport(error_value) => {
                 prefill.record_outcome(false);
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_PREFILL,
+                    metrics_labels::CONNECTION_HTTP,
+                    "ambiguous_response_transport",
+                );
                 error!(
                     prefill_url = prefill.url(),
                     error = ?error_value,
