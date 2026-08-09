@@ -23,7 +23,7 @@ class BenchmarkResult:
     :ivar fused_us: Median fused kernel time in microseconds.
     :ivar residual_exact_fraction: Fraction of updated residual values that match.
     :ivar packed_exact_fraction: Fraction of packed FP4 bytes that match.
-    :ivar scale_exact_fraction: Fraction of E4M3 scale values that match.
+    :ivar scale_exact_fraction: Fraction of E4M3 scale bytes that match.
     """
 
     token_count: int
@@ -54,6 +54,21 @@ def _exact_fraction(left: torch.Tensor, right: torch.Tensor) -> float:
     if left.shape != right.shape or left.dtype != right.dtype:
         return 0.0
     return float((left == right).to(torch.float32).mean().item())
+
+
+def _byte_exact_fraction(left: torch.Tensor, right: torch.Tensor) -> float:
+    """Return the exact-match fraction over raw tensor bytes.
+
+    :param left: First contiguous tensor.
+    :param right: Second contiguous tensor with the same byte size.
+    :returns: Fraction of exactly equal bytes.
+    """
+
+    left_bytes = left.contiguous().view(torch.uint8).flatten()
+    right_bytes = right.contiguous().view(torch.uint8).flatten()
+    if left_bytes.shape != right_bytes.shape:
+        return 0.0
+    return float((left_bytes == right_bytes).to(torch.float32).mean().item())
 
 
 def _time_cuda(operation: Callable[[], None], repeats: int) -> float:
@@ -151,7 +166,7 @@ def _run_shape(
         fused_residual,
     )
     packed_exact_fraction = _exact_fraction(baseline_packed, fused_packed)
-    scale_exact_fraction = _exact_fraction(baseline_scale, fused_scale)
+    scale_exact_fraction = _byte_exact_fraction(baseline_scale, fused_scale)
 
     baseline_input = source_input.clone()
     baseline_residual = source_residual.clone()
