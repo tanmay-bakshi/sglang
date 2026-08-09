@@ -17,6 +17,13 @@ import re
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+from torch import nn
+from transformers import (
+    Gemma4TextConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+)
+
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
@@ -60,12 +67,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.common import is_sm100_supported
-from torch import nn
-from transformers import (
-    Gemma4TextConfig,
-    PretrainedConfig,
-    PreTrainedModel,
-)
 
 logger = logging.getLogger(__name__)
 
