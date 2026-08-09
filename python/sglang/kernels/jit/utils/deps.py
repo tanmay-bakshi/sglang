@@ -71,12 +71,14 @@ def get_flashinfer_trtllm_include_paths() -> list[str]:
     flashinfer_root = _find_package_root("flashinfer")
     assert flashinfer_root is not None
     trtllm_root = flashinfer_root / "data" / "csrc" / "nv_internal"
-    if not trtllm_root.exists():
-        raise RuntimeError(
-            "Cannot find FlashInfer's vendored TensorRT-LLM headers at "
-            f"{trtllm_root}. Please check your FlashInfer installation."
-        )
-    return [*include_paths, str(trtllm_root)]
+    trtllm_include_root = trtllm_root / "include"
+    for path in (trtllm_root, trtllm_include_root):
+        if not path.exists():
+            raise RuntimeError(
+                "Cannot find FlashInfer's vendored TensorRT-LLM headers at "
+                f"{path}. Please check your FlashInfer installation."
+            )
+    return [*include_paths, str(trtllm_root), str(trtllm_include_root)]
 
 
 def get_mathdx_root() -> Optional[pathlib.Path]:
