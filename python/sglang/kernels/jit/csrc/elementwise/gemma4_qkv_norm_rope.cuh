@@ -30,14 +30,6 @@ struct Gemma4QKVNormRopeParams {
   float eps;
 };
 
-SGL_DEVICE float load_cache_value(const float* ptr, int64_t index) {
-#ifdef USE_ROCM
-  return ptr[index];
-#else
-  return __ldg(ptr + index);
-#endif
-}
-
 template <typename PositionType, int64_t kHeadDim, bool kUsePDL>
 __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid_constant__ params) {
   using namespace device;
@@ -48,21 +40,42 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
   constexpr uint32_t kElementsPerThread = kHeadDim / kWarpThreads;
   constexpr uint32_t kPackedElementsPerThread = kElementsPerThread / 2;
   constexpr uint32_t kHalfHeadDim = kHeadDim / 2;
+  constexpr uint32_t kHeadPairsPerWarp = kWarpThreads / 2;
   using Packed = packed_t<bf16_t>;
   using Storage = AlignedVector<Packed, kPackedElementsPerThread>;
+  __shared__ float transposed_rope_cache[kHeadDim];
 
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
-  const uint32_t first_work_id = blockIdx.x * kWarpsPerBlock + warp_id;
-  const uint32_t worker_count = gridDim.x * kWarpsPerBlock;
+  const uint32_t first_block_work_id = blockIdx.x * kWarpsPerBlock;
+  const uint32_t block_work_stride = gridDim.x * kWarpsPerBlock;
   const uint32_t heads_per_token = params.num_q_heads + 2 * params.num_kv_heads;
   const uint32_t work_count = heads_per_token * params.num_tokens;
+  const uint32_t rope_head_count = params.num_q_heads + params.num_kv_heads;
 
   PDLWaitPrimary<kUsePDL>();
 
-  for (uint32_t work_id = first_work_id; work_id < work_count; work_id += worker_count) {
-    const uint32_t token_id = work_id / heads_per_token;
-    const uint32_t head_id = work_id % heads_per_token;
+  for (uint32_t block_work_id = first_block_work_id; block_work_id < work_count;
+       block_work_id += block_work_stride) {
+    const uint32_t token_id = block_work_id / heads_per_token;
+    const uint32_t first_head_id = block_work_id % heads_per_token;
+    const bool block_applies_rope = first_head_id < rope_head_count;
+
+    if (block_applies_rope) {
+      const auto position = static_cast<int64_t>(static_cast<const PositionType*>(params.positions)[token_id]);
+      const float* source_cache = params.cos_sin_cache + position * kHeadDim;
+      const uint32_t source_index = threadIdx.x;
+      const uint32_t cache_half = source_index / kHalfHeadDim;
+      const uint32_t frequency_index = source_index % kHalfHeadDim;
+      const uint32_t pair_lane = frequency_index / kElementsPerThread;
+      const uint32_t element_index = frequency_index % kElementsPerThread;
+      const uint32_t transposed_index =
+          cache_half * kHalfHeadDim + element_index * kHeadPairsPerWarp + pair_lane;
+      transposed_rope_cache[transposed_index] = source_cache[source_index];
+      __syncthreads();
+    }
+
+    const uint32_t head_id = first_head_id + warp_id;
     const bool is_q = head_id < params.num_q_heads;
     const bool is_k = head_id >= params.num_q_heads && head_id < params.num_q_heads + params.num_kv_heads;
     const bool apply_rope = is_q || is_k;
@@ -98,18 +111,14 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
         elements[2 * packed_index + 1] = rounded1;
       }
 
-      const auto position = static_cast<int64_t>(static_cast<const PositionType*>(params.positions)[token_id]);
-      const float* cos_values = params.cos_sin_cache + position * kHeadDim;
-      const float* sin_values = cos_values + kHalfHeadDim;
-
 #pragma unroll
       for (uint32_t element_index = 0; element_index < kElementsPerThread; ++element_index) {
         const float paired = __shfl_xor_sync(0xffffffffu, elements[element_index], kWarpThreads / 2);
         const float rotated = lane_id < kWarpThreads / 2 ? -paired : paired;
-        const uint32_t dimension = lane_id * kElementsPerThread + element_index;
-        const uint32_t frequency_index = dimension % kHalfHeadDim;
-        const float cosine = load_cache_value(cos_values, frequency_index);
-        const float sine = load_cache_value(sin_values, frequency_index);
+        const uint32_t pair_lane = lane_id % kHeadPairsPerWarp;
+        const uint32_t cache_index = element_index * kHeadPairsPerWarp + pair_lane;
+        const float cosine = transposed_rope_cache[cache_index];
+        const float sine = transposed_rope_cache[kHalfHeadDim + cache_index];
         elements[element_index] = elements[element_index] * cosine + rotated * sine;
       }
 
@@ -128,6 +137,9 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
     }
 
     store_as<Storage>(input, input_vector, lane_id);
+    if (block_applies_rope) {
+      __syncthreads();
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -177,6 +189,9 @@ void gemma4_qkv_norm_rope(
   RuntimeCheck(num_q_heads > 0, "num_q_heads must be positive");
   RuntimeCheck(num_kv_heads > 0, "num_kv_heads must be positive");
   RuntimeCheck(
+      (num_q_heads + 2 * num_kv_heads) % kWarpsPerBlock == 0,
+      "the QKV head count must be divisible by the warps per block");
+  RuntimeCheck(
       qkv_width.unwrap() == (num_q_heads + 2 * num_kv_heads) * head_dim,
       "qkv width must equal (num_q_heads + 2 * num_kv_heads) * head_dim");
 
@@ -202,8 +217,13 @@ void gemma4_qkv_norm_rope(
   constexpr auto kernel = gemma4_qkv_norm_rope_kernel<PositionType, kHeadDim, kUsePDL>;
   const uint32_t sm_count = runtime::get_sm_count(device.unwrap().device_id);
   static const uint32_t blocks_per_sm = runtime::get_blocks_per_sm(kernel, kThreadsPerBlock);
+  const uint32_t blocks_per_token = (q_head_count + 2 * kv_head_count) / kWarpsPerBlock;
   const uint32_t needed_blocks = div_ceil(work_count, kWarpsPerBlock);
-  const uint32_t block_count = std::min(blocks_per_sm * sm_count, needed_blocks);
+  uint32_t block_count = std::min(blocks_per_sm * sm_count, needed_blocks);
+  if (block_count < needed_blocks) {
+    block_count -= block_count % blocks_per_token;
+    block_count = std::max(block_count, blocks_per_token);
+  }
   LaunchKernel(block_count, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
 }
 
