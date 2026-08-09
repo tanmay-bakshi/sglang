@@ -11,6 +11,9 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
     source_tp_ranks_for_destination,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
 from sglang.srt.mem_cache.allocation_pin import (
     AllocationPin,
     AllocationPinSnapshot,
@@ -103,8 +106,13 @@ class DecodeWriterManifest:
     def __post_init__(self) -> None:
         """Own and validate exact destination-local writer membership."""
 
-        if self.source_tp_size not in (2, 4):
-            raise ValueError("source_tp_size must be 2 or 4")
+        if (
+            type(self.source_tp_size) is not int
+            or self.source_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES
+        ):
+            raise ValueError(
+                f"source_tp_size must be one of {SUPPORTED_PACKED_SOURCE_TP_SIZES}"
+            )
         if self.source_tp_size < self.destination_tp_size:
             raise ValueError(
                 "decode allocation manifests do not support destination TP "
@@ -146,14 +154,19 @@ class DecodeWriterManifest:
     ) -> "DecodeWriterManifest":
         """Build the canonical destination-local TP writer manifest.
 
-        :param source_tp_size: Source TP2 or TP4 width.
+        :param source_tp_size: Supported packed source TP width.
         :param destination_tp_size: Destination attention TP width.
         :param destination_tp_rank: Destination attention TP rank.
         :returns: Exact ordered destination-local writer manifest.
         """
 
-        if source_tp_size not in (2, 4):
-            raise ValueError("source_tp_size must be 2 or 4")
+        if (
+            type(source_tp_size) is not int
+            or source_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES
+        ):
+            raise ValueError(
+                f"source_tp_size must be one of {SUPPORTED_PACKED_SOURCE_TP_SIZES}"
+            )
         if source_tp_size < destination_tp_size:
             raise ValueError(
                 "decode allocation manifests do not support destination TP "
@@ -305,7 +318,7 @@ class DecodeAllocationLeaseSnapshot:
     :ivar lease_id: Random process-local migration lease identity.
     :ivar request_slot: Exact decode request-pool slot.
     :ivar request_generation: Allocator-derived slot reuse generation.
-    :ivar writer_manifest: Exact expected TP2 or TP4 source writers.
+    :ivar writer_manifest: Exact expected packed source writers.
     :ivar components: FULL, SWA, and Mamba mappings in fixed order.
     :ivar writer_participation: Every writer's fixed ordered component phases.
     :ivar allocation_digest: Stable generation and mapping digest.
@@ -507,7 +520,7 @@ class DecodeAllocationLeaseAuthority:
         :param request_pool: Process-local owner of the decode request slot.
         :param request_slot: Exact request-pool slot.
         :param expected_request_generation: Engine-observed slot generation.
-        :param writer_manifest: Exact expected TP2 or TP4 source writers.
+        :param writer_manifest: Exact expected packed source writers.
         :param component_claims: FULL, SWA, and Mamba claims in fixed order.
         :returns: Opaque process-local migration lease.
         """

@@ -1344,6 +1344,31 @@ def test_prepare_wire_round_trip_is_deterministic(
     assert encode_packed_message(decoded) == payload
 
 
+def test_tp1_prepare_wire_round_trip_preserves_single_writer_geometry() -> None:
+    """Round-trip one exact TP1-to-TP1 packed-v4 PREPARE."""
+
+    base_spec = layout_spec()
+    spec = dataclasses.replace(
+        base_spec,
+        source_components=base_spec.destination_components,
+        writers=(WRITERS[0],),
+        topology=PackedTopology(
+            source_tp_size=1,
+            destination_tp_size=1,
+            destination_tp_rank=0,
+        ),
+    )
+    message = prepare(WRITERS[0], spec)
+
+    payload = encode_packed_message(message)
+    decoded = decode_packed_message(payload)
+
+    assert decoded == message
+    assert decoded.spec.topology.source_tp_size == 1
+    assert decoded.spec.writers == (WRITERS[0],)
+    assert decoded.spec.build() == spec.build()
+
+
 @pytest.mark.parametrize(
     "visibility",
     [
@@ -1515,6 +1540,11 @@ def test_wire_rejects_invalid_domain_values_and_frame_bounds() -> None:
 
     with pytest.raises(PackedWireError, match="invalid packed wire"):
         decode_packed_message(msgspec.msgpack.encode(envelope))
+
+    unsupported_topology = msgspec.msgpack.decode(payload)
+    unsupported_topology["spec"]["topology"]["source_tp_size"] = 3
+    with pytest.raises(PackedWireError, match="invalid packed wire"):
+        decode_packed_message(msgspec.msgpack.encode(unsupported_topology))
     with pytest.raises(PackedWireError, match="must not be empty"):
         decode_packed_message(b"")
     with pytest.raises(PackedWireError, match="exceeds"):

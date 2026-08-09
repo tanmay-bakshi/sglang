@@ -102,8 +102,11 @@ class _FakeManager:
     failures: list[tuple[int, str]]
     statuses: list[tuple[int, int]]
 
-    def __init__(self) -> None:
-        """Initialize canonical TP2 source-rank-zero state."""
+    def __init__(self, attn_tp_size: int = 2) -> None:
+        """Initialize canonical source-rank-zero state.
+
+        :param attn_tp_size: Supported source attention TP width.
+        """
 
         kv_args = KVArgs()
         kv_args.gpu_id = 0
@@ -113,7 +116,7 @@ class _FakeManager:
         self.agent_metadata = b"metadata"
         self.attn_cp_rank = 0
         self.attn_tp_rank = 0
-        self.attn_tp_size = 2
+        self.attn_tp_size = attn_tp_size
         self.kv_args = kv_args
         self.pp_rank = 0
         self.process_generation = str(uuid.uuid4())
@@ -684,6 +687,7 @@ def _packed_kv_args(item_length: int) -> KVArgs:
 
 def _cache_hit_allocation(
     manager: _PackedDecodeManager,
+    source_tp_size: int = 2,
 ) -> tuple[
     DecodeAllocationLeaseAuthority,
     DecodeAllocationLease,
@@ -692,6 +696,7 @@ def _cache_hit_allocation(
     """Pin one 64-token FULL/SWA migration beginning at token 448.
 
     :param manager: Exact lifecycle authority retained by the lease.
+    :param source_tp_size: Supported packed source TP width.
     :returns: Authority, exact allocation lease, and request owner.
     """
 
@@ -726,7 +731,7 @@ def _cache_hit_allocation(
         request_slot=owner.req_pool_idx,
         expected_request_generation=request_generation,
         writer_manifest=DecodeWriterManifest.for_tensor_parallel(
-            2,
+            source_tp_size,
             manager.attn_tp_size,
             manager.attn_tp_rank,
         ),
@@ -977,10 +982,13 @@ def test_control_envelope_round_trips_generation_bound_ready() -> None:
     )
 
 
-def test_prefill_capability_binds_registration_runtime_and_topology() -> None:
-    """Build a TP2-to-TP1 capability only for the accepted runtime digest."""
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+def test_prefill_capability_binds_supported_source_runtime_and_topology(
+    source_tp_size: int,
+) -> None:
+    """Bind every supported source width only for the accepted runtime digest."""
 
-    manager = _FakeManager()
+    manager = _FakeManager(source_tp_size)
     artifacts = _runtime_artifacts()
     policy = build_same_host_visibility_policy(artifacts)
     runtime = PackedPrefillRuntime(manager, artifacts, policy)
@@ -1004,12 +1012,15 @@ def test_prefill_capability_binds_registration_runtime_and_topology() -> None:
     )
 
     assert capability.route.peer == peer
-    assert capability.route.topology.source_tp_size == 2
+    assert capability.route.topology.source_tp_size == source_tp_size
     assert capability.route.topology.destination_tp_size == 1
     assert capability.request_generation == b"r" * 16
 
 
-def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout() -> None:
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
+    source_tp_size: int,
+) -> None:
     """Project only migration-owned SWA pages into a runtime PREPARE."""
 
     artifacts = _runtime_artifacts()
@@ -1025,7 +1036,8 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout() -> None:
     )
     decode_runtime.attach_scheduler(_PackedMetadataAllocator(), object())
     allocation_authority, allocation_lease, owner = _cache_hit_allocation(
-        decode_manager
+        decode_manager,
+        source_tp_size,
     )
     allocation_snapshot = allocation_authority.snapshot(allocation_lease)
     transaction = decode_runtime.prepare_transaction(
@@ -1035,7 +1047,7 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout() -> None:
         allocation_lease=allocation_lease,
         allocation_authority=allocation_authority,
         lifecycle_authority=decode_manager,
-        source_tp_size=2,
+        source_tp_size=source_tp_size,
     )
     publication = transaction.publish()
     receipts = {
@@ -1046,7 +1058,7 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout() -> None:
     assert len(full_receipt.physical_pages) == 1
     assert len(swa_receipt.physical_pages) == 1
 
-    source_kv_args = _packed_kv_args(item_length=512)
+    source_kv_args = _packed_kv_args(item_length=1024 // source_tp_size)
     source_manager = object.__new__(NixlKVManager)
     source_manager.kv_args = source_kv_args
     destination_swa_window = (
@@ -1088,10 +1100,14 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout() -> None:
             page_size=decode_kv_args.page_size,
         ),
         components=components,
-        source_tp_size=2,
+        source_tp_size=source_tp_size,
         destination_tp_size=1,
         destination_tp_rank=0,
         writers=allocation_snapshot.writer_manifest.writers,
+    )
+    assert len(source_spec.writers) == source_tp_size
+    assert tuple(writer.source_attn_tp_rank for writer in source_spec.writers) == tuple(
+        range(source_tp_size)
     )
     assert source_spec.build() == publication.chunk_specs[0].build()
     source_layout = source_spec.build()

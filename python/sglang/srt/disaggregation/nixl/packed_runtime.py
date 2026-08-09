@@ -92,6 +92,9 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestPublication,
     PackedRequestTransactionState,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -718,8 +721,8 @@ class PackedPrefillRuntime:
         :param visibility_policy: Same-host route visibility policy.
         """
 
-        if manager.attn_tp_size not in (2, 4):
-            raise ValueError("packed source actor supports only TP2 and TP4")
+        if manager.attn_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES:
+            raise ValueError("packed source actor requires a supported source TP width")
         if manager.attn_cp_rank != 0 or manager.pp_rank != 0:
             raise ValueError("packed source actor requires CP1 and PP1")
         manifest = DecodeWriterManifest.for_tensor_parallel(manager.attn_tp_size)
@@ -1467,8 +1470,11 @@ class PackedDecodeRuntime:
         :returns: Exact arena and route advertisement.
         """
 
+        # Process advertisement omits request topology. This reflexive route
+        # extracts only arena-owned fields; the authenticated source rebuilds
+        # the exact TP1/TP2/TP4 request capability before transfer.
         topology = PackedTopology(
-            source_tp_size=2,
+            source_tp_size=self._manager.attn_tp_size,
             destination_tp_size=self._manager.attn_tp_size,
             destination_tp_rank=self._manager.attn_tp_rank,
         )
@@ -1542,7 +1548,7 @@ class PackedDecodeRuntime:
         :param allocation_lease: Exact pinned decode allocation.
         :param allocation_authority: Exact allocation authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
-        :param source_tp_size: TP2 or TP4 writer width.
+        :param source_tp_size: Supported packed writer width.
         :returns: Complete prepared transaction.
         """
 

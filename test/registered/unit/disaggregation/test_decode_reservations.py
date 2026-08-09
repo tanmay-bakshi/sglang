@@ -327,6 +327,24 @@ def test_cross_language_digest_vectors() -> None:
     )
 
 
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+def test_reserve_wire_accepts_every_supported_packed_source_width(
+    source_tp_size: int,
+) -> None:
+    """Authenticate control-v1 reserve transcripts for every source width."""
+
+    request = _reserve_request()
+    base_attempt = DecodeReservationAttempt.from_value(request)
+    candidate = dataclasses.replace(base_attempt, source_tp_size=source_tp_size)
+    request["source_tp_size"] = source_tp_size
+    request["reserve_attempt_digest"] = candidate.compute_digest().hex()
+
+    attempt = DecodeReservationAttempt.from_value(request)
+
+    assert attempt.source_tp_size == source_tp_size
+    assert attempt.reserve_attempt_digest == candidate.compute_digest()
+
+
 def test_process_global_expiry_produces_identical_rank_receipts() -> None:
     """Rank-local clock sampling cannot enter a TP decoder grant digest."""
 
@@ -398,7 +416,7 @@ def test_bootstrap_rooms_are_deterministic_ordered_and_staging_scoped() -> None:
     "mutation",
     (
         lambda value: value.update({"unexpected": True}),
-        lambda value: value.update({"source_tp_size": 1}),
+        lambda value: value.update({"source_tp_size": 3}),
         lambda value: value.update({"reserve_attempt_digest": "00" * 32}),
         lambda value: value.update({"child_request_ids": list(reversed(_CHILD_IDS))}),
     ),

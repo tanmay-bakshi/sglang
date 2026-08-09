@@ -69,6 +69,9 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestPublication,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -398,7 +401,7 @@ class _DecodePreparedCohortRecord:
     :ivar handle: Opaque handle returned to the reservation authority.
     :ivar grant_id: Exact tokenizer-issued grant identity.
     :ivar reservation_attempt_id: Exact reserve-attempt identity.
-    :ivar source_tp_size: Fixed TP2 or TP4 source writer width.
+    :ivar source_tp_size: Fixed supported packed source writer width.
     :ivar decode_reqs: Ordered exact reserved decode requests.
     :ivar packed_transactions: Ordered request-scoped packed transfer owners.
     :ivar allocations: Ordered immutable allocation receipts.
@@ -3198,9 +3201,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.kv_receiver.require_staging:
                 return
             source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
-        if source_tp_size not in (2, 4):
+        if source_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES:
             raise DecodeAllocationLeaseError(
-                "decode allocation leases require TP2 or TP4 source"
+                "decode allocation leases require a supported packed source TP"
             )
         destination_tp_size = self.kv_manager.attn_tp_size
         destination_tp_rank = self.kv_manager.attn_tp_rank

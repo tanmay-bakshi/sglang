@@ -483,7 +483,7 @@ def _fixture(
 ) -> _Fixture:
     """Allocate one complete CPU request with FULL, SWA, and zero Mamba.
 
-    :param source_tp_size: Exact TP2 or TP4 source width.
+    :param source_tp_size: Exact supported packed source width.
     :param room_id: Decoder-minted request room.
     :param logical_start: Request-local FULL migration start.
     :param logical_length: Exact FULL migration length.
@@ -822,13 +822,13 @@ def _ack(request: PackedRequestTeardown) -> PackedRequestTeardownAck:
     )
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_page64_exact_repeat_preserves_final_full_and_swa_page(
     source_tp_size: int,
 ) -> None:
     """Build a valid packed transaction for the exact-repeat migration tail.
 
-    :param source_tp_size: TP2 or TP4 prefill width.
+    :param source_tp_size: Supported packed prefill width.
     """
 
     fixture = _fixture(
@@ -853,11 +853,11 @@ def test_page64_exact_repeat_preserves_final_full_and_swa_page(
     _transaction(fixture)
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_multichunk_success_waits_for_every_chunk_and_scheduler_commit(
     source_tp_size: int,
 ) -> None:
-    """TP2/TP4 complete out of order without committing after one chunk."""
+    """Supported cohorts complete out of order without an early commit."""
 
     fixture = _fixture(source_tp_size)
     transaction = _transaction(fixture)

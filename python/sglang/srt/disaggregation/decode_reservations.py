@@ -16,6 +16,10 @@ from typing import Protocol
 
 import blake3
 
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
+
 SCHEMA_VERSION = 1
 GRANT_TOKEN_BYTES = 32
 RESERVE_ATTEMPT_DIGEST_DOMAIN = b"sglang-pd-decoder-reserve-attempt-v1"
@@ -441,7 +445,7 @@ class DecodeReservationAttempt:
     :ivar logical_request_chain_id: Stable logical retry-chain identity.
     :ivar reservation_attempt_id: Exact allocator-attempt identity.
     :ivar reserve_attempt_digest: Gateway-computed BLAKE3 transcript digest.
-    :ivar source_tp_size: TP2 or TP4 prefill width.
+    :ivar source_tp_size: Supported packed prefill TP width.
     :ivar prepared_ttl_ms: Engine-clock-owned prepared TTL.
     :ivar inference_route: Exact inference HTTP route.
     :ivar request_shape: Scalar or batch request shape.
@@ -491,8 +495,10 @@ class DecodeReservationAttempt:
         _require_exact_fields(fields, _RESERVE_FIELDS, "reserve request")
         _require_schema_version(fields["schema_version"])
         source_tp_size = _require_integer(fields["source_tp_size"], "source_tp_size")
-        if source_tp_size not in (2, 4):
-            raise DecodeReservationValidationError("source_tp_size must be 2 or 4")
+        if source_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES:
+            raise DecodeReservationValidationError(
+                f"source_tp_size must be one of {SUPPORTED_PACKED_SOURCE_TP_SIZES}"
+            )
         prepared_ttl_ms = _require_integer(fields["prepared_ttl_ms"], "prepared_ttl_ms")
         if prepared_ttl_ms <= 0:
             raise DecodeReservationValidationError("prepared_ttl_ms must be positive")
@@ -1193,7 +1199,7 @@ class DecodeReservationSnapshot:
     :ivar prefill_bootstrap_endpoint: Selected bootstrap endpoint.
     :ivar decoder_process: Selected decoder process generation.
     :ivar logical_request_chain_id: Stable logical retry-chain identity.
-    :ivar source_tp_size: TP2 or TP4 source width.
+    :ivar source_tp_size: Supported packed source width.
     :ivar prepared_ttl_ms: Prepared lease TTL.
     :ivar prepared_expires_at_unix_ms: Engine-clock expiry.
     :ivar inference_route: Exact normal inference route.

@@ -96,6 +96,9 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedDestinationRegistration,
     PackedPeerIdentity,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
@@ -929,7 +932,7 @@ class NixlKVManager(CommonKVManager):
         elif (
             self.enable_staging
             and self.disaggregation_mode == DisaggregationMode.PREFILL
-            and self.attn_tp_size in (2, 4)
+            and self.attn_tp_size in SUPPORTED_PACKED_SOURCE_TP_SIZES
             and self.attn_cp_size == 1
             and self.pp_size == 1
         ):

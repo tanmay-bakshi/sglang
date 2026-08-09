@@ -300,13 +300,13 @@ class _FakePackedRuntimeManager:
         :param allocation_lease: Prepared fake allocation lease.
         :param allocation_authority: Exact fake allocation authority.
         :param lifecycle_authority: Exact lifecycle transition authority.
-        :param source_tp_size: TP2 or TP4 source width.
+        :param source_tp_size: Supported packed source width.
         :returns: Prepared fake transaction.
         """
 
         assert allocation_authority is self.authority
         assert lifecycle_authority is self.authority.lifecycle
-        assert source_tp_size in (2, 4)
+        assert source_tp_size in (1, 2, 4)
         transaction = _FakePackedTransaction(
             room_id=room_id,
             request_owner=request_owner,
@@ -518,7 +518,7 @@ def _attempt(
     """Build one exact reservation attempt for a child cohort.
 
     :param child_ids: Ordered request identities.
-    :param source_tp_size: TP2 or TP4 source width.
+    :param source_tp_size: Supported packed source width.
     :returns: Reservation attempt consumed by the queue.
     """
 
@@ -732,7 +732,7 @@ def _queue_fixture(
     )
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_prepare_owns_exact_resources_without_queue_publication(
     monkeypatch: pytest.MonkeyPatch,
     source_tp_size: int,

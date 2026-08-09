@@ -1355,6 +1355,93 @@ class TestNixlMetadataSnapshot(CustomTestCase):
         self.assertEqual(manager.agent_metadata, b"4096,8192")
         self.assertEqual(agent.metadata_snapshots, [b"4096,8192"])
 
+    def test_supported_prefill_widths_initialize_live_packed_runtime(self) -> None:
+        """Select the real packed source actor for TP1, TP2, and TP4."""
+
+        artifacts = object()
+        visibility_policy = object()
+        for source_tp_size in (1, 2, 4):
+            with self.subTest(source_tp_size=source_tp_size):
+                agent = MetadataSnapshotFakeAgent()
+                args = SimpleNamespace(
+                    engine_rank=0,
+                    kv_data_lens=[4096],
+                    kv_data_mem_kinds=["VRAM"],
+                    kv_data_ptrs=[0x1000],
+                    kv_item_lens=[64],
+                    pp_rank=0,
+                )
+                server_args = SimpleNamespace(tp_size=source_tp_size)
+                runtime = object()
+                with (
+                    patch.object(
+                        CommonKVManager,
+                        "__init__",
+                        new=self._common_manager_init,
+                    ),
+                    patch.object(NixlKVManager, "register_buffer_to_engine"),
+                    patch.object(NixlKVManager, "_init_staging_prefill_ctx"),
+                    patch.object(NixlKVManager, "_init_staging_buffers"),
+                    patch.object(NixlKVManager, "register_to_bootstrap"),
+                    patch.object(NixlKVManager, "_start_bootstrap_thread"),
+                    patch.object(
+                        envs.SGLANG_DISAGGREGATION_NIXL_BACKEND,
+                        "get",
+                        return_value="UCX",
+                    ),
+                    patch.object(
+                        envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS,
+                        "get",
+                        return_value="{}",
+                    ),
+                    patch.object(
+                        envs.SGLANG_DISAGG_STAGING_BUFFER,
+                        "get",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        envs.SGLANG_DISAGGREGATION_QUEUE_SIZE,
+                        "get",
+                        return_value=0,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.nixl.conn."
+                        "load_exact_nixl_runtime_artifacts",
+                        return_value=artifacts,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.nixl.conn."
+                        "build_same_host_visibility_policy",
+                        return_value=visibility_policy,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.nixl.conn.PackedPrefillRuntime",
+                        return_value=runtime,
+                    ) as runtime_constructor,
+                    patch("nixl._api.nixl_agent", return_value=agent),
+                    patch("nixl._api.nixl_agent_config", return_value=object()),
+                ):
+                    manager = NixlKVManager(
+                        args,
+                        DisaggregationMode.PREFILL,
+                        server_args,
+                    )
+
+                runtime_constructor.assert_called_once_with(
+                    manager,
+                    artifacts,
+                    visibility_policy,
+                )
+                self.assertIs(manager._packed_prefill_runtime, runtime)
+                self.assertEqual(
+                    manager.kv_transfer_protocol(),
+                    PACKED_KV_TRANSFER_PROTOCOL,
+                )
+                self.assertEqual(
+                    manager.prepared_grant_protocol(),
+                    PACKED_PREPARED_GRANT_PROTOCOL,
+                )
+
 
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
@@ -3327,12 +3414,12 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
 
 
 class TestNixlPackedControlRoutes(CustomTestCase):
-    """Bind complete TP2 and TP4 native writer cohorts to packed routes."""
+    """Bind every supported native writer cohort to packed routes."""
 
-    def test_tp2_and_tp4_routes_preserve_writer_and_socket_ownership(self) -> None:
+    def test_supported_routes_preserve_writer_and_socket_ownership(self) -> None:
         """Keep each canonically ordered writer bound to its own socket."""
 
-        for source_tp_size in (2, 4):
+        for source_tp_size in (1, 2, 4):
             with self.subTest(source_tp_size=source_tp_size):
                 receiver = object.__new__(NixlKVReceiver)
                 receiver.bootstrap_infos = [

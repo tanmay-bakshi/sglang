@@ -1052,11 +1052,11 @@ def test_decode_rebuilds_supported_source_layouts(
     assert decode_spec.build() == source_spec.build()
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
     source_tp_size: int,
 ) -> None:
-    """Packed TP2/TP4 writers preserve heterogeneous target and draft KV."""
+    """Supported packed writers preserve heterogeneous target and draft KV."""
 
     draft_pool = object.__new__(MHATokenToKVPool)
     draft_pool.start_layer = 0

@@ -21,6 +21,9 @@ from sglang.srt.disaggregation.common.staging_runtime import (
     StagingEndpointBufferBinding,
     bind_staging_endpoint_buffers,
 )
+from sglang.srt.disaggregation.runtime_capabilities import (
+    SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,9 +453,13 @@ class PackedTopology:
     def __post_init__(self) -> None:
         """Validate topology values before layout construction."""
 
-        if type(self.source_tp_size) is not int or self.source_tp_size <= 0:
+        if (
+            type(self.source_tp_size) is not int
+            or self.source_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES
+        ):
             raise ValueError(
-                f"source_tp_size must be positive, got {self.source_tp_size}"
+                "source_tp_size must be one of "
+                f"{SUPPORTED_PACKED_SOURCE_TP_SIZES}, got {self.source_tp_size}"
             )
         if type(self.destination_tp_size) is not int or self.destination_tp_size <= 0:
             raise ValueError(

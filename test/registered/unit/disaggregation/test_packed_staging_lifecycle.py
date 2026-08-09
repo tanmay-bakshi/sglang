@@ -520,11 +520,11 @@ class LifecycleHarness:
         )
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_manifest_and_completion_require_every_tp_writer(
     source_tp_size: int,
 ) -> None:
-    """Require every TP2 or TP4 writer before cohort completion."""
+    """Require every supported packed writer before cohort completion."""
 
     harness = LifecycleHarness(source_tp_size)
     completed = harness.complete_native()
@@ -1062,11 +1062,11 @@ def test_scatter_completion_receipts_are_one_shot_and_cross_bound() -> None:
         harness.scatter.accept_completion(inflight[0], first_receipt)
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_teardown_waits_for_every_exact_authenticated_ack(
     source_tp_size: int,
 ) -> None:
-    """Release nothing until every TP2 or TP4 writer acks exact teardown."""
+    """Release nothing until every supported writer acks exact teardown."""
 
     harness = LifecycleHarness(source_tp_size)
     harness.complete_native()

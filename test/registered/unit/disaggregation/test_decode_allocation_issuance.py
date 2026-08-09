@@ -73,7 +73,7 @@ def _fixture(
     """Build one exact live request and queue authority.
 
     :param allocator: Concrete or SWA composite KV allocator.
-    :param source_tp_size: TP2 or TP4 prefill width.
+    :param source_tp_size: Supported packed prefill width.
     :param destination_tp_size: Decode attention TP width.
     :param destination_tp_rank: Decode attention TP rank.
     :param sliding_window_size: Active SWA window.
@@ -165,8 +165,8 @@ def _swa_allocator() -> SWATokenToKVPoolAllocator:
     )
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
-def test_live_tp2_tp4_to_tp1_issuance_pins_exact_full_mapping(
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+def test_live_supported_source_to_tp1_issuance_pins_exact_full_mapping(
     source_tp_size: int,
 ) -> None:
     """Asymmetric issuance binds source writers, slot generation, and FULL."""
@@ -274,7 +274,7 @@ def test_issuance_rejects_destination_tp_wider_than_source() -> None:
     assert fixture.decode_request.allocation_lease is None
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_reserved_issuance_uses_authorized_source_before_receiver_handshake(
     source_tp_size: int,
 ) -> None:

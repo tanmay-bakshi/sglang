@@ -151,7 +151,7 @@ class PackedNixlDecodeController:
         :param allocation_lease: Exact pinned decode allocation.
         :param allocation_authority: Exact allocation authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
-        :param source_tp_size: TP2 or TP4 source writer width.
+        :param source_tp_size: Supported packed source writer width.
         :returns: Prepared request transaction.
         """
 

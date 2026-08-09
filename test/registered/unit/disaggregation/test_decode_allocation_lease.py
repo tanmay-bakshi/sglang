@@ -176,7 +176,7 @@ def _acquire(
     """Acquire one generation-bound local allocation lease.
 
     :param fixture: Exact local allocation owners.
-    :param source_tp_size: Exact TP2 or TP4 source width.
+    :param source_tp_size: Exact supported packed source width.
     :param include_swa: Whether SWA has local work.
     :param include_mamba: Whether Mamba has local work.
     :returns: Opaque allocation lease.
@@ -232,11 +232,11 @@ def _alter_digest(digest: bytes) -> bytes:
     return bytes((digest[0] ^ 1,)) + digest[1:]
 
 
-@pytest.mark.parametrize("source_tp_size", (2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
 def test_tp_manifest_and_component_participation_are_exact(
     source_tp_size: int,
 ) -> None:
-    """TP2 and TP4 receipts contain every writer and ordered zero-work phase."""
+    """Every supported source width retains exact ordered participation."""
 
     fixture = _lease_fixture()
     lease = _acquire(
@@ -272,6 +272,7 @@ def test_tp_manifest_and_component_participation_are_exact(
 @pytest.mark.parametrize(
     ("source_tp_size", "destination_tp_size", "destination_tp_rank", "source_ranks"),
     (
+        (1, 1, 0, (0,)),
         (2, 1, 0, (0, 1)),
         (4, 1, 0, (0, 1, 2, 3)),
         (2, 2, 0, (0,)),
