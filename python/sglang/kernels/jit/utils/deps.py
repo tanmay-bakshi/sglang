@@ -57,6 +57,28 @@ def get_flashinfer_include_paths() -> List[str]:
     return include_paths
 
 
+@register_dependency("flashinfer_trtllm")
+def get_flashinfer_trtllm_include_paths() -> list[str]:
+    """Resolve FlashInfer plus its vendored TensorRT-LLM header root.
+
+    :returns: Include paths required by headers under
+        ``nv_internal/tensorrt_llm``.
+    :raises RuntimeError: If the installed FlashInfer package omits its
+        TensorRT-LLM headers.
+    """
+
+    include_paths = get_flashinfer_include_paths()
+    flashinfer_root = _find_package_root("flashinfer")
+    assert flashinfer_root is not None
+    trtllm_root = flashinfer_root / "data" / "csrc" / "nv_internal"
+    if not trtllm_root.exists():
+        raise RuntimeError(
+            "Cannot find FlashInfer's vendored TensorRT-LLM headers at "
+            f"{trtllm_root}. Please check your FlashInfer installation."
+        )
+    return [*include_paths, str(trtllm_root)]
+
+
 def get_mathdx_root() -> Optional[pathlib.Path]:
     """Locate the NVIDIA Math-DX install (cuBLASDx headers).
 
