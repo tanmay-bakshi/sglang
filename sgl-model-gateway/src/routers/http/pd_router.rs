@@ -77,7 +77,8 @@ struct PDRequestContext<'a> {
 
 struct PdTopologyRoutingReceipt {
     topology_sha256: String,
-    request_id: String,
+    logical_request_id: String,
+    child_request_ids: Vec<Uuid>,
     group_id: String,
     prefill_origin: String,
     prefill_launch_instance_id: String,
@@ -116,7 +117,8 @@ impl PdTopologyRoutingReceipt {
 
         Ok(Self {
             topology_sha256: topology_sha256.to_string(),
-            request_id: session.request_id().to_string(),
+            logical_request_id: session.logical_request_id().to_string(),
+            child_request_ids: session.child_request_ids().to_vec(),
             group_id: group_id.as_str().to_string(),
             prefill_origin: prefill.origin().to_string(),
             prefill_launch_instance_id: prefill.metadata().launch_instance_id().to_string(),
@@ -136,10 +138,17 @@ impl PdTopologyRoutingReceipt {
     }
 
     fn insert_into(self, response: &mut Response) {
+        let child_request_ids = self
+            .child_request_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let headers = response.headers_mut();
         for (name, value) in [
             ("x-sglang-pd-topology-sha256", self.topology_sha256),
-            ("x-sglang-pd-request-id", self.request_id),
+            ("x-sglang-pd-logical-request-id", self.logical_request_id),
+            ("x-sglang-pd-child-request-ids", child_request_ids),
             ("x-sglang-pd-group-id", self.group_id),
             ("x-sglang-pd-prefill-origin", self.prefill_origin),
             (
@@ -1783,13 +1792,12 @@ mod tests {
         Box::new(worker)
     }
 
-    #[test]
-    fn topology_receipt_emits_the_frozen_response_headers() {
-        let mut response = Response::new(Body::empty());
+    fn topology_receipt(child_request_ids: Vec<Uuid>) -> PdTopologyRoutingReceipt {
         PdTopologyRoutingReceipt {
             topology_sha256: "24afeedde0264f2874a77f18266ad57b096e397c43bc65e16bd46334b52df5a2"
                 .to_string(),
-            request_id: "request-0".to_string(),
+            logical_request_id: "11111111-2222-4333-8444-555555555555".to_string(),
+            child_request_ids,
             group_id: "group-0".to_string(),
             prefill_origin: "http://prefill.test:30000".to_string(),
             prefill_launch_instance_id: "00000000-0000-0000-0000-000000000001".to_string(),
@@ -1798,14 +1806,27 @@ mod tests {
             kv_transfer_protocol: "packed-v4".to_string(),
             prepared_grant_protocol: "control-v1".to_string(),
         }
-        .insert_into(&mut response);
+    }
+
+    #[test]
+    fn topology_receipt_emits_scalar_request_identities() {
+        let child_request_id = Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap();
+        let mut response = Response::new(Body::empty());
+        topology_receipt(vec![child_request_id]).insert_into(&mut response);
 
         for (name, expected) in [
             (
                 "x-sglang-pd-topology-sha256",
                 "24afeedde0264f2874a77f18266ad57b096e397c43bc65e16bd46334b52df5a2",
             ),
-            ("x-sglang-pd-request-id", "request-0"),
+            (
+                "x-sglang-pd-logical-request-id",
+                "11111111-2222-4333-8444-555555555555",
+            ),
+            (
+                "x-sglang-pd-child-request-ids",
+                "01020304-0506-4708-890a-0b0c0d0e0f10",
+            ),
             ("x-sglang-pd-group-id", "group-0"),
             ("x-sglang-pd-prefill-origin", "http://prefill.test:30000"),
             (
@@ -1822,6 +1843,31 @@ mod tests {
         ] {
             assert_eq!(response.headers().get(name).unwrap(), expected);
         }
+        assert!(response.headers().get("x-sglang-pd-request-id").is_none());
+    }
+
+    #[test]
+    fn topology_receipt_preserves_ordered_multi_child_identities() {
+        let first = Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap();
+        let second = Uuid::parse_str("f0e0d0c0-b0a0-4908-8706-050403020100").unwrap();
+        let mut response = Response::new(Body::empty());
+        topology_receipt(vec![first, second]).insert_into(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-sglang-pd-logical-request-id")
+                .unwrap(),
+            "11111111-2222-4333-8444-555555555555"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-sglang-pd-child-request-ids")
+                .unwrap(),
+            "01020304-0506-4708-890a-0b0c0d0e0f10,f0e0d0c0-b0a0-4908-8706-050403020100"
+        );
+        assert!(response.headers().get("x-sglang-pd-request-id").is_none());
     }
 
     #[test]

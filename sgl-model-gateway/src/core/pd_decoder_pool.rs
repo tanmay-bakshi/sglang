@@ -704,6 +704,11 @@ impl DecoderAssignmentCohort {
         self.binding.decoder_id()
     }
 
+    /// Ordered engine child request identities bound to the original inputs.
+    pub fn child_request_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.binding.child_request_ids()
+    }
+
     /// Ordered rooms corresponding one-to-one with the original child order.
     pub fn bootstrap_rooms(&self) -> &[u64] {
         self.binding.bootstrap_rooms()

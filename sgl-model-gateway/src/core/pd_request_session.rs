@@ -123,7 +123,8 @@ impl fmt::Display for PdSessionTimingRecord {
 }
 
 struct PdSessionHandle {
-    request_id: String,
+    logical_request_id: String,
+    child_request_ids: Arc<[uuid::Uuid]>,
     group_id: Option<PdGroupId>,
     prefill_worker: Arc<dyn Worker>,
     decoder_worker: Arc<dyn Worker>,
@@ -193,7 +194,8 @@ impl PdReservedRequestSession {
             .map_err(|_| PdRequestSessionError::ActorUnavailable)??;
         Ok(Self {
             handle: PdSessionHandle {
-                request_id: reserved.request_id,
+                logical_request_id: reserved.logical_request_id,
+                child_request_ids: reserved.child_request_ids,
                 group_id: reserved.group_id,
                 prefill_worker: reserved.prefill_worker,
                 decoder_worker: reserved.decoder_worker,
@@ -236,7 +238,8 @@ impl PdReservedRequestSession {
             .map_err(|_| PdRequestSessionError::ActorUnavailable)??;
         Ok(Self {
             handle: PdSessionHandle {
-                request_id: reserved.request_id,
+                logical_request_id: reserved.logical_request_id,
+                child_request_ids: reserved.child_request_ids,
                 group_id: reserved.group_id,
                 prefill_worker: reserved.prefill_worker,
                 decoder_worker: reserved.decoder_worker,
@@ -247,8 +250,13 @@ impl PdReservedRequestSession {
     }
 
     /// Logical request identity used by topology routing receipts.
-    pub fn request_id(&self) -> &str {
-        &self.handle.request_id
+    pub fn logical_request_id(&self) -> &str {
+        &self.handle.logical_request_id
+    }
+
+    /// Ordered engine child request identities bound to this session.
+    pub fn child_request_ids(&self) -> &[uuid::Uuid] {
+        &self.handle.child_request_ids
     }
 
     /// Selected topology group, absent only for legacy flat PD mode.
@@ -374,7 +382,8 @@ struct ActorInputs {
 }
 
 struct SessionReserved {
-    request_id: String,
+    logical_request_id: String,
+    child_request_ids: Arc<[uuid::Uuid]>,
     group_id: Option<PdGroupId>,
     prefill_worker: Arc<dyn Worker>,
     decoder_worker: Arc<dyn Worker>,
@@ -887,9 +896,12 @@ impl PdRequestActor {
     }
 
     fn reserved(&self) -> Result<SessionReserved, PdRequestSessionError> {
-        if !matches!(self.authority, SessionAuthority::Reserved { .. }) {
-            return Err(PdRequestSessionError::NotActive);
-        }
+        let child_request_ids = match &self.authority {
+            SessionAuthority::Reserved { cohort } => {
+                Arc::from(cohort.child_request_ids().collect::<Vec<_>>())
+            }
+            _ => return Err(PdRequestSessionError::NotActive),
+        };
         let decoder_worker = self
             .decoder
             .as_ref()
@@ -900,7 +912,8 @@ impl PdRequestActor {
             .clone()
             .ok_or(PdRequestSessionError::NotActive)?;
         Ok(SessionReserved {
-            request_id: self.request_id.clone(),
+            logical_request_id: self.request_id.clone(),
+            child_request_ids,
             group_id: self.group_id.clone(),
             prefill_worker: Arc::clone(self.prefill.worker()),
             decoder_worker,
@@ -1649,7 +1662,11 @@ mod tests {
                 .build(),
         );
         let handle = PdSessionHandle {
-            request_id: "test-request".to_string(),
+            logical_request_id: "test-request".to_string(),
+            child_request_ids: Arc::from([
+                uuid::Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap(),
+                uuid::Uuid::parse_str("f0e0d0c0-b0a0-4908-8706-050403020100").unwrap(),
+            ]),
             group_id: None,
             prefill_worker,
             decoder_worker,
@@ -1680,6 +1697,20 @@ mod tests {
         assert!(!debug.contains(API_KEY_SECRET));
         assert!(!debug.contains(REQUEST_BODY_SECRET));
         assert!(debug.contains("request_body_bytes"));
+    }
+
+    #[test]
+    fn reserved_session_exposes_logical_and_ordered_child_identities() {
+        let (reserved, _commands) = reserved_session();
+
+        assert_eq!(reserved.logical_request_id(), "test-request");
+        assert_eq!(
+            reserved.child_request_ids(),
+            [
+                uuid::Uuid::parse_str("01020304-0506-4708-890a-0b0c0d0e0f10").unwrap(),
+                uuid::Uuid::parse_str("f0e0d0c0-b0a0-4908-8706-050403020100").unwrap(),
+            ]
+        );
     }
 
     #[test]
