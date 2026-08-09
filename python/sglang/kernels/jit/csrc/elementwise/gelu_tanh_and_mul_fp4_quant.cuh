@@ -220,9 +220,10 @@ struct GeluTanhMulFP4QuantKernel {
         "scale column count must be padded to 4");
 
     constexpr uint64_t kElementsPerThread = kFP4ElementsPerThread;
+    constexpr uint64_t kThreadsPerScale = 16 / kElementsPerThread;
     RuntimeCheck(
-        hidden_size % (kElementsPerThread * 32) == 0,
-        "hidden size must keep every FP4 scale group inside one warp");
+        kThreadsPerScale == 1 || hidden_size % (kElementsPerThread * 32) == 0,
+        "multi-thread FP4 scale groups must not cross warp boundaries");
     const uint64_t total_work = tokens * (hidden_size / kElementsPerThread);
     RuntimeCheck(
         total_work <= std::numeric_limits<uint32_t>::max(),
