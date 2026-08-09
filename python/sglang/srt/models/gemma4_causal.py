@@ -24,6 +24,10 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.kernels.ops.attention.gemma4_qkv_norm_rope import (
+    can_use_gemma4_qkv_norm_rope,
+    gemma4_qkv_norm_rope,
+)
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
@@ -388,6 +392,18 @@ class Gemma4Attention(nn.Module):
             partial_rotary_factor=rope_parameters.get("partial_rotary_factor", 1.0),
             is_neox_style=True,
         )
+        self._use_fused_qkv_norm_rope = (
+            get_server_args().enable_fused_qk_norm_rope
+            and self.head_dim == 256
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and self.q_norm.eps == self.k_norm.eps
+            and self.q_norm.eps == self.v_norm.eps
+            and self.q_norm.scale_shift == 0.0
+            and self.k_norm.scale_shift == 0.0
+            and not self.v_norm.with_scale
+        )
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -421,13 +437,52 @@ class Gemma4Attention(nn.Module):
         is_kv_shared = (
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
+        use_fused_qkv_norm_rope = (
+            self._use_fused_qkv_norm_rope
+            and not is_kv_shared
+            and qkv.is_cuda
+            and qkv.dtype == torch.bfloat16
+            and qkv.dim() == 2
+            and qkv.is_contiguous()
+            and positions.dim() == 1
+            and positions.is_contiguous()
+            and positions.shape[0] == qkv.shape[0]
+            and self.q_norm.weight.is_contiguous()
+            and self.k_norm.weight.is_contiguous()
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.q_norm.weight.device == qkv.device
+            and self.k_norm.weight.device == qkv.device
+            and self.rotary_emb.cos_sin_cache.is_contiguous()
+            and self.rotary_emb.cos_sin_cache.shape[-1] == self.head_dim
+            and self.rotary_emb.cos_sin_cache.device == qkv.device
+            and positions.device == qkv.device
+            and can_use_gemma4_qkv_norm_rope(
+                positions.dtype,
+                qkv.dtype,
+                self.head_dim,
+            )
+        )
         can_fuse_qkv_norm = (
             (q.is_cuda or q.is_xpu)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
         )
-        if can_fuse_qkv_norm:
+        if use_fused_qkv_norm_rope:
+            gemma4_qkv_norm_rope(
+                qkv,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.q_norm.eps,
+            )
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        elif can_fuse_qkv_norm:
             if is_kv_shared:
                 gemma_qkv_rmsnorm(
                     q,
@@ -489,7 +544,13 @@ class Gemma4Attention(nn.Module):
                 use_fused_kv = True
             else:
                 fused_arg = None
-            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
+            if not use_fused_qkv_norm_rope:
+                q, k = self.rotary_emb(
+                    positions,
+                    q,
+                    k,
+                    fused_set_kv_buffer_arg=fused_arg,
+                )
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
