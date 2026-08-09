@@ -45,6 +45,11 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp4_utils import (
+    fused_add_rmsnorm_fp4_quantize,
+    get_fp4_gemm_runner_backend,
+)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4LinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -632,6 +637,17 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_feedforward_layernorm_2 = None
             self.pre_feedforward_layernorm_2 = None
 
+        gate_up_quant_method = self.mlp.gate_up_proj.quant_method
+        self._use_fused_pre_feedforward_fp4 = (
+            not self.enable_moe_block
+            and fused_add_rmsnorm_fp4_quantize is not None
+            and isinstance(gate_up_quant_method, ModelOptNvFp4LinearMethod)
+            and not gate_up_quant_method.quant_config.is_awq
+            and not get_fp4_gemm_runner_backend().is_marlin()
+        )
+        if self._use_fused_pre_feedforward_fp4:
+            self.mlp.gate_up_proj._accepts_prequantized_fp4 = True
+
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
@@ -714,9 +730,18 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
         else:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
+            if self._use_fused_pre_feedforward_fp4:
+                hidden_states, residual = (
+                    self.pre_feedforward_layernorm.forward_cuda_fp4_quantized(
+                        hidden_states,
+                        residual,
+                        self.mlp.gate_up_proj.input_scale_inv,
+                    )
+                )
+            else:
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
             hidden_states = self.mlp(hidden_states)
 
         if (

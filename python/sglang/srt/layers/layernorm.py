@@ -26,6 +26,9 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp4_utils import (
+    fused_add_rmsnorm_fp4_quantize,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -401,6 +404,39 @@ class RMSNorm(MultiPlatformOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
+
+    def forward_cuda_fp4_quantized(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Fuse the residual RMSNorm boundary into ModelOpt FP4 quantization.
+
+        :param x: Token-major BF16 input to add to ``residual``.
+        :param residual: Contiguous BF16 residual updated in place.
+        :param global_scale: ModelOpt activation scale for the consuming linear.
+        :returns: Prequantized FP4 activations with the updated residual.
+        :raises RuntimeError: If the fused Blackwell kernel is unavailable.
+        :raises ValueError: If this RMSNorm variant cannot use the fused ABI.
+        """
+        if fused_add_rmsnorm_fp4_quantize is None:
+            raise RuntimeError("fused FP4 RMSNorm is unavailable on this platform")
+        if self.variance_size_override is not None:
+            raise ValueError("fused FP4 RMSNorm does not support variance overrides")
+        if self.cast_x_before_out_mul:
+            raise ValueError("fused FP4 RMSNorm does not support HF cast semantics")
+        if is_batch_invariant_mode_enabled():
+            raise ValueError("fused FP4 RMSNorm is not batch invariant")
+
+        quantized = fused_add_rmsnorm_fp4_quantize(
+            x,
+            residual,
+            self.weight.data,
+            global_scale,
+            self.variance_epsilon,
+        )
+        return quantized, residual
 
     def forward_cuda(
         self,

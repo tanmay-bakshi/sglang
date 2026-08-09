@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -9,9 +10,13 @@ import torch
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    is_flashinfer_available,
     is_sm100_supported,
 )
-from sglang.srt.utils.custom_op import register_custom_op_from_extern
+from sglang.srt.utils.custom_op import (
+    register_custom_op,
+    register_custom_op_from_extern,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -19,14 +24,112 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+FusedAddRMSNormFp4Quantize = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
+def _round_up(x: int, multiple: int) -> int:
+    """Round an integer up to a positive multiple.
+
+    :param x: Integer to round.
+    :param multiple: Positive alignment.
+    :returns: The least aligned integer greater than or equal to ``x``.
+    """
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+def _fused_add_rmsnorm_fp4_quantize_fake(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe fused Gemma MLP input quantization to FakeTensor.
+
+    :param input: Token-major activation tensor.
+    :param residual: Residual tensor mutated by the real operator.
+    :param weight: RMSNorm weight.
+    :param global_scale: ModelOpt activation scale.
+    :param eps: RMSNorm epsilon.
+    :returns: Packed FP4 activations and 128x4-swizzled block scales.
+    """
+    del residual, weight, global_scale, eps
+    if input.dim() != 2:
+        raise ValueError("fused FP4 RMSNorm requires a two-dimensional input")
+    token_count, hidden_size = input.shape
+    scale_rows = _round_up(token_count, 128)
+    scale_columns = _round_up(hidden_size // 16, 4)
+    return (
+        input.new_empty((token_count, hidden_size // 2), dtype=torch.uint8),
+        input.new_empty((scale_rows, scale_columns), dtype=torch.float8_e4m3fn),
+    )
+
+
+fused_add_rmsnorm_fp4_quantize: FusedAddRMSNormFp4Quantize | None = None
+
+if is_cuda() and is_sm100_supported() and is_flashinfer_available():
+    from flashinfer import add_rmsnorm_fp4quant as _flashinfer_add_rmsnorm_fp4quant
+
+    @register_custom_op(
+        op_name="flashinfer_add_rmsnorm_fp4_quantize",
+        mutates_args=["residual"],
+        fake_impl=_fused_add_rmsnorm_fp4_quantize_fake,
+    )
+    def _fused_add_rmsnorm_fp4_quantize(
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse residual addition, RMSNorm, and ModelOpt FP4 quantization.
+
+        :param input: Token-major BF16 activation tensor.
+        :param residual: Contiguous BF16 residual updated in place.
+        :param weight: BF16 RMSNorm weight.
+        :param global_scale: ModelOpt inverse activation scale.
+        :param eps: RMSNorm epsilon.
+        :returns: Packed FP4 activations and swizzled E4M3 block scales.
+        :raises ValueError: If the tensors do not satisfy the kernel ABI.
+        """
+        if input.dim() != 2:
+            raise ValueError("fused FP4 RMSNorm requires a two-dimensional input")
+        if input.shape != residual.shape:
+            raise ValueError("input and residual must have identical shapes")
+        if not input.is_contiguous() or not residual.is_contiguous():
+            raise ValueError("input and residual must be contiguous")
+        if input.dtype != residual.dtype or input.dtype != weight.dtype:
+            raise ValueError("input, residual, and weight must share a dtype")
+        if input.shape[1] % 16 != 0:
+            raise ValueError("the hidden dimension must be divisible by 16")
+
+        output, block_scale = _flashinfer_add_rmsnorm_fp4quant(
+            input=input,
+            residual=residual,
+            weight=weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=16,
+            scale_format="e4m3",
+            is_sf_swizzled_layout=True,
+            enable_pdl=True,
+        )
+        token_count, hidden_size = input.shape
+        scale_rows = _round_up(token_count, 128)
+        scale_columns = _round_up(hidden_size // 16, 4)
+        return output.view(torch.uint8), block_scale.view(scale_rows, scale_columns)
+
+    fused_add_rmsnorm_fp4_quantize = _fused_add_rmsnorm_fp4_quantize
+
+
 fp4_quantize = None
 try:
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
     _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
-
-    def _round_up(x: int, y: int) -> int:
-        return ((x + y - 1) // y) * y
 
     def _flashinfer_fp4_quantize_impl(
         input: torch.Tensor,
