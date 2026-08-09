@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fused_add_rmsnorm_fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4LinearMethod
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -641,7 +641,7 @@ class Gemma4DecoderLayer(nn.Module):
         self._use_fused_pre_feedforward_fp4 = (
             not self.enable_moe_block
             and fused_add_rmsnorm_fp4_quantize is not None
-            and isinstance(gate_up_quant_method, ModelOptNvFp4LinearMethod)
+            and isinstance(gate_up_quant_method, ModelOptFp4LinearMethod)
             and not gate_up_quant_method.quant_config.is_awq
             and not get_fp4_gemm_runner_backend().is_marlin()
         )
