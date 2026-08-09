@@ -8,11 +8,22 @@ sys.modules["libtpu"] = None
 import mmap
 import os
 import unittest
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.pool_host.common import (
+    HostTensorAllocator,
+    ShmHostTensorAllocator,
+)
+from sglang.srt.mem_cache.storage.mmap import (
+    NumaPlacement,
+    alloc_mmap,
+    alloc_shm,
+    mmap_allocator,
+    sample_numa_placement,
+)
 
 
 class TestMmapAllocator(unittest.TestCase):
@@ -113,6 +124,105 @@ class TestMmapAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             allocator.allocate((2, 2), torch.float32, device="cuda")
         self.assertIn("only supports CPU allocations", str(ctx.exception))
+
+    def test_sample_numa_placement_reports_node_distribution(self):
+        fake_libnuma = MagicMock()
+
+        def move_pages(_pid, count, _pages, _nodes, statuses, _flags):
+            for index in range(count.value):
+                statuses[index] = 1 if index < count.value - 1 else 0
+            return 0
+
+        fake_libnuma.move_pages.side_effect = move_pages
+        with (
+            patch.object(mmap_allocator, "_libnuma", fake_libnuma),
+            patch.object(mmap_allocator.os, "sysconf", return_value=4096),
+        ):
+            placement = sample_numa_placement(
+                address=0x100000,
+                n_bytes=4096 * 4,
+                requested_node=1,
+                max_sample_pages=4,
+            )
+
+        self.assertEqual(placement.pages_by_node, ((0, 1), (1, 3)))
+        self.assertFalse(placement.is_local)
+
+    def test_mbind_uses_a_complete_machine_word_mask(self):
+        fake_libnuma = MagicMock()
+        fake_libnuma.mbind.return_value = 0
+        with patch.object(mmap_allocator, "_libnuma", fake_libnuma):
+            bound = mmap_allocator._bind_memory_to_numa_node(
+                address=0x100000,
+                n_bytes=4096,
+                numa_node=1,
+            )
+
+        self.assertTrue(bound)
+        args = fake_libnuma.mbind.call_args.args
+        self.assertEqual(args[3][0], 0b10)
+        self.assertEqual(args[4].value, 64)
+
+    def test_host_allocator_propagates_and_records_rank_local_node(self):
+        buffer = torch.empty((16,), dtype=torch.float32)
+        placement = NumaPlacement(
+            requested_node=1,
+            sampled_pages=1,
+            pages_by_node=((1, 1),),
+            errors_by_code=(),
+            query_error=None,
+        )
+        with (
+            envs.SGLANG_LOCAL_NUMA_NODE.override(1),
+            patch(
+                "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
+                return_value=buffer,
+            ) as mock_alloc_mmap,
+            patch(
+                "sglang.srt.mem_cache.pool_host.common.sample_numa_placement",
+                return_value=placement,
+            ) as mock_sample,
+        ):
+            allocator = HostTensorAllocator()
+            actual = allocator.allocate((16,), torch.float32, "cpu")
+
+        self.assertIs(actual, buffer)
+        self.assertEqual(allocator.placements, [placement])
+        mock_alloc_mmap.assert_called_once_with(
+            (16,),
+            torch.float32,
+            numa_node=1,
+        )
+        mock_sample.assert_called_once_with(
+            address=buffer.data_ptr(),
+            n_bytes=buffer.numel() * buffer.element_size(),
+            requested_node=1,
+        )
+
+    def test_strict_host_allocator_rejects_remote_pages(self):
+        buffer = torch.empty((16,), dtype=torch.float32)
+        placement = NumaPlacement(
+            requested_node=1,
+            sampled_pages=1,
+            pages_by_node=((0, 1),),
+            errors_by_code=(),
+            query_error=None,
+        )
+        with (
+            envs.SGLANG_LOCAL_NUMA_NODE.override(1),
+            envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.override(True),
+            patch(
+                "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
+                return_value=buffer,
+            ),
+            patch(
+                "sglang.srt.mem_cache.pool_host.common.sample_numa_placement",
+                return_value=placement,
+            ),
+        ):
+            allocator = HostTensorAllocator()
+            with self.assertRaisesRegex(RuntimeError, "requested_node=1"):
+                allocator.allocate((16,), torch.float32, "cpu")
 
 
 if __name__ == "__main__":

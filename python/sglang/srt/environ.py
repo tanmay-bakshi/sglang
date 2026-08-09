@@ -918,6 +918,9 @@ class Envs:
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
+    SGLANG_LOCAL_NUMA_NODE = EnvInt(None)
+    SGLANG_LOCAL_GPU_ID = EnvInt(None)
+    SGLANG_LOCAL_NVML_DEVICE_INDEX = EnvInt(None)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)

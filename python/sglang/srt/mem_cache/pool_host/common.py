@@ -1,34 +1,121 @@
-from __future__ import annotations
-
 import json
 import logging
+import mmap
 import os
 from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.storage.mmap import (
+    NumaPlacement,
+    alloc_mmap,
+    alloc_shm,
+    sample_numa_placement,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class HostTensorAllocator:
-    def __init__(self):
-        """Initialize the HostTensorAllocator."""
+    """Allocate page-populated host tensors for hierarchical KV cache."""
+
+    dtype: torch.dtype | None
+    dims: tuple[int, ...] | None
+    numa_node: int | None
+    placements: list[NumaPlacement]
+
+    def __init__(self) -> None:
+        """Initialize a rank-local host allocator."""
+
         self.dtype = None
         self.dims = None
+        self.numa_node = envs.SGLANG_LOCAL_NUMA_NODE.get()
+        self.placements = []
 
-    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+    def allocate(
+        self,
+        dims: tuple[int, ...],
+        dtype: torch.dtype,
+        device: str,
+    ) -> torch.Tensor:
+        """Allocate and verify one host tensor.
+
+        :param dims: Tensor dimensions.
+        :param dtype: Tensor element type.
+        :param device: Host device, which must be ``cpu``.
+        :returns: Allocated host tensor.
+        """
+
         assert (
             device == "cpu"
         ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        return alloc_mmap(dims, dtype)
+        buffer = alloc_mmap(dims, dtype, numa_node=self.numa_node)
+        self._record_numa_placement(buffer)
+        return buffer
+
+    def _record_numa_placement(self, buffer: torch.Tensor) -> None:
+        """Record bounded placement evidence for one populated allocation.
+
+        :param buffer: Newly allocated host tensor.
+        :raises RuntimeError: If strict NUMA validation is enabled and sampled
+            pages are not local.
+        """
+
+        if self.numa_node is None:
+            return
+
+        n_bytes = buffer.numel() * buffer.element_size()
+        placement = sample_numa_placement(
+            address=buffer.data_ptr(),
+            n_bytes=n_bytes,
+            requested_node=self.numa_node,
+        )
+        self.placements.append(placement)
+        identity = (
+            f"logical_gpu_id={envs.SGLANG_LOCAL_GPU_ID.get()}, "
+            "physical_gpu_id="
+            f"{envs.SGLANG_LOCAL_NVML_DEVICE_INDEX.get()}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
+        )
+        if placement.query_error is not None:
+            message = (
+                "Could not verify NUMA placement for "
+                f"{n_bytes / 1e9:.3f} GB HiCache host allocation on requested "
+                f"node {self.numa_node} ({identity}): {placement.query_error}"
+            )
+            logger.warning(message)
+            if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
+                raise RuntimeError(message)
+            return
+
+        message = (
+            f"HiCache host allocation NUMA placement: bytes={n_bytes}, "
+            f"requested_node={self.numa_node}, "
+            f"sampled_pages={placement.sampled_pages}, "
+            f"pages_by_node={dict(placement.pages_by_node)}, "
+            f"errors_by_code={dict(placement.errors_by_code)}, {identity}"
+        )
+        if placement.is_local:
+            logger.info(message)
+            return
+
+        logger.warning(message)
+        if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
+            raise RuntimeError(message)
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
-    def __init__(self):
+    """Allocate NUMA-local host tensors backed by shareable memory mappings."""
+
+    fds: list[int]
+    mms: list[mmap.mmap]
+
+    def __init__(self) -> None:
+        """Initialize a rank-local shared-memory allocator."""
+
         super().__init__()
         self.fds = []
         self.mms = []
@@ -41,17 +128,29 @@ class ShmHostTensorAllocator(HostTensorAllocator):
     def mm(self):
         return self.mms[0] if self.mms else None
 
-    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+    def allocate(
+        self,
+        dims: tuple[int, ...],
+        dtype: torch.dtype,
+        device: str,
+    ) -> torch.Tensor:
+        """Allocate and verify one shared-memory host tensor.
+
+        :param dims: Tensor dimensions.
+        :param dtype: Tensor element type.
+        :param device: Host device, which must be ``cpu``.
+        :returns: Allocated host tensor.
+        """
+
         assert (
             device == "cpu"
         ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        from sglang.srt.mem_cache.storage.mmap import alloc_shm
-
-        tensor, fd, mm = alloc_shm(dims, dtype)
+        tensor, fd, mm = alloc_shm(dims, dtype, numa_node=self.numa_node)
         self.fds.append(fd)
         self.mms.append(mm)
+        self._record_numa_placement(tensor)
         return tensor
 
     def __del__(self):

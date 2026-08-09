@@ -8,7 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from multiprocessing import resource_tracker
 from pathlib import Path
@@ -58,13 +58,20 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                     )
                     yield
                     return
+                physical_gpu_id = _get_nvml_device_index(gpu_id)
+                runtime_environment = {
+                    "SGLANG_LOCAL_NUMA_NODE": str(numa_node),
+                    "SGLANG_LOCAL_GPU_ID": str(gpu_id),
+                    "SGLANG_LOCAL_NVML_DEVICE_INDEX": str(physical_gpu_id),
+                }
                 with _create_numactl_executable(
-                    numactl_args=numactl_args
+                    numactl_args=numactl_args,
+                    runtime_environment=runtime_environment,
                 ) as executable_info:
                     executable, debug_str = executable_info
                     debug_str += (
                         f", logical_gpu_id={gpu_id}, "
-                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        f"physical_gpu_id={physical_gpu_id}, "
                         "CUDA_VISIBLE_DEVICES="
                         f"{os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
                     )
@@ -80,19 +87,28 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
 @contextmanager
 def _create_numactl_executable(
     numactl_args: str,
+    runtime_environment: Mapping[str, str] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Create a private NUMA launcher for one multiprocessing spawn context.
 
     :param numactl_args: Validated arguments inserted before the Python
         executable.
+    :param runtime_environment: Rank-local placement metadata exported only to
+        the spawned worker.
     :yields: Executable path and debug description.
     """
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     quoted_executable = shlex.quote(old_executable)
+    exports = ""
+    if runtime_environment is not None:
+        exports = "".join(
+            f"export {name}={shlex.quote(value)}\n"
+            for name, value in sorted(runtime_environment.items())
+        )
     script = f'''#!/bin/sh
 /bin/rm -f -- "$0"
-exec numactl {numactl_args} {quoted_executable} "$@"'''
+{exports}exec numactl {numactl_args} {quoted_executable} "$@"'''
     file_descriptor, temporary_path = tempfile.mkstemp(
         prefix="sglang-numactl-",
         suffix=".sh",

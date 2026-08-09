@@ -62,10 +62,10 @@ def _write_gated_shell(path: Path, gate_path: Path) -> None:
 
     quoted_gate_path = shlex.quote(str(gate_path))
     path.write_text(
-        f'''#!/bin/sh
+        f"""#!/bin/sh
 read -r _release < {quoted_gate_path}
 exec /bin/sh "$@"
-''',
+""",
         encoding="utf-8",
     )
     path.chmod(0o700)
@@ -73,6 +73,30 @@ exec /bin/sh "$@"
 
 class TestNumactlExecutable(unittest.TestCase):
     """Tests private launcher placement, permissions, and lifetime."""
+
+    def test_exports_rank_local_placement_metadata(self) -> None:
+        """The private launcher passes placement identity only to its worker."""
+
+        parent_value = os.environ.get("SGLANG_LOCAL_NUMA_NODE")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch(
+                "sglang.srt.utils.numa_utils.tempfile.gettempdir",
+                return_value=temporary_directory,
+            ):
+                with _create_numactl_executable(
+                    "--cpunodebind=1 --membind=1",
+                    runtime_environment={
+                        "SGLANG_LOCAL_GPU_ID": "0",
+                        "SGLANG_LOCAL_NUMA_NODE": "1",
+                        "SGLANG_LOCAL_NVML_DEVICE_INDEX": "4",
+                    },
+                ) as executable_info:
+                    launcher = Path(executable_info[0]).read_text(encoding="utf-8")
+
+        self.assertIn("export SGLANG_LOCAL_GPU_ID=0", launcher)
+        self.assertIn("export SGLANG_LOCAL_NUMA_NODE=1", launcher)
+        self.assertIn("export SGLANG_LOCAL_NVML_DEVICE_INDEX=4", launcher)
+        self.assertEqual(os.environ.get("SGLANG_LOCAL_NUMA_NODE"), parent_value)
 
     def test_uses_private_launcher_and_cleans_up_failed_spawn(self) -> None:
         """The parent owns and removes a launcher until spawn succeeds."""
@@ -98,7 +122,7 @@ class TestNumactlExecutable(unittest.TestCase):
                             0o700,
                         )
                         self.assertIn(
-                            "/bin/rm -f -- \"$0\"",
+                            '/bin/rm -f -- "$0"',
                             executable_path.read_text(encoding="utf-8"),
                         )
                         self.assertIn(
