@@ -4,7 +4,7 @@
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/utils.cuh>
 
-#include <nv_internal/tensorrt_llm/kernels/quantization.cuh>
+#include <nv_internal/tensorrt_llm/kernels/quantization_utils.cuh>
 
 #include <cuda_bf16.h>
 #include <tvm/ffi/container/tensor.h>
@@ -77,13 +77,10 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(
     const uint64_t gate_offset =
         static_cast<uint64_t>(row) * vectors_per_row * 2 + column;
 
-    InputVector gate;
-    InputVector up;
-    tk::loadPackedVec(
-        gate, reinterpret_cast<const InputVector*>(params.input) + gate_offset);
-    tk::loadPackedVec(
-        up,
-        reinterpret_cast<const InputVector*>(params.input) + gate_offset + vectors_per_row);
+    const auto* input_vectors =
+        reinterpret_cast<const InputVector*>(params.input);
+    InputVector gate = input_vectors[gate_offset];
+    const InputVector up = input_vectors[gate_offset + vectors_per_row];
     gelu_tanh_and_mul(gate, up);
 
     auto* scale_output = tk::cvt_quant_to_fp4_get_sf_out_offset<
