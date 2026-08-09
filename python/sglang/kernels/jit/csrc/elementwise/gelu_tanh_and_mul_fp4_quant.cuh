@@ -4,6 +4,8 @@
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/utils.cuh>
 
+#include <cfloat>
+
 #include <nv_internal/tensorrt_llm/kernels/quantization_utils.cuh>
 
 #include <cuda_bf16.h>
