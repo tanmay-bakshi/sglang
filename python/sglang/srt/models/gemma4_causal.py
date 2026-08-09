@@ -710,7 +710,7 @@ class Gemma4DecoderLayer(nn.Module):
         self._use_fused_pre_feedforward_fp4 = (
             not self.enable_moe_block
             and fused_add_rmsnorm_fp4_quantize is not None
-            and isinstance(gate_up_quant_method, ModelOptNvFp4LinearMethod)
+            and isinstance(gate_up_quant_method, ModelOptFp4LinearMethod)
             and not gate_up_quant_method.quant_config.is_awq
             and not get_fp4_gemm_runner_backend().is_marlin()
         )
