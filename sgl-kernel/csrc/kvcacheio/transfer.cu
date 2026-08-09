@@ -3,6 +3,7 @@
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -829,14 +830,23 @@ inline void transfer_kv_page_first_direct_impl(
   }
   static const bool use_v13_signature = runtime_version >= 13000;
 
-  size_t num_copies = 0;
-  std::vector<void*> batch_srcs;
-  std::vector<void*> batch_dsts;
-  std::vector<size_t> batch_sizes;
-  std::vector<size_t> attrs_idxs(1, 0);
-  cudaMemcpyAttributes attrs{};
   const int device_id = at::cuda::current_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (stream == nullptr) {
+    fallback_to_page_copy();
+    return;
+  }
+
+  size_t num_copies = 0;
+  thread_local std::vector<void*> batch_srcs;
+  thread_local std::vector<void*> batch_dsts;
+  thread_local std::vector<size_t> batch_sizes;
+  batch_srcs.clear();
+  batch_dsts.clear();
+  batch_sizes.clear();
+  std::array<size_t, 1> attrs_idxs{0};
+  cudaMemcpyAttributes attrs{};
+  attrs.flags = cudaMemcpyFlagPreferOverlapWithCompute;
 
   auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
     batch_srcs.push_back(src);
@@ -858,8 +868,6 @@ inline void transfer_kv_page_first_direct_impl(
     attrs.srcLocHint.id = device_id;
     attrs.dstLocHint.type = cudaMemLocationTypeHost;
     attrs.dstLocHint.id = 0;
-    attrs.flags = 0;
-
     num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     batch_srcs.reserve(num_copies);
     batch_dsts.reserve(num_copies);
@@ -899,8 +907,6 @@ inline void transfer_kv_page_first_direct_impl(
     attrs.srcLocHint.id = 0;
     attrs.dstLocHint.type = cudaMemLocationTypeDevice;
     attrs.dstLocHint.id = device_id;
-    attrs.flags = 0;
-
     num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     batch_srcs.reserve(num_copies);
     batch_dsts.reserve(num_copies);
@@ -958,7 +964,8 @@ inline void transfer_kv_page_first_direct_impl(
              &fail_idx,
              stream);
     }
-    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver || err == cudaErrorInvalidValue) {
+      (void)cudaGetLastError();
       fallback_to_page_copy();
       return;
     }
