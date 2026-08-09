@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
@@ -101,9 +102,31 @@ impl ConfigValidator {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+                topology,
                 prefill_policy,
                 decode_policy,
             } => {
+                if let Some(topology) = topology {
+                    topology
+                        .validate()
+                        .map_err(|error| ConfigError::InvalidValue {
+                            field: "pd_topology".to_string(),
+                            value: "<document>".to_string(),
+                            reason: error.to_string(),
+                        })?;
+                    if !prefill_urls.is_empty() || !decode_urls.is_empty() {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "strict PD topology cannot be combined with flat prefill or decode URLs"
+                                .to_string(),
+                        });
+                    }
+                    if prefill_policy.is_some() || decode_policy.is_some() {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: "strict PD topology owns group admission and cannot be combined with generic PD policies"
+                                .to_string(),
+                        });
+                    }
+                }
                 // Allow empty URLs even without service discovery to support dynamic worker addition
                 // URLs will be validated if provided
                 if !prefill_urls.is_empty() {
@@ -551,6 +574,30 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.mode.pd_topology().is_some() {
+            if config.connection_mode != ConnectionMode::Http {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason:
+                        "strict PD topology supports only the generation-aware HTTP request path"
+                            .to_string(),
+                });
+            }
+            if config
+                .discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.enabled)
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "strict PD topology cannot be combined with service discovery"
+                        .to_string(),
+                });
+            }
+            if config.enable_igw {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "strict PD topology cannot be combined with IGW mode".to_string(),
+                });
+            }
+        }
         if config.enable_igw {
             return Ok(());
         }
@@ -574,6 +621,7 @@ impl ConfigValidator {
                 decode_urls,
                 prefill_policy,
                 decode_policy,
+                ..
             } = &config.mode
             {
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
@@ -760,6 +808,7 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                topology: None,
                 prefill_policy: None,
                 decode_policy: None,
             },
@@ -776,6 +825,7 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                topology: None,
                 prefill_policy: None,
                 decode_policy: None,
             },
@@ -793,6 +843,7 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
+                topology: None,
                 prefill_policy: None,
                 decode_policy: None,
             },
@@ -840,6 +891,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
+                topology: None,
                 prefill_policy: Some(PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
                     balance_abs_threshold: 32,
@@ -867,6 +919,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
+                topology: None,
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }), // Requires 2+ workers
@@ -894,6 +947,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
+                topology: None,
                 prefill_policy: Some(PolicyConfig::Bucket {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
@@ -922,6 +976,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
+                topology: None,
                 prefill_policy: Some(PolicyConfig::Bucket {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
@@ -950,6 +1005,7 @@ mod tests {
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
+                topology: None,
                 prefill_policy: None,
                 decode_policy: None,
             },

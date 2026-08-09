@@ -31,7 +31,7 @@ use crate::{
         pd_discovery::discover_pd_process,
         worker::{HealthChecker, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, HttpOrigin, PdProcessRegistration, PdProcessRole,
-        Worker,
+        PdTopology, Worker,
     },
     observability::metrics::Metrics,
 };
@@ -257,6 +257,9 @@ pub struct WorkerRegistry {
     /// Generation-aware authority for every PD process lifecycle.
     pd_process_directory: Arc<PdProcessDirectory>,
 
+    /// Optional immutable ownership and process-shape contract for strict PD routing.
+    pd_topology: Option<Arc<PdTopology>>,
+
     /// Serializes directory transitions with generic index publication.
     lifecycle: Arc<Mutex<()>>,
 
@@ -269,6 +272,12 @@ pub struct WorkerRegistry {
 impl WorkerRegistry {
     /// Create a new worker registry
     pub fn new() -> Self {
+        Self::with_pd_topology(None)
+    }
+
+    /// Create a worker registry under an optional immutable PD topology.
+    pub fn with_pd_topology(topology: Option<PdTopology>) -> Self {
+        let pd_topology = topology.map(Arc::new);
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
@@ -276,7 +285,8 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
-            pd_process_directory: Arc::new(PdProcessDirectory::default()),
+            pd_process_directory: Arc::new(PdProcessDirectory::new(pd_topology.clone())),
+            pd_topology,
             lifecycle: Arc::new(Mutex::new(())),
             mesh_sync: Arc::new(RwLock::new(None)),
         }
@@ -653,6 +663,24 @@ impl WorkerRegistry {
             .pd_process
             .as_ref()
             .map(|registration| registration.metadata());
+
+        if let (Some(topology), Some(registration)) = (
+            self.pd_topology.as_ref(),
+            worker.metadata().pd_process.as_ref(),
+        ) {
+            topology
+                .match_registration(registration.origin(), registration.metadata())
+                .map_err(|error| WorkerRegistryError::InvalidPdLifecycleTransition {
+                    worker_url: worker.url().to_string(),
+                    reason: format!("worker violates immutable PD topology: {error}"),
+                })?;
+        } else if self.pd_topology.is_some() {
+            return Err(WorkerRegistryError::InvalidPdLifecycleTransition {
+                worker_url: worker.url().to_string(),
+                reason: "strict PD topology rejects workers without authenticated PD metadata"
+                    .to_string(),
+            });
+        }
 
         if previous_metadata.is_some() && role.is_none() {
             return Err(WorkerRegistryError::InvalidPdLifecycleTransition {

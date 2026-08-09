@@ -25,6 +25,7 @@ pub mod pd_decoder_pool;
 mod pd_discovery;
 pub mod pd_process;
 pub mod pd_request_session;
+pub mod pd_topology;
 pub mod retry;
 pub mod steps;
 pub mod token_bucket;
@@ -40,12 +41,18 @@ pub use error::{WorkerError, WorkerResult};
 pub use http_origin::{HttpOrigin, HttpOriginError};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
+pub use pd_decoder_directory::PdGroupRequest;
 pub use pd_process::{
     KvTransferProtocol, PdMetadataSchema, PdProcessAdvertisement, PdProcessAdvertisementError,
     PdProcessMetadata, PdProcessMetadataError, PdProcessRegistration, PdProcessRole,
     PrefillBootstrapAdvertisement, PrefillBootstrapEndpoint, PreparedGrantProtocol,
 };
 pub use pd_request_session::{PdRequestSession, PdRequestSessionError, PdReservedRequestSession};
+pub use pd_topology::{
+    PdDecoderSpec, PdGroupId, PdPrefillSpec, PdTopology, PdTopologyBootstrapEndpoint,
+    PdTopologyError, PdTopologyGroup, PdTopologyProcessSpec, PdTopologyRegistrationError,
+    PdTopologySchema,
+};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,

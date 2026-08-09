@@ -296,7 +296,7 @@ impl AppContextBuilder {
             .with_tokenizer_registry(&router_config)?
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
-            .with_worker_registry()
+            .with_worker_registry(&router_config)
             .with_policy_registry(&router_config)
             .with_storage(&router_config)?
             .with_load_monitor(&router_config)
@@ -417,8 +417,10 @@ impl AppContextBuilder {
     }
 
     /// Create worker registry
-    fn with_worker_registry(mut self) -> Self {
-        self.worker_registry = Some(Arc::new(WorkerRegistry::new()));
+    fn with_worker_registry(mut self, config: &RouterConfig) -> Self {
+        self.worker_registry = Some(Arc::new(WorkerRegistry::with_pd_topology(
+            config.mode.pd_topology().cloned(),
+        )));
         self
     }
 

@@ -1652,13 +1652,13 @@ impl DecoderPool {
         declared_prefill_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
     ) -> Result<Self, DecoderPoolError> {
-        if declared_prefill_tp_size != 2 && declared_prefill_tp_size != 4 {
+        if !matches!(declared_prefill_tp_size, 1 | 2 | 4) {
             return Err(DecoderPoolError::InvalidConfiguration(
-                "declared prefill tensor parallel size must be 2 or 4".to_string(),
+                "declared prefill tensor parallel size must be 1, 2, or 4".to_string(),
             ));
         }
         let declared_prefill_tp_size =
-            NonZeroUsize::new(declared_prefill_tp_size).expect("2 and 4 are nonzero");
+            NonZeroUsize::new(declared_prefill_tp_size).expect("1, 2, and 4 are nonzero");
         Ok(Self {
             inner: Arc::new(DecoderPoolInner {
                 pool_id: Uuid::new_v4(),

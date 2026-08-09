@@ -15,7 +15,7 @@ use smg::{
         TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
         DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
-    core::ConnectionMode,
+    core::{ConnectionMode, PdTopology},
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -206,6 +206,10 @@ struct CliArgs {
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
+
+    /// Immutable strict prefill-decode topology JSON document
+    #[arg(long, value_name = "PATH", help_heading = "PD Disaggregation")]
+    pd_topology_file: Option<PathBuf>,
 
     /// Specific policy for prefill nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
@@ -935,6 +939,33 @@ impl CliArgs {
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         let api_key = self.resolve_api_key()?;
+        let topology = self
+            .pd_topology_file
+            .as_ref()
+            .map(PdTopology::from_path)
+            .transpose()
+            .map_err(|error| ConfigError::InvalidValue {
+                field: "pd_topology_file".to_string(),
+                value: self
+                    .pd_topology_file
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string()),
+                reason: error.to_string(),
+            })?;
+
+        if topology.is_some()
+            && (!prefill_urls.is_empty()
+                || !self.decode.is_empty()
+                || !self.worker_urls.is_empty()
+                || self.prefill_policy.is_some()
+                || self.decode_policy.is_some()
+                || self.service_discovery)
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--pd-topology-file cannot be combined with flat workers, generic PD policies, or service discovery"
+                    .to_string(),
+            });
+        }
 
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
@@ -942,10 +973,11 @@ impl CliArgs {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
-        } else if self.pd_disaggregation {
+        } else if self.pd_disaggregation || topology.is_some() {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
+                topology,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
@@ -992,12 +1024,17 @@ impl CliArgs {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+                topology,
                 ..
             } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
+                if let Some(topology) = topology {
+                    all_urls.extend(topology.origins().map(ToString::to_string));
+                } else {
+                    for (url, _) in prefill_urls {
+                        all_urls.push(url.clone());
+                    }
+                    all_urls.extend(decode_urls.clone());
                 }
-                all_urls.extend(decode_urls.clone());
             }
             RoutingMode::OpenAI { .. } => {}
         }

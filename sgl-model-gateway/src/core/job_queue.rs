@@ -544,16 +544,34 @@ impl JobQueue {
                     RoutingMode::PrefillDecode {
                         prefill_urls,
                         decode_urls,
+                        topology,
                         ..
                     } => {
-                        let prefill_workers = prefill_urls
-                            .iter()
-                            .map(|(url, port)| (url.clone(), "prefill", *port));
+                        if let Some(topology) = topology {
+                            let mut workers = Vec::with_capacity(topology.origins().count());
+                            for group in &topology.groups {
+                                workers.push((
+                                    group.prefill.origin.to_string(),
+                                    "prefill",
+                                    Some(group.prefill.bootstrap_endpoint.port),
+                                ));
+                                workers.extend(
+                                    group.decoders.iter().map(|decoder| {
+                                        (decoder.origin.to_string(), "decode", None)
+                                    }),
+                                );
+                            }
+                            workers
+                        } else {
+                            let prefill_workers = prefill_urls
+                                .iter()
+                                .map(|(url, port)| (url.clone(), "prefill", *port));
 
-                        let decode_workers =
-                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
+                            let decode_workers =
+                                decode_urls.iter().map(|url| (url.clone(), "decode", None));
 
-                        prefill_workers.chain(decode_workers).collect()
+                            prefill_workers.chain(decode_workers).collect()
+                        }
                     }
                     RoutingMode::OpenAI { worker_urls } => {
                         // OpenAI mode: submit AddWorker jobs with runtime: "external"

@@ -5,7 +5,7 @@ pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConf
 use serde::{Deserialize, Serialize};
 
 use super::ConfigResult;
-use crate::core::ConnectionMode;
+use crate::core::{ConnectionMode, PdTopology};
 
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -230,6 +230,9 @@ pub enum RoutingMode {
         /// With optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        /// Immutable deployment topology for strict HTTP PD routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topology: Option<PdTopology>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,14 +247,26 @@ impl RoutingMode {
         matches!(self, RoutingMode::PrefillDecode { .. })
     }
 
+    /// Return the immutable topology when strict PD routing is configured.
+    pub fn pd_topology(&self) -> Option<&PdTopology> {
+        match self {
+            RoutingMode::PrefillDecode { topology, .. } => topology.as_ref(),
+            RoutingMode::Regular { .. } | RoutingMode::OpenAI { .. } => None,
+        }
+    }
+
     pub fn worker_count(&self) -> usize {
         match self {
             RoutingMode::Regular { worker_urls } => worker_urls.len(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
+                topology,
                 ..
-            } => prefill_urls.len() + decode_urls.len(),
+            } => topology.as_ref().map_or_else(
+                || prefill_urls.len() + decode_urls.len(),
+                |topology| topology.origins().count(),
+            ),
             RoutingMode::OpenAI { .. } => 1,
         }
     }
@@ -812,6 +827,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -839,6 +855,7 @@ mod tests {
                 "http://decode2".to_string(),
                 "http://decode3".to_string(),
             ],
+            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -862,6 +879,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -1321,6 +1339,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1351,6 +1370,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1379,6 +1399,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1403,6 +1424,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };

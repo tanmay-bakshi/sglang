@@ -16,8 +16,8 @@ use super::{
     },
 };
 use crate::core::{
-    ConnectionMode, HttpOrigin, PdProcessMetadata, PdProcessRegistration, PdProcessRole,
-    PrefillBootstrapEndpoint, Worker, WorkerType,
+    ConnectionMode, HttpOrigin, PdGroupId, PdProcessMetadata, PdProcessRegistration, PdProcessRole,
+    PdTopology, PrefillBootstrapEndpoint, Worker, WorkerType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +98,32 @@ struct DirectoryState {
     current_prefill_by_origin: HashMap<HttpOrigin, PrefillId>,
     decoders: HashMap<DecoderId, DecoderRecord>,
     current_decoder_by_origin: HashMap<HttpOrigin, DecoderId>,
+    last_selected_group_index: Option<usize>,
+    group_selection_counts: HashMap<PdGroupId, u64>,
+}
+
+/// Non-cloneable authority proving that group choice and request charging were atomic.
+#[derive(Debug)]
+pub struct PdGroupRequest {
+    group_id: PdGroupId,
+    prefill: Arc<PrefillDirectoryEntry>,
+    owner: LogicalRequestOwner,
+}
+
+impl PdGroupRequest {
+    /// Return the immutable selected group identifier.
+    pub fn group_id(&self) -> &PdGroupId {
+        &self.group_id
+    }
+
+    /// Return the selected prefill generation.
+    pub fn prefill(&self) -> &Arc<PrefillDirectoryEntry> {
+        &self.prefill
+    }
+
+    pub(crate) fn into_parts(self) -> (PdGroupId, Arc<PrefillDirectoryEntry>, LogicalRequestOwner) {
+        (self.group_id, self.prefill, self.owner)
+    }
 }
 
 #[derive(Debug)]
@@ -106,12 +132,40 @@ pub(crate) struct PdRetirementSweep {
     pub(crate) failures: Vec<PdDirectoryError>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PdProcessDirectory {
+    topology: Option<Arc<PdTopology>>,
     state: RwLock<DirectoryState>,
 }
 
+impl Default for PdProcessDirectory {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl PdProcessDirectory {
+    /// Construct a process directory, optionally under immutable topology ownership.
+    pub fn new(topology: Option<Arc<PdTopology>>) -> Self {
+        Self {
+            topology,
+            state: RwLock::new(DirectoryState::default()),
+        }
+    }
+
+    fn owns_pair(&self, prefill: &HttpOrigin, decoder: &HttpOrigin) -> bool {
+        let Some(topology) = self.topology.as_ref() else {
+            return true;
+        };
+        match (
+            topology.group_for_origin(prefill),
+            topology.group_for_origin(decoder),
+        ) {
+            (Some(prefill_group), Some(decoder_group)) => prefill_group.id == decoder_group.id,
+            _ => false,
+        }
+    }
+
     /// All directory mutations take this lock before touching a pool. Pool code
     /// never calls back into the directory, which keeps the lock order acyclic.
     pub(super) fn admit_prefill(
@@ -119,7 +173,7 @@ impl PdProcessDirectory {
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
         let (origin, metadata) = required_process(&worker, PdProcessRole::Prefill)?;
-        if !matches!(metadata.tensor_parallel_size(), 2 | 4) {
+        if !matches!(metadata.tensor_parallel_size(), 1 | 2 | 4) {
             return Err(PdDirectoryError::UnsupportedPrefillTp(
                 metadata.tensor_parallel_size(),
             ));
@@ -142,6 +196,7 @@ impl PdProcessDirectory {
             .filter(|(_, record)| {
                 record.availability == ProcessAvailability::Ready
                     && record.entry.id().url() != id.url()
+                    && self.owns_pair(id.origin(), record.entry.id().origin())
                     && metadata.is_compatible_with(record.entry.metadata())
             })
             .map(|(decoder_id, record)| (decoder_id.clone(), Arc::clone(&record.entry)))
@@ -214,6 +269,7 @@ impl PdProcessDirectory {
             .filter(|(_, record)| {
                 record.availability == ProcessAvailability::Ready
                     && record.entry.id().url() != id.url()
+                    && self.owns_pair(record.entry.id().origin(), id.origin())
                     && record.entry.metadata().is_compatible_with(entry.metadata())
             })
             .map(|(prefill_id, record)| (prefill_id.clone(), record.entry.pool().clone()))
@@ -447,6 +503,113 @@ impl PdProcessDirectory {
         ensure_worker_available(record.entry.worker())?;
         let owner = record.entry.pool().begin_request(request_id)?;
         Ok((Arc::clone(&record.entry), owner))
+    }
+
+    /// Select one topology group and charge its logical-request load atomically.
+    pub fn begin_group_request(
+        &self,
+        request_id: impl Into<String>,
+        model_id: Option<&str>,
+    ) -> Result<PdGroupRequest, PdDirectoryError> {
+        let topology = self
+            .topology
+            .as_ref()
+            .ok_or(PdDirectoryError::TopologyNotConfigured)?;
+        let request_id = request_id.into();
+        let mut state = self.state.write();
+        let mut candidates = Vec::new();
+
+        for (manifest_index, group) in topology.groups.iter().enumerate() {
+            let Some(prefill_id) = state.current_prefill_by_origin.get(&group.prefill.origin)
+            else {
+                continue;
+            };
+            let Some(prefill_record) = state.prefills.get(prefill_id) else {
+                continue;
+            };
+            if prefill_record.availability != ProcessAvailability::Ready
+                || !prefill_record.entry.worker().is_available()
+                || model_id
+                    .is_some_and(|model_id| !prefill_record.entry.worker().supports_model(model_id))
+            {
+                continue;
+            }
+
+            let ready_decoder_count = group
+                .decoders
+                .iter()
+                .filter(|decoder_spec| {
+                    let Some(decoder_id) =
+                        state.current_decoder_by_origin.get(&decoder_spec.origin)
+                    else {
+                        return false;
+                    };
+                    state
+                        .decoders
+                        .get(decoder_id)
+                        .is_some_and(|decoder_record| {
+                            decoder_record.availability == ProcessAvailability::Ready
+                                && decoder_record.pool_memberships.contains(prefill_id)
+                                && decoder_record.entry.worker().is_available()
+                        })
+                })
+                .count();
+            if ready_decoder_count == 0 {
+                continue;
+            }
+
+            candidates.push((
+                manifest_index,
+                group.id.clone(),
+                Arc::clone(&prefill_record.entry),
+                prefill_record
+                    .entry
+                    .pool()
+                    .snapshot()
+                    .active_logical_requests,
+                ready_decoder_count,
+            ));
+        }
+        if candidates.is_empty() {
+            return Err(PdDirectoryError::NoEligibleTopologyGroup);
+        }
+
+        let mut best = Vec::new();
+        for candidate in candidates {
+            match best.first() {
+                None => best.push(candidate),
+                Some(current) => {
+                    let ordering = ((candidate.3 as u128) * (current.4 as u128))
+                        .cmp(&((current.3 as u128) * (candidate.4 as u128)));
+                    match ordering {
+                        std::cmp::Ordering::Less => {
+                            best.clear();
+                            best.push(candidate);
+                        }
+                        std::cmp::Ordering::Equal => best.push(candidate),
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+            }
+        }
+
+        let selected_index = state.last_selected_group_index.map_or(0, |last_index| {
+            best.iter()
+                .position(|candidate| candidate.0 > last_index)
+                .unwrap_or(0)
+        });
+        let (manifest_index, group_id, prefill, _, _) = best.swap_remove(selected_index);
+        let owner = prefill.pool().begin_request(request_id)?;
+        state.last_selected_group_index = Some(manifest_index);
+        *state
+            .group_selection_counts
+            .entry(group_id.clone())
+            .or_default() += 1;
+        Ok(PdGroupRequest {
+            group_id,
+            prefill,
+            owner,
+        })
     }
 
     pub(crate) fn begin_admission(
@@ -732,7 +895,7 @@ pub enum PdDirectoryError {
     UnsupportedProcessTransport,
     #[error("PD worker transport and registered process origin differ")]
     ProcessOriginMismatch,
-    #[error("prefill directory supports TP2 or TP4, received TP{0}")]
+    #[error("prefill directory supports TP1, TP2, or TP4, received TP{0}")]
     UnsupportedPrefillTp(usize),
     #[error("decoder directory supports TP1 or TP2, received TP{0}")]
     UnsupportedDecodeTp(usize),
@@ -754,6 +917,10 @@ pub enum PdDirectoryError {
     ProcessNotCurrent,
     #[error("process-generation metadata changed without a new launch identity")]
     GenerationMetadataChanged,
+    #[error("strict PD topology is not configured")]
+    TopologyNotConfigured,
+    #[error("no PD topology group has a ready prefill and owned decoder capacity")]
+    NoEligibleTopologyGroup,
     #[error(transparent)]
     InvalidProcessIdentity(#[from] ProcessIdentityError),
     #[error(transparent)]

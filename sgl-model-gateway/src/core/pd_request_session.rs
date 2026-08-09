@@ -14,7 +14,8 @@ use tracing::{info, warn};
 
 use super::{
     pd_decoder_directory::{
-        DecoderDirectoryEntry, PdDirectoryError, PdProcessDirectory, PrefillDirectoryEntry,
+        DecoderDirectoryEntry, PdDirectoryError, PdGroupRequest, PdProcessDirectory,
+        PrefillDirectoryEntry,
     },
     pd_decoder_grant::{
         BindReconciliationGrant, BoundPreparedGrant, DecoderControlAuthorization,
@@ -28,7 +29,7 @@ use super::{
         RetryDisposition,
     },
     retry::BackoffCalculator,
-    Worker,
+    PdGroupId, Worker,
 };
 use crate::config::types::RetryConfig;
 
@@ -122,6 +123,8 @@ impl fmt::Display for PdSessionTimingRecord {
 }
 
 struct PdSessionHandle {
+    request_id: String,
+    group_id: Option<PdGroupId>,
     prefill_worker: Arc<dyn Worker>,
     decoder_worker: Arc<dyn Worker>,
     request_body: Bytes,
@@ -173,7 +176,10 @@ impl PdReservedRequestSession {
         let (reserved_tx, reserved_rx) = oneshot::channel();
         let inputs = ActorInputs {
             directory,
-            selected_prefill: selected_prefill.clone(),
+            selected_prefill: Some(selected_prefill.clone()),
+            precharged_prefill: None,
+            precharged_owner: None,
+            group_id: None,
             request_id: request_id.into(),
             model_id: model_id.map(str::to_string),
             template,
@@ -187,12 +193,67 @@ impl PdReservedRequestSession {
             .map_err(|_| PdRequestSessionError::ActorUnavailable)??;
         Ok(Self {
             handle: PdSessionHandle {
+                request_id: reserved.request_id,
+                group_id: reserved.group_id,
                 prefill_worker: reserved.prefill_worker,
                 decoder_worker: reserved.decoder_worker,
                 request_body: reserved.request_body,
                 command_tx,
             },
         })
+    }
+
+    /// Establish a strict-topology request from an atomically precharged group capability.
+    pub async fn establish_group(
+        directory: Arc<PdProcessDirectory>,
+        group_request: PdGroupRequest,
+        model_id: Option<&str>,
+        template: DecoderRequestTemplate,
+        control: &DecoderGrantControlClient,
+        retry_config: &RetryConfig,
+    ) -> Result<Self, PdRequestSessionError> {
+        let timing = PdSessionTiming::for_info_logging(tracing::enabled!(tracing::Level::INFO));
+        let (group_id, prefill, owner) = group_request.into_parts();
+        let request_id = owner.request_id().to_string();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (reserved_tx, reserved_rx) = oneshot::channel();
+        let inputs = ActorInputs {
+            directory,
+            selected_prefill: None,
+            precharged_prefill: Some(prefill),
+            precharged_owner: Some(owner),
+            group_id: Some(group_id),
+            request_id,
+            model_id: model_id.map(str::to_string),
+            template,
+            control: control.clone(),
+            retry_config: retry_config.clone(),
+            timing,
+        };
+        tokio::spawn(run_request_actor(inputs, command_rx, reserved_tx));
+        let reserved = reserved_rx
+            .await
+            .map_err(|_| PdRequestSessionError::ActorUnavailable)??;
+        Ok(Self {
+            handle: PdSessionHandle {
+                request_id: reserved.request_id,
+                group_id: reserved.group_id,
+                prefill_worker: reserved.prefill_worker,
+                decoder_worker: reserved.decoder_worker,
+                request_body: reserved.request_body,
+                command_tx,
+            },
+        })
+    }
+
+    /// Logical request identity used by topology routing receipts.
+    pub fn request_id(&self) -> &str {
+        &self.handle.request_id
+    }
+
+    /// Selected topology group, absent only for legacy flat PD mode.
+    pub fn group_id(&self) -> Option<&PdGroupId> {
+        self.handle.group_id.as_ref()
     }
 
     /// Selected prefill worker generation.
@@ -300,7 +361,10 @@ enum SessionCommand {
 
 struct ActorInputs {
     directory: Arc<PdProcessDirectory>,
-    selected_prefill: PrefillId,
+    selected_prefill: Option<PrefillId>,
+    precharged_prefill: Option<Arc<PrefillDirectoryEntry>>,
+    precharged_owner: Option<LogicalRequestOwner>,
+    group_id: Option<PdGroupId>,
     request_id: String,
     model_id: Option<String>,
     template: DecoderRequestTemplate,
@@ -310,6 +374,8 @@ struct ActorInputs {
 }
 
 struct SessionReserved {
+    request_id: String,
+    group_id: Option<PdGroupId>,
     prefill_worker: Arc<dyn Worker>,
     decoder_worker: Arc<dyn Worker>,
     request_body: Bytes,
@@ -417,6 +483,8 @@ struct PdRequestActor {
     request_body: Option<Bytes>,
     authority: SessionAuthority,
     timing: Option<PdSessionTiming>,
+    request_id: String,
+    group_id: Option<PdGroupId>,
 }
 
 impl PdRequestActor {
@@ -436,6 +504,8 @@ impl PdRequestActor {
             request_body: None,
             authority: SessionAuthority::Idle,
             timing: inputs.timing,
+            request_id: inputs.request_id,
+            group_id: inputs.group_id,
         }
     }
 
@@ -830,6 +900,8 @@ impl PdRequestActor {
             .clone()
             .ok_or(PdRequestSessionError::NotActive)?;
         Ok(SessionReserved {
+            request_id: self.request_id.clone(),
+            group_id: self.group_id.clone(),
             prefill_worker: Arc::clone(self.prefill.worker()),
             decoder_worker,
             request_body,
@@ -1243,20 +1315,31 @@ impl PdRequestActor {
 }
 
 async fn run_request_actor(
-    inputs: ActorInputs,
+    mut inputs: ActorInputs,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     reserved_tx: oneshot::Sender<Result<SessionReserved, PdRequestSessionError>>,
 ) {
     if commands.is_closed() {
         return;
     }
-    let request = inputs
-        .directory
-        .begin_prefill_request(&inputs.selected_prefill, inputs.request_id.clone());
-    let (prefill, owner) = match request {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = reserved_tx.send(Err(error.into()));
+    let (prefill, owner) = match (
+        inputs.precharged_prefill.take(),
+        inputs.precharged_owner.take(),
+        inputs.selected_prefill.as_ref(),
+    ) {
+        (Some(prefill), Some(owner), None) => (prefill, owner),
+        (None, None, Some(selected_prefill)) => match inputs
+            .directory
+            .begin_prefill_request(selected_prefill, inputs.request_id.clone())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = reserved_tx.send(Err(error.into()));
+                return;
+            }
+        },
+        _ => {
+            let _ = reserved_tx.send(Err(PdRequestSessionError::InvalidInitialAuthority));
             return;
         }
     };
@@ -1525,6 +1608,8 @@ pub enum PdRequestSessionError {
     AllocatorRefused(PendingAdmissionDisposition),
     #[error("PD request session actor is unavailable")]
     ActorUnavailable,
+    #[error("PD request actor received inconsistent initial request authority")]
+    InvalidInitialAuthority,
     #[error("PD request session is not active")]
     NotActive,
     #[error("PD request actor entered an invalid authority transition")]
@@ -1564,6 +1649,8 @@ mod tests {
                 .build(),
         );
         let handle = PdSessionHandle {
+            request_id: "test-request".to_string(),
+            group_id: None,
             prefill_worker,
             decoder_worker,
             request_body: Bytes::from_static(REQUEST_BODY_SECRET.as_bytes()),
