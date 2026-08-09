@@ -1325,6 +1325,20 @@ def _tgv_bf16_gemm_run(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    return _tgv_bf16_gemm_with_tactic_run(
+        x,
+        weight,
+        bias,
+        _pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+    )
+
+
+def _tgv_bf16_gemm_with_tactic_run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    tactic: int,
+) -> torch.Tensor:
     if get_device_sm() not in (100, 103):
         raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
@@ -1339,7 +1353,7 @@ def _tgv_bf16_gemm_run(
         bias,
         out,
         pdl=True,
-        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+        tactic=tactic,
     )
 
 
@@ -1351,11 +1365,27 @@ def _tgv_bf16_gemm_fake(
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 
+def _tgv_bf16_gemm_with_tactic_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    tactic: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
 direct_register_custom_op(
     op_name="cutedsl_tgv_bf16_gemm",
     op_func=_tgv_bf16_gemm_run,
     mutates_args=[],
     fake_impl=_tgv_bf16_gemm_fake,
+)
+
+direct_register_custom_op(
+    op_name="cutedsl_tgv_bf16_gemm_with_tactic",
+    op_func=_tgv_bf16_gemm_with_tactic_run,
+    mutates_args=[],
+    fake_impl=_tgv_bf16_gemm_with_tactic_fake,
 )
 
 
@@ -1367,3 +1397,20 @@ def cutedsl_bf16_gemm(
 ) -> torch.Tensor:
     """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
     return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+
+
+@debug_kernel_api
+def cutedsl_bf16_gemm_with_tactic(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    tactic: int,
+) -> torch.Tensor:
+    """Run an exact TGV tactic for one BF16 GEMM custom-op invocation."""
+
+    return torch.ops.sglang.cutedsl_tgv_bf16_gemm_with_tactic(
+        x,
+        weight,
+        bias,
+        tactic,
+    )
