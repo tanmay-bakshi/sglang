@@ -1,4 +1,6 @@
 import torch
+from tvm_ffi.module import Module
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -6,7 +8,6 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from tvm_ffi.module import Module
 
 
 def _round_up(value: int, multiple: int) -> int:

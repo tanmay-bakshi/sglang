@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
+
 from sglang.kernels.ops.quantization.gelu_tanh_and_mul_fp4_quant import (
     gelu_tanh_and_mul_fp4_quant,
 )
