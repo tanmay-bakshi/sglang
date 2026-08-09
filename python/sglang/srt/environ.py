@@ -935,6 +935,9 @@ class Envs:
 
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
+    # Gemma 4
+    SGLANG_ENABLE_GEMMA4_NVFP4_GEGLU_FUSION = EnvBool(True)
+
     # ====================================================================
     # DeepSeek V4
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
