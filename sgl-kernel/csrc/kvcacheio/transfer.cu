@@ -902,7 +902,10 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t dst_stride0 = dst_ptrs[0].stride(0);
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
-    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    // HiCache retains each immutable host source page through the load-stream
+    // completion event, so the driver may access it after this API call and
+    // independently of earlier work in the stream.
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
     attrs.srcLocHint.type = cudaMemLocationTypeHost;
     attrs.srcLocHint.id = 0;
     attrs.dstLocHint.type = cudaMemLocationTypeDevice;
