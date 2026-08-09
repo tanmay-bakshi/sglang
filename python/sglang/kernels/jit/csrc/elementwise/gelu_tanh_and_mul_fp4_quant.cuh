@@ -38,6 +38,27 @@ struct GeluTanhMulFP4QuantParams {
   uint32_t hidden_size;
 };
 
+SGL_DEVICE uint64_t fp4_scale_output_offset(
+    const uint32_t row,
+    const uint32_t scale_column,
+    const uint32_t padded_scale_columns) {
+  constexpr uint32_t kColumnsPerGroup = 4;
+  constexpr uint32_t kRowsPerInnerGroup = 32;
+  constexpr uint32_t kRowsPerGroup = 128;
+
+  const uint32_t column_in_group = scale_column % kColumnsPerGroup;
+  const uint32_t column_group = scale_column / kColumnsPerGroup;
+  const uint32_t row_in_inner_group = row % kRowsPerInnerGroup;
+  const uint32_t inner_row_group = (row % kRowsPerGroup) / kRowsPerInnerGroup;
+  const uint32_t row_group = row / kRowsPerGroup;
+
+  return static_cast<uint64_t>(column_in_group) +
+         static_cast<uint64_t>(column_group) * 512 +
+         static_cast<uint64_t>(row_in_inner_group) * 16 +
+         static_cast<uint64_t>(inner_row_group) * 4 +
+         static_cast<uint64_t>(row_group) * kRowsPerGroup * padded_scale_columns;
+}
+
 template <int kElementsPerThread>
 SGL_DEVICE void gelu_tanh_and_mul(
     tk::PackedVec<__nv_bfloat16, kElementsPerThread>& gate,
@@ -76,6 +97,9 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(
   static_assert(kScaleVectorSize % kElementsPerThread == 0);
 
   const uint32_t vectors_per_row = params.hidden_size / kElementsPerThread;
+  const uint32_t scale_columns = params.hidden_size / kScaleVectorSize;
+  const uint32_t padded_scale_columns = (scale_columns + 3) / 4 * 4;
+  const uint32_t padded_scale_rows = (params.num_tokens + 127) / 128 * 128;
   const uint64_t work_items = static_cast<uint64_t>(params.num_tokens) * vectors_per_row;
   const uint64_t thread_id = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const uint64_t thread_stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
@@ -93,14 +117,12 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(
     const InputVector up = input_vectors[gate_offset + vectors_per_row];
     gelu_tanh_and_mul(gate, up);
 
-    auto* scale_output = tk::cvt_quant_to_fp4_get_sf_out_offset<
-        uint32_t,
-        kScaleVectorSize,
-        kThreadsPerScale>(
-        static_cast<int>(row),
-        static_cast<int>(column),
-        static_cast<int>(params.hidden_size),
-        reinterpret_cast<uint32_t*>(params.output_scale));
+    uint8_t* scale_output = nullptr;
+    if (column % kThreadsPerScale == 0) {
+      const uint32_t scale_column = column / kThreadsPerScale;
+      scale_output = params.output_scale +
+                     fp4_scale_output_offset(row, scale_column, padded_scale_columns);
+    }
 
     reinterpret_cast<PackedOutput*>(params.output)[work_index] =
         tk::cvt_warp_fp16_to_fp4<
@@ -109,6 +131,30 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(
             kElementsPerThread,
             false,
             false>(gate, params.global_scale[0], scale_output);
+  }
+
+  const uint32_t padding_scale_columns = padded_scale_columns - scale_columns;
+  const uint64_t padding_column_items =
+      static_cast<uint64_t>(params.num_tokens) * padding_scale_columns;
+  for (uint64_t padding_index = thread_id;
+       padding_index < padding_column_items;
+       padding_index += thread_stride) {
+    const uint32_t row = static_cast<uint32_t>(padding_index / padding_scale_columns);
+    const uint32_t scale_column =
+        scale_columns + static_cast<uint32_t>(padding_index % padding_scale_columns);
+    params.output_scale[fp4_scale_output_offset(row, scale_column, padded_scale_columns)] = 0;
+  }
+
+  const uint32_t padding_scale_rows = padded_scale_rows - params.num_tokens;
+  const uint64_t padding_row_items =
+      static_cast<uint64_t>(padding_scale_rows) * padded_scale_columns;
+  for (uint64_t padding_index = thread_id;
+       padding_index < padding_row_items;
+       padding_index += thread_stride) {
+    const uint32_t row =
+        params.num_tokens + static_cast<uint32_t>(padding_index / padded_scale_columns);
+    const uint32_t scale_column = static_cast<uint32_t>(padding_index % padded_scale_columns);
+    params.output_scale[fp4_scale_output_offset(row, scale_column, padded_scale_columns)] = 0;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 #endif
