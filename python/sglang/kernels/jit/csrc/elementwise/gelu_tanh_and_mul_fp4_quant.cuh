@@ -19,6 +19,14 @@ namespace {
 
 namespace tk = tensorrt_llm::kernels;
 
+#if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH >= 1000 && defined(__CUDACC_VER_MAJOR__) && \
+    defined(__CUDACC_VER_MINOR__) &&                                                      \
+    ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
+constexpr int kFP4ElementsPerThread = 16;
+#else
+constexpr int kFP4ElementsPerThread = 8;
+#endif
+
 struct GeluTanhMulFP4QuantParams {
   const __nv_bfloat16* __restrict__ input;
   const float* __restrict__ global_scale;
@@ -57,7 +65,7 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(
     const __grid_constant__ GeluTanhMulFP4QuantParams params) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr int kScaleVectorSize = 16;
-  constexpr int kElementsPerThread = tk::CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  constexpr int kElementsPerThread = kFP4ElementsPerThread;
   constexpr int kThreadsPerScale = kScaleVectorSize / kElementsPerThread;
   using InputVector = tk::PackedVec<__nv_bfloat16, kElementsPerThread>;
   using PackedOutput = std::conditional_t<kElementsPerThread == 16, uint64_t, uint32_t>;
@@ -163,7 +171,7 @@ struct GeluTanhMulFP4QuantKernel {
         static_cast<uint64_t>(scale_columns.unwrap()) == expected_scale_columns,
         "scale column count must be padded to 4");
 
-    constexpr uint64_t kElementsPerThread = tk::CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+    constexpr uint64_t kElementsPerThread = kFP4ElementsPerThread;
     RuntimeCheck(
         hidden_size % (kElementsPerThread * 32) == 0,
         "hidden size must keep every FP4 scale group inside one warp");
