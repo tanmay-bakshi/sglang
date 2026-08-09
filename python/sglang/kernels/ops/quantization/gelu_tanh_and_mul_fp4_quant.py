@@ -38,7 +38,7 @@ def _jit_module(use_pdl: bool) -> Module:
             )
         ],
         extra_cuda_cflags=["-DENABLE_BF16", "-DENABLE_FP4"],
-        extra_dependencies=["flashinfer"],
+        extra_dependencies=["flashinfer_trtllm"],
     )
 
 
