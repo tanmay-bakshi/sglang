@@ -41,11 +41,9 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
   constexpr uint32_t kPackedElementsPerThread = kElementsPerThread / 2;
   constexpr uint32_t kHalfHeadDim = kHeadDim / 2;
   constexpr uint32_t kHeadPairsPerWarp = kWarpThreads / 2;
-  constexpr uint32_t kPaddedElementsPerPair = kElementsPerThread + 1;
-  constexpr uint32_t kCacheHalfStride = kHeadPairsPerWarp * kPaddedElementsPerPair;
   using Packed = packed_t<bf16_t>;
   using Storage = AlignedVector<Packed, kPackedElementsPerThread>;
-  __shared__ float padded_rope_cache[2 * kCacheHalfStride];
+  __shared__ float transposed_rope_cache[kHeadDim];
 
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
@@ -71,9 +69,9 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
       const uint32_t frequency_index = source_index % kHalfHeadDim;
       const uint32_t pair_lane = frequency_index / kElementsPerThread;
       const uint32_t element_index = frequency_index % kElementsPerThread;
-      const uint32_t padded_index = cache_half * kCacheHalfStride +
-          pair_lane * kPaddedElementsPerPair + element_index;
-      padded_rope_cache[padded_index] = source_cache[source_index];
+      const uint32_t transposed_index =
+          cache_half * kHalfHeadDim + element_index * kHeadPairsPerWarp + pair_lane;
+      transposed_rope_cache[transposed_index] = source_cache[source_index];
       __syncthreads();
     }
 
@@ -118,9 +116,9 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
         const float paired = __shfl_xor_sync(0xffffffffu, elements[element_index], kWarpThreads / 2);
         const float rotated = lane_id < kWarpThreads / 2 ? -paired : paired;
         const uint32_t pair_lane = lane_id % kHeadPairsPerWarp;
-        const uint32_t cache_index = pair_lane * kPaddedElementsPerPair + element_index;
-        const float cosine = padded_rope_cache[cache_index];
-        const float sine = padded_rope_cache[kCacheHalfStride + cache_index];
+        const uint32_t cache_index = element_index * kHeadPairsPerWarp + pair_lane;
+        const float cosine = transposed_rope_cache[cache_index];
+        const float sine = transposed_rope_cache[kHalfHeadDim + cache_index];
         elements[element_index] = elements[element_index] * cosine + rotated * sine;
       }
 
