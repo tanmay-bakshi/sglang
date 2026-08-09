@@ -1,3 +1,4 @@
+import argparse
 import dataclasses
 import unittest
 import uuid
@@ -75,8 +76,8 @@ class TestLaunchInstanceId(CustomTestCase):
 
         self.assertEqual(ports.instance_id, server_args.launch_instance_id)
 
-    def test_launch_uuid_has_no_cli_surface(self) -> None:
-        """Operators cannot override the implementation-owned generation UUID."""
+    def test_launch_uuid_retains_generated_default(self) -> None:
+        """Launch identity remains self-generated when the operator omits it."""
 
         field = next(
             field
@@ -85,6 +86,65 @@ class TestLaunchInstanceId(CustomTestCase):
         )
 
         self.assertTrue(field.default_factory is not dataclasses.MISSING)
+
+    def test_cli_launch_uuid_controls_advertised_generation(self) -> None:
+        """The explicit launch identity reaches the authenticated advertisement."""
+
+        launch_instance_id = str(uuid.uuid4())
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--launch-instance-id",
+                launch_instance_id,
+                "--api-key",
+                "secret",
+                "--disaggregation-mode",
+                "prefill",
+                "--tp-size",
+                "4",
+                "--pd-model-fingerprint",
+                _DIGEST_A,
+                "--pd-logical-kv-layout-fingerprint",
+                _DIGEST_B,
+                "--pd-prefill-bootstrap-advertise-host",
+                "10.20.30.40",
+                "--disaggregation-bootstrap-port",
+                "8998",
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(parsed)
+        advertisement = build_pd_process_advertisement(
+            server_args, runtime_capabilities=_CAPABILITIES
+        )
+
+        self.assertEqual(server_args.launch_instance_id, launch_instance_id)
+        self.assertIsNotNone(advertisement)
+        self.assertEqual(advertisement["launch_instance_id"], launch_instance_id)
+
+    def test_cli_launch_uuid_rejects_noncanonical_or_nil_values(self) -> None:
+        """The CLI uses the same canonical generation-identity validation."""
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        valid_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+        for invalid_uuid in ("not-a-uuid", str(uuid.UUID(int=0)), valid_uuid.upper()):
+            with self.subTest(launch_instance_id=invalid_uuid):
+                parsed = parser.parse_args(
+                    [
+                        "--model",
+                        "dummy",
+                        "--launch-instance-id",
+                        invalid_uuid,
+                    ]
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "launch_instance_id must be a canonical, non-nil UUID"
+                ):
+                    ServerArgs.from_cli_args(parsed)
 
 
 class TestPdProcessAdvertisement(CustomTestCase):

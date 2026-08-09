@@ -1289,7 +1289,10 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     launch_instance_id: A[
         str,
-        Arg(no_cli=True),
+        Arg(
+            help="Canonical non-nil UUID for this server launch generation. "
+            "If omitted, SGLang generates one when the server arguments are constructed."
+        ),
         NS("serving"),
     ] = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     api_key: A[
