@@ -28,6 +28,10 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.gemma4_prefill_bf16 import (
+    GEMMA4_TP2_PCG_PREFILL_BF16_TACTICS,
+    gemma4_prefill_bf16_shape,
+)
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -78,11 +82,15 @@ class Bf16GemmBackend(Enum):
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
+_cutedsl_bf16_gemm_with_tactic = None
 _use_cutedsl_bf16_gemm = None
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
-    global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _BF16_GEMM_BACKEND
+    global _cutedsl_bf16_gemm
+    global _cutedsl_bf16_gemm_with_tactic
+    global _use_cutedsl_bf16_gemm
 
     from sglang.srt.utils import is_sm100_supported
 
@@ -100,10 +108,12 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
+            cutedsl_bf16_gemm_with_tactic,
             use_cutedsl_bf16_gemm,
         )
 
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
+        _cutedsl_bf16_gemm_with_tactic = cutedsl_bf16_gemm_with_tactic
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _BF16_GEMM_BACKEND = backend
@@ -115,10 +125,43 @@ def _bf16_gemm_dispatch_fake(
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
-@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
-def bf16_gemm_dispatch(
-    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+def _gemma4_prefill_bf16_tactic(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> int | None:
+    if _cutedsl_bf16_gemm_with_tactic is None:
+        return None
+    shape = gemma4_prefill_bf16_shape(
+        tuple(x.shape),
+        tuple(weight.shape),
+        has_bias=bias is not None,
+    )
+    if shape is None:
+        return None
+    return GEMMA4_TP2_PCG_PREFILL_BF16_TACTICS.resolve(
+        shape,
+        x_is_contiguous=x.is_contiguous(),
+        weight_is_contiguous=weight.is_contiguous(),
+        bias_is_contiguous=bias is None or bias.is_contiguous(),
+    )
+
+
+def _dispatch_bf16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    tactic = _gemma4_prefill_bf16_tactic(x, weight, bias)
+    if tactic is not None:
+        x_shape = x.shape
+        output = _cutedsl_bf16_gemm_with_tactic(
+            x.view(-1, x_shape[-1]),
+            weight,
+            bias,
+            tactic,
+        )
+        return output.view(*x_shape[:-1], -1)
     if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
     ):
@@ -126,6 +169,13 @@ def bf16_gemm_dispatch(
             *x.shape[:-1], -1
         )
     return F.linear(x, weight, bias)
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return _dispatch_bf16_linear(x, weight, bias)
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -240,17 +290,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # opaque op resolves it at runtime with concrete shapes,
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
-            if _use_cutedsl_bf16_gemm(
-                x.numel() // x.shape[-1],
-                layer.weight.shape[0],
-                layer.weight.shape[1],
-            ):
-                x_shapes = x.shape
-                output = _cutedsl_bf16_gemm(
-                    x.view(-1, x_shapes[-1]), layer.weight, bias
-                )
-                return output.view(*x_shapes[:-1], -1)
-            return F.linear(x, layer.weight, bias)
+            return _dispatch_bf16_linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
