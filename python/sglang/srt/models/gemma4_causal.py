@@ -17,13 +17,6 @@ import re
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
-from torch import nn
-from transformers import (
-    Gemma4TextConfig,
-    PretrainedConfig,
-    PreTrainedModel,
-)
-
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
@@ -31,9 +24,13 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
 )
+from sglang.kernels.ops.quantization.gelu_tanh_and_mul_fp4_quant import (
+    gelu_tanh_and_mul_fp4_quant,
+)
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -45,6 +42,8 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -60,6 +59,13 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.common import is_sm100_supported
+from torch import nn
+from transformers import (
+    Gemma4TextConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +76,72 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+class Gemma4MLP(Gemma3MLP):
+    """Gemma 4 dense MLP with a prefill-only fused NVFP4 down-projection input."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_activation: str,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        """Initialize the dense Gemma 4 MLP.
+
+        :param hidden_size: Transformer hidden width.
+        :param intermediate_size: Per-rank-agnostic MLP intermediate width.
+        :param hidden_activation: Required Gemma GeGLU activation name.
+        :param quant_config: Optional checkpoint quantization configuration.
+        :param prefix: Parameter-name prefix.
+        """
+        super().__init__(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_activation=hidden_activation,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        down_quant_method = self.down_proj.quant_method
+        self._use_fused_geglu_fp4 = (
+            envs.SGLANG_ENABLE_GEMMA4_NVFP4_GEGLU_FUSION.get()
+            and is_sm100_supported()
+            and isinstance(down_quant_method, ModelOptFp4LinearMethod)
+            and not down_quant_method.quant_config.is_awq
+            and not get_fp4_gemm_runner_backend().is_marlin()
+        )
+        if self._use_fused_geglu_fp4:
+            self.down_proj._accepts_prequantized_fp4 = True
+
+    def forward(
+        self,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch | None = None,
+    ) -> torch.Tensor:
+        """Run the dense MLP, fusing GeGLU and FP4 quantization in prefill.
+
+        :param x: BF16 or prequantized FP4 MLP input.
+        :param forward_batch: Current model-forward metadata.
+        :returns: BF16 row-parallel MLP output.
+        """
+        gate_up, _ = self.gate_up_proj(x)
+        use_fused = (
+            self._use_fused_geglu_fp4
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if use_fused:
+            down_input = gelu_tanh_and_mul_fp4_quant(
+                gate_up,
+                self.down_proj.input_scale_inv,
+            )
+        else:
+            down_input = self.act_fn(gate_up)
+        output, _ = self.down_proj(down_input)
+        return output
 
 
 def pp_filter_load_weight(
@@ -677,7 +747,7 @@ class Gemma4DecoderLayer(nn.Module):
             moe_input = residual
 
             # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
+            hidden_states_1 = self.mlp(hidden_states, forward_batch)
 
             # MoE branch: router sees residual (= post_attn_out + old_residual)
             router_logits = self.router(moe_input)
@@ -717,7 +787,7 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if (
             not self.has_ple
