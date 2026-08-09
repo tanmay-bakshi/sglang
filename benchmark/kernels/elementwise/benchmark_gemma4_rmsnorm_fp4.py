@@ -120,7 +120,7 @@ def _run_shape(
         device=device,
         generator=generator,
     )
-    global_scale = torch.tensor(21.503999, dtype=torch.float32, device=device)
+    global_scale = torch.tensor([21.503999], dtype=torch.float32, device=device)
 
     baseline_input = source_input.clone()
     baseline_residual = source_residual.clone()
