@@ -820,9 +820,9 @@ fn validate_grant_identity(
             "logical request-chain identity cannot be the nil UUID".to_string(),
         ));
     }
-    if source_tp_size != 2 && source_tp_size != 4 {
+    if !matches!(source_tp_size, 1 | 2 | 4) {
         return Err(EngineGrantError::InvalidGrant(
-            "source tensor-parallel size must be 2 or 4".to_string(),
+            "source tensor-parallel size must be 1, 2, or 4".to_string(),
         ));
     }
     Ok(())

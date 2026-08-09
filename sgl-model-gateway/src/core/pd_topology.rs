@@ -110,6 +110,71 @@ pub struct PdTopology {
     pub groups: Vec<PdTopologyGroup>,
 }
 
+#[derive(Serialize)]
+struct CanonicalPdTopology<'a> {
+    schema: &'static str,
+    groups: Vec<CanonicalPdTopologyGroup<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalPdTopologyGroup<'a> {
+    id: &'a str,
+    prefill: CanonicalPdPrefillSpec<'a>,
+    decoders: Vec<CanonicalPdDecoderSpec<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalPdPrefillSpec<'a> {
+    origin: &'a str,
+    tensor_parallel_size: usize,
+    bootstrap_endpoint: CanonicalPdBootstrapEndpoint<'a>,
+}
+
+#[derive(Serialize)]
+struct CanonicalPdBootstrapEndpoint<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+#[derive(Serialize)]
+struct CanonicalPdDecoderSpec<'a> {
+    origin: &'a str,
+    tensor_parallel_size: usize,
+}
+
+impl<'a> From<&'a PdTopology> for CanonicalPdTopology<'a> {
+    fn from(topology: &'a PdTopology) -> Self {
+        Self {
+            schema: match topology.schema {
+                PdTopologySchema::V1 => "pd-topology-v1",
+            },
+            groups: topology
+                .groups
+                .iter()
+                .map(|group| CanonicalPdTopologyGroup {
+                    id: group.id.as_str(),
+                    prefill: CanonicalPdPrefillSpec {
+                        origin: group.prefill.origin.as_str(),
+                        tensor_parallel_size: group.prefill.tensor_parallel_size,
+                        bootstrap_endpoint: CanonicalPdBootstrapEndpoint {
+                            host: &group.prefill.bootstrap_endpoint.host,
+                            port: group.prefill.bootstrap_endpoint.port,
+                        },
+                    },
+                    decoders: group
+                        .decoders
+                        .iter()
+                        .map(|decoder| CanonicalPdDecoderSpec {
+                            origin: decoder.origin.as_str(),
+                            tensor_parallel_size: decoder.tensor_parallel_size,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl PdTopology {
     /// Parse and fully validate a topology JSON document.
     pub fn from_json(json: &str) -> Result<Self, PdTopologyError> {
@@ -138,9 +203,10 @@ impl PdTopology {
                     group.id.as_str().to_string(),
                 ));
             }
-            if group.prefill.tensor_parallel_size == 0 {
-                return Err(PdTopologyError::ZeroTensorParallelSize {
+            if !matches!(group.prefill.tensor_parallel_size, 1 | 2 | 4) {
+                return Err(PdTopologyError::UnsupportedPrefillTensorParallelSize {
                     origin: group.prefill.origin.to_string(),
+                    tensor_parallel_size: group.prefill.tensor_parallel_size,
                 });
             }
             group.prefill.bootstrap_endpoint.validate()?;
@@ -155,9 +221,17 @@ impl PdTopology {
                 });
             }
             for decoder in &group.decoders {
-                if decoder.tensor_parallel_size == 0 {
-                    return Err(PdTopologyError::ZeroTensorParallelSize {
+                if !matches!(decoder.tensor_parallel_size, 1 | 2) {
+                    return Err(PdTopologyError::UnsupportedDecodeTensorParallelSize {
                         origin: decoder.origin.to_string(),
+                        tensor_parallel_size: decoder.tensor_parallel_size,
+                    });
+                }
+                if group.prefill.tensor_parallel_size % decoder.tensor_parallel_size != 0 {
+                    return Err(PdTopologyError::IncompatibleTensorParallelSizes {
+                        group_id: group.id.as_str().to_string(),
+                        prefill_tensor_parallel_size: group.prefill.tensor_parallel_size,
+                        decode_tensor_parallel_size: decoder.tensor_parallel_size,
                     });
                 }
                 if !origins.insert(decoder.origin.clone()) {
@@ -249,11 +323,20 @@ impl PdTopology {
         }
     }
 
+    /// Serialize the topology under the cross-language canonical byte contract.
+    ///
+    /// Object fields are emitted in schema/group/spec declaration order, arrays retain
+    /// manifest order, origins use their normalized spelling, strings use compact JSON
+    /// escaping with non-ASCII text encoded directly as UTF-8, and the byte sequence has
+    /// no BOM, insignificant whitespace, or trailing newline.
+    pub fn canonical_json_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&CanonicalPdTopology::from(self))
+            .expect("a validated topology contains only infallibly serializable values")
+    }
+
     /// Return the canonical SHA-256 digest of the validated document.
     pub fn sha256(&self) -> String {
-        let canonical = serde_json::to_vec(self)
-            .expect("a validated topology contains only infallibly serializable values");
-        format!("{:x}", Sha256::digest(canonical))
+        format!("{:x}", Sha256::digest(self.canonical_json_bytes()))
     }
 
     /// Return process origins in manifest order.
@@ -293,8 +376,28 @@ pub enum PdTopologyError {
     DuplicateGroupId(String),
     #[error("PD topology group {group_id:?} must contain at least one decoder")]
     NoDecoders { group_id: String },
-    #[error("tensor_parallel_size must be positive for {origin}")]
-    ZeroTensorParallelSize { origin: String },
+    #[error(
+        "unsupported prefill tensor_parallel_size {tensor_parallel_size} for {origin}; expected 1, 2, or 4"
+    )]
+    UnsupportedPrefillTensorParallelSize {
+        origin: String,
+        tensor_parallel_size: usize,
+    },
+    #[error(
+        "unsupported decode tensor_parallel_size {tensor_parallel_size} for {origin}; expected 1 or 2"
+    )]
+    UnsupportedDecodeTensorParallelSize {
+        origin: String,
+        tensor_parallel_size: usize,
+    },
+    #[error(
+        "PD topology group {group_id:?} has incompatible tensor-parallel sizes: prefill TP{prefill_tensor_parallel_size}, decode TP{decode_tensor_parallel_size}"
+    )]
+    IncompatibleTensorParallelSizes {
+        group_id: String,
+        prefill_tensor_parallel_size: usize,
+        decode_tensor_parallel_size: usize,
+    },
     #[error("duplicate PD process origin {0}")]
     DuplicateOrigin(String),
     #[error("invalid prefill bootstrap endpoint")]
@@ -401,6 +504,54 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bytes_match_cross_language_test_vector() {
+        let input = r#"{
+            "groups": [
+                {
+                    "decoders": [
+                        {"tensor_parallel_size": 1, "origin": "http://127.0.0.1:32101"},
+                        {"tensor_parallel_size": 1, "origin": "http://127.0.0.1:32102"},
+                        {"tensor_parallel_size": 1, "origin": "http://127.0.0.1:32103"}
+                    ],
+                    "prefill": {
+                        "bootstrap_endpoint": {"port": 32150, "host": "gemma-dev-1"},
+                        "tensor_parallel_size": 1,
+                        "origin": "HTTP://127.0.0.1:32100/"
+                    },
+                    "id": "group-0"
+                },
+                {
+                    "decoders": [
+                        {"origin": "http://127.0.0.1:32105", "tensor_parallel_size": 1},
+                        {"origin": "http://127.0.0.1:32106", "tensor_parallel_size": 1},
+                        {"origin": "http://127.0.0.1:32107", "tensor_parallel_size": 1}
+                    ],
+                    "prefill": {
+                        "origin": "http://127.0.0.1:32104",
+                        "tensor_parallel_size": 1,
+                        "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32151}
+                    },
+                    "id": "group-1"
+                }
+            ],
+            "schema": "pd-topology-v1"
+        }"#;
+        let expected = concat!(
+            r#"{"schema":"pd-topology-v1","groups":[{"id":"group-0","prefill":{"origin":"http://127.0.0.1:32100","tensor_parallel_size":1,"bootstrap_endpoint":{"host":"gemma-dev-1","port":32150}},"decoders":["#,
+            r#"{"origin":"http://127.0.0.1:32101","tensor_parallel_size":1},{"origin":"http://127.0.0.1:32102","tensor_parallel_size":1},{"origin":"http://127.0.0.1:32103","tensor_parallel_size":1}]},"#,
+            r#"{"id":"group-1","prefill":{"origin":"http://127.0.0.1:32104","tensor_parallel_size":1,"bootstrap_endpoint":{"host":"gemma-dev-1","port":32151}},"decoders":["#,
+            r#"{"origin":"http://127.0.0.1:32105","tensor_parallel_size":1},{"origin":"http://127.0.0.1:32106","tensor_parallel_size":1},{"origin":"http://127.0.0.1:32107","tensor_parallel_size":1}]}]}"#,
+        );
+        let topology = PdTopology::from_json(input).unwrap();
+
+        assert_eq!(topology.canonical_json_bytes(), expected.as_bytes());
+        assert_eq!(
+            topology.sha256(),
+            "24afeedde0264f2874a77f18266ad57b096e397c43bc65e16bd46334b52df5a2"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_invalid_cross_object_state() {
         let mut document: serde_json::Value = serde_json::from_str(&topology_json()).unwrap();
         document["mystery"] = json!(true);
@@ -419,6 +570,23 @@ mod tests {
         assert!(matches!(
             PdTopology::from_json(&no_decoders.to_string()),
             Err(PdTopologyError::NoDecoders { .. })
+        ));
+
+        let mut unsupported_prefill: serde_json::Value =
+            serde_json::from_str(&topology_json()).unwrap();
+        unsupported_prefill["groups"][0]["prefill"]["tensor_parallel_size"] = json!(3);
+        assert!(matches!(
+            PdTopology::from_json(&unsupported_prefill.to_string()),
+            Err(PdTopologyError::UnsupportedPrefillTensorParallelSize { .. })
+        ));
+
+        let mut incompatible_decode: serde_json::Value =
+            serde_json::from_str(&topology_json()).unwrap();
+        incompatible_decode["groups"][1]["prefill"]["tensor_parallel_size"] = json!(1);
+        incompatible_decode["groups"][1]["decoders"][0]["tensor_parallel_size"] = json!(2);
+        assert!(matches!(
+            PdTopology::from_json(&incompatible_decode.to_string()),
+            Err(PdTopologyError::IncompatibleTensorParallelSizes { .. })
         ));
     }
 

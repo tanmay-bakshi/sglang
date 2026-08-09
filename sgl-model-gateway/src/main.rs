@@ -1277,6 +1277,31 @@ fn load_api_key_file(path: &Path) -> ConfigResult<String> {
 mod tests {
     use super::*;
 
+    fn write_test_topology() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pd-topology.json");
+        fs::write(
+            &path,
+            r#"{
+                "schema": "pd-topology-v1",
+                "groups": [{
+                    "id": "group-0",
+                    "prefill": {
+                        "origin": "http://prefill.test:30000",
+                        "tensor_parallel_size": 2,
+                        "bootstrap_endpoint": {"host": "prefill-transfer.test", "port": 50051}
+                    },
+                    "decoders": [{
+                        "origin": "http://decode.test:30001",
+                        "tensor_parallel_size": 1
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        (directory, path)
+    }
+
     #[test]
     fn api_key_file_loads_one_line_without_retaining_the_terminator() {
         let directory = tempfile::tempdir().unwrap();
@@ -1313,6 +1338,48 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn topology_file_builds_only_the_strict_pd_mode() {
+        let (_directory, topology_path) = write_test_topology();
+        let topology_path = topology_path.to_str().unwrap();
+        let cli = Cli::try_parse_from(["sgl-model-gateway", "--pd-topology-file", topology_path])
+            .unwrap();
+        let config = cli.router_args.to_router_config(Vec::new()).unwrap();
+
+        assert!(config.mode.pd_topology().is_some());
+        assert_eq!(config.mode.worker_count(), 2);
+    }
+
+    #[test]
+    fn topology_file_rejects_every_flat_cli_ownership_source() {
+        let (_directory, topology_path) = write_test_topology();
+        let topology_path = topology_path.to_str().unwrap();
+        for conflicting_args in [
+            vec!["--decode", "http://decode.test:30001"],
+            vec!["--worker-urls", "http://worker.test:30002"],
+            vec!["--prefill-policy", "random"],
+            vec!["--decode-policy", "random"],
+            vec!["--service-discovery"],
+        ] {
+            let mut args = vec!["sgl-model-gateway", "--pd-topology-file", topology_path];
+            args.extend(conflicting_args);
+            let cli = Cli::try_parse_from(args).unwrap();
+
+            assert!(matches!(
+                cli.router_args.to_router_config(Vec::new()),
+                Err(ConfigError::IncompatibleConfig { .. })
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["sgl-model-gateway", "--pd-topology-file", topology_path])
+            .unwrap();
+        assert!(matches!(
+            cli.router_args
+                .to_router_config(vec![("http://prefill.test:30000".to_string(), None,)]),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
     }
 }
 

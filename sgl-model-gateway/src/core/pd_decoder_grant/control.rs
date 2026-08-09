@@ -259,9 +259,9 @@ impl DecoderGrantReservation {
                 "reservation attempt identity cannot be the nil UUID".to_string(),
             ));
         }
-        if source_tp_size != 2 && source_tp_size != 4 {
+        if !matches!(source_tp_size, 1 | 2 | 4) {
             return Err(EngineGrantError::InvalidGrant(
-                "source tensor-parallel size must be 2 or 4".to_string(),
+                "source tensor-parallel size must be 1, 2, or 4".to_string(),
             ));
         }
         let prepared_ttl_ms = u64::try_from(prepared_ttl.as_millis()).map_err(|_| {
@@ -2310,7 +2310,7 @@ mod tests {
         core::{
             pd_decoder_directory::PdProcessDirectory, BasicWorkerBuilder, HttpOrigin,
             KvTransferProtocol, PdMetadataSchema, PdProcessMetadata, PdProcessRegistration,
-            PdProcessRole, PdReservedRequestSession, PrefillBootstrapEndpoint,
+            PdProcessRole, PdReservedRequestSession, PdTopology, PrefillBootstrapEndpoint,
             PreparedGrantProtocol, Worker, WorkerType,
         },
     };
@@ -2728,6 +2728,49 @@ mod tests {
                 "http://prefill.test:30000",
                 PdProcessRole::Prefill,
                 prefill_tp_size,
+                Uuid::new_v4(),
+            ))
+            .unwrap();
+        directory
+            .admit_decoder(session_worker(
+                decoder_url,
+                PdProcessRole::Decode,
+                1,
+                Uuid::new_v4(),
+            ))
+            .unwrap();
+        (directory, prefill.id().clone())
+    }
+
+    fn topology_session_directory(decoder_url: &str) -> (Arc<PdProcessDirectory>, PrefillId) {
+        let topology = PdTopology::from_json(
+            &json!({
+                "schema": "pd-topology-v1",
+                "groups": [{
+                    "id": "group-0",
+                    "prefill": {
+                        "origin": "http://prefill.test:30000",
+                        "tensor_parallel_size": 2,
+                        "bootstrap_endpoint": {
+                            "host": "prefill-bootstrap.test",
+                            "port": 42_000
+                        }
+                    },
+                    "decoders": [{
+                        "origin": decoder_url,
+                        "tensor_parallel_size": 1
+                    }]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let directory = Arc::new(PdProcessDirectory::new(Some(Arc::new(topology))));
+        let prefill = directory
+            .admit_prefill(session_worker(
+                "http://prefill.test:30000",
+                PdProcessRole::Prefill,
+                2,
                 Uuid::new_v4(),
             ))
             .unwrap();
@@ -3551,8 +3594,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_session_runs_reserve_bind_promote_and_complete_for_tp2_and_tp4() {
-        for prefill_tp_size in [2, 4] {
+    async fn production_session_runs_for_every_supported_prefill_tp() {
+        for prefill_tp_size in [1, 2, 4] {
             let (server_url, state, task) = start_server().await;
             let terminal = Arc::new(Notify::new());
             *state.session_engine.lock().unwrap() = Some(SessionEngine::new(Arc::clone(&terminal)));
@@ -3614,6 +3657,56 @@ mod tests {
             drop(requests);
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn topology_precharge_runs_one_complete_lifecycle_without_leaking_ownership() {
+        let (server_url, state, task) = start_server().await;
+        let terminal = Arc::new(Notify::new());
+        *state.session_engine.lock().unwrap() = Some(SessionEngine::new(terminal));
+        let (directory, prefill_id) = topology_session_directory(&server_url);
+        let client = DecoderGrantControlClient::new().unwrap();
+        let group_request = directory
+            .begin_group_request("topology-production-session", None)
+            .unwrap();
+        assert_eq!(group_request.group_id().as_str(), "group-0");
+        assert_eq!(
+            directory
+                .prefill(&prefill_id)
+                .unwrap()
+                .pool()
+                .snapshot()
+                .active_logical_requests,
+            1
+        );
+
+        let reserved = PdReservedRequestSession::establish_group(
+            Arc::clone(&directory),
+            group_request,
+            None,
+            session_template(),
+            &client,
+            &RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reserved.group_id().unwrap().as_str(), "group-0");
+        let session = reserved.promote().await.unwrap();
+        session.complete().await.unwrap();
+        wait_for_session_cleanup(&directory, &prefill_id).await;
+
+        let requests = state.requests.lock().unwrap();
+        let paths = requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0], format!("{CONTROL_PATH}/reserve"));
+        assert!(paths[1].ends_with("/bind"));
+        assert!(paths[2].ends_with("/promote"));
+        assert!(paths[3].ends_with("/complete"));
+        drop(requests);
+        task.abort();
     }
 
     #[tokio::test]
@@ -4057,8 +4150,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tp2_and_tp4_control_lifecycles_preserve_exact_source_topology() {
-        for source_tp_size in [2, 4] {
+    async fn supported_tp_control_lifecycles_preserve_exact_source_topology() {
+        for source_tp_size in [1, 2, 4] {
             for child_count in [1, 3] {
                 let (server_url, state, task) = start_server().await;
                 let fixture = fixture_with_tp(&server_url, child_count, source_tp_size);

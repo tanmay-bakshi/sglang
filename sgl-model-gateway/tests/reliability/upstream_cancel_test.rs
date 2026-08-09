@@ -9,7 +9,10 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        StatusCode,
+    },
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -18,10 +21,11 @@ use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{
-        clear_fail_status_code, clear_slow_stream_chunks, clear_stream_error_after_chunks,
-        get_stream_tracking_state, reset_stream_tracker, set_fail_status_code,
-        set_slow_stream_chunks, set_stream_error_after_chunks, wait_for_stream_finish,
-        StreamTrackingState, MOCK_STREAM_BUFFER,
+        clear_disconnect_after_promote, clear_fail_status_code, clear_slow_stream_chunks,
+        clear_stream_error_after_chunks, get_stream_tracking_state, reset_stream_tracker,
+        set_disconnect_after_promote, set_fail_status_code, set_slow_stream_chunks,
+        set_stream_error_after_chunks, wait_for_stream_finish, StreamTrackingState,
+        MOCK_STREAM_BUFFER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -82,6 +86,7 @@ fn extract_response_id_from_sse(buf: &[u8]) -> Option<String> {
 /// instant its producer task exits, so a healthy run returns well before
 /// this. The 3s budget is just a guard against a hung test.
 const STREAM_FINISH_TIMEOUT: Duration = Duration::from_secs(3);
+const PD_TEST_API_KEY: &str = "pd-test-secret";
 
 async fn assert_cancelled_before_completion(port: u16) -> StreamTrackingState {
     let state = wait_for_stream_finish(port, STREAM_FINISH_TIMEOUT)
@@ -570,6 +575,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4257)
@@ -601,6 +607,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
 
@@ -1643,6 +1650,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4272)
@@ -1680,6 +1688,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
 
@@ -2064,6 +2073,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4292)
@@ -2096,6 +2106,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -2155,6 +2166,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4313)
@@ -2188,6 +2200,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -2372,6 +2385,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4296)
@@ -2404,6 +2418,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -2454,6 +2469,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4298)
@@ -2489,6 +2505,7 @@ mod upstream_cancel_tests {
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -2622,6 +2639,7 @@ mod upstream_cancel_tests {
                 vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
                 vec![format!("http://127.0.0.1:{}", decode_port)],
             )
+            .api_key(PD_TEST_API_KEY)
             .round_robin_policy()
             .host("127.0.0.1")
             .port(4311)
@@ -2639,7 +2657,7 @@ mod upstream_cancel_tests {
                 jitter_factor: 0.0,
             })
             .build_unchecked();
-        let mut ctx = AppTestContext::new_with_config(
+        let ctx = AppTestContext::new_with_config(
             config,
             vec![
                 TestWorkerConfig::prefill(prefill_port),
@@ -2655,17 +2673,17 @@ mod upstream_cancel_tests {
         let (s_pre_decode, f_pre_decode) = breaker_counts(&decode_worker);
         let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill_worker);
 
-        // Stop ONLY the decode worker (index 1; prefill was registered
-        // first). Prefill stays up so its half of the tokio::join! send
-        // succeeds — the test specifically exercises the
-        // "decode_result is Err" arm in `execute_dual_dispatch_internal`.
-        ctx.workers[1].stop().await;
+        // Reservation and promotion must succeed before the decoder listener
+        // disappears. This isolates the decode inference dispatch failure from
+        // the control plane's intentionally persistent ambiguous-reserve path.
+        set_disconnect_after_promote(decode_port);
 
         let payload = json!({ "text": "x", "stream": true });
         let req = Request::builder()
             .method("POST")
             .uri("/generate")
             .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {PD_TEST_API_KEY}"))
             .body(Body::from(serde_json::to_string(&payload).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -2709,6 +2727,7 @@ mod upstream_cancel_tests {
             f_post_prefill
         );
 
+        clear_disconnect_after_promote(decode_port);
         ctx.shutdown().await;
     }
 }

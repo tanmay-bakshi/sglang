@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -73,6 +73,100 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+struct PdTopologyRoutingReceipt {
+    topology_sha256: String,
+    request_id: String,
+    group_id: String,
+    prefill_origin: String,
+    prefill_launch_instance_id: String,
+    decoder_origin: String,
+    decoder_launch_instance_id: String,
+    kv_transfer_protocol: String,
+    prepared_grant_protocol: String,
+}
+
+impl PdTopologyRoutingReceipt {
+    fn from_session(
+        topology_sha256: &str,
+        session: &PdReservedRequestSession,
+    ) -> Result<Self, String> {
+        let group_id = session
+            .group_id()
+            .ok_or_else(|| "strict topology session is missing its group authority".to_string())?;
+        let prefill = session
+            .prefill_worker()
+            .metadata()
+            .pd_process
+            .as_ref()
+            .ok_or_else(|| "strict topology prefill is missing process metadata".to_string())?;
+        let decoder = session
+            .decoder_worker()
+            .metadata()
+            .pd_process
+            .as_ref()
+            .ok_or_else(|| "strict topology decoder is missing process metadata".to_string())?;
+        if prefill.metadata().kv_transfer_protocol() != decoder.metadata().kv_transfer_protocol()
+            || prefill.metadata().prepared_grant_protocol()
+                != decoder.metadata().prepared_grant_protocol()
+        {
+            return Err("strict topology pair changed its authenticated PD protocols".to_string());
+        }
+
+        Ok(Self {
+            topology_sha256: topology_sha256.to_string(),
+            request_id: session.request_id().to_string(),
+            group_id: group_id.as_str().to_string(),
+            prefill_origin: prefill.origin().to_string(),
+            prefill_launch_instance_id: prefill.metadata().launch_instance_id().to_string(),
+            decoder_origin: decoder.origin().to_string(),
+            decoder_launch_instance_id: decoder.metadata().launch_instance_id().to_string(),
+            kv_transfer_protocol: prefill
+                .metadata()
+                .kv_transfer_protocol()
+                .as_str()
+                .to_string(),
+            prepared_grant_protocol: prefill
+                .metadata()
+                .prepared_grant_protocol()
+                .as_str()
+                .to_string(),
+        })
+    }
+
+    fn insert_into(self, response: &mut Response) {
+        let headers = response.headers_mut();
+        for (name, value) in [
+            ("x-sglang-pd-topology-sha256", self.topology_sha256),
+            ("x-sglang-pd-request-id", self.request_id),
+            ("x-sglang-pd-group-id", self.group_id),
+            ("x-sglang-pd-prefill-origin", self.prefill_origin),
+            (
+                "x-sglang-pd-prefill-launch-instance-id",
+                self.prefill_launch_instance_id,
+            ),
+            ("x-sglang-pd-decoder-origin", self.decoder_origin),
+            (
+                "x-sglang-pd-decoder-launch-instance-id",
+                self.decoder_launch_instance_id,
+            ),
+            (
+                "x-sglang-pd-kv-transfer-protocol",
+                self.kv_transfer_protocol,
+            ),
+            (
+                "x-sglang-pd-prepared-grant-protocol",
+                self.prepared_grant_protocol,
+            ),
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(&value)
+                    .expect("validated topology receipt values are legal HTTP header values"),
+            );
+        }
+    }
 }
 
 impl PDRouter {
@@ -227,29 +321,48 @@ impl PDRouter {
                 return error::bad_request("invalid_pd_request", error.to_string());
             }
         };
-        let selected_prefill = match self
-            .select_session_prefill(
-                context.request_text.as_deref(),
+        let directory = Arc::clone(self.worker_registry.pd_process_directory());
+        let request_id = Uuid::new_v4().to_string();
+        let topology_sha256 = self.worker_registry.pd_topology_sha256();
+        let session_result = if topology_sha256.is_some() {
+            match directory.begin_group_request(&request_id, context.model_id) {
+                Ok(group_request) => {
+                    PdReservedRequestSession::establish_group(
+                        directory,
+                        group_request,
+                        context.model_id,
+                        template,
+                        &self.decoder_control,
+                        &self.retry_config,
+                    )
+                    .await
+                }
+                Err(error) => Err(error.into()),
+            }
+        } else {
+            let selected_prefill = match self
+                .select_session_prefill(
+                    context.request_text.as_deref(),
+                    context.model_id,
+                    context.headers.as_ref(),
+                )
+                .await
+            {
+                Ok(prefill) => prefill,
+                Err(error) => return Self::handle_server_selection_error(error),
+            };
+            PdReservedRequestSession::establish(
+                directory,
+                selected_prefill.id(),
+                request_id,
                 context.model_id,
-                context.headers.as_ref(),
+                template,
+                &self.decoder_control,
+                &self.retry_config,
             )
             .await
-        {
-            Ok(prefill) => prefill,
-            Err(error) => return Self::handle_server_selection_error(error),
         };
-        let directory = Arc::clone(self.worker_registry.pd_process_directory());
-        let session = match PdReservedRequestSession::establish(
-            directory,
-            selected_prefill.id(),
-            Uuid::new_v4().to_string(),
-            context.model_id,
-            template,
-            &self.decoder_control,
-            &self.retry_config,
-        )
-        .await
-        {
+        let session = match session_result {
             Ok(session) => session,
             Err(error) => {
                 error!(error = %error, "Failed to establish PD request session");
@@ -260,9 +373,28 @@ impl PDRouter {
             }
         };
 
-        let response = self
+        let topology_receipt = match topology_sha256 {
+            Some(topology_sha256) => {
+                match PdTopologyRoutingReceipt::from_session(topology_sha256, &session) {
+                    Ok(receipt) => Some(receipt),
+                    Err(error) => {
+                        error!(error, "Failed to construct strict topology routing receipt");
+                        return error::internal_error(
+                            "pd_topology_receipt_failed",
+                            "Strict topology routing receipt could not be constructed",
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut response = self
             .execute_pd_session_internal(headers, context, session)
             .await;
+        if let Some(receipt) = topology_receipt {
+            receipt.insert_into(&mut response);
+        }
         let duration = start_time.elapsed();
         if response.status().is_success() {
             Metrics::record_router_duration(
@@ -1649,6 +1781,47 @@ mod tests {
         let worker = builder.build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn topology_receipt_emits_the_frozen_response_headers() {
+        let mut response = Response::new(Body::empty());
+        PdTopologyRoutingReceipt {
+            topology_sha256: "24afeedde0264f2874a77f18266ad57b096e397c43bc65e16bd46334b52df5a2"
+                .to_string(),
+            request_id: "request-0".to_string(),
+            group_id: "group-0".to_string(),
+            prefill_origin: "http://prefill.test:30000".to_string(),
+            prefill_launch_instance_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            decoder_origin: "http://decode.test:30001".to_string(),
+            decoder_launch_instance_id: "00000000-0000-0000-0000-000000000002".to_string(),
+            kv_transfer_protocol: "packed-v4".to_string(),
+            prepared_grant_protocol: "control-v1".to_string(),
+        }
+        .insert_into(&mut response);
+
+        for (name, expected) in [
+            (
+                "x-sglang-pd-topology-sha256",
+                "24afeedde0264f2874a77f18266ad57b096e397c43bc65e16bd46334b52df5a2",
+            ),
+            ("x-sglang-pd-request-id", "request-0"),
+            ("x-sglang-pd-group-id", "group-0"),
+            ("x-sglang-pd-prefill-origin", "http://prefill.test:30000"),
+            (
+                "x-sglang-pd-prefill-launch-instance-id",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            ("x-sglang-pd-decoder-origin", "http://decode.test:30001"),
+            (
+                "x-sglang-pd-decoder-launch-instance-id",
+                "00000000-0000-0000-0000-000000000002",
+            ),
+            ("x-sglang-pd-kv-transfer-protocol", "packed-v4"),
+            ("x-sglang-pd-prepared-grant-protocol", "control-v1"),
+        ] {
+            assert_eq!(response.headers().get(name).unwrap(), expected);
+        }
     }
 
     #[test]

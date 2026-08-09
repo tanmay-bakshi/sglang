@@ -31,7 +31,7 @@ use crate::{
         pd_discovery::discover_pd_process,
         worker::{HealthChecker, RuntimeType, WorkerType},
         BasicWorkerBuilder, ConnectionMode, HttpOrigin, PdProcessRegistration, PdProcessRole,
-        PdTopology, Worker,
+        PdTopology, PdTopologyStatus, Worker,
     },
     observability::metrics::Metrics,
 };
@@ -837,6 +837,21 @@ impl WorkerRegistry {
         &self.pd_process_directory
     }
 
+    /// Return the immutable strict topology, when configured.
+    pub fn pd_topology(&self) -> Option<&PdTopology> {
+        self.pd_topology.as_deref()
+    }
+
+    /// Snapshot the immutable topology and its current process generations.
+    pub fn pd_topology_status(&self) -> Option<PdTopologyStatus> {
+        self.pd_process_directory.topology_status()
+    }
+
+    /// Return the startup-computed immutable topology digest.
+    pub fn pd_topology_sha256(&self) -> Option<&str> {
+        self.pd_process_directory.topology_sha256()
+    }
+
     fn retire_drained_locked(&self) -> Result<usize, WorkerRegistryError> {
         let sweep = self.pd_process_directory.retire_drained();
         let retired_count = sweep.retired.len();
@@ -1459,8 +1474,8 @@ mod tests {
     use super::*;
     use crate::core::{
         circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, KvTransferProtocol, ModelCard,
-        PdMetadataSchema, PdProcessMetadata, PdProcessRegistration, PrefillBootstrapEndpoint,
-        PreparedGrantProtocol,
+        PdMetadataSchema, PdProcessMetadata, PdProcessRegistration, PdTopology,
+        PrefillBootstrapEndpoint, PreparedGrantProtocol,
     };
 
     const MODEL_FINGERPRINT: &str =
@@ -1582,6 +1597,35 @@ mod tests {
         launch_instance_id: Uuid,
     ) -> PdProcessRegistration {
         PdProcessRegistration::new(origin(url), pd_metadata(role, tp_size, launch_instance_id))
+    }
+
+    fn strict_topology() -> PdTopology {
+        PdTopology::from_json(
+            &json!({
+                "schema": "pd-topology-v1",
+                "groups": [
+                    {
+                        "id": "group-0",
+                        "prefill": {
+                            "origin": "http://prefill.test:30000",
+                            "tensor_parallel_size": 2,
+                            "bootstrap_endpoint": {
+                                "host": "prefill-transfer.test",
+                                "port": 50_051
+                            }
+                        },
+                        "decoders": [
+                            {
+                                "origin": "http://decode.test:30001",
+                                "tensor_parallel_size": 1
+                            }
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap()
     }
 
     #[derive(Clone, Default)]
@@ -1889,7 +1933,7 @@ mod tests {
     #[test]
     fn pd_startup_registration_seeds_both_orders_and_arbitrary_decoder_counts() {
         for prefill_first in [false, true] {
-            for prefill_tp in [2, 4] {
+            for prefill_tp in [1, 2, 4] {
                 let registry = WorkerRegistry::new();
                 let prefill = pd_worker(
                     "http://prefill.test:30000",
@@ -1919,6 +1963,109 @@ mod tests {
                 assert_eq!(ready[0].pool().snapshot().replicas.len(), 3);
             }
         }
+    }
+
+    #[test]
+    fn strict_topology_rejects_unmanifested_and_drifted_registrations() {
+        let cases = [
+            pd_worker(
+                "http://unmanifested.test:30001",
+                PdProcessRole::Decode,
+                1,
+                Uuid::from_u128(1),
+            ),
+            pd_worker(
+                "http://prefill.test:30000",
+                PdProcessRole::Decode,
+                1,
+                Uuid::from_u128(2),
+            ),
+            pd_worker(
+                "http://prefill.test:30000",
+                PdProcessRole::Prefill,
+                4,
+                Uuid::from_u128(3),
+            ),
+        ];
+        for worker in cases {
+            let registry = WorkerRegistry::with_pd_topology(Some(strict_topology()));
+            assert!(matches!(
+                registry.register(worker),
+                Err(WorkerRegistryError::InvalidPdLifecycleTransition { .. })
+            ));
+            assert!(registry.is_empty());
+            assert!(!registry.pd_topology_status().unwrap().fully_registered);
+        }
+
+        let drifted_metadata = PdProcessMetadata::new(
+            PdMetadataSchema::V1,
+            Uuid::from_u128(4),
+            PdProcessRole::Prefill,
+            2,
+            1,
+            MODEL_FINGERPRINT,
+            KV_LAYOUT_FINGERPRINT,
+            "bf16",
+            64,
+            KvTransferProtocol::PackedV4,
+            PreparedGrantProtocol::V1,
+            Some(PrefillBootstrapEndpoint::new("wrong-transfer.test", 50_051).unwrap()),
+        )
+        .unwrap();
+        let drifted_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill.test:30000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .pd_process(PdProcessRegistration::new(
+                    origin("http://prefill.test:30000"),
+                    drifted_metadata,
+                ))
+                .build(),
+        );
+        let registry = WorkerRegistry::with_pd_topology(Some(strict_topology()));
+        assert!(matches!(
+            registry.register(drifted_worker),
+            Err(WorkerRegistryError::InvalidPdLifecycleTransition { .. })
+        ));
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn strict_topology_registration_retains_new_launch_generations() {
+        let registry = WorkerRegistry::with_pd_topology(Some(strict_topology()));
+        registry
+            .register(pd_worker(
+                "http://decode.test:30001",
+                PdProcessRole::Decode,
+                1,
+                Uuid::from_u128(10),
+            ))
+            .unwrap();
+        registry
+            .register(pd_worker(
+                "http://prefill.test:30000",
+                PdProcessRole::Prefill,
+                2,
+                Uuid::from_u128(20),
+            ))
+            .unwrap();
+        assert!(registry.pd_topology_status().unwrap().fully_registered);
+
+        registry
+            .register(pd_worker(
+                "http://decode.test:30001",
+                PdProcessRole::Decode,
+                1,
+                Uuid::from_u128(11),
+            ))
+            .unwrap();
+        let status = registry.pd_topology_status().unwrap();
+        assert!(status.fully_registered);
+        assert_eq!(
+            status.groups[0].decoders[0].launch_instance_id,
+            Some(Uuid::from_u128(11))
+        );
     }
 
     #[test]

@@ -994,13 +994,13 @@ impl PdRequestActor {
                     self.cancel_bound_pending().await?;
                 }
                 SessionAuthority::Reserved { .. } => {
-                    self.cancel_reserved().await?;
+                    return self.cancel_reserved().await;
                 }
                 SessionAuthority::Promoting { .. } => {
-                    self.abort_promoting(reason_code).await?;
+                    return self.abort_promoting(reason_code).await;
                 }
                 SessionAuthority::Active { .. } => {
-                    self.abort_active(reason_code).await?;
+                    return self.abort_active(reason_code).await;
                 }
                 SessionAuthority::Quarantined { cohort } => {
                     let assignment_id = cohort.assignment_id();

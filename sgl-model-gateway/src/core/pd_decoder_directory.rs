@@ -5,7 +5,9 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use serde::Serialize;
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::{
     pd_decoder_grant::{DecoderId, DecoderRequestTemplate, PrefillId, ProcessIdentityError},
@@ -19,6 +21,54 @@ use crate::core::{
     ConnectionMode, HttpOrigin, PdGroupId, PdProcessMetadata, PdProcessRegistration, PdProcessRole,
     PdTopology, PrefillBootstrapEndpoint, Worker, WorkerType,
 };
+
+/// Current authenticated process state for one topology prefill.
+#[derive(Clone, Debug, Serialize)]
+pub struct PdTopologyPrefillStatus {
+    pub origin: HttpOrigin,
+    pub tensor_parallel_size: usize,
+    pub bootstrap_endpoint: crate::core::PdTopologyBootstrapEndpoint,
+    pub launch_instance_id: Option<Uuid>,
+    pub generation_ready: bool,
+    pub healthy: bool,
+    pub available: bool,
+}
+
+/// Current authenticated process and pool state for one topology decoder.
+#[derive(Clone, Debug, Serialize)]
+pub struct PdTopologyDecoderStatus {
+    pub origin: HttpOrigin,
+    pub tensor_parallel_size: usize,
+    pub launch_instance_id: Option<Uuid>,
+    pub generation_ready: bool,
+    pub healthy: bool,
+    pub available: bool,
+    pub pending_admissions: usize,
+    pub active_child_requests: usize,
+}
+
+/// Current admission and process state for one immutable topology group.
+#[derive(Clone, Debug, Serialize)]
+pub struct PdTopologyGroupStatus {
+    pub id: PdGroupId,
+    pub manifest_index: usize,
+    pub eligible: bool,
+    pub selection_count: u64,
+    pub outstanding_logical_requests: usize,
+    pub ready_decoder_count: usize,
+    pub prefill: PdTopologyPrefillStatus,
+    pub decoders: Vec<PdTopologyDecoderStatus>,
+}
+
+/// Read-only attestation of the immutable topology and observed process generations.
+#[derive(Clone, Debug, Serialize)]
+pub struct PdTopologyStatus {
+    pub schema: String,
+    pub topology_sha256: String,
+    pub topology: PdTopology,
+    pub fully_registered: bool,
+    pub groups: Vec<PdTopologyGroupStatus>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessAvailability {
@@ -135,6 +185,7 @@ pub(crate) struct PdRetirementSweep {
 #[derive(Debug)]
 pub struct PdProcessDirectory {
     topology: Option<Arc<PdTopology>>,
+    topology_sha256: Option<Arc<str>>,
     state: RwLock<DirectoryState>,
 }
 
@@ -147,8 +198,12 @@ impl Default for PdProcessDirectory {
 impl PdProcessDirectory {
     /// Construct a process directory, optionally under immutable topology ownership.
     pub fn new(topology: Option<Arc<PdTopology>>) -> Self {
+        let topology_sha256 = topology
+            .as_ref()
+            .map(|topology| Arc::<str>::from(topology.sha256()));
         Self {
             topology,
+            topology_sha256,
             state: RwLock::new(DirectoryState::default()),
         }
     }
@@ -612,6 +667,123 @@ impl PdProcessDirectory {
         })
     }
 
+    /// Snapshot the immutable topology and current generation-aware process state.
+    pub fn topology_status(&self) -> Option<PdTopologyStatus> {
+        let topology = self.topology.as_ref()?;
+        let topology_sha256 = self
+            .topology_sha256
+            .as_ref()
+            .expect("a configured topology has a startup-computed digest");
+        let state = self.state.read();
+        let mut groups = Vec::with_capacity(topology.groups.len());
+
+        for (manifest_index, group) in topology.groups.iter().enumerate() {
+            let prefill_record = state
+                .current_prefill_by_origin
+                .get(&group.prefill.origin)
+                .and_then(|prefill_id| state.prefills.get(prefill_id));
+            let prefill_generation_ready = prefill_record
+                .is_some_and(|record| record.availability == ProcessAvailability::Ready);
+            let prefill_healthy =
+                prefill_record.is_some_and(|record| record.entry.worker().is_healthy());
+            let prefill_available = prefill_record.is_some_and(|record| {
+                record.availability == ProcessAvailability::Ready
+                    && record.entry.worker().is_available()
+            });
+            let pool_snapshot = prefill_record.map(|record| record.entry.pool().snapshot());
+
+            let decoders = group
+                .decoders
+                .iter()
+                .map(|decoder_spec| {
+                    let decoder_record = state
+                        .current_decoder_by_origin
+                        .get(&decoder_spec.origin)
+                        .and_then(|decoder_id| state.decoders.get(decoder_id));
+                    let generation_ready = decoder_record
+                        .is_some_and(|record| record.availability == ProcessAvailability::Ready);
+                    let healthy =
+                        decoder_record.is_some_and(|record| record.entry.worker().is_healthy());
+                    let replica = decoder_record.and_then(|record| {
+                        pool_snapshot.as_ref().and_then(|snapshot| {
+                            snapshot
+                                .replicas
+                                .iter()
+                                .find(|replica| &replica.id == record.entry.id())
+                        })
+                    });
+                    let available = decoder_record.is_some_and(|record| {
+                        generation_ready
+                            && record.entry.worker().is_available()
+                            && prefill_record.is_some_and(|prefill| {
+                                record.pool_memberships.contains(prefill.entry.id())
+                            })
+                            && replica.is_some_and(|replica| {
+                                replica.availability == DecoderAvailability::Ready
+                            })
+                    });
+                    PdTopologyDecoderStatus {
+                        origin: decoder_spec.origin.clone(),
+                        tensor_parallel_size: decoder_spec.tensor_parallel_size,
+                        launch_instance_id: decoder_record
+                            .map(|record| record.entry.metadata().launch_instance_id()),
+                        generation_ready,
+                        healthy,
+                        available,
+                        pending_admissions: replica.map_or(0, |replica| replica.pending_admissions),
+                        active_child_requests: replica
+                            .map_or(0, |replica| replica.active_child_requests),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let ready_decoder_count = decoders.iter().filter(|decoder| decoder.available).count();
+            groups.push(PdTopologyGroupStatus {
+                id: group.id.clone(),
+                manifest_index,
+                eligible: prefill_available && ready_decoder_count > 0,
+                selection_count: state
+                    .group_selection_counts
+                    .get(&group.id)
+                    .copied()
+                    .unwrap_or(0),
+                outstanding_logical_requests: pool_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.active_logical_requests),
+                ready_decoder_count,
+                prefill: PdTopologyPrefillStatus {
+                    origin: group.prefill.origin.clone(),
+                    tensor_parallel_size: group.prefill.tensor_parallel_size,
+                    bootstrap_endpoint: group.prefill.bootstrap_endpoint.clone(),
+                    launch_instance_id: prefill_record
+                        .map(|record| record.entry.metadata().launch_instance_id()),
+                    generation_ready: prefill_generation_ready,
+                    healthy: prefill_healthy,
+                    available: prefill_available,
+                },
+                decoders,
+            });
+        }
+
+        let fully_registered = groups.iter().all(|group| {
+            group.prefill.generation_ready
+                && group.prefill.healthy
+                && group.prefill.available
+                && group.decoders.iter().all(|decoder| decoder.available)
+        });
+        Some(PdTopologyStatus {
+            schema: "pd-topology-status-v1".to_string(),
+            topology_sha256: topology_sha256.to_string(),
+            topology: (**topology).clone(),
+            fully_registered,
+            groups,
+        })
+    }
+
+    /// Return the startup-computed immutable topology digest.
+    pub fn topology_sha256(&self) -> Option<&str> {
+        self.topology_sha256.as_deref()
+    }
+
     pub(crate) fn begin_admission(
         &self,
         prefill_id: &PrefillId,
@@ -936,6 +1108,7 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
@@ -1058,6 +1231,111 @@ mod tests {
         )
     }
 
+    fn strict_topology() -> PdTopology {
+        PdTopology::from_json(
+            &json!({
+                "schema": "pd-topology-v1",
+                "groups": [
+                    {
+                        "id": "group-0",
+                        "prefill": {
+                            "origin": "http://prefill-a.test:30000",
+                            "tensor_parallel_size": 2,
+                            "bootstrap_endpoint": {
+                                "host": "prefill-transfer.test",
+                                "port": 50_051
+                            }
+                        },
+                        "decoders": [
+                            {
+                                "origin": "http://decode-a.test:30001",
+                                "tensor_parallel_size": 1
+                            }
+                        ]
+                    },
+                    {
+                        "id": "group-1",
+                        "prefill": {
+                            "origin": "http://prefill-b.test:30000",
+                            "tensor_parallel_size": 2,
+                            "bootstrap_endpoint": {
+                                "host": "prefill-transfer.test",
+                                "port": 50_051
+                            }
+                        },
+                        "decoders": [
+                            {
+                                "origin": "http://decode-b0.test:30001",
+                                "tensor_parallel_size": 1
+                            },
+                            {
+                                "origin": "http://decode-b1.test:30001",
+                                "tensor_parallel_size": 1
+                            },
+                            {
+                                "origin": "http://decode-b2.test:30001",
+                                "tensor_parallel_size": 1
+                            }
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    fn fully_populated_topology_directory() -> (PdProcessDirectory, Vec<Arc<dyn Worker>>) {
+        let directory = PdProcessDirectory::new(Some(Arc::new(strict_topology())));
+        let prefills = vec![
+            worker(
+                "http://prefill-a.test:30000",
+                PdProcessRole::Prefill,
+                2,
+                instance(100),
+            ),
+            worker(
+                "http://prefill-b.test:30000",
+                PdProcessRole::Prefill,
+                2,
+                instance(200),
+            ),
+        ];
+        let decoders = vec![
+            worker(
+                "http://decode-a.test:30001",
+                PdProcessRole::Decode,
+                1,
+                instance(101),
+            ),
+            worker(
+                "http://decode-b0.test:30001",
+                PdProcessRole::Decode,
+                1,
+                instance(201),
+            ),
+            worker(
+                "http://decode-b1.test:30001",
+                PdProcessRole::Decode,
+                1,
+                instance(202),
+            ),
+            worker(
+                "http://decode-b2.test:30001",
+                PdProcessRole::Decode,
+                1,
+                instance(203),
+            ),
+        ];
+        for prefill in &prefills {
+            directory.admit_prefill(Arc::clone(prefill)).unwrap();
+        }
+        for decoder in &decoders {
+            directory.admit_decoder(Arc::clone(decoder)).unwrap();
+        }
+        (directory, prefills)
+    }
+
     #[test]
     fn rejects_non_http_pd_transport_before_directory_mutation() {
         let url = "http://decode.test:30001";
@@ -1084,6 +1362,186 @@ mod tests {
             Err(PdDirectoryError::UnsupportedProcessTransport)
         ));
         assert!(directory.ready_prefills().is_empty());
+    }
+
+    #[test]
+    fn topology_ownership_is_static_in_both_registration_orders() {
+        for prefill_first in [false, true] {
+            let directory = PdProcessDirectory::new(Some(Arc::new(strict_topology())));
+            let prefills = [
+                worker(
+                    "http://prefill-a.test:30000",
+                    PdProcessRole::Prefill,
+                    2,
+                    instance(100),
+                ),
+                worker(
+                    "http://prefill-b.test:30000",
+                    PdProcessRole::Prefill,
+                    2,
+                    instance(200),
+                ),
+            ];
+            let decoders = [
+                worker(
+                    "http://decode-a.test:30001",
+                    PdProcessRole::Decode,
+                    1,
+                    instance(101),
+                ),
+                worker(
+                    "http://decode-b0.test:30001",
+                    PdProcessRole::Decode,
+                    1,
+                    instance(201),
+                ),
+                worker(
+                    "http://decode-b1.test:30001",
+                    PdProcessRole::Decode,
+                    1,
+                    instance(202),
+                ),
+                worker(
+                    "http://decode-b2.test:30001",
+                    PdProcessRole::Decode,
+                    1,
+                    instance(203),
+                ),
+            ];
+            if prefill_first {
+                for prefill in &prefills {
+                    directory.admit_prefill(Arc::clone(prefill)).unwrap();
+                }
+            }
+            for decoder in &decoders {
+                directory.admit_decoder(Arc::clone(decoder)).unwrap();
+            }
+            if !prefill_first {
+                for prefill in &prefills {
+                    directory.admit_prefill(Arc::clone(prefill)).unwrap();
+                }
+            }
+
+            let ready = directory.ready_prefills();
+            assert_eq!(ready.len(), 2);
+            let first = ready
+                .iter()
+                .find(|prefill| prefill.id().url() == "http://prefill-a.test:30000")
+                .unwrap();
+            let second = ready
+                .iter()
+                .find(|prefill| prefill.id().url() == "http://prefill-b.test:30000")
+                .unwrap();
+            assert_eq!(first.pool().snapshot().replicas.len(), 1);
+            assert_eq!(
+                first.pool().snapshot().replicas[0].id.url(),
+                "http://decode-a.test:30001"
+            );
+            let second_origins = second
+                .pool()
+                .snapshot()
+                .replicas
+                .into_iter()
+                .map(|replica| replica.id.url().to_string())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                second_origins,
+                [
+                    "http://decode-b0.test:30001".to_string(),
+                    "http://decode-b1.test:30001".to_string(),
+                    "http://decode-b2.test:30001".to_string(),
+                ]
+                .into_iter()
+                .collect()
+            );
+            assert!(directory.topology_status().unwrap().fully_registered);
+        }
+    }
+
+    #[test]
+    fn concurrent_group_charging_is_atomic_and_capacity_normalized() {
+        let (directory, prefills) = fully_populated_topology_directory();
+        let directory = Arc::new(directory);
+        let barrier = Arc::new(Barrier::new(41));
+        let mut handles = Vec::new();
+        for index in 0..40 {
+            let directory = Arc::clone(&directory);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                directory
+                    .begin_group_request(format!("request-{index}"), None)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let requests = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        let status = directory.topology_status().unwrap();
+        assert_eq!(status.groups[0].selection_count, 10);
+        assert_eq!(status.groups[0].outstanding_logical_requests, 10);
+        assert_eq!(status.groups[1].selection_count, 30);
+        assert_eq!(status.groups[1].outstanding_logical_requests, 30);
+        assert_eq!(
+            status.groups[0].prefill.launch_instance_id,
+            Some(instance(100))
+        );
+        assert_eq!(status.groups[1].ready_decoder_count, 3);
+
+        for request in requests {
+            let (_, prefill, mut owner) = request.into_parts();
+            prefill.pool().finalize_request(&mut owner).unwrap();
+        }
+        assert!(directory
+            .topology_status()
+            .unwrap()
+            .groups
+            .iter()
+            .all(|group| group.outstanding_logical_requests == 0));
+
+        prefills[0].set_healthy(false);
+        let status = directory.topology_status().unwrap();
+        assert!(!status.fully_registered);
+        assert!(!status.groups[0].prefill.available);
+    }
+
+    #[test]
+    fn retry_another_decoder_cannot_escape_the_selected_group() {
+        let (directory, _) = fully_populated_topology_directory();
+        let request = directory
+            .begin_group_request("bounded-retry", None)
+            .unwrap();
+        assert_eq!(request.group_id().as_str(), "group-0");
+        let (_, prefill, mut owner) = request.into_parts();
+        let mut pending = begin_scalar_admission(&directory, &prefill, &owner).unwrap();
+        assert_eq!(pending.decoder_id().url(), "http://decode-a.test:30001");
+        let snapshot = prefill.pool().snapshot();
+        let refusal = issue_test_reserve_refusal_receipt(
+            snapshot.prefill_id,
+            pending.decoder_id().clone(),
+            owner.chain_id(),
+            pending.reservation_attempt_id(),
+            pending.reserve_attempt_digest(),
+            DecoderReserveRefusalDisposition::RetryAnotherDecoder,
+            true,
+        );
+        assert_eq!(
+            prefill
+                .pool()
+                .install_reserve_refusal_proof(&mut pending, &refusal)
+                .unwrap(),
+            PendingAdmissionDisposition::RetryAnotherDecoder
+        );
+        assert!(matches!(
+            begin_scalar_admission(&directory, &prefill, &owner),
+            Err(PdDirectoryError::Pool(
+                DecoderPoolError::RetryAlternativesExhausted
+            ))
+        ));
+        prefill.pool().finalize_request(&mut owner).unwrap();
     }
 
     #[test]
@@ -1115,8 +1573,8 @@ mod tests {
     }
 
     #[test]
-    fn seeds_prefills_from_tp2_and_arbitrary_current_tp1_replica_counts() {
-        for prefill_tp in [2, 4] {
+    fn seeds_prefills_from_supported_tp_and_arbitrary_current_tp1_replica_counts() {
+        for prefill_tp in [1, 2, 4] {
             for replica_count in [1, 2, 3, 5] {
                 let directory = PdProcessDirectory::default();
                 let mut decoders = Vec::new();
@@ -1132,16 +1590,18 @@ mod tests {
                             .unwrap(),
                     );
                 }
-                decoders.push(
-                    directory
-                        .admit_decoder(worker(
-                            "http://decode-tp2.test:30001",
-                            PdProcessRole::Decode,
-                            2,
-                            instance(200),
-                        ))
-                        .unwrap(),
-                );
+                if prefill_tp % 2 == 0 {
+                    decoders.push(
+                        directory
+                            .admit_decoder(worker(
+                                "http://decode-tp2.test:30001",
+                                PdProcessRole::Decode,
+                                2,
+                                instance(200),
+                            ))
+                            .unwrap(),
+                    );
+                }
 
                 let prefill = directory
                     .admit_prefill(worker(
@@ -1152,7 +1612,7 @@ mod tests {
                     ))
                     .unwrap();
 
-                assert_eq!(prefill.pool().snapshot().replicas.len(), replica_count + 1);
+                assert_eq!(prefill.pool().snapshot().replicas.len(), decoders.len());
                 assert_eq!(prefill.bootstrap_endpoint().host(), "prefill-transfer.test");
                 for decoder in decoders {
                     assert!(prefill

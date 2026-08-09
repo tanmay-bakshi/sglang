@@ -701,7 +701,28 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ConnectionMode;
+    use crate::core::{ConnectionMode, PdTopology};
+
+    fn strict_topology() -> PdTopology {
+        PdTopology::from_json(
+            r#"{
+                "schema": "pd-topology-v1",
+                "groups": [{
+                    "id": "group-0",
+                    "prefill": {
+                        "origin": "http://prefill.test:30000",
+                        "tensor_parallel_size": 2,
+                        "bootstrap_endpoint": {"host": "prefill-transfer.test", "port": 50051}
+                    },
+                    "decoders": [{
+                        "origin": "http://decode.test:30001",
+                        "tensor_parallel_size": 1
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_validate_regular_mode() {
@@ -816,6 +837,79 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn strict_topology_is_valid_only_on_the_generation_aware_http_path() {
+        let mut config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                topology: Some(strict_topology()),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.connection_mode = ConnectionMode::Grpc { port: Some(50_052) };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_topology_rejects_flat_workers_policies_and_discovery() {
+        let flat = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill.test:30000".to_string(), None)],
+                decode_urls: Vec::new(),
+                topology: Some(strict_topology()),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&flat),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+
+        let policies = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                topology: Some(strict_topology()),
+                prefill_policy: Some(PolicyConfig::Random),
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        assert!(matches!(
+            ConfigValidator::validate(&policies),
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
+
+        let mut discovery = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                topology: Some(strict_topology()),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+        discovery.discovery = Some(DiscoveryConfig {
+            enabled: true,
+            selector: [("app".to_string(), "gemma".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        assert!(ConfigValidator::validate(&discovery).is_err());
     }
 
     #[test]

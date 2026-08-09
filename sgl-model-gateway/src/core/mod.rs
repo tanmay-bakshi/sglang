@@ -41,7 +41,10 @@ pub use error::{WorkerError, WorkerResult};
 pub use http_origin::{HttpOrigin, HttpOriginError};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
-pub use pd_decoder_directory::PdGroupRequest;
+pub use pd_decoder_directory::{
+    PdGroupRequest, PdTopologyDecoderStatus, PdTopologyGroupStatus, PdTopologyPrefillStatus,
+    PdTopologyStatus,
+};
 pub use pd_process::{
     KvTransferProtocol, PdMetadataSchema, PdProcessAdvertisement, PdProcessAdvertisementError,
     PdProcessMetadata, PdProcessMetadataError, PdProcessRegistration, PdProcessRole,
