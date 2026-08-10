@@ -820,9 +820,9 @@ fn validate_grant_identity(
             "logical request-chain identity cannot be the nil UUID".to_string(),
         ));
     }
-    if !matches!(source_tp_size, 1 | 2 | 4) {
+    if !matches!(source_tp_size, 1 | 2 | 4 | 8) {
         return Err(EngineGrantError::InvalidGrant(
-            "source tensor-parallel size must be 1, 2, or 4".to_string(),
+            "source tensor-parallel size must be 1, 2, 4, or 8".to_string(),
         ));
     }
     Ok(())
@@ -3378,6 +3378,25 @@ mod tests {
         assert!(PrefillBootstrapEndpoint::new("localhost", 5000).is_err());
         assert!(PrefillBootstrapEndpoint::new("127.0.0.1", 5000).is_err());
         assert!(PrefillBootstrapEndpoint::new("[::1]", 5000).is_err());
+    }
+
+    #[test]
+    fn grant_identity_accepts_supported_prefill_tp_and_rejects_other_sizes() {
+        let fixture = digest_fixture();
+        for source_tp_size in [1, 2, 4, 8] {
+            let mut candidate = fixture.clone();
+            candidate.source_tp_size = source_tp_size;
+            assert!(candidate.try_binding().is_ok());
+        }
+        for source_tp_size in [0, 3, 6, 16] {
+            let mut candidate = fixture.clone();
+            candidate.source_tp_size = source_tp_size;
+            assert!(matches!(
+                candidate.try_binding(),
+                Err(EngineGrantError::InvalidGrant(message))
+                    if message == "source tensor-parallel size must be 1, 2, 4, or 8"
+            ));
+        }
     }
 
     #[test]

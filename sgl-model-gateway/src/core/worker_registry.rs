@@ -1933,7 +1933,7 @@ mod tests {
     #[test]
     fn pd_startup_registration_seeds_both_orders_and_arbitrary_decoder_counts() {
         for prefill_first in [false, true] {
-            for prefill_tp in [1, 2, 4] {
+            for prefill_tp in [1, 2, 4, 8] {
                 let registry = WorkerRegistry::new();
                 let prefill = pd_worker(
                     "http://prefill.test:30000",

@@ -1657,13 +1657,13 @@ impl DecoderPool {
         declared_prefill_tp_size: usize,
         compatibility: EngineCompatibilityMetadata,
     ) -> Result<Self, DecoderPoolError> {
-        if !matches!(declared_prefill_tp_size, 1 | 2 | 4) {
+        if !matches!(declared_prefill_tp_size, 1 | 2 | 4 | 8) {
             return Err(DecoderPoolError::InvalidConfiguration(
-                "declared prefill tensor parallel size must be 1, 2, or 4".to_string(),
+                "declared prefill tensor parallel size must be 1, 2, 4, or 8".to_string(),
             ));
         }
-        let declared_prefill_tp_size =
-            NonZeroUsize::new(declared_prefill_tp_size).expect("1, 2, and 4 are nonzero");
+        let declared_prefill_tp_size = NonZeroUsize::new(declared_prefill_tp_size)
+            .expect("supported prefill tensor-parallel sizes are nonzero");
         Ok(Self {
             inner: Arc::new(DecoderPoolInner {
                 pool_id: Uuid::new_v4(),
@@ -5280,7 +5280,7 @@ mod tests {
 
     #[test]
     fn registers_declared_tp_metadata_without_claiming_transport_correctness() {
-        for declared_prefill_tp_size in [1, 2, 4] {
+        for declared_prefill_tp_size in [1, 2, 4, 8] {
             let pool = pool(declared_prefill_tp_size);
             pool.register(replica_with_tp("decode-tp1", 1, "packed-v1"))
                 .unwrap();
@@ -5305,7 +5305,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_prefill_tensor_parallelism() {
-        for declared_prefill_tp_size in [0, 3, 8] {
+        for declared_prefill_tp_size in [0, 3, 6, 16] {
             assert!(DecoderPool::new(
                 prefill_id("prefill-invalid"),
                 declared_prefill_tp_size,
@@ -5452,7 +5452,7 @@ mod tests {
 
     #[test]
     fn balances_supported_prefill_tp_across_arbitrary_replica_counts() {
-        for prefill_tp_size in [1, 2, 4] {
+        for prefill_tp_size in [1, 2, 4, 8] {
             for replica_count in [1, 2, 3, 5] {
                 let pool = pool(prefill_tp_size);
                 for index in 0..replica_count {
@@ -5490,7 +5490,7 @@ mod tests {
 
     #[test]
     fn round_robins_serial_completions_across_arbitrary_replica_counts() {
-        for prefill_tp_size in [1, 2, 4] {
+        for prefill_tp_size in [1, 2, 4, 8] {
             for replica_count in [1, 2, 3, 5] {
                 let pool = pool(prefill_tp_size);
                 for index in 0..replica_count {
@@ -5527,7 +5527,7 @@ mod tests {
 
     #[test]
     fn balances_pending_supported_tp_bursts_across_arbitrary_replica_counts() {
-        for prefill_tp_size in [1, 2, 4] {
+        for prefill_tp_size in [1, 2, 4, 8] {
             for replica_count in [1, 2, 3, 5] {
                 let pool = pool(prefill_tp_size);
                 for index in 0..replica_count {

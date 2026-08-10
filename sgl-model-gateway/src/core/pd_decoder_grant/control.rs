@@ -259,9 +259,9 @@ impl DecoderGrantReservation {
                 "reservation attempt identity cannot be the nil UUID".to_string(),
             ));
         }
-        if !matches!(source_tp_size, 1 | 2 | 4) {
+        if !matches!(source_tp_size, 1 | 2 | 4 | 8) {
             return Err(EngineGrantError::InvalidGrant(
-                "source tensor-parallel size must be 1, 2, or 4".to_string(),
+                "source tensor-parallel size must be 1, 2, 4, or 8".to_string(),
             ));
         }
         let prepared_ttl_ms = u64::try_from(prepared_ttl.as_millis()).map_err(|_| {
@@ -3339,6 +3339,53 @@ mod tests {
     }
 
     #[test]
+    fn reservation_accepts_supported_prefill_tp_and_rejects_other_sizes() {
+        let prefill_id = PrefillId::new(
+            HttpOrigin::parse("http://prefill.test:30000").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let decoder_id = DecoderId::new(
+            HttpOrigin::parse("http://decoder.test:30001").unwrap(),
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        let bootstrap = PrefillBootstrapEndpoint::new("bootstrap.test", 40000).unwrap();
+        let template = DecoderRequestTemplate::new(
+            DecoderInferenceRoute::Generate,
+            Bytes::from_static(br#"{"text":"test"}"#),
+        )
+        .unwrap();
+
+        for source_tp_size in [1, 2, 4, 8] {
+            assert!(template
+                .prepare_reservation(
+                    prefill_id.clone(),
+                    bootstrap.clone(),
+                    decoder_id.clone(),
+                    Uuid::new_v4(),
+                    source_tp_size,
+                    Duration::from_secs(1),
+                )
+                .is_ok());
+        }
+        for source_tp_size in [0, 3, 6, 16] {
+            assert!(matches!(
+                template.prepare_reservation(
+                    prefill_id.clone(),
+                    bootstrap.clone(),
+                    decoder_id.clone(),
+                    Uuid::new_v4(),
+                    source_tp_size,
+                    Duration::from_secs(1),
+                ),
+                Err(EngineGrantError::InvalidGrant(message))
+                    if message == "source tensor-parallel size must be 1, 2, 4, or 8"
+            ));
+        }
+    }
+
+    #[test]
     fn reservation_rejects_parallel_sampling_for_scalar_and_batch_bodies() {
         let make = |route: DecoderInferenceRoute, body: Value| {
             DecoderRequestTemplate::new(route, Bytes::from(serde_json::to_vec(&body).unwrap()))
@@ -3595,7 +3642,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_session_runs_for_every_supported_prefill_tp() {
-        for prefill_tp_size in [1, 2, 4] {
+        for prefill_tp_size in [1, 2, 4, 8] {
             let (server_url, state, task) = start_server().await;
             let terminal = Arc::new(Notify::new());
             *state.session_engine.lock().unwrap() = Some(SessionEngine::new(Arc::clone(&terminal)));
@@ -4151,7 +4198,7 @@ mod tests {
 
     #[tokio::test]
     async fn supported_tp_control_lifecycles_preserve_exact_source_topology() {
-        for source_tp_size in [1, 2, 4] {
+        for source_tp_size in [1, 2, 4, 8] {
             for child_count in [1, 3] {
                 let (server_url, state, task) = start_server().await;
                 let fixture = fixture_with_tp(&server_url, child_count, source_tp_size);

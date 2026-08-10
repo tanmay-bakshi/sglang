@@ -228,7 +228,7 @@ impl PdProcessDirectory {
         worker: Arc<dyn Worker>,
     ) -> Result<Arc<PrefillDirectoryEntry>, PdDirectoryError> {
         let (origin, metadata) = required_process(&worker, PdProcessRole::Prefill)?;
-        if !matches!(metadata.tensor_parallel_size(), 1 | 2 | 4) {
+        if !matches!(metadata.tensor_parallel_size(), 1 | 2 | 4 | 8) {
             return Err(PdDirectoryError::UnsupportedPrefillTp(
                 metadata.tensor_parallel_size(),
             ));
@@ -1067,7 +1067,7 @@ pub enum PdDirectoryError {
     UnsupportedProcessTransport,
     #[error("PD worker transport and registered process origin differ")]
     ProcessOriginMismatch,
-    #[error("prefill directory supports TP1, TP2, or TP4, received TP{0}")]
+    #[error("prefill directory supports TP1, TP2, TP4, or TP8, received TP{0}")]
     UnsupportedPrefillTp(usize),
     #[error("decoder directory supports TP1 or TP2, received TP{0}")]
     UnsupportedDecodeTp(usize),
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn seeds_prefills_from_supported_tp_and_arbitrary_current_tp1_replica_counts() {
-        for prefill_tp in [1, 2, 4] {
+        for prefill_tp in [1, 2, 4, 8] {
             for replica_count in [1, 2, 3, 5] {
                 let directory = PdProcessDirectory::default();
                 let mut decoders = Vec::new();

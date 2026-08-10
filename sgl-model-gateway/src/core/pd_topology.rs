@@ -203,7 +203,7 @@ impl PdTopology {
                     group.id.as_str().to_string(),
                 ));
             }
-            if !matches!(group.prefill.tensor_parallel_size, 1 | 2 | 4) {
+            if !matches!(group.prefill.tensor_parallel_size, 1 | 2 | 4 | 8) {
                 return Err(PdTopologyError::UnsupportedPrefillTensorParallelSize {
                     origin: group.prefill.origin.to_string(),
                     tensor_parallel_size: group.prefill.tensor_parallel_size,
@@ -377,7 +377,7 @@ pub enum PdTopologyError {
     #[error("PD topology group {group_id:?} must contain at least one decoder")]
     NoDecoders { group_id: String },
     #[error(
-        "unsupported prefill tensor_parallel_size {tensor_parallel_size} for {origin}; expected 1, 2, or 4"
+        "unsupported prefill tensor_parallel_size {tensor_parallel_size} for {origin}; expected 1, 2, 4, or 8"
     )]
     UnsupportedPrefillTensorParallelSize {
         origin: String,
@@ -588,6 +588,16 @@ mod tests {
             PdTopology::from_json(&incompatible_decode.to_string()),
             Err(PdTopologyError::IncompatibleTensorParallelSizes { .. })
         ));
+    }
+
+    #[test]
+    fn accepts_tp8_prefill_with_tp1_decoders() {
+        let mut document: serde_json::Value = serde_json::from_str(&topology_json()).unwrap();
+        document["groups"][0]["prefill"]["tensor_parallel_size"] = json!(8);
+
+        let topology = PdTopology::from_json(&document.to_string()).unwrap();
+
+        assert_eq!(topology.groups[0].prefill.tensor_parallel_size, 8);
     }
 
     #[test]
