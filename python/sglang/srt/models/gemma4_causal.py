@@ -38,6 +38,7 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -393,7 +394,8 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
         self._use_fused_qkv_norm_rope = (
-            get_server_args().enable_fused_qk_norm_rope
+            envs.SGLANG_ENABLE_GEMMA4_QKV_NORM_ROPE_FUSION.get()
+            and get_server_args().enable_fused_qk_norm_rope
             and self.head_dim == 256
             and self.rotary_emb.rotary_dim == self.head_dim
             and self.rotary_emb.is_neox_style
