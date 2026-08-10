@@ -126,6 +126,10 @@ if _is_hip:
         _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
+    from sglang.kernels.ops.quantization.fused_add_rmsnorm_fp4_quant import (
+        fused_add_rmsnorm_fp4_quant,
+    )
+
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
     # (the transformers backend path) to produce outputs that are numerically identical
     # to HuggingFace `LlamaRMSNorm`: the cast from fp32 to the activation dtype happens
@@ -401,6 +405,37 @@ class RMSNorm(MultiPlatformOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
+
+    def forward_cuda_fp4_quantized(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Fuse residual addition and RMSNorm into exact NVFP4 quantization.
+
+        :param x: Token-major BF16 input to add to ``residual``.
+        :param residual: Contiguous BF16 residual updated in place.
+        :param global_scale: ModelOpt inverse activation scale.
+        :returns: Prequantized FP4 activations with the updated residual.
+        :raises ValueError: If this RMSNorm variant cannot use the fused ABI.
+        """
+
+        if self.variance_size_override is not None:
+            raise ValueError("fused FP4 RMSNorm does not support variance overrides")
+        if self.cast_x_before_out_mul:
+            raise ValueError("fused FP4 RMSNorm does not support HF cast semantics")
+        if is_batch_invariant_mode_enabled():
+            raise ValueError("fused FP4 RMSNorm is not batch invariant")
+
+        quantized = fused_add_rmsnorm_fp4_quant(
+            x,
+            residual,
+            self.weight.data,
+            global_scale,
+            self.variance_epsilon,
+        )
+        return quantized, residual
 
     def forward_cuda(
         self,

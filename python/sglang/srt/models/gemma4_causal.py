@@ -703,6 +703,18 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_feedforward_layernorm_2 = None
             self.pre_feedforward_layernorm_2 = None
 
+        gate_up_quant_method = self.mlp.gate_up_proj.quant_method
+        self._use_fused_pre_feedforward_fp4 = (
+            not self.enable_moe_block
+            and envs.SGLANG_ENABLE_GEMMA4_NVFP4_RMSNORM_FUSION.get()
+            and is_sm100_supported()
+            and isinstance(gate_up_quant_method, ModelOptFp4LinearMethod)
+            and not gate_up_quant_method.quant_config.is_awq
+            and not get_fp4_gemm_runner_backend().is_marlin()
+        )
+        if self._use_fused_pre_feedforward_fp4:
+            self.mlp.gate_up_proj._accepts_prequantized_fp4 = True
+
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
@@ -785,9 +797,22 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
         else:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+            use_fused_pre_feedforward = (
+                self._use_fused_pre_feedforward_fp4
+                and forward_batch.forward_mode.is_extend_without_speculative()
             )
+            if use_fused_pre_feedforward:
+                hidden_states, residual = (
+                    self.pre_feedforward_layernorm.forward_cuda_fp4_quantized(
+                        hidden_states,
+                        residual,
+                        self.mlp.gate_up_proj.input_scale_inv,
+                    )
+                )
+            else:
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
             hidden_states = self.mlp(hidden_states, forward_batch)
 
         if (
