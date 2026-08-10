@@ -938,6 +938,7 @@ class Envs:
     # Gemma 4
     SGLANG_ENABLE_GEMMA4_NVFP4_GEGLU_FUSION = EnvBool(True)
     SGLANG_ENABLE_GEMMA4_NVFP4_RMSNORM_FUSION = EnvBool(False)
+    SGLANG_ENABLE_GEMMA4_QKV_NORM_ROPE_FUSION = EnvBool(False)
 
     # ====================================================================
     # DeepSeek V4
