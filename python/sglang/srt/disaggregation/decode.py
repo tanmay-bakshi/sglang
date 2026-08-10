@@ -798,6 +798,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             owned_requests,
         )
         self._validate_preallocated_structural_capacity(owned_requests)
+        source_component_geometry = (
+            self._require_preallocated_source_component_geometry(attempt)
+        )
         rooms = derive_decode_reservation_bootstrap_rooms(
             grant_id,
             attempt.child_request_ids,
@@ -877,13 +880,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "reserved asymmetric request acquired no migration lease"
                     )
                 snapshot = self.allocation_lease_authority.snapshot(lease)
-                source_component_geometry = (
-                    decode_req.kv_receiver.prefill_info.packed_source_geometry
-                )
-                if source_component_geometry is None:
-                    raise DecodeAllocationLeaseError(
-                        "packed prefill bootstrap omitted source component geometry"
-                    )
                 packed_transaction = (
                     self.kv_manager.prepare_packed_decode_request_transaction(
                         room_id=room,
@@ -1338,6 +1334,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "request_exceeds_decode_capacity",
                     DecodeReservationRefusalDisposition.TERMINAL,
                 )
+
+    def _require_preallocated_source_component_geometry(
+        self,
+        attempt: DecodeReservationAttempt,
+    ) -> str:
+        """Pin source geometry before any reservation ownership is mutated.
+
+        :param attempt: Authenticated reserve attempt naming the prefill endpoint.
+        :returns: Bootstrap-authenticated canonical source geometry.
+        :raises DecodeReservationAdmissionRefused: If the source cannot provide
+            geometry matching the authenticated topology.
+        :raises DecodeAllocationLeaseError: If bootstrap state is internally
+            inconsistent.
+        """
+
+        endpoint = attempt.prefill_bootstrap_endpoint
+        bootstrap_addr = NetworkAddress(
+            endpoint.host,
+            endpoint.port,
+        ).to_host_port_str()
+        if not self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            raise DecodeReservationAdmissionRefused(
+                "prefill_bootstrap_unavailable",
+                DecodeReservationRefusalDisposition.RETRY_SAME_DECODER,
+            )
+
+        prefill_info = self.kv_manager.prefill_info_table.get(bootstrap_addr)
+        if prefill_info is None:
+            raise DecodeAllocationLeaseError(
+                "prefill bootstrap resolution returned no cached source descriptor"
+            )
+        if prefill_info.attn_tp_size != attempt.source_tp_size:
+            raise DecodeReservationAdmissionRefused(
+                "prefill_source_tp_mismatch",
+                DecodeReservationRefusalDisposition.TERMINAL,
+            )
+        source_component_geometry = prefill_info.packed_source_geometry
+        if source_component_geometry is None:
+            raise DecodeReservationAdmissionRefused(
+                "packed_source_geometry_unavailable",
+                DecodeReservationRefusalDisposition.TERMINAL,
+            )
+        return source_component_geometry
 
     def _validate_preallocated_capacity(
         self,
