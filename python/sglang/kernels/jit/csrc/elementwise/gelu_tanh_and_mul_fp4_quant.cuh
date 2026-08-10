@@ -231,10 +231,10 @@ struct GeluTanhMulFP4QuantKernel {
 
     const auto kernel = gelu_tanh_mul_fp4_quant_kernel<kUsePDL>;
     const uint32_t blocks_per_sm = host::runtime::get_blocks_per_sm(kernel, kBlockSize);
-    const uint32_t max_blocks =
+    const uint32_t resident_blocks =
         host::runtime::get_sm_count(device.unwrap().device_id) * blocks_per_sm;
     const uint32_t grid_size = std::min(
-        div_ceil(static_cast<uint32_t>(total_work), kBlockSize), max_blocks);
+        div_ceil(static_cast<uint32_t>(total_work), kBlockSize), resident_blocks * 2);
     const auto params = GeluTanhMulFP4QuantParams{
         .input = static_cast<const __nv_bfloat16*>(input.data_ptr()),
         .global_scale = static_cast<const float*>(global_scale.data_ptr()),
