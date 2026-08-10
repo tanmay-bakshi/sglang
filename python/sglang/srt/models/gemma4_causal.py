@@ -34,6 +34,7 @@ from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -67,6 +68,8 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
+
+_GEMMA4_FUSED_RMSNORM_FP4_MAX_TOKENS = 4096
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -639,7 +642,8 @@ class Gemma4DecoderLayer(nn.Module):
 
         gate_up_quant_method = self.mlp.gate_up_proj.quant_method
         self._use_fused_pre_feedforward_fp4 = (
-            not self.enable_moe_block
+            envs.SGLANG_ENABLE_GEMMA4_NVFP4_RMSNORM_FUSION.get()
+            and not self.enable_moe_block
             and fused_add_rmsnorm_fp4_quantize is not None
             and isinstance(gate_up_quant_method, ModelOptFp4LinearMethod)
             and not gate_up_quant_method.quant_config.is_awq
@@ -730,7 +734,16 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
         else:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            if self._use_fused_pre_feedforward_fp4:
+            use_fused_pre_feedforward_fp4 = (
+                self._use_fused_pre_feedforward_fp4
+                and hidden_states.dim() == 2
+                and hidden_states.is_contiguous()
+                and residual.dim() == 2
+                and residual.is_contiguous()
+                and hidden_states.shape == residual.shape
+                and hidden_states.shape[0] <= _GEMMA4_FUSED_RMSNORM_FP4_MAX_TOKENS
+            )
+            if use_fused_pre_feedforward_fp4:
                 hidden_states, residual = (
                     self.pre_feedforward_layernorm.forward_cuda_fp4_quantized(
                         hidden_states,
