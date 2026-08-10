@@ -68,7 +68,6 @@ __global__ void fused_add_rmsnorm_fp4_quant_kernel(const __grid_constant__ Fused
   const bool is_active = vector_column < vectors_per_row;
 
   NormVector summed;
-  NormVector weight;
   float2 square_sum = make_float2(0.0f, 0.0f);
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -76,7 +75,6 @@ __global__ void fused_add_rmsnorm_fp4_quant_kernel(const __grid_constant__ Fused
     const uint64_t vector_offset = static_cast<uint64_t>(token_id) * vectors_per_row + vector_column;
     const NormVector input = reinterpret_cast<const NormVector*>(params.input)[vector_offset];
     const NormVector residual = reinterpret_cast<const NormVector*>(params.residual)[vector_offset];
-    weight = reinterpret_cast<const NormVector*>(params.weight)[vector_column];
 
 #pragma unroll
     for (uint32_t index = 0; index < kPackedPairsPerVector; ++index) {
@@ -107,6 +105,7 @@ __global__ void fused_add_rmsnorm_fp4_quant_kernel(const __grid_constant__ Fused
 
   if (is_active) {
     const float inverse_rms = reduction_buffer[threadIdx.x / 32];
+    const NormVector weight = reinterpret_cast<const NormVector*>(params.weight)[vector_column];
     QuantVector normalized;
 #pragma unroll
     for (uint32_t index = 0; index < kPackedPairsPerVector; ++index) {
