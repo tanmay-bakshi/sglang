@@ -1,6 +1,6 @@
-#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -16,17 +16,9 @@ namespace {
 
 constexpr uint32_t kThreadsPerBlock = 256;
 constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / device::kWarpThreads;
-
-__device__ __forceinline__ float
-rotate_neox_exact(float value, float paired, float cosine, float sine, uint32_t lane_id) {
-  if (lane_id < device::kWarpThreads / 2) {
-    return fmaf(value, cosine, -paired * sine);
-  }
-
-  // The incumbent's second half is x * sin + y * cos. Its product/FMA order
-  // determines sparse BF16 ties, even though real-number addition commutes.
-  return fmaf(paired, sine, value * cosine);
-}
+constexpr uint32_t kWarpsPerHead = 4;
+constexpr uint32_t kThreadsPerHead = kWarpsPerHead * device::kWarpThreads;
+constexpr uint32_t kHeadsPerBlock = kThreadsPerBlock / kThreadsPerHead;
 
 struct Gemma4QKVNormRopeParams {
   bf16_t* __restrict__ qkv;
@@ -46,18 +38,18 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
   using namespace device;
 
   static_assert(kHeadDim == 256, "Gemma 4 specialization requires head_dim=256");
-  static_assert(kHeadDim % kWarpThreads == 0, "head_dim must be divisible by warp size");
+  static_assert(kHeadDim == 2 * kThreadsPerHead, "each reduction thread must own one BF16 pair");
 
-  constexpr uint32_t kElementsPerThread = kHeadDim / kWarpThreads;
-  constexpr uint32_t kPackedElementsPerThread = kElementsPerThread / 2;
   constexpr uint32_t kHalfHeadDim = kHeadDim / 2;
-  constexpr uint32_t kHeadPairsPerWarp = kWarpThreads / 2;
   using Packed = packed_t<bf16_t>;
-  using Storage = AlignedVector<Packed, kPackedElementsPerThread>;
-  __shared__ float transposed_rope_cache[kHeadDim];
+  __shared__ float rope_cache[kHeadDim];
+  __shared__ float warp_sums[kHeadsPerBlock][kWarpsPerHead];
+  __shared__ Packed normalized_pairs[kHeadsPerBlock][kThreadsPerHead];
 
-  const uint32_t lane_id = threadIdx.x % kWarpThreads;
-  const uint32_t warp_id = threadIdx.x / kWarpThreads;
+  const uint32_t head_group = threadIdx.x / kThreadsPerHead;
+  const uint32_t head_thread = threadIdx.x % kThreadsPerHead;
+  const uint32_t warp_in_head = head_thread / kWarpThreads;
+  const uint32_t lane_id = head_thread % kWarpThreads;
   const uint32_t heads_per_token = params.num_q_heads + 2 * params.num_kv_heads;
   const uint32_t rope_head_count = params.num_q_heads + params.num_kv_heads;
 
@@ -66,77 +58,71 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
   for (uint32_t token_id = blockIdx.x; token_id < params.num_tokens; token_id += gridDim.x) {
     const auto position = static_cast<int64_t>(static_cast<const PositionType*>(params.positions)[token_id]);
     const float* source_cache = params.cos_sin_cache + position * kHeadDim;
-    const uint32_t source_index = threadIdx.x;
-    const uint32_t cache_half = source_index / kHalfHeadDim;
-    const uint32_t frequency_index = source_index % kHalfHeadDim;
-    const uint32_t pair_lane = frequency_index / kElementsPerThread;
-    const uint32_t element_index = frequency_index % kElementsPerThread;
-    const uint32_t transposed_index =
-        cache_half * kHalfHeadDim + element_index * kHeadPairsPerWarp + pair_lane;
-    transposed_rope_cache[transposed_index] = source_cache[source_index];
+    rope_cache[threadIdx.x] = source_cache[threadIdx.x];
     __syncthreads();
 
-    for (uint32_t head_id = warp_id; head_id < heads_per_token; head_id += kWarpsPerBlock) {
+    for (uint32_t head_id = head_group; head_id < heads_per_token; head_id += kHeadsPerBlock) {
       const bool is_q = head_id < params.num_q_heads;
       const bool is_k = head_id >= params.num_q_heads && head_id < rope_head_count;
       const bool apply_rope = is_q || is_k;
 
       bf16_t* input = params.qkv + token_id * params.token_stride + head_id * kHeadDim;
       const bf16_t* weight = is_q ? params.q_weight : params.k_weight;
-      auto input_vector = load_as<Storage>(input, lane_id);
-
-      float elements[kElementsPerThread];
-      float sum_of_squares = 0.0f;
+      const auto input_pair = load_as<Packed>(input, head_thread);
+      const auto [x0, x1] = cast<fp32x2_t>(input_pair);
+      float sum_of_squares = fmaf(x0, x0, x1 * x1);
 
 #pragma unroll
-      for (uint32_t packed_index = 0; packed_index < kPackedElementsPerThread; ++packed_index) {
-        const auto [x0, x1] = cast<fp32x2_t>(input_vector[packed_index]);
-        elements[2 * packed_index] = x0;
-        elements[2 * packed_index + 1] = x1;
-        sum_of_squares += x0 * x0 + x1 * x1;
+      for (uint32_t offset = kWarpThreads / 2; offset > 0; offset /= 2) {
+        sum_of_squares += __shfl_xor_sync(0xffffffffu, sum_of_squares, offset);
       }
 
-      sum_of_squares = warp::reduce_sum(sum_of_squares);
-      const float inverse_rms = math::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + params.eps);
+      if (lane_id == 0) {
+        warp_sums[head_group][warp_in_head] = sum_of_squares;
+      }
+      __syncthreads();
+
+      if (warp_in_head == 0) {
+        float head_sum = lane_id < kWarpsPerHead ? warp_sums[head_group][lane_id] : 0.0f;
+        head_sum += __shfl_xor_sync(0xffffffffu, head_sum, 2);
+        head_sum += __shfl_xor_sync(0xffffffffu, head_sum, 1);
+        if (lane_id == 0) {
+          warp_sums[head_group][0] = head_sum;
+        }
+      }
+      __syncthreads();
+
+      const float inverse_rms =
+          math::rsqrt(fmaf(warp_sums[head_group][0], 1.0f / static_cast<float>(kHeadDim), params.eps));
+      Packed normalized_pair;
 
       if (apply_rope) {
-        const auto weight_vector = load_as<Storage>(weight, lane_id);
-#pragma unroll
-        for (uint32_t packed_index = 0; packed_index < kPackedElementsPerThread; ++packed_index) {
-          const auto [w0, w1] = cast<fp32x2_t>(weight_vector[packed_index]);
-          input_vector[packed_index] = cast<Packed, fp32x2_t>(
-              {elements[2 * packed_index] * inverse_rms * w0,
-               elements[2 * packed_index + 1] * inverse_rms * w1});
-          const auto [rounded0, rounded1] = cast<fp32x2_t>(input_vector[packed_index]);
-          elements[2 * packed_index] = rounded0;
-          elements[2 * packed_index + 1] = rounded1;
-        }
-
-#pragma unroll
-        for (uint32_t element_index = 0; element_index < kElementsPerThread; ++element_index) {
-          const float paired = __shfl_xor_sync(0xffffffffu, elements[element_index], kWarpThreads / 2);
-          const uint32_t pair_lane = lane_id % kHeadPairsPerWarp;
-          const uint32_t cache_index = element_index * kHeadPairsPerWarp + pair_lane;
-          const float cosine = transposed_rope_cache[cache_index];
-          const float sine = transposed_rope_cache[kHalfHeadDim + cache_index];
-          elements[element_index] = rotate_neox_exact(elements[element_index], paired, cosine, sine, lane_id);
-        }
-
-#pragma unroll
-        for (uint32_t packed_index = 0; packed_index < kPackedElementsPerThread; ++packed_index) {
-          input_vector[packed_index] = cast<Packed, fp32x2_t>(
-              {elements[2 * packed_index], elements[2 * packed_index + 1]});
-        }
+        const auto [w0, w1] = cast<fp32x2_t>(load_as<Packed>(weight, head_thread));
+        normalized_pair = cast<Packed, fp32x2_t>({x0 * inverse_rms * w0, x1 * inverse_rms * w1});
       } else {
-#pragma unroll
-        for (uint32_t packed_index = 0; packed_index < kPackedElementsPerThread; ++packed_index) {
-          input_vector[packed_index] = cast<Packed, fp32x2_t>(
-              {elements[2 * packed_index] * inverse_rms,
-               elements[2 * packed_index + 1] * inverse_rms});
-        }
+        normalized_pair = cast<Packed, fp32x2_t>({x0 * inverse_rms, x1 * inverse_rms});
       }
 
-      store_as<Storage>(input, input_vector, lane_id);
+      normalized_pairs[head_group][head_thread] = normalized_pair;
+      __syncthreads();
+
+      if (apply_rope) {
+        const auto [value0, value1] = cast<fp32x2_t>(normalized_pair);
+        const auto [paired0, paired1] =
+            cast<fp32x2_t>(normalized_pairs[head_group][head_thread ^ (kThreadsPerHead / 2)]);
+        const uint32_t frequency_pair = (head_thread % (kThreadsPerHead / 2)) * 2;
+        const float cosine0 = rope_cache[frequency_pair];
+        const float cosine1 = rope_cache[frequency_pair + 1];
+        const float sine0 = rope_cache[kHalfHeadDim + frequency_pair];
+        const float sine1 = rope_cache[kHalfHeadDim + frequency_pair + 1];
+        const float rotated0 = head_thread < kThreadsPerHead / 2 ? -paired0 : paired0;
+        const float rotated1 = head_thread < kThreadsPerHead / 2 ? -paired1 : paired1;
+        normalized_pair =
+            cast<Packed, fp32x2_t>({value0 * cosine0 + rotated0 * sine0, value1 * cosine1 + rotated1 * sine1});
+      }
+
+      store_as<Packed>(input, normalized_pair, head_thread);
+      __syncthreads();
     }
 
     __syncthreads();
@@ -180,11 +166,7 @@ void gemma4_qkv_norm_rope(
       .with_dtype<fp32_t>()
       .with_device(device)
       .verify(cos_sin_cache);
-  TensorMatcher({num_tokens})
-      .with_strides({1})
-      .with_dtype<PositionType>()
-      .with_device(device)
-      .verify(positions);
+  TensorMatcher({num_tokens}).with_strides({1}).with_dtype<PositionType>().with_device(device).verify(positions);
 
   RuntimeCheck(num_q_heads > 0, "num_q_heads must be positive");
   RuntimeCheck(num_kv_heads > 0, "num_kv_heads must be positive");
