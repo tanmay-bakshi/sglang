@@ -312,7 +312,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     :param argv: Optional command-line arguments.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tp", default="1,2,4")
+    parser.add_argument("--tp", default="1,2,4,8")
     parser.add_argument("--tokens", default="1,8,1024,8192")
     parser.add_argument("--repeats", type=int, default=100)
     args = parser.parse_args(argv)

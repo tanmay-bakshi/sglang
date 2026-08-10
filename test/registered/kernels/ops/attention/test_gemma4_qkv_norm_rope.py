@@ -66,7 +66,7 @@ def _mismatch_summary(
     return f"Q={counts[0]}, K={counts[1]}, V={counts[2]}"
 
 
-@pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4])
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("token_count", [1, 1024])
 @pytest.mark.parametrize("rope_type", ["sliding", "proportional"])
 @torch.inference_mode()
