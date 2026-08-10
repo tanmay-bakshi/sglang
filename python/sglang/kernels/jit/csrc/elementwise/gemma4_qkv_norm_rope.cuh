@@ -17,6 +17,17 @@ namespace {
 constexpr uint32_t kThreadsPerBlock = 256;
 constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / device::kWarpThreads;
 
+__device__ __forceinline__ float
+rotate_neox_exact(float value, float paired, float cosine, float sine, uint32_t lane_id) {
+  if (lane_id < device::kWarpThreads / 2) {
+    return fmaf(value, cosine, -paired * sine);
+  }
+
+  // The incumbent's second half is x * sin + y * cos. Its product/FMA order
+  // determines sparse BF16 ties, even though real-number addition commutes.
+  return fmaf(paired, sine, value * cosine);
+}
+
 struct Gemma4QKVNormRopeParams {
   bf16_t* __restrict__ qkv;
   const bf16_t* __restrict__ q_weight;
@@ -104,12 +115,11 @@ __global__ void gemma4_qkv_norm_rope_kernel(const Gemma4QKVNormRopeParams __grid
 #pragma unroll
         for (uint32_t element_index = 0; element_index < kElementsPerThread; ++element_index) {
           const float paired = __shfl_xor_sync(0xffffffffu, elements[element_index], kWarpThreads / 2);
-          const float rotated = lane_id < kWarpThreads / 2 ? -paired : paired;
           const uint32_t pair_lane = lane_id % kHeadPairsPerWarp;
           const uint32_t cache_index = element_index * kHeadPairsPerWarp + pair_lane;
           const float cosine = transposed_rope_cache[cache_index];
           const float sine = transposed_rope_cache[kHalfHeadDim + cache_index];
-          elements[element_index] = elements[element_index] * cosine + rotated * sine;
+          elements[element_index] = rotate_neox_exact(elements[element_index], paired, cosine, sine, lane_id);
         }
 
 #pragma unroll
