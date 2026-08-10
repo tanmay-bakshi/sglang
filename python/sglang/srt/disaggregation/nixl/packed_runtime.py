@@ -14,6 +14,7 @@ from typing import Any, Protocol
 import numpy as np
 import numpy.typing as npt
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -84,6 +85,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     build_decode_spec,
     build_nixl_ucx_lane_identifier,
     build_prefill_chunk,
+    writer_layout_for,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
@@ -616,6 +618,9 @@ class _PackedPrefillTransferStats:
 
     :ivar room_id: Decoder-minted bootstrap room.
     :ivar source_rank: Source attention tensor-parallel rank.
+    :ivar copy_group_count: Source component-entry groups carrying payload.
+    :ivar payload_bytes: Logical KV bytes gathered from source tensors.
+    :ivar transport_bytes: Bytes submitted through the physical transport.
     :ivar ready_wait_duration_ms: PREPARE-to-READY wall time.
     :ivar source_gather_copy_duration_ms: Synchronous source gather wall time.
     :ivar main_transport_duration_ms: Posted NIXL transfer-to-receipt wall time.
@@ -623,6 +628,9 @@ class _PackedPrefillTransferStats:
 
     room_id: int
     source_rank: int
+    copy_group_count: int
+    payload_bytes: int
+    transport_bytes: int
     ready_wait_duration_ms: float
     source_gather_copy_duration_ms: float
     main_transport_duration_ms: float
@@ -636,6 +644,9 @@ class _PackedPrefillTransferStats:
         return (
             f"PackedTransferStats(room={self.room_id}, role=prefill, "
             f"source_rank={self.source_rank}, "
+            f"copy_group_count={self.copy_group_count}, "
+            f"payload_bytes={self.payload_bytes}, "
+            f"transport_bytes={self.transport_bytes}, "
             f"ready_wait_duration={self.ready_wait_duration_ms:.3f}ms, "
             "source_gather_copy_duration="
             f"{self.source_gather_copy_duration_ms:.3f}ms, "
@@ -1083,10 +1094,12 @@ class PackedPrefillRuntime:
         ready_wait_duration_ms = record.ready_wait_duration_ms
         source_gather_copy_duration_ms = record.source_gather_copy_duration_ms
         main_transport_duration_ms = record.main_transport_duration_ms
+        source_transfer = record.source_transfer
         if (
             ready_wait_duration_ms is None
             or source_gather_copy_duration_ms is None
             or main_transport_duration_ms is None
+            or source_transfer is None
         ):
             logger.error(
                 "PackedTransferStatsUnavailable(room=%d, role=prefill, source_rank=%d)",
@@ -1094,11 +1107,20 @@ class PackedPrefillRuntime:
                 record.writer_id.source_attn_tp_rank,
             )
             return
+        writer_layout = writer_layout_for(
+            source_transfer.layout,
+            record.writer_id,
+        )
         logger.info(
             "%s",
             _PackedPrefillTransferStats(
                 room_id=record.chunk_key.room_id,
                 source_rank=record.writer_id.source_attn_tp_rank,
+                copy_group_count=len(writer_layout.copy_groups),
+                payload_bytes=sum(
+                    group.length_bytes for group in writer_layout.copy_groups
+                ),
+                transport_bytes=source_transfer.length_bytes,
                 ready_wait_duration_ms=ready_wait_duration_ms,
                 source_gather_copy_duration_ms=source_gather_copy_duration_ms,
                 main_transport_duration_ms=main_transport_duration_ms,

@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -32,8 +33,11 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedWriterVisibilityEvidence,
 )
 from sglang.srt.disaggregation.common.staging_layout import (
+    StagingComponentGeometry,
     StagingComponentId,
+    StagingComponentSpan,
     StagingWriterId,
+    build_staging_chunk_layout,
 )
 from sglang.srt.disaggregation.nixl import packed_runtime as runtime_module
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -54,6 +58,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedNixlRuntimeArtifactIdentity,
     PackedNixlRuntimeRoot,
     PackedPeerIdentity,
+    PackedSourceTransfer,
     build_prefill_chunk,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
@@ -1212,7 +1217,43 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
         chunk_key=chunk_key,
     )
     runtime._records[plan.key] = record
-    source_transfer = object()
+    component_id = StagingComponentId(None, None)
+    geometry = StagingComponentGeometry(
+        component_id=component_id,
+        item_lens=(2048, 1024),
+        layer_ids=(0, 1),
+        page_size=1,
+    )
+    layout = build_staging_chunk_layout(
+        chunk_id=0,
+        is_last=True,
+        spans=(
+            StagingComponentSpan(
+                component_id=component_id,
+                source_index_offset=0,
+                destination_index_offset=0,
+                logical_token_count=1,
+                physical_token_count=1,
+            ),
+        ),
+        source_components=(geometry,),
+        destination_components=(geometry,),
+        source_tp_size=2,
+        destination_tp_size=2,
+        destination_tp_rank=0,
+        writers=(_writer(),),
+        alignment_bytes=4096,
+    )
+    source_transfer = PackedSourceTransfer(
+        key=chunk_key,
+        destination=Mock(),
+        layout=layout,
+        writer_id=_writer(),
+        source_binding=Mock(),
+        lease_id=9,
+        destination_address=0x400000,
+        length_bytes=layout.writers[0].length_bytes,
+    )
     runtime._ready = _ReadyCoordinator(source_transfer)
     ready = PackedReady(
         key=chunk_key,
@@ -1290,6 +1331,7 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     assert plan.key not in runtime._records
     assert (
         "PackedTransferStats(room=41, role=prefill, source_rank=0, "
+        "copy_group_count=2, payload_bytes=3072, transport_bytes=8192, "
         "ready_wait_duration=11.000ms, "
         "source_gather_copy_duration=5.000ms, "
         "main_transport_duration=19.000ms)"
