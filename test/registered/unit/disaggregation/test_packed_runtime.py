@@ -982,7 +982,7 @@ def test_control_envelope_round_trips_generation_bound_ready() -> None:
     )
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_prefill_capability_binds_supported_source_runtime_and_topology(
     source_tp_size: int,
 ) -> None:
@@ -1017,7 +1017,7 @@ def test_prefill_capability_binds_supported_source_runtime_and_topology(
     assert capability.request_generation == b"r" * 16
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
     source_tp_size: int,
 ) -> None:

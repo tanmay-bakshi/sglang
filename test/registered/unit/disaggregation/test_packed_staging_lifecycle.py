@@ -520,7 +520,7 @@ class LifecycleHarness:
         )
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_manifest_and_completion_require_every_tp_writer(
     source_tp_size: int,
 ) -> None:
@@ -1062,7 +1062,7 @@ def test_scatter_completion_receipts_are_one_shot_and_cross_bound() -> None:
         harness.scatter.accept_completion(inflight[0], first_receipt)
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_teardown_waits_for_every_exact_authenticated_ack(
     source_tp_size: int,
 ) -> None:

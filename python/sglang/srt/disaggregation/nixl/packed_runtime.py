@@ -1472,7 +1472,7 @@ class PackedDecodeRuntime:
 
         # Process advertisement omits request topology. This reflexive route
         # extracts only arena-owned fields; the authenticated source rebuilds
-        # the exact TP1/TP2/TP4 request capability before transfer.
+        # the exact supported source-TP request capability before transfer.
         topology = PackedTopology(
             source_tp_size=self._manager.attn_tp_size,
             destination_tp_size=self._manager.attn_tp_size,

@@ -1052,7 +1052,7 @@ def test_decode_rebuilds_supported_source_layouts(
     assert decode_spec.build() == source_spec.build()
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
     source_tp_size: int,
 ) -> None:

@@ -232,7 +232,7 @@ def _alter_digest(digest: bytes) -> bytes:
     return bytes((digest[0] ^ 1,)) + digest[1:]
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_tp_manifest_and_component_participation_are_exact(
     source_tp_size: int,
 ) -> None:

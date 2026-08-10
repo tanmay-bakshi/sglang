@@ -3,7 +3,7 @@ from typing import Literal
 
 KvTransferProtocol = Literal["packed-v4"]
 PreparedGrantProtocol = Literal["control-v1"]
-SUPPORTED_PACKED_SOURCE_TP_SIZES: tuple[int, ...] = (1, 2, 4)
+SUPPORTED_PACKED_SOURCE_TP_SIZES: tuple[int, ...] = (1, 2, 4, 8)
 
 PD_RUNTIME_CAPABILITIES_FIELD = "pd_runtime_capabilities"
 _KV_DTYPE_ALIASES = {
