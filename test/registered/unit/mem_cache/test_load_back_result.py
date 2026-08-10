@@ -1,4 +1,4 @@
-"""Tests for the explicit cache load-back result contract."""
+"""Tests for the explicit cache load-back ticket contract."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,22 +8,38 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
+    LoadBackTicketState,
 )
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestLoadBackResult(unittest.TestCase):
+class TestLoadBackTicket(unittest.TestCase):
     """Validates transfer state independently of the full-index tensor."""
 
-    def test_all_fields_are_required(self) -> None:
-        with self.assertRaises(TypeError):
-            LoadBackResult(  # type: ignore[call-arg]
-                new_full_device_indices=torch.empty(0, dtype=torch.int64),
-                restored_node=object(),
-                queued_any_component=False,
-            )
+    def test_default_ticket_owns_no_copy_and_is_prepared(self) -> None:
+        ticket = LoadBackTicket(
+            new_full_device_indices=torch.empty(0, dtype=torch.int64),
+            restored_node=object(),
+        )
+
+        self.assertFalse(ticket.queued_any_component)
+        self.assertEqual(ticket.state, LoadBackTicketState.PREPARED)
+        self.assertFalse(ticket.owns_restored_lock)
+
+    def test_sidecar_only_ticket_reports_controller_work(self) -> None:
+        ticket = LoadBackTicket(
+            new_full_device_indices=torch.empty(0, dtype=torch.int64),
+            restored_node=object(),
+            queued_sidecars=frozenset({PoolName.INDEXER}),
+        )
+
+        self.assertTrue(ticket.queued_any_component)
 
     def test_hiradix_success_reports_async_full_transfer(self) -> None:
         node = SimpleNamespace(evicted=True, id=17)

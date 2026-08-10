@@ -85,6 +85,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -890,6 +891,7 @@ class Req(ReqDllmMixin):
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
+        self.last_node_lock_params: DecLockRefParams | None = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
@@ -1518,6 +1520,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
+        self.last_node_lock_params = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None

@@ -779,16 +779,28 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
-    def start_loading(self) -> int:
-        if len(self.load_queue) == 0:
+    def start_loading(self, *, force_empty: bool = False) -> int:
+        """Start one load generation, optionally with no rank-local copy.
+
+        :param force_empty: Advance the layer counter for TP alignment when this
+            rank has no controller work.
+        :returns: Producer index, or ``-1`` when no generation was requested.
+        """
+
+        if len(self.load_queue) == 0 and not force_empty:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
+        op = (
+            CacheOperation.merge_ops(self.load_queue)
+            if len(self.load_queue) > 0
+            else None
         )
-        self.load_queue.clear()
+        if op is not None:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
+            self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -798,37 +810,36 @@ class HiCacheController:
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+                if op is not None:
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
                         host_indices,
                         device_indices,
                         i,
                         self.io_backend,
                     )
+                    if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
                 producer_event.complete(i)
             ack_finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            if op is not None:
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=ack_start_event,
                 finish_event=ack_finish_event,
-                node_ids=op.node_ids,
-                num_tokens=len(op.device_indices),
+                node_ids=op.node_ids if op is not None else [],
+                num_tokens=len(op.device_indices) if op is not None else 0,
                 timing_enabled=timing_enabled,
             )
         )

@@ -824,6 +824,41 @@ class SWAComponent(TreeComponent):
             )
             return
 
+    def rollback_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        """Restore SWA tombstones after a rejected load publication.
+
+        :param node: Deepest node covered by the load-back.
+        :param phase: Transfer direction being rolled back.
+        :param transfers: SWA transfer descriptors used for publication.
+        """
+
+        if phase != CacheTransferPhase.LOAD_BACK or len(transfers) == 0:
+            return
+
+        transfer = transfers[0]
+        device_lru = self.tree_core.lru_lists[self.component_type]
+        host_lru = self.tree_core.host_lru_lists[self.component_type]
+        for node_id in reversed(transfer.nodes_to_load or ()):
+            loaded_node = self.tree_core.node_by_id(node_id)
+            component_data = loaded_node.component_data[self.component_type]
+            if component_data.value is None:
+                continue
+            if device_lru.in_list(loaded_node):
+                device_lru.remove_node(loaded_node)
+            self.tree_core.component_evictable_size_[self.component_type] -= len(
+                component_data.value
+            )
+            component_data.value = None
+            if component_data.host_value is not None and not host_lru.in_list(
+                loaded_node
+            ):
+                host_lru.insert_mru(loaded_node)
+
     def _release_swa_host(
         self,
         host_indices: torch.Tensor,

@@ -1676,9 +1676,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_indices: torch.Tensor,
         kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        *,
+        record_events: bool = True,
     ) -> list[CacheAction | ComponentAction]:
-        """Commit a successful H->D load-back onto the node; the SWA full->swa mapping
-        rebuild is deferred to the orchestration layer."""
+        """Publish an H->D load-back onto the tree.
+
+        The SWA full-to-SWA mapping is emitted as a cache action. Event
+        emission can be deferred until tensor-parallel publication agreement.
+
+        :param node_id: Deepest cache node restored to device residency.
+        :param device_indices: Full-attention device allocation.
+        :param kv_xfer: Full-attention transfer descriptor.
+        :param comp_xfers: Auxiliary component transfer descriptors.
+        :param record_events: Whether to emit device-store events immediately.
+        :returns: Deferred cache actions produced by component publication.
+        """
+
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
         kv_xfer.device_indices = device_indices
@@ -1688,9 +1701,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             [kv_xfer],
             cache_actions=cache_actions,
         )
-        for nid in kv_xfer.nodes_to_load or ():
-            loaded = self.node_by_id(nid)
-            self._record_store_event(loaded, medium=StorageMedium.GPU)
+        if record_events:
+            self.record_load_back_events(kv_xfer)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
@@ -1700,6 +1712,45 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         self._update_evictable_leaf_sets(node)
         return cache_actions
+
+    def record_load_back_events(self, kv_xfer: PoolTransfer) -> None:
+        """Emit device placement events for a globally accepted load-back.
+
+        :param kv_xfer: Full-attention transfer descriptor that was published.
+        """
+
+        for node_id in kv_xfer.nodes_to_load or ():
+            self._record_store_event(
+                self.node_by_id(node_id),
+                medium=StorageMedium.GPU,
+            )
+
+    def rollback_load_back(
+        self,
+        node_id: NodeId,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> None:
+        """Undo tree publication before an H->D generation starts.
+
+        :param node_id: Deepest cache node covered by the publication.
+        :param kv_xfer: Full-attention transfer descriptor used for publication.
+        :param comp_xfers: Auxiliary component transfer descriptors.
+        """
+
+        node = self.node_by_id(node_id)
+        for component_type, transfers in reversed(tuple(comp_xfers.items())):
+            self.components_by_type[component_type].rollback_hicache_transfer(
+                node,
+                CacheTransferPhase.LOAD_BACK,
+                transfers,
+            )
+        self.components_by_type[BASE_COMPONENT_TYPE].rollback_hicache_transfer(
+            node,
+            CacheTransferPhase.LOAD_BACK,
+            [kv_xfer],
+        )
+        self._update_evictable_leaf_sets(node)
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:
         """Mark a node as having an in-flight write-through backup."""

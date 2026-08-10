@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
+
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
@@ -13,6 +14,7 @@ from sglang.srt.disaggregation.decode_reservations import (
     DecodeReservationAdmissionRefused,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -132,6 +134,7 @@ class TestDecodePrefixRestoreIntent(unittest.TestCase):
         self.assertEqual(prefix_match.swa_host_hit_length, 33)
         self.assertEqual(prefix_match.mamba_host_hit_length, 1)
         self.assertEqual(prefix_match.page_size, 16)
+        self.assertEqual(prefix_match.restore_budget.mamba_slots, 2)
 
     def test_swa_host_hit_requires_restore_when_full_prefix_is_on_device(self) -> None:
         prefix_match = DecodePrefixMatch(
@@ -187,22 +190,22 @@ class TestDecodeRestoreAdmission(unittest.TestCase):
                 SimpleNamespace(
                     prefix_match=pending,
                     hicache_restore_status=HiCacheRestoreResult.PENDING,
-                    hicache_restored_node=None,
+                    hicache_load_back_ticket=None,
                 ),
                 SimpleNamespace(
                     prefix_match=swa_only,
                     hicache_restore_status=HiCacheRestoreResult.PENDING,
-                    hicache_restored_node=None,
+                    hicache_load_back_ticket=None,
                 ),
                 SimpleNamespace(
                     prefix_match=pending,
                     hicache_restore_status=HiCacheRestoreResult.PENDING,
-                    hicache_restored_node=object(),
+                    hicache_load_back_ticket=object(),
                 ),
                 SimpleNamespace(
                     prefix_match=pending,
                     hicache_restore_status=HiCacheRestoreResult.READY,
-                    hicache_restored_node=None,
+                    hicache_load_back_ticket=None,
                 ),
             ]
         )
@@ -306,6 +309,7 @@ class TestDecodeRestoreAdmission(unittest.TestCase):
             origin_input_ids=list(range(8)),
             output_ids=[1],
             last_node=last_device_node,
+            last_node_lock_params=DecLockRefParams(swa_uuid_for_lock=17),
             finished_reason=None,
             cache_protected_len=0,
             sampling_params=SimpleNamespace(max_new_tokens=0),
@@ -327,6 +331,7 @@ class TestDecodeRestoreAdmission(unittest.TestCase):
                 last_device_node=last_device_node,
                 swa_host_hit_length=4,
                 page_size=1,
+                last_device_lock_params=request.last_node_lock_params,
             )
         )
         queue._pre_alloc = MagicMock(
@@ -346,7 +351,10 @@ class TestDecodeRestoreAdmission(unittest.TestCase):
         self.assertEqual(queue.pop_preallocated(), ([], []))
 
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(last_device_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            last_device_node,
+            DecLockRefParams(swa_uuid_for_lock=17),
+        )
 
     def test_reservation_admission_uses_asymmetric_page_one_capacity(self) -> None:
         cases = (

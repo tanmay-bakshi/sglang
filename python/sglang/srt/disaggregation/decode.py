@@ -103,7 +103,11 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation_pin import RequestSlotPinOwner
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    LoadBackTicket,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -226,9 +230,9 @@ class DecodeReqToTokenPool(RequestSlotPinOwner):
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert len(reusing) <= 1, (
-            "only one chunked request may reuse req_pool_idx in a batch"
-        )
+        assert (
+            len(reusing) <= 1
+        ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -341,9 +345,7 @@ class DecodeRequest:
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
-    hicache_restored_kv_indices: Optional[torch.Tensor] = None
-    hicache_restored_node: Any = None
-    hicache_load_consumer_index: int = -1
+    hicache_load_back_ticket: LoadBackTicket | None = None
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
@@ -1621,8 +1623,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_match = decode_req.prefix_match
         if prefix_match is None:
             return
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
-        decode_req.req.last_node = None
+        self._release_matched_prefix_lock(decode_req.req, prefix_match)
+
+    def _release_matched_prefix_lock(
+        self,
+        req: Req,
+        prefix_match: DecodePrefixMatch,
+    ) -> None:
+        """Release one decoder match using its acquisition receipt.
+
+        :param req: Request whose match fields name the locked node.
+        :param prefix_match: Exact match that owns the tree lock.
+        """
+
+        if prefix_match.last_device_lock_params is None:
+            raise RuntimeError("Prepared HiCache match has no exact lock ownership")
+        self.tree_cache.dec_lock_ref(
+            prefix_match.last_device_node,
+            prefix_match.last_device_lock_params,
+        )
+        prefix_match.last_device_lock_params = None
+        req.last_node = None
+        req.last_node_lock_params = None
 
     def _quarantine_preallocated_record_locked(
         self,
@@ -1756,7 +1778,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 for decode_req in record.decode_reqs
                 if decode_req.prefix_match is not None
                 and decode_req.hicache_restore_status is HiCacheRestoreResult.PENDING
-                and decode_req.hicache_restored_node is None
+                and decode_req.hicache_load_back_ticket is None
             )
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
@@ -1772,16 +1794,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
-        self.tree_cache.inc_lock_ref(result.last_device_node)
+        lock_params = self.tree_cache.inc_lock_ref(
+            result.last_device_node
+        ).to_dec_params()
         try:
-            return self._build_decode_prefix_match(req, result)
+            prefix_match = self._build_decode_prefix_match(req, result)
+            prefix_match.last_device_lock_params = lock_params
+            req.last_node_lock_params = lock_params
+            return prefix_match
         except Exception:  # noqa: BLE001
             logger.error(
                 "Decoder prefix-match construction failed for %s:\n%s",
                 req.rid,
                 traceback.format_exc(),
             )
-            self.tree_cache.dec_lock_ref(result.last_device_node)
+            self.tree_cache.dec_lock_ref(result.last_device_node, lock_params)
             raise
 
     def _match_preallocated_prefix_and_lock(
@@ -2437,11 +2464,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 > full_allocatable_tokens
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_matched_prefix_lock(decode_req.req, prefix_match)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_matched_prefix_lock(decode_req.req, prefix_match)
                 break
 
             if uses_swa_tail_prealloc:
@@ -2459,14 +2486,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     > swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                        self._release_matched_prefix_lock(
+                            decode_req.req,
+                            prefix_match,
+                        )
                     break
 
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
                 if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._release_matched_prefix_lock(decode_req.req, prefix_match)
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
@@ -3291,9 +3321,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -3943,9 +3973,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

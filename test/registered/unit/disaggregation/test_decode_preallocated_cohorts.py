@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
     DecodeAllocationLeaseError,
@@ -27,8 +28,10 @@ from sglang.srt.disaggregation.decode import (
     DecodeRequest,
     _DecodeMetadataSubmission,
 )
-from sglang.srt.disaggregation.decode_hicache_mixin import DecodeRestoreBudget
-from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodePrefixMatch,
+    DecodeRestoreBudget,
+)
 from sglang.srt.disaggregation.decode_reservations import (
     DecodeReservationAdmissionRefused,
     DecodeReservationAttempt,
@@ -41,6 +44,7 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 )
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -498,6 +502,7 @@ def _request(child_id: uuid.UUID, *, prompt_tokens: int = 8) -> Req:
     req.time_stats = MagicMock()
     req.extra_key = None
     req.last_node = None
+    req.last_node_lock_params = None
     req.last_host_node = None
     req.best_match_node = None
     req.host_hit_length = 0
@@ -631,8 +636,10 @@ def _queue_fixture(
         :returns: Reservation-owned root match.
         """
 
+        lock_params = DecLockRefParams()
         req.prefix_indices = torch.empty((0,), dtype=torch.int64)
         req.last_node = root_node
+        req.last_node_lock_params = lock_params
         req.last_host_node = root_node
         req.best_match_node = root_node
         return DecodePrefixMatch(
@@ -640,6 +647,7 @@ def _queue_fixture(
             l2_host_hit_length=0,
             l3_storage_hit_length=0,
             last_device_node=root_node,
+            last_device_lock_params=lock_params,
         )
 
     queue._match_preallocated_prefix_and_lock = MagicMock(side_effect=match_prefix)
@@ -1355,11 +1363,13 @@ def test_prepared_l1_repeat_reuses_locked_prefix_through_publication(
         l2_host_hit_length=0,
         l3_storage_hit_length=0,
         last_device_node=last_node,
+        last_device_lock_params=DecLockRefParams(),
     )
 
     def match(req: Req) -> DecodePrefixMatch:
         req.prefix_indices = prefix_match.prefix_indices
         req.last_node = last_node
+        req.last_node_lock_params = prefix_match.last_device_lock_params
         return prefix_match
 
     fixture.queue._match_preallocated_prefix_and_lock = MagicMock(side_effect=match)
@@ -1421,11 +1431,13 @@ def test_prepared_l2_restore_retains_restore_gap_without_transfer_ownership(
         l3_storage_hit_length=0,
         last_device_node=last_node,
         swa_host_hit_length=2,
+        last_device_lock_params=DecLockRefParams(),
     )
 
     def match(req: Req) -> DecodePrefixMatch:
         req.prefix_indices = prefix_match.prefix_indices
         req.last_node = last_node
+        req.last_node_lock_params = prefix_match.last_device_lock_params
         return prefix_match
 
     fixture.queue._match_preallocated_prefix_and_lock = MagicMock(side_effect=match)
@@ -1487,17 +1499,20 @@ def test_prepared_prefetch_rollback_releases_each_owner_once(
     fixture.queue.scheduler.enable_decode_hicache = True
     child_id = uuid.uuid4()
     request = _request(child_id)
+    lock_params = DecLockRefParams()
     prefix_match = DecodePrefixMatch(
         prefix_indices=torch.arange(4, dtype=torch.int64),
         l2_host_hit_length=0,
         l3_storage_hit_length=2,
         last_device_node=object(),
         last_host_node=object(),
+        last_device_lock_params=lock_params,
     )
 
     def match(req: Req) -> DecodePrefixMatch:
         req.prefix_indices = prefix_match.prefix_indices
         req.last_node = prefix_match.last_device_node
+        req.last_node_lock_params = prefix_match.last_device_lock_params
         return prefix_match
 
     def start_prefetch(req: Req, match_result: DecodePrefixMatch) -> None:
@@ -1534,17 +1549,20 @@ def test_l3_prefetch_fallback_is_revalidated_as_a_larger_transfer(
     fixture.queue._allocatable_token_budgets.return_value = 3
     child_id = uuid.uuid4()
     request = _request(child_id)
+    lock_params = DecLockRefParams()
     prefix_match = DecodePrefixMatch(
         prefix_indices=torch.arange(4, dtype=torch.int64),
         l2_host_hit_length=0,
         l3_storage_hit_length=2,
         last_device_node=object(),
         last_host_node=object(),
+        last_device_lock_params=lock_params,
     )
 
     def match(req: Req) -> DecodePrefixMatch:
         req.prefix_indices = prefix_match.prefix_indices
         req.last_node = prefix_match.last_device_node
+        req.last_node_lock_params = prefix_match.last_device_lock_params
         return prefix_match
 
     def fail_prefetch(req: Req, match_result: DecodePrefixMatch) -> None:
@@ -1564,7 +1582,8 @@ def test_l3_prefetch_fallback_is_revalidated_as_a_larger_transfer(
 
     fixture.queue._pre_alloc.assert_not_called()
     fixture.queue.tree_cache.dec_lock_ref.assert_called_once_with(
-        prefix_match.last_device_node
+        prefix_match.last_device_node,
+        lock_params,
     )
     assert fixture.receivers[0].clear_count == 1
 

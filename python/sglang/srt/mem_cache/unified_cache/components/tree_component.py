@@ -496,6 +496,24 @@ class TreeComponent(ABC):
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass
 
+    def rollback_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        """Undo a transfer publication before its copy generation starts.
+
+        :param node: Cache node targeted by the transfer.
+        :param phase: Direction of the transfer being rolled back.
+        :param transfers: Component transfer descriptors used for publication.
+        """
+
+        if phase == CacheTransferPhase.LOAD_BACK and len(transfers) > 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot roll back load-back publication"
+            )
+
     def drive_host_eviction(
         self,
         num_tokens: int,

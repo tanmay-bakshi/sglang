@@ -704,6 +704,7 @@ class UnifiedRadixCacheSuite:
         self._rid += 1
         req_to_token_pool.alloc([req])
         req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        req.last_node_lock_params = DecLockRefParams()
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -5185,6 +5186,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req.kv_committed_len = len(tokens)
         req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
         req.cache_protected_len = 0
+        req.last_node_lock_params = DecLockRefParams()
         req.swa_uuid_for_lock = None
         req.extra_key = None
         req.mamba_last_track_seqlen = len(tokens)

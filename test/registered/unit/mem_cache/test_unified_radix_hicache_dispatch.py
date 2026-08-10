@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
@@ -12,7 +13,8 @@ from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
+    LoadBackTicketState,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -35,6 +37,13 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     register_stack_strategy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+    MambaComponent,
+)
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    CacheTransferPhase,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -96,6 +105,49 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(MiniMaxSparseKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _MiniMaxSparseStrategy)
+
+    def test_auxiliary_load_back_rollback_restores_host_lru_membership(self) -> None:
+        for component_class, component_type, pool_name in (
+            (SWAComponent, SWA, PoolName.SWA),
+            (MambaComponent, MAMBA, PoolName.MAMBA),
+        ):
+            with self.subTest(component_type=component_type):
+                node = SimpleNamespace(
+                    component_data={
+                        component_type: SimpleNamespace(
+                            value=torch.tensor([7], dtype=torch.int64),
+                            host_value=torch.tensor([11], dtype=torch.int64),
+                        )
+                    }
+                )
+                device_lru = MagicMock()
+                device_lru.in_list.return_value = True
+                host_lru = MagicMock()
+                host_lru.in_list.return_value = False
+                tree_core = SimpleNamespace(
+                    lru_lists={component_type: device_lru},
+                    host_lru_lists={component_type: host_lru},
+                    component_evictable_size_={component_type: 1},
+                    node_by_id=MagicMock(return_value=node),
+                )
+                component = component_class.__new__(component_class)
+                component.tree_core = tree_core
+
+                component.rollback_hicache_transfer(
+                    node,
+                    CacheTransferPhase.LOAD_BACK,
+                    [
+                        PoolTransfer(
+                            name=pool_name,
+                            nodes_to_load=[17],
+                        )
+                    ],
+                )
+
+                device_lru.remove_node.assert_called_once_with(node)
+                host_lru.insert_mru.assert_called_once_with(node)
+                self.assertIsNone(node.component_data[component_type].value)
+                self.assertEqual(tree_core.component_evictable_size_[component_type], 0)
 
     def test_minimax_sparse_build_registers_indexer_sidecar(self):
         strategy = _MiniMaxSparseStrategy()
@@ -415,15 +467,19 @@ class TestUnifiedLoadBackCompletion(unittest.TestCase):
                     cache.dec_host_lock_ref.assert_called_once()
 
 
-class TestUnifiedLoadBackResult(unittest.TestCase):
+class TestUnifiedLoadBackTicket(unittest.TestCase):
     _BEST_NODE = 29
     _OLD_DEVICE_NODE = 11
 
     @classmethod
     def _restore(
-        cls, full_physical_tokens: int, swa_physical_tokens: int
+        cls,
+        full_physical_tokens: int,
+        swa_physical_tokens: int,
+        *,
+        defer_publication: bool = False,
     ) -> tuple[
-        LoadBackResult,
+        LoadBackTicket,
         UnifiedRadixCache,
         PoolTransfer,
         PoolTransfer | None,
@@ -432,6 +488,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
 
         :param full_physical_tokens: Physical full-KV indices in the transfer.
         :param swa_physical_tokens: Physical SWA indices in the transfer.
+        :param defer_publication: Whether to retain a reversible publication.
         :returns: Public result, cache, and queued full/SWA transfers.
         """
 
@@ -463,18 +520,18 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
 
         controller = MagicMock()
 
-        def load(
+        def prepare_load(
             *,
             host_indices: torch.Tensor,
             node_id: int,
             extra_pools: list[PoolTransfer] | None,
-        ) -> torch.Tensor:
+        ) -> SimpleNamespace:
             """Allocate physical destinations for the queued transfers.
 
             :param host_indices: Full-KV source indices.
             :param node_id: Restored radix node.
             :param extra_pools: Auxiliary component transfers.
-            :returns: Full-KV destination indices.
+            :returns: Prepared controller allocation receipt.
             """
 
             if node_id != cls._BEST_NODE:
@@ -485,9 +542,32 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
                     transfer.device_indices = torch.arange(
                         int(transfer.host_indices.numel()), dtype=torch.int64
                     )
-            return torch.arange(int(host_indices.numel()), dtype=torch.int64)
+            return SimpleNamespace(
+                device_indices=torch.arange(
+                    int(host_indices.numel()),
+                    dtype=torch.int64,
+                ),
+                queued=False,
+                cancelled=False,
+            )
 
-        controller.load.side_effect = load
+        controller.prepare_load.side_effect = prepare_load
+        controller.enqueue_prepared_load.side_effect = lambda prepared: setattr(
+            prepared,
+            "queued",
+            True,
+        )
+
+        def cancel_prepared_load(prepared: SimpleNamespace) -> None:
+            """Mark a controller allocation released before generation start.
+
+            :param prepared: Allocation receipt being cancelled.
+            """
+
+            prepared.queued = False
+            prepared.cancelled = True
+
+        controller.cancel_prepared_load.side_effect = cancel_prepared_load
         cache.cache_controller = controller
         cache._components_tuple = ()
         cache.inc_host_lock_ref = MagicMock(return_value=IncLockRefResult(delta=0))
@@ -513,6 +593,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
                 best_match_node=cls._BEST_NODE,
                 host_hit_length=int(full_physical_tokens > 0),
                 req=req,
+                defer_publication=defer_publication,
             )
         )
         return result, cache, kv_transfer, swa_transfer
@@ -530,6 +611,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
         self.assertIsNotNone(swa_transfer.device_indices)
         self.assertEqual(kv_transfer.device_indices.numel(), 6)
         self.assertEqual(swa_transfer.device_indices.numel(), 4)
+        cache.cache_controller.enqueue_prepared_load.assert_called_once()
         cache.tree_core.collect_full_device_indices.assert_not_called()
 
     def test_swa_only_result_restores_node_without_new_full_indices(self) -> None:
@@ -545,7 +627,122 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
         self.assertIsNotNone(swa_transfer.device_indices)
         self.assertEqual(kv_transfer.device_indices.numel(), 0)
         self.assertEqual(swa_transfer.device_indices.numel(), 4)
+        cache.cache_controller.enqueue_prepared_load.assert_called_once()
         cache.tree_core.collect_full_device_indices.assert_not_called()
+
+    def test_deferred_publication_waits_for_explicit_tp_commit(self) -> None:
+        result, cache, kv_transfer, _ = self._restore(
+            6,
+            0,
+            defer_publication=True,
+        )
+
+        cache.tree_core.commit_load_back.assert_not_called()
+        cache.cache_controller.enqueue_prepared_load.assert_not_called()
+        self.assertIsNotNone(result.publication)
+
+        cache.publish_load_back(result)
+
+        self.assertEqual(result.state, LoadBackTicketState.PUBLISHED)
+        self.assertTrue(result.owns_restored_lock)
+        cache.tree_core.commit_load_back.assert_called_once_with(
+            self._BEST_NODE,
+            result.new_full_device_indices,
+            kv_transfer,
+            {},
+            record_events=False,
+        )
+        cache._apply_cache_actions.assert_not_called()
+        cache.tree_core.record_load_back_events.assert_not_called()
+        cache.cache_controller.enqueue_prepared_load.assert_called_once()
+
+        cache.commit_load_back_publication(result)
+
+        cache._apply_cache_actions.assert_called_once_with([])
+        cache.tree_core.record_load_back_events.assert_called_once_with(kv_transfer)
+        self.assertIsNone(result.publication)
+
+    def test_publication_rejection_rolls_back_tree_and_allocations(self) -> None:
+        result, cache, kv_transfer, _ = self._restore(
+            6,
+            0,
+            defer_publication=True,
+        )
+        cache.publish_load_back(result)
+
+        cache.abort_load_back_publication(result)
+
+        cache.tree_core.rollback_load_back.assert_called_once_with(
+            self._BEST_NODE,
+            kv_transfer,
+            {},
+        )
+        cache.cache_controller.cancel_prepared_load.assert_called_once()
+        self.assertEqual(cache.ongoing_load_back, {})
+        self.assertFalse(result.owns_restored_lock)
+        self.assertEqual(cache.dec_lock_ref.call_count, 3)
+        cache.dec_host_lock_ref.assert_called_once()
+
+    def test_partial_local_publication_failure_remains_reversible(self) -> None:
+        result, cache, kv_transfer, _ = self._restore(
+            6,
+            0,
+            defer_publication=True,
+        )
+        cache.cache_controller.enqueue_prepared_load.side_effect = RuntimeError(
+            "injected enqueue failure"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected enqueue failure"):
+            cache.publish_load_back(result)
+        cache.abort_load_back_publication(result)
+
+        cache.tree_core.rollback_load_back.assert_called_once_with(
+            self._BEST_NODE,
+            kv_transfer,
+            {},
+        )
+        cache.cache_controller.cancel_prepared_load.assert_called_once()
+        self.assertEqual(cache.ongoing_load_back, {})
+        self.assertFalse(result.owns_restored_lock)
+
+    def test_existing_load_back_entry_is_never_replaced_or_reaped(self) -> None:
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        existing_entry = object()
+        cache.ongoing_load_back = {self._BEST_NODE: existing_entry}
+        cache.tree_core = MagicMock()
+        cache.tree_core.build_load_back_spec.return_value = (
+            PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.tensor([3], dtype=torch.int64),
+            ),
+            {},
+        )
+        cache._build_sidecar_transfers = MagicMock(return_value=[])
+        cache.load_back_threshold = 0
+        cache.supports_swa = MagicMock(return_value=False)
+        cache.token_to_kv_pool_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=8)
+        )
+        cache.cache_controller = MagicMock()
+        cache.dec_lock_ref = MagicMock()
+        cache.dec_host_lock_ref = MagicMock()
+        host_params = object()
+
+        result = cache._prepare_load_back_transfers(
+            node_id=self._BEST_NODE,
+            mem_quota=None,
+            req=None,
+            result=IncLockRefResult(delta=0),
+            host_anchor_params=host_params,
+            component_preparations={},
+        )
+
+        self.assertIsNone(result)
+        self.assertIs(cache.ongoing_load_back[self._BEST_NODE], existing_entry)
+        cache.cache_controller.prepare_load.assert_not_called()
+        cache.dec_lock_ref.assert_not_called()
+        cache.dec_host_lock_ref.assert_not_called()
 
 
 if __name__ == "__main__":

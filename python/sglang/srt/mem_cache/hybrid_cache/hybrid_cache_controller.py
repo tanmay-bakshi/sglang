@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
@@ -51,9 +52,11 @@ class CacheOperation(BaseCacheOperation):
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
-    ):
+        auto_allocated_device_transfers: tuple[PoolTransfer, ...] = (),
+    ) -> None:
         super().__init__(host_indices, device_indices, node_id, priority)
         self.pool_transfers = pool_transfers
+        self.auto_allocated_device_transfers = auto_allocated_device_transfers
 
     @staticmethod
     def merge_pool_transfers(
@@ -101,6 +104,33 @@ class CacheOperation(BaseCacheOperation):
         )
         merged.node_ids = node_ids
         return merged
+
+
+class PreparedLoad:
+    """Own controller allocations until a load generation consumes them."""
+
+    operation: CacheOperation
+    queued: bool
+    cancelled: bool
+
+    def __init__(self, operation: CacheOperation) -> None:
+        """Initialize one unqueued controller allocation.
+
+        :param operation: Fully resolved load operation.
+        """
+
+        self.operation = operation
+        self.queued = False
+        self.cancelled = False
+
+    @property
+    def device_indices(self) -> torch.Tensor:
+        """Return the full-attention allocation owned by this receipt.
+
+        :returns: Device indices reserved for the load.
+        """
+
+        return self.operation.device_indices
 
 
 class StorageOperation(BaseStorageOperation):
@@ -463,6 +493,43 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        """Allocate and immediately enqueue one controller load.
+
+        :param host_indices: Full-attention host indices to load.
+        :param priority: Optional controller priority.
+        :param node_id: Cache node associated with the load.
+        :param extra_pools: Auxiliary component transfers.
+        :returns: Full-attention device indices, or ``None`` when allocation
+            fails.
+        """
+
+        prepared = self.prepare_load(
+            host_indices,
+            priority=priority,
+            node_id=node_id,
+            extra_pools=extra_pools,
+        )
+        if prepared is None:
+            return None
+        self.enqueue_prepared_load(prepared)
+        return prepared.device_indices
+
+    def prepare_load(
+        self,
+        host_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> Optional[PreparedLoad]:
+        """Allocate one load without publishing it to a generation.
+
+        :param host_indices: Full-attention host indices to load.
+        :param priority: Optional controller priority.
+        :param node_id: Cache node associated with the load.
+        :param extra_pools: Auxiliary component transfers.
+        :returns: Allocation receipt, or ``None`` when allocation fails.
+        """
+
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(
@@ -477,37 +544,119 @@ class HybridCacheController(BaseHiCacheController):
             if device_indices is None:
                 return None
 
-        pool_transfers = self._resolve_pool_transfers_allocation(
-            extra_pools,
-            alloc_host=False,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-        )
+        auto_allocated_device_transfers: list[PoolTransfer] = []
+        try:
+            pool_transfers = self._resolve_pool_transfers_allocation(
+                extra_pools,
+                alloc_host=False,
+                kv_device_indices=device_indices,
+                kv_host_indices=host_indices,
+                newly_allocated_out=auto_allocated_device_transfers,
+            )
+        except Exception:
+            if need_load_kv:
+                full_allocator.free(device_indices)
+            logger.error(
+                "Failed to prepare HiCache component allocations:\n%s",
+                traceback.format_exc(),
+            )
+            raise
         if pool_transfers is None and extra_pools:
             if need_load_kv:
                 full_allocator.free(device_indices)
             return None
 
-        self.load_queue.append(
-            CacheOperation(
+        return PreparedLoad(
+            operation=CacheOperation(
                 host_indices,
                 device_indices,
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                auto_allocated_device_transfers=tuple(auto_allocated_device_transfers),
             )
         )
-        return device_indices
 
-    def start_loading(self) -> int:
-        if not self.load_queue:
+    def enqueue_prepared_load(self, prepared: PreparedLoad) -> None:
+        """Publish one prepared allocation to the next load generation.
+
+        :param prepared: Allocation receipt returned by :meth:`prepare_load`.
+        :raises ValueError: If the receipt no longer owns an unqueued load.
+        """
+
+        if prepared.queued or prepared.cancelled:
+            raise ValueError("Prepared HiCache load is not publishable")
+        self.load_queue.append(prepared.operation)
+        prepared.queued = True
+
+    def cancel_prepared_load(self, prepared: PreparedLoad) -> None:
+        """Cancel one prepared or queued load and release all allocations.
+
+        :param prepared: Allocation receipt returned by :meth:`prepare_load`.
+        :raises ValueError: If the load was cancelled or its generation started.
+        """
+
+        if prepared.cancelled:
+            raise ValueError("Prepared HiCache load was already cancelled")
+        if prepared.queued:
+            operation_index = next(
+                (
+                    index
+                    for index in range(len(self.load_queue) - 1, -1, -1)
+                    if self.load_queue[index] is prepared.operation
+                ),
+                None,
+            )
+            if operation_index is None:
+                raise ValueError("Prepared HiCache load has already started")
+            self.load_queue.pop(operation_index)
+        self._release_load_operation(prepared.operation)
+        prepared.cancelled = True
+
+    def _release_load_operation(self, operation: CacheOperation) -> None:
+        """Release every device allocation owned by one unstarted load.
+
+        :param operation: Controller operation that has not started.
+        """
+
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+        if operation.device_indices.numel() > 0:
+            full_allocator.free(operation.device_indices)
+
+        for transfer in operation.auto_allocated_device_transfers:
+            entry = self.mem_pool_host.entry_map[transfer.name]
+            free_fn = entry.device_free_fn or entry.device_pool.free
+            assert transfer.device_indices is not None
+            free_fn(transfer.device_indices)
+            transfer.device_indices = None
+        for transfer in operation.pool_transfers or ():
+            if transfer.indices_from_pool is not None:
+                transfer.device_indices = None
+
+    def start_loading(self, *, force_empty: bool = False) -> int:
+        """Start one load generation, including an aligned empty generation.
+
+        :param force_empty: Advance the layer counter without local copy work.
+        :returns: Producer index, or ``-1`` when no generation was requested.
+        """
+
+        if len(self.load_queue) == 0 and not force_empty:
             return -1
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
+        op = (
+            CacheOperation.merge_ops(self.load_queue)
+            if len(self.load_queue) > 0
+            else None
         )
-        self.load_queue.clear()
+        if op is not None:
+            host_indices, device_indices, resolved_pool_transfers = (
+                self.move_hybrid_indices(op)
+            )
+            self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -517,40 +666,42 @@ class HybridCacheController(BaseHiCacheController):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
             for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                    pool_transfers=resolved_pool_transfers,
-                )
-                if (
-                    self.has_draft
-                    and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
-                ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+                if op is not None:
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
                         host_indices,
                         device_indices,
                         i,
                         self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
                     )
+                    if (
+                        self.has_draft
+                        and host_indices.numel() > 0
+                        and i < self.mem_pool_host_draft.layer_num
+                    ):
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
                 producer_event.complete(i)
             ack_finish_event.record()
-            self._record_transfer_indices_on_stream(
-                self.load_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
-            )
+            if op is not None:
+                self._record_transfer_indices_on_stream(
+                    self.load_stream,
+                    host_indices,
+                    device_indices,
+                    resolved_pool_transfers,
+                )
         self.ack_load_queue.append(
             HiCacheAck(
                 ack_start_event,
                 ack_finish_event,
-                op.node_ids,
-                num_tokens=len(op.device_indices),
+                op.node_ids if op is not None else [],
+                num_tokens=len(op.device_indices) if op is not None else 0,
                 timing_enabled=timing_enabled,
             )
         )
@@ -747,6 +898,7 @@ class HybridCacheController(BaseHiCacheController):
         alloc_host: bool,
         kv_device_indices: Optional[torch.Tensor] = None,
         kv_host_indices: Optional[torch.Tensor] = None,
+        newly_allocated_out: Optional[list[PoolTransfer]] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
@@ -762,64 +914,74 @@ class HybridCacheController(BaseHiCacheController):
                     prev_pool.host_indices = None
                 else:
                     prev_pool.device_indices = None
+            for derived_pool in derived_transfers:
+                if alloc_host:
+                    derived_pool.host_indices = None
+                else:
+                    derived_pool.device_indices = None
 
-        for pool in extra_pools:
-            if pool.indices_from_pool is not None:
-                derived_transfers.append(pool)
-                continue
-            entry = self.mem_pool_host.entry_map.get(pool.name)
-            if entry is None:
-                continue
-            if alloc_host:
-                if pool.host_indices is not None or pool.device_indices is None:
+        try:
+            for pool in extra_pools:
+                if pool.indices_from_pool is not None:
+                    derived_transfers.append(pool)
                     continue
-                alloc_fn = entry.host_pool.alloc
-                free_fn = entry.host_pool.free
-                evict_fn = entry.host_evict_fn
-                size = len(pool.device_indices)
-            else:
-                if pool.device_indices is not None or pool.host_indices is None:
+                entry = self.mem_pool_host.entry_map.get(pool.name)
+                if entry is None:
                     continue
-                # device_alloc_fn / device_free_fn override entry.device_pool's
-                # methods for pools whose device_pool is a raw KV pool (layout)
-                # rather than an allocator (e.g. SWA).
-                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
-                free_fn = entry.device_free_fn or entry.device_pool.free
-                evict_fn = entry.device_evict_fn
-                size = len(pool.host_indices)
-            indices = alloc_fn(size)
-            if indices is None and evict_fn:
-                evict_fn(size)
+                if alloc_host:
+                    if pool.host_indices is not None or pool.device_indices is None:
+                        continue
+                    alloc_fn = entry.host_pool.alloc
+                    free_fn = entry.host_pool.free
+                    evict_fn = entry.host_evict_fn
+                    size = len(pool.device_indices)
+                else:
+                    if pool.device_indices is not None or pool.host_indices is None:
+                        continue
+                    alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                    free_fn = entry.device_free_fn or entry.device_pool.free
+                    evict_fn = entry.device_evict_fn
+                    size = len(pool.host_indices)
                 indices = alloc_fn(size)
-            if indices is None:
-                # Atomic rollback: free everything we successfully allocated.
-                rollback_allocated()
-                return None
-            if alloc_host:
-                pool.host_indices = indices
-            else:
-                pool.device_indices = indices
-            newly_allocated.append((pool, free_fn, indices))
+                if indices is None and evict_fn:
+                    evict_fn(size)
+                    indices = alloc_fn(size)
+                if indices is None:
+                    rollback_allocated()
+                    return None
+                if alloc_host:
+                    pool.host_indices = indices
+                else:
+                    pool.device_indices = indices
+                newly_allocated.append((pool, free_fn, indices))
 
-        # Assign indices to deferred pools from their source.
-        for pool in derived_transfers:
-            if pool.indices_from_pool == PoolName.KV:
-                pool.host_indices = kv_host_indices
-                pool.device_indices = kv_device_indices
-                continue
+            for pool in derived_transfers:
+                if pool.indices_from_pool == PoolName.KV:
+                    pool.host_indices = kv_host_indices
+                    pool.device_indices = kv_device_indices
+                    continue
 
-            source = next(
-                (
-                    transfer
-                    for transfer in extra_pools
-                    if transfer.indices_from_pool is None
-                    and transfer.name == pool.indices_from_pool
-                ),
-                None,
+                source = next(
+                    (
+                        transfer
+                        for transfer in extra_pools
+                        if transfer.indices_from_pool is None
+                        and transfer.name == pool.indices_from_pool
+                    ),
+                    None,
+                )
+                if source is None:
+                    rollback_allocated()
+                    return None
+                pool.host_indices = source.host_indices
+                pool.device_indices = source.device_indices
+        except Exception:
+            rollback_allocated()
+            logger.error(
+                "Failed to resolve HiCache pool transfers:\n%s",
+                traceback.format_exc(),
             )
-            if source is None:
-                rollback_allocated()
-                return None
-            pool.host_indices = source.host_indices
-            pool.device_indices = source.device_indices
+            raise
+        if newly_allocated_out is not None:
+            newly_allocated_out.extend(pool for pool, _, _ in newly_allocated)
         return extra_pools

@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -51,6 +51,7 @@ class SessionSlot:
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
+    last_node_lock_params: DecLockRefParams | None = None
     cache_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
 
@@ -74,6 +75,7 @@ class SessionSlot:
 
         if is_first:
             self.last_node = req.last_node
+            self.last_node_lock_params = req.last_node_lock_params
             self.cache_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
 
@@ -93,6 +95,7 @@ class SessionSlot:
         # the slot is later freed.
         req.req_pool_idx = None
         req.kv = None
+        req.last_node_lock_params = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -104,6 +107,7 @@ class SessionSlot:
         req.req_pool_idx = self.req_pool_idx
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
+        req.last_node_lock_params = self.last_node_lock_params
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -305,6 +309,7 @@ class StreamingSession(BasePrefixCache):
                     req_pool_idx=req.req_pool_idx,
                     kv=copy.copy(req.kv),
                     last_node=req.last_node,
+                    last_node_lock_params=req.last_node_lock_params,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
                     mamba_pool_idx=req.mamba_pool_idx,
@@ -313,6 +318,7 @@ class StreamingSession(BasePrefixCache):
                 self.slots[session_id] = slot
                 # Slot now owns the mamba state — drop the req's refs so
                 # the abort fall-through doesn't double-free.
+                req.last_node_lock_params = None
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
             slot.kv.kv_allocated_len = max(
@@ -419,13 +425,10 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            if slot.last_node_lock_params is None:
+                raise RuntimeError("Streaming session has no exact tree-lock ownership")
+            self.inner.dec_lock_ref(lock_node, slot.last_node_lock_params)
+            slot.last_node_lock_params = None
 
         if slot.is_holding_kv:
             start = protected_len
@@ -591,11 +594,35 @@ class StreamingSession(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, params: InitLoadBackParams) -> LoadBackResult:
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackTicket:
         return self.inner.init_load_back(params)
 
-    def ready_to_load_host_cache(self):
-        return self.inner.ready_to_load_host_cache()
+    def publish_load_back(self, ticket: LoadBackTicket) -> None:
+        """Publish a deferred inner-cache load-back.
+
+        :param ticket: Prepared restoration owned by the inner cache.
+        """
+
+        self.inner.publish_load_back(ticket)
+
+    def commit_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Finalize an accepted inner-cache load-back publication.
+
+        :param ticket: Published restoration owned by the inner cache.
+        """
+
+        self.inner.commit_load_back_publication(ticket)
+
+    def abort_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Abort a reversible inner-cache load-back publication.
+
+        :param ticket: Prepared or published restoration.
+        """
+
+        self.inner.abort_load_back_publication(ticket)
+
+    def ready_to_load_host_cache(self, *, force_empty: bool = False):
+        return self.inner.ready_to_load_host_cache(force_empty=force_empty)
 
     def flush_write_through_acks(self) -> None:
         return self.inner.flush_write_through_acks()

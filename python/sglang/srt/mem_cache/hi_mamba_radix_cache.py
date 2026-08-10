@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
+from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -352,22 +353,34 @@ class HiMambaRadixCache(MambaRadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> LoadBackResult:
+    ) -> LoadBackTicket:
+        if params.defer_publication:
+            raise NotImplementedError(
+                "HiMambaRadixCache does not support reversible load-back publication"
+            )
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
+        restore_mamba = last_node.mamba_evicted and last_node.mamba_backuped
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return LoadBackResult(
+                queued_components = set()
+                if len(loading_values) > 0:
+                    queued_components.add(ComponentType.FULL)
+                if restore_mamba:
+                    queued_components.add(ComponentType.MAMBA)
+                return LoadBackTicket(
                     new_full_device_indices=loading_values,
                     restored_node=last_node,
-                    queued_any_component=True,
+                    queued_components=frozenset(queued_components),
                     full_tokens=len(loading_values),
                     swa_tokens=0,
+                    mamba_slots=int(restore_mamba),
+                    mamba_device_slots=int(restore_mamba),
                 )
 
             while last_node is not self.root_node and (
@@ -375,12 +388,11 @@ class HiMambaRadixCache(MambaRadixCache):
             ):
                 last_node = last_node.parent
 
-        return LoadBackResult(
+        return LoadBackTicket(
             new_full_device_indices=torch.empty(
                 (0,), dtype=torch.int64, device=self.device
             ),
             restored_node=last_node,
-            queued_any_component=False,
             full_tokens=0,
             swa_tokens=0,
         )
@@ -475,8 +487,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     )
             finish_count -= 1
 
-    def ready_to_load_host_cache(self) -> int:
-        return self.cache_controller.start_loading()
+    def ready_to_load_host_cache(self, *, force_empty: bool = False) -> int:
+        return self.cache_controller.start_loading(force_empty=force_empty)
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()

@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -278,20 +278,23 @@ class FlexKVRadixCache(RadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> LoadBackResult:
+    ) -> LoadBackTicket:
         """MP RETRIEVE. Allocates uncached slots and fires the FlexKV
         load; inserts the resulting TreeNode."""
+        if params.defer_publication:
+            raise NotImplementedError(
+                "FlexKVRadixCache does not support reversible load-back publication"
+            )
         req = params.req
         last_node: TreeNode = params.best_match_node
         marker = self._load_markers.pop(req.rid, None)
         if marker is None:
             self.flexkv_connector.release_pending(req.rid)
-            return LoadBackResult(
+            return LoadBackTicket(
                 new_full_device_indices=torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 ),
                 restored_node=last_node,
-                queued_any_component=False,
                 full_tokens=0,
                 swa_tokens=0,
             )
@@ -311,20 +314,18 @@ class FlexKVRadixCache(RadixCache):
             # is idempotent for the case where allocation failed before
             # we even popped the held task.
             self.flexkv_connector.release_pending(req.rid)
-            return LoadBackResult(
+            return LoadBackTicket(
                 new_full_device_indices=torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 ),
                 restored_node=last_node,
-                queued_any_component=False,
                 full_tokens=0,
                 swa_tokens=0,
             )
         new_indices, restored_node = result
-        return LoadBackResult(
+        return LoadBackTicket(
             new_full_device_indices=new_indices,
             restored_node=restored_node,
-            queued_any_component=False,
             full_tokens=len(new_indices),
             swa_tokens=0,
         )

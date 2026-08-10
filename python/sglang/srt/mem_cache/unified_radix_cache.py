@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+import traceback
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, TypeVar
 
 import torch
+
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -20,7 +22,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     InsertResult,
-    LoadBackResult,
+    LoadBackPublication,
+    LoadBackTicket,
+    LoadBackTicketState,
     MatchPrefixParams,
     MatchResult,
 )
@@ -32,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PreparedLoad,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -125,18 +130,62 @@ class _OngoingLoadBack(NamedTuple):
     host_lock_params: DecLockRefParams
 
 
+@dataclass
+class _PreparedUnifiedLoadBackPublication(LoadBackPublication):
+    """Own every reversible resource for one Unified load-back.
+
+    :ivar node_id: Deepest cache node covered by the restoration.
+    :ivar req: Request receiving component-local restored state.
+    :ivar prepared_load: Controller allocation not yet consumed by a generation.
+    :ivar kv_xfer: Full-attention transfer descriptor.
+    :ivar comp_xfers: Auxiliary component transfer descriptors.
+    :ivar host_anchor_params: Exact host-tree lock release receipt.
+    :ivar component_preparations: Per-component pre-allocation receipts.
+    :ivar tree_publication_attempted: Whether tree mutation may need rollback.
+    :ivar published_entry: In-flight tracking entry installed during publication.
+    :ivar cache_actions: Side effects deferred until global publication agreement.
+    :ivar component_preparations_finalized: Whether component receipts resolved.
+    :ivar finalized: Whether deferred effects and component preparations committed.
+    :ivar aborted: Whether every reversible resource was released.
+    """
+
+    node_id: NodeId
+    req: Req | None
+    prepared_load: PreparedLoad
+    kv_xfer: PoolTransfer
+    comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    host_anchor_params: DecLockRefParams
+    component_preparations: dict[ComponentType, PrepareLoadBackResult]
+    tree_publication_attempted: bool = False
+    published_entry: _OngoingLoadBack | None = None
+    cache_actions: list[CacheAction | ComponentAction] = field(default_factory=list)
+    component_preparations_finalized: bool = False
+    finalized: bool = False
+    aborted: bool = False
+
+
 @dataclass(frozen=True)
 class _QueuedLoadBackResult:
     """Describes the component payload accepted by the load controller.
 
     :ivar new_full_device_indices: Newly allocated full-KV device indices.
+    :ivar queued_components: Logical cache components queued for copying.
+    :ivar queued_sidecars: Auxiliary cache pools queued for copying.
     :ivar full_tokens: Physical full-KV tokens queued for copying.
     :ivar swa_tokens: Physical SWA tokens queued for copying.
+    :ivar mamba_slots: Recurrent-state host slots queued for copying.
+    :ivar mamba_device_slots: Recurrent-state device slots allocated by the load.
+    :ivar publication: Reversible cache publication receipt.
     """
 
     new_full_device_indices: torch.Tensor
+    queued_components: frozenset[ComponentType]
+    queued_sidecars: frozenset[PoolName]
     full_tokens: int
     swa_tokens: int
+    mamba_slots: int
+    mamba_device_slots: int
+    publication: _PreparedUnifiedLoadBackPublication
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -674,11 +723,14 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        if req.last_node_lock_params is None:
+            raise RuntimeError("Unified cache request has no exact tree-lock ownership")
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            req.last_node_lock_params,
+            skip_swa=req.swa_prefix_lock_released,
         )
+        req.last_node_lock_params = None
 
         # cleanup
         for comp in self._components_tuple:
@@ -764,10 +816,9 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.cache_protected_len :],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-        )
+        if req.last_node_lock_params is None:
+            raise RuntimeError("Unified cache request has no exact tree-lock ownership")
+        self.dec_lock_ref(req.last_node, req.last_node_lock_params)
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -779,6 +830,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
+        req.last_node_lock_params = lock_result.to_dec_params()
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
@@ -949,64 +1001,274 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         mem_quota: int | None = None,
         req: Req | None = None,
+        *,
+        defer_publication: bool = False,
     ) -> _QueuedLoadBackResult | None:
         """Prepare an evicted component payload for host-to-device loading.
 
         :param node_id: Deepest radix node covered by the restoration.
         :param mem_quota: Maximum additional full-KV allocation, if constrained.
         :param req: Request receiving per-request component state.
-        :returns: Metadata for the queued component payload, or ``None`` on failure.
+        :param defer_publication: Whether to retain a reversible allocation
+            receipt instead of mutating the tree and controller queue.
+        :returns: Metadata for the prepared component payload, or ``None`` on
+            allocation failure.
         """
         if self.cache_controller is None:
             return None
 
         host_anchor_params = self.inc_host_lock_ref(node_id).to_dec_params()
-
-        # Lock the path before building transfers (the aux build can evict).
         result = self.inc_lock_ref(node_id)
         ancestor_lock_params = result.to_dec_params()
-
-        # Let each component pre-allocate per-request state for the load-back;
-        # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
-        }
-        load_result: _QueuedLoadBackResult | None = None
+        component_preparations: dict[ComponentType, PrepareLoadBackResult] = {}
         try:
-            load_result = self._load_back_transfers(
+            for component in self._components_tuple:
+                component_preparations[component.component_type] = (
+                    component.prepare_load_back(node_id, req=req)
+                )
+            load_result = self._prepare_load_back_transfers(
                 node_id=node_id,
                 mem_quota=mem_quota,
                 req=req,
                 result=result,
-                ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
+                component_preparations=component_preparations,
+            )
+        except Exception:
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            self._finalize_load_back_preparations(
+                req,
+                component_preparations,
+                success=False,
+            )
+            logger.error(
+                "Failed to prepare unified HiCache load-back:\n%s",
+                traceback.format_exc(),
+            )
+            raise
+        self.dec_lock_ref(node_id, ancestor_lock_params)
+
+        if load_result is None:
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            self._finalize_load_back_preparations(
+                req,
+                component_preparations,
+                success=False,
+            )
+            return None
+
+        if defer_publication:
+            return load_result
+
+        publication = load_result.publication
+        try:
+            self._publish_unified_load_back(
+                publication,
+                ticket=None,
+                defer_side_effects=False,
             )
             return load_result
-        finally:
-            success = load_result is not None
-            for comp in self._components_tuple:
-                comp.finalize_load_back(req, preps[comp.component_type], success)
+        except Exception:
+            self._abort_unified_load_back(publication, ticket=None)
+            logger.error(
+                "Failed to publish unified HiCache load-back:\n%s",
+                traceback.format_exc(),
+            )
+            raise
 
-    def _load_back_transfers(
+    def _finalize_load_back_preparations(
+        self,
+        req: Req | None,
+        preparations: dict[ComponentType, PrepareLoadBackResult],
+        *,
+        success: bool,
+    ) -> None:
+        """Resolve every component pre-allocation exactly once.
+
+        :param req: Request receiving component-local restored state.
+        :param preparations: Per-component preparation receipts.
+        :param success: Whether the prepared load committed.
+        """
+
+        for component in self._components_tuple:
+            preparation = preparations.get(component.component_type)
+            if preparation is None:
+                continue
+            component.finalize_load_back(req, preparation, success)
+
+    def _finalize_publication_preparations(
+        self,
+        publication: _PreparedUnifiedLoadBackPublication,
+        *,
+        success: bool,
+    ) -> None:
+        """Resolve publication-owned component pre-allocations once.
+
+        :param publication: Reversible Unified publication receipt.
+        :param success: Whether the prepared load committed.
+        """
+
+        if publication.component_preparations_finalized:
+            return
+        self._finalize_load_back_preparations(
+            publication.req,
+            publication.component_preparations,
+            success=success,
+        )
+        publication.component_preparations_finalized = True
+
+    def _publish_unified_load_back(
+        self,
+        publication: _PreparedUnifiedLoadBackPublication,
+        *,
+        ticket: LoadBackTicket | None,
+        defer_side_effects: bool,
+    ) -> None:
+        """Publish tree values and enqueue an unstarted controller operation.
+
+        :param publication: Reversible Unified publication receipt.
+        :param ticket: Decode ticket receiving the request-owned tree lock.
+        :param defer_side_effects: Whether cache actions and placement events
+            must wait for tensor-parallel agreement.
+        """
+
+        if publication.aborted or publication.tree_publication_attempted:
+            raise ValueError("Unified load-back publication is not publishable")
+        if publication.node_id in self.ongoing_load_back:
+            raise RuntimeError(
+                f"Unified load-back node {publication.node_id} is already in flight"
+            )
+
+        publication.tree_publication_attempted = True
+        publication.cache_actions = self.tree_core.commit_load_back(
+            publication.node_id,
+            publication.prepared_load.device_indices,
+            publication.kv_xfer,
+            publication.comp_xfers,
+            record_events=not defer_side_effects,
+        )
+        ongoing_entry = _OngoingLoadBack(
+            publication.node_id,
+            self.inc_lock_ref(publication.node_id).to_dec_params(),
+            publication.host_anchor_params,
+        )
+        self.ongoing_load_back[publication.node_id] = ongoing_entry
+        publication.published_entry = ongoing_entry
+
+        if ticket is not None:
+            request_lock = self.inc_lock_ref(publication.node_id).to_dec_params()
+            ticket.restored_lock_params = request_lock
+            ticket.owns_restored_lock = True
+
+        self.cache_controller.enqueue_prepared_load(publication.prepared_load)
+        if defer_side_effects:
+            if ticket is not None:
+                ticket.state = LoadBackTicketState.PUBLISHED
+            return
+
+        self._apply_cache_actions(publication.cache_actions)
+        self._finalize_publication_preparations(publication, success=True)
+        publication.finalized = True
+
+    def _abort_unified_load_back(
+        self,
+        publication: _PreparedUnifiedLoadBackPublication,
+        *,
+        ticket: LoadBackTicket | None,
+    ) -> None:
+        """Release every reversible publication resource despite local errors.
+
+        :param publication: Prepared or published Unified receipt.
+        :param ticket: Decode ticket holding a request-owned tree lock, if any.
+        """
+
+        if publication.aborted:
+            return
+        if publication.finalized:
+            raise RuntimeError("Cannot abort a finalized Unified load-back publication")
+
+        cleanup_errors: list[str] = []
+
+        if ticket is not None and ticket.owns_restored_lock:
+            try:
+                self.dec_lock_ref(
+                    ticket.restored_node,
+                    ticket.restored_lock_params,
+                )
+                ticket.owns_restored_lock = False
+            except Exception:
+                cleanup_errors.append(traceback.format_exc())
+
+        published_entry = publication.published_entry
+        if (
+            published_entry is not None
+            and self.ongoing_load_back.get(publication.node_id) is published_entry
+        ):
+            self.ongoing_load_back.pop(publication.node_id)
+            try:
+                self.dec_lock_ref(
+                    published_entry.node_id,
+                    published_entry.lock_params,
+                )
+            except Exception:
+                cleanup_errors.append(traceback.format_exc())
+
+        if publication.tree_publication_attempted:
+            try:
+                self.tree_core.rollback_load_back(
+                    publication.node_id,
+                    publication.kv_xfer,
+                    publication.comp_xfers,
+                )
+            except Exception:
+                cleanup_errors.append(traceback.format_exc())
+
+        if not publication.prepared_load.cancelled:
+            try:
+                self.cache_controller.cancel_prepared_load(publication.prepared_load)
+            except Exception:
+                cleanup_errors.append(traceback.format_exc())
+
+        try:
+            self.dec_host_lock_ref(
+                publication.node_id,
+                publication.host_anchor_params,
+            )
+        except Exception:
+            cleanup_errors.append(traceback.format_exc())
+
+        try:
+            self._finalize_publication_preparations(publication, success=False)
+        except Exception:
+            cleanup_errors.append(traceback.format_exc())
+
+        publication.aborted = True
+        if len(cleanup_errors) > 0:
+            raise RuntimeError(
+                "Unified load-back rollback failed:\n" + "\n".join(cleanup_errors)
+            )
+
+    def _prepare_load_back_transfers(
         self,
         *,
         node_id: NodeId,
         mem_quota: int | None,
         req: Req | None,
         result: IncLockRefResult,
-        ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
+        component_preparations: dict[ComponentType, PrepareLoadBackResult],
     ) -> _QueuedLoadBackResult | None:
-        """Allocate and commit controller-owned component transfers.
+        """Allocate component transfers without publishing them.
 
         :param node_id: Deepest radix node covered by the restoration.
         :param mem_quota: Maximum additional full-KV allocation, if constrained.
         :param req: Request receiving per-request component state.
         :param result: Device-tree lock acquisition result.
-        :param ancestor_lock_params: Device-tree lease release parameters.
         :param host_anchor_params: Host-tree lease release parameters.
-        :returns: Metadata for the queued component payload, or ``None`` on failure.
+        :param component_preparations: Per-component pre-allocation receipts.
+        :returns: Metadata for the prepared component payload, or ``None`` on
+            allocation failure.
         """
 
         # Build the KV + per-component aux transfers.
@@ -1023,8 +1285,6 @@ class UnifiedRadixCache(BasePrefixCache):
             for xfer in aux_xfers
         )
         if not has_component_payload:
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return None
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
@@ -1033,8 +1293,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return None
 
         if self.supports_swa():
@@ -1045,47 +1303,92 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
                 return None
 
-        # Load H→D
-        device_indices = self.cache_controller.load(
+        if node_id in self.ongoing_load_back:
+            return None
+
+        unallocated_mamba_transfers = tuple(
+            transfer
+            for transfer in aux_xfers
+            if transfer.name == PoolName.MAMBA and transfer.device_indices is None
+        )
+        prepared_load: PreparedLoad | None = self.cache_controller.prepare_load(
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(node_id, ancestor_lock_params)
-        if device_indices is None:
-            self.dec_host_lock_ref(node_id, host_anchor_params)
+        if prepared_load is None:
             return None
 
-        kv_xfer.device_indices = device_indices
-        full_tokens = _queued_transfer_token_count(kv_xfer)
-        swa_tokens = sum(
-            _queued_transfer_token_count(xfer)
-            for xfer in comp_xfers.get(ComponentType.SWA, ())
-        )
-
-        # Commit the loaded KV back onto the node + apply its emitted actions.
-        self._apply_cache_actions(
-            self.tree_core.commit_load_back(
-                node_id, device_indices, kv_xfer, comp_xfers
+        try:
+            device_indices = prepared_load.device_indices
+            kv_xfer.device_indices = device_indices
+            full_tokens = _queued_transfer_token_count(kv_xfer)
+            swa_tokens = sum(
+                _queued_transfer_token_count(xfer)
+                for xfer in comp_xfers.get(ComponentType.SWA, ())
             )
-        )
+            mamba_slots = sum(
+                _queued_transfer_token_count(xfer)
+                for xfer in comp_xfers.get(ComponentType.MAMBA, ())
+            )
+            mamba_preparation = component_preparations.get(ComponentType.MAMBA)
+            mamba_device_slots = sum(
+                int(transfer.device_indices.numel())
+                for transfer in unallocated_mamba_transfers
+                if transfer.device_indices is not None
+            ) + (
+                int(mamba_preparation.allocated_mamba_slot.numel())
+                if mamba_preparation is not None
+                and mamba_preparation.allocated_mamba_slot is not None
+                else 0
+            )
 
-        self.ongoing_load_back[node_id] = _OngoingLoadBack(
-            node_id,
-            self.inc_lock_ref(node_id).to_dec_params(),
-            host_anchor_params,
-        )
+            publication = _PreparedUnifiedLoadBackPublication(
+                node_id=node_id,
+                req=req,
+                prepared_load=prepared_load,
+                kv_xfer=kv_xfer,
+                comp_xfers=comp_xfers,
+                host_anchor_params=host_anchor_params,
+                component_preparations=component_preparations,
+            )
 
-        return _QueuedLoadBackResult(
-            new_full_device_indices=device_indices,
-            full_tokens=full_tokens,
-            swa_tokens=swa_tokens,
-        )
+            return _QueuedLoadBackResult(
+                new_full_device_indices=device_indices,
+                queued_components=frozenset(
+                    {
+                        component_type
+                        for component_type, transfers in comp_xfers.items()
+                        if any(
+                            transfer.host_indices is not None
+                            and transfer.host_indices.numel() > 0
+                            for transfer in transfers
+                        )
+                    }
+                    | ({ComponentType.FULL} if full_tokens > 0 else set())
+                ),
+                queued_sidecars=frozenset(
+                    transfer.name
+                    for transfer in sidecar_xfers
+                    if transfer.host_indices is not None
+                    and transfer.host_indices.numel() > 0
+                ),
+                full_tokens=full_tokens,
+                swa_tokens=swa_tokens,
+                mamba_slots=mamba_slots,
+                mamba_device_slots=mamba_device_slots,
+                publication=publication,
+            )
+        except Exception:
+            self.cache_controller.cancel_prepared_load(prepared_load)
+            logger.error(
+                "Failed to validate prepared HiCache transfers:\n%s",
+                traceback.format_exc(),
+            )
+            raise
 
     def _build_sidecar_transfers(
         self,
@@ -1886,7 +2189,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> LoadBackResult:
+    ) -> LoadBackTicket:
         """Prepare rank-local cache components for host-to-device loading.
 
         :param params: Prefix match, request, and optional allocation quota.
@@ -1904,7 +2207,12 @@ class UnifiedRadixCache(BasePrefixCache):
             or req.swa_host_hit_length > 0
             or req.mamba_host_hit_length > 0
         ):
-            load_result = self.load_back(best_match_node_id, mem_quota, req=req)
+            load_result = self.load_back(
+                best_match_node_id,
+                mem_quota,
+                req=req,
+                defer_publication=params.defer_publication,
+            )
             if load_result is not None:
                 logger.debug(
                     "init_load_back queued full=%d swa=%d tokens for node %d",
@@ -1912,21 +2220,81 @@ class UnifiedRadixCache(BasePrefixCache):
                     load_result.swa_tokens,
                     best_match_node_id,
                 )
-                return LoadBackResult(
+                return LoadBackTicket(
                     new_full_device_indices=load_result.new_full_device_indices,
                     restored_node=best_match_node_id,
-                    queued_any_component=True,
+                    queued_components=load_result.queued_components,
+                    queued_sidecars=load_result.queued_sidecars,
                     full_tokens=load_result.full_tokens,
                     swa_tokens=load_result.swa_tokens,
+                    mamba_slots=load_result.mamba_slots,
+                    mamba_device_slots=load_result.mamba_device_slots,
+                    publication=(
+                        load_result.publication if params.defer_publication else None
+                    ),
                 )
 
-        return LoadBackResult(
+        return LoadBackTicket(
             new_full_device_indices=self.tree_core.empty_match_result.device_indices,
             restored_node=last_best_match_device_node_id,
-            queued_any_component=False,
             full_tokens=0,
             swa_tokens=0,
         )
+
+    def publish_load_back(self, ticket: LoadBackTicket) -> None:
+        """Publish a deferred Unified restoration reversibly.
+
+        :param ticket: Prepared decode restoration.
+        """
+
+        publication = ticket.publication
+        if not isinstance(publication, _PreparedUnifiedLoadBackPublication):
+            raise ValueError("Load-back ticket has no Unified publication receipt")
+        if ticket.state != LoadBackTicketState.PREPARED:
+            raise ValueError(f"Cannot publish load-back ticket in {ticket.state} state")
+        self._publish_unified_load_back(
+            publication,
+            ticket=ticket,
+            defer_side_effects=True,
+        )
+
+    def commit_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Finalize effects after every decode TP rank published successfully.
+
+        :param ticket: Locally published decode restoration.
+        """
+
+        publication = ticket.publication
+        if not isinstance(publication, _PreparedUnifiedLoadBackPublication):
+            raise ValueError("Load-back ticket has no Unified publication receipt")
+        if ticket.state != LoadBackTicketState.PUBLISHED:
+            raise ValueError(
+                f"Cannot commit load-back publication in {ticket.state} state"
+            )
+        if publication.finalized or publication.aborted:
+            raise ValueError("Unified load-back publication is not committable")
+
+        self._apply_cache_actions(publication.cache_actions)
+        self.tree_core.record_load_back_events(publication.kv_xfer)
+        self._finalize_publication_preparations(publication, success=True)
+        publication.finalized = True
+        ticket.publication = None
+
+    def abort_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Cancel a prepared or published Unified restoration.
+
+        :param ticket: Decode restoration whose generation has not started.
+        """
+
+        publication = ticket.publication
+        if not isinstance(publication, _PreparedUnifiedLoadBackPublication):
+            raise ValueError("Load-back ticket has no Unified publication receipt")
+        if ticket.state not in (
+            LoadBackTicketState.PREPARED,
+            LoadBackTicketState.PUBLISHED,
+        ):
+            raise ValueError(f"Cannot abort load-back ticket in {ticket.state} state")
+        self._abort_unified_load_back(publication, ticket=ticket)
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
@@ -1945,10 +2313,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Flush pending write-through acknowledgements."""
         self.writing_check()
 
-    def ready_to_load_host_cache(self) -> int:
-        """Notify the cache controller to start the KV cache loading."""
+    def ready_to_load_host_cache(self, *, force_empty: bool = False) -> int:
+        """Notify the cache controller to start an aligned load generation."""
         if self.cache_controller is not None:
-            return self.cache_controller.start_loading()
+            return self.cache_controller.start_loading(force_empty=force_empty)
         return 0
 
     # ---- Query / Inspection APIs ----

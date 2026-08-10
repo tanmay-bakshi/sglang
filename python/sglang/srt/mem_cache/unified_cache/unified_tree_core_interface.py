@@ -429,8 +429,25 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         device_indices: torch.Tensor,
         kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        *,
+        record_events: bool = True,
     ) -> list[CacheAction | ComponentAction]:
         """Commit a successful H->D load-back onto the node; returns any cache actions."""
+        ...
+
+    @abstractmethod
+    def record_load_back_events(self, kv_xfer: PoolTransfer) -> None:
+        """Emit device-placement events for an accepted load-back."""
+        ...
+
+    @abstractmethod
+    def rollback_load_back(
+        self,
+        node_id: NodeId,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> None:
+        """Undo tree publication before an H->D generation starts."""
         ...
 
     @abstractmethod

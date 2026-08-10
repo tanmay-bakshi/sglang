@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InitLoadBackParams,
-    LoadBackResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -284,7 +284,7 @@ class LMCRadixCache(RadixCache):
             best_match_node=new_node,
         )
 
-    def init_load_back(self, params: InitLoadBackParams) -> LoadBackResult:
+    def init_load_back(self, params: InitLoadBackParams) -> LoadBackTicket:
         """MP RETRIEVE.
 
         Called by the scheduler when ``match_prefix`` returned
@@ -292,6 +292,10 @@ class LMCRadixCache(RadixCache):
         allocate slots and fire RETRIEVE, inserts the resulting
         TreeNode into the radix tree, and returns the restored state.
         """
+        if params.defer_publication:
+            raise NotImplementedError(
+                "LMCRadixCache does not support reversible load-back publication"
+            )
         req = params.req
         marker = self._mp_load_back_markers.pop(req.rid)
         last_node: TreeNode = params.best_match_node
@@ -313,20 +317,18 @@ class LMCRadixCache(RadixCache):
             # retrieve returned nothing (locks already released by
             # retrieve_kv). release_pending is idempotent on locks_held.
             self.lmcache_connector.release_pending(req.rid)
-            return LoadBackResult(
+            return LoadBackTicket(
                 new_full_device_indices=torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 ),
                 restored_node=last_node,
-                queued_any_component=False,
                 full_tokens=0,
                 swa_tokens=0,
             )
         new_indices, restored_node = result
-        return LoadBackResult(
+        return LoadBackTicket(
             new_full_device_indices=new_indices,
             restored_node=restored_node,
-            queued_any_component=False,
             full_tokens=len(new_indices),
             swa_tokens=0,
         )

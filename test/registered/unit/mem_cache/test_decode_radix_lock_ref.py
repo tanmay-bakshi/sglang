@@ -35,6 +35,7 @@ import torch
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -78,6 +79,7 @@ class MockReq:
         self.req_pool_idx = req_pool_idx
         self.cache_protected_len = cache_protected_len
         self.last_node = last_node
+        self.last_node_lock_params = None
         self.extra_key = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
@@ -318,14 +320,16 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
-        queue._match_prefix_and_lock = MagicMock(
-            return_value=DecodePrefixMatch(
-                prefix_indices=torch.arange(4, dtype=torch.int64),
-                l2_host_hit_length=0,
-                l3_storage_hit_length=0,
-                last_device_node=req.last_node,
-            )
+        matched_node = req.last_node
+        lock_params = DecLockRefParams()
+        prefix_match = DecodePrefixMatch(
+            prefix_indices=torch.arange(4, dtype=torch.int64),
+            l2_host_hit_length=0,
+            l3_storage_hit_length=0,
+            last_device_node=matched_node,
+            last_device_lock_params=lock_params,
         )
+        queue._match_prefix_and_lock = MagicMock(return_value=prefix_match)
         queue._pre_alloc = MagicMock(
             side_effect=AssertionError("_pre_alloc should not run")
         )
@@ -361,7 +365,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(
+            matched_node,
+            lock_params,
+        )
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):

@@ -362,6 +362,38 @@ class FullComponent(TreeComponent):
 
             self.tree_core._update_evictable_leaf_sets(node)
 
+    def rollback_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        """Restore Full-KV tombstones after a rejected load publication.
+
+        :param node: Deepest node covered by the load-back.
+        :param phase: Transfer direction being rolled back.
+        :param transfers: Full-KV transfer descriptors used for publication.
+        """
+
+        if phase != CacheTransferPhase.LOAD_BACK or len(transfers) == 0:
+            return
+
+        transfer = transfers[0]
+        for node_id in reversed(transfer.nodes_to_load or ()):
+            loaded_node = self.tree_core.node_by_id(node_id)
+            component_data = loaded_node.component_data[self.component_type]
+            if component_data.value is None:
+                continue
+            self.tree_core.component_evictable_size_[self.component_type] -= len(
+                component_data.value
+            )
+            component_data.value = None
+            self.tree_core._update_evictable_leaf_sets(loaded_node)
+            if loaded_node.parent is not None:
+                self.tree_core._update_evictable_leaf_sets(loaded_node.parent)
+
+        self.tree_core._update_evictable_leaf_sets(node)
+
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._full_kv_pool_host is None:
             return

@@ -22,9 +22,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
-    LoadBackResult,
     InsertParams,
     InsertResult,
+    LoadBackTicket,
     MatchPrefixParams,
     MatchResult,
 )
@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
+from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -1371,7 +1372,11 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> LoadBackResult:
+    ) -> LoadBackTicket:
+        if params.defer_publication:
+            raise NotImplementedError(
+                "HiRadixCache does not support reversible load-back publication"
+            )
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
@@ -1380,10 +1385,10 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return LoadBackResult(
+                return LoadBackTicket(
                     new_full_device_indices=loading_values,
                     restored_node=last_node,
-                    queued_any_component=True,
+                    queued_components=frozenset({ComponentType.FULL}),
                     full_tokens=len(loading_values),
                     swa_tokens=0,
                 )
@@ -1391,10 +1396,9 @@ class HiRadixCache(RadixCache):
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return LoadBackResult(
+        return LoadBackTicket(
             new_full_device_indices=self._empty_match_result.device_indices,
             restored_node=last_node,
-            queued_any_component=False,
             full_tokens=0,
             swa_tokens=0,
         )
@@ -1443,12 +1447,12 @@ class HiRadixCache(RadixCache):
         storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
         return storage_hit_count
 
-    def ready_to_load_host_cache(self) -> int:
+    def ready_to_load_host_cache(self, *, force_empty: bool = False) -> int:
         """
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        return self.cache_controller.start_loading()
+        return self.cache_controller.start_loading(force_empty=force_empty)
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()

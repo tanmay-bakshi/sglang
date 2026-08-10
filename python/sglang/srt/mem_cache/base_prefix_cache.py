@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -16,6 +17,7 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -153,30 +155,84 @@ class DecLockRefResult:
 
 @dataclasses.dataclass
 class InitLoadBackParams:
-    """Unified parameters for init_load_back across different cache types."""
+    """Unified parameters for init_load_back across different cache types.
+
+    :ivar best_match_node: Deepest cache node covered by the host match.
+    :ivar host_hit_length: Full-attention tokens available on the host tier.
+    :ivar mem_quota: Optional full-attention device-allocation quota.
+    :ivar req: Request receiving component-local restored state.
+    :ivar defer_publication: Whether allocation must remain reversible until a
+        later tensor-parallel agreement.
+    """
 
     best_match_node: Any
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    defer_publication: bool = False
 
 
-@dataclasses.dataclass(frozen=True)
-class LoadBackResult:
-    """Result of preparing a host-to-device cache restoration.
+class LoadBackPublication:
+    """Cache-owned receipt for one reversible load-back publication."""
+
+
+class LoadBackTicketState(str, Enum):
+    """Ownership state for one host-to-device load-back operation."""
+
+    PREPARED = "prepared"
+    PUBLISHED = "published"
+    STARTED = "started"
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+
+
+@dataclasses.dataclass
+class LoadBackTicket:
+    """Own one prepared host-to-device cache restoration.
 
     :ivar new_full_device_indices: Newly allocated full-KV device indices.
+    :ivar restored_full_device_indices: Exact full-KV suffix consumed by the
+        request after rematching.
     :ivar restored_node: Deepest cache node restored to device residency.
-    :ivar queued_any_component: Whether an asynchronous component transfer was queued.
+    :ivar queued_components: Components with asynchronous copies queued.
+    :ivar queued_sidecars: Auxiliary pools with asynchronous copies queued.
     :ivar full_tokens: Number of full-KV tokens restored by this operation.
     :ivar swa_tokens: Number of sliding-window tokens restored by this operation.
+    :ivar mamba_slots: Number of recurrent-state host slots restored.
+    :ivar mamba_device_slots: Number of newly allocated recurrent-state slots.
+    :ivar restored_lock_params: Exact parameters for releasing the request's
+        restored-node lock.
+    :ivar owns_restored_lock: Whether the ticket still owns that lock.
+    :ivar consumer_index: Layer-done counter slot after the copy starts.
+    :ivar publication: Cache-owned receipt while publication is reversible.
+    :ivar state: Current ownership state.
     """
 
     new_full_device_indices: torch.Tensor
     restored_node: Any
-    queued_any_component: bool
-    full_tokens: int
-    swa_tokens: int
+    restored_full_device_indices: torch.Tensor | None = None
+    queued_components: frozenset[ComponentType] = dataclasses.field(
+        default_factory=frozenset
+    )
+    queued_sidecars: frozenset[PoolName] = dataclasses.field(default_factory=frozenset)
+    full_tokens: int = 0
+    swa_tokens: int = 0
+    mamba_slots: int = 0
+    mamba_device_slots: int = 0
+    restored_lock_params: DecLockRefParams | None = None
+    owns_restored_lock: bool = False
+    consumer_index: int = -1
+    publication: LoadBackPublication | None = None
+    state: LoadBackTicketState = LoadBackTicketState.PREPARED
+
+    @property
+    def queued_any_component(self) -> bool:
+        """Return whether the controller owns any component copy.
+
+        :returns: Whether at least one component was queued.
+        """
+
+        return len(self.queued_components) > 0 or len(self.queued_sidecars) > 0
 
 
 class MatchResult(NamedTuple):
@@ -377,7 +433,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> LoadBackResult:
+    ) -> LoadBackTicket:
         """Prepare KV-cache restoration from host to device.
 
         :param params: Cache-specific restoration parameters.
@@ -385,11 +441,44 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def ready_to_load_host_cache(self) -> Any:
+    def ready_to_load_host_cache(self, *, force_empty: bool = False) -> Any:
         """
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def publish_load_back(self, ticket: LoadBackTicket) -> None:
+        """Publish a deferred load-back without starting its copy generation.
+
+        :param ticket: Prepared restoration owned by this cache.
+        """
+
+        if ticket.publication is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support deferred load-back publication"
+            )
+
+    def commit_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Make a globally accepted load-back publication irreversible.
+
+        :param ticket: Published restoration owned by this cache.
+        """
+
+        if ticket.publication is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support deferred load-back publication"
+            )
+
+    def abort_load_back_publication(self, ticket: LoadBackTicket) -> None:
+        """Roll back a prepared or published load-back.
+
+        :param ticket: Restoration whose generation has not started.
+        """
+
+        if ticket.publication is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support deferred load-back publication"
+            )
 
     def flush_write_through_acks(self) -> None:
         """Release lock_ref on radix-tree nodes whose write-through has completed.
