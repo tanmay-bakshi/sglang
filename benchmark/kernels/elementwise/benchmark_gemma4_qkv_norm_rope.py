@@ -4,7 +4,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
-
 from sglang.kernels.ops.attention.gemma4_qkv_norm_rope import (
     gemma4_qkv_norm_rope,
 )
@@ -18,6 +17,38 @@ CONTEXT_LENGTH = 8192
 
 
 @dataclass(frozen=True, slots=True)
+class RegionMismatchCounts:
+    """Bitwise mismatch counts partitioned by the fused operation boundary.
+
+    :ivar q_first_half: Query mismatches in the first NeoX half.
+    :ivar q_second_half: Query mismatches in the second NeoX half.
+    :ivar k_first_half: Key mismatches in the first NeoX half.
+    :ivar k_second_half: Key mismatches in the second NeoX half.
+    :ivar v: Value mismatches after RMSNorm.
+    """
+
+    q_first_half: int
+    q_second_half: int
+    k_first_half: int
+    k_second_half: int
+    v: int
+
+    @property
+    def total(self) -> int:
+        """Return the total mismatch count.
+
+        :returns: Mismatches across every QKV region.
+        """
+        return (
+            self.q_first_half
+            + self.q_second_half
+            + self.k_first_half
+            + self.k_second_half
+            + self.v
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class BenchmarkResult:
     """Timing and numerical comparison for one Gemma 4 attention shape.
 
@@ -28,6 +59,7 @@ class BenchmarkResult:
     :ivar fused_us: Median fused kernel time in microseconds.
     :ivar exact_fraction: Fraction of BF16 outputs that match bit-for-bit.
     :ivar max_absolute_error: Largest output difference after BF16 conversion.
+    :ivar region_mismatches: Mismatch counts partitioned by QKV and NeoX half.
     """
 
     tensor_parallel_size: int
@@ -37,6 +69,7 @@ class BenchmarkResult:
     fused_us: float
     exact_fraction: float
     max_absolute_error: float
+    region_mismatches: RegionMismatchCounts
 
     @property
     def speedup(self) -> float:
@@ -56,13 +89,11 @@ def _build_rope_cache(rope_type: str, device: torch.device) -> torch.Tensor:
     """
     if rope_type == "sliding":
         inverse_frequency = 1.0 / (
-            10000.0
-            ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+            10000.0 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
         )
     elif rope_type == "proportional":
         rotated_frequency = 1.0 / (
-            1000000.0
-            ** (torch.arange(0, 64, 2, dtype=torch.float32) / HEAD_DIM)
+            1000000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / HEAD_DIM)
         )
         inverse_frequency = torch.cat(
             (rotated_frequency, torch.zeros(96, dtype=torch.float32))
@@ -96,6 +127,54 @@ def _time_cuda(operation: Callable[[], None], repeats: int) -> float:
     return statistics.median(
         start.elapsed_time(end) * 1000.0
         for start, end in zip(starts, ends, strict=True)
+    )
+
+
+def _count_region_mismatches(
+    baseline_output: torch.Tensor,
+    fused_output: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> RegionMismatchCounts:
+    """Partition bitwise mismatches across QKV and the two NeoX halves.
+
+    :param baseline_output: Incumbent QKV result.
+    :param fused_output: Candidate QKV result.
+    :param q_size: Flattened query width.
+    :param kv_size: Flattened key or value width.
+    :param num_q_heads: Query head count.
+    :param num_kv_heads: Key and value head count.
+    :returns: Regional mismatch counts.
+    """
+    baseline_q, baseline_k, baseline_v = baseline_output.split(
+        (q_size, kv_size, kv_size), dim=-1
+    )
+    fused_q, fused_k, fused_v = fused_output.split((q_size, kv_size, kv_size), dim=-1)
+    baseline_q = baseline_q.view(-1, num_q_heads, HEAD_DIM)
+    fused_q = fused_q.view(-1, num_q_heads, HEAD_DIM)
+    baseline_k = baseline_k.view(-1, num_kv_heads, HEAD_DIM)
+    fused_k = fused_k.view(-1, num_kv_heads, HEAD_DIM)
+    half_head_dim = HEAD_DIM // 2
+
+    def mismatch_count(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
+        return int(torch.count_nonzero(lhs != rhs).item())
+
+    return RegionMismatchCounts(
+        q_first_half=mismatch_count(
+            baseline_q[..., :half_head_dim], fused_q[..., :half_head_dim]
+        ),
+        q_second_half=mismatch_count(
+            baseline_q[..., half_head_dim:], fused_q[..., half_head_dim:]
+        ),
+        k_first_half=mismatch_count(
+            baseline_k[..., :half_head_dim], fused_k[..., :half_head_dim]
+        ),
+        k_second_half=mismatch_count(
+            baseline_k[..., half_head_dim:], fused_k[..., half_head_dim:]
+        ),
+        v=mismatch_count(baseline_v, fused_v),
     )
 
 
@@ -188,7 +267,15 @@ def _run_shape(
     baseline()
     fused()
     difference = (baseline_output.float() - fused_output.float()).abs()
-    exact_fraction = float((baseline_output == fused_output).float().mean().item())
+    region_mismatches = _count_region_mismatches(
+        baseline_output,
+        fused_output,
+        q_size,
+        kv_size,
+        num_q_heads,
+        num_kv_heads,
+    )
+    exact_fraction = 1.0 - region_mismatches.total / baseline_output.numel()
     max_absolute_error = float(difference.max().item())
 
     baseline_timing_input = source.clone()
@@ -206,6 +293,7 @@ def _run_shape(
         fused_us=fused_us,
         exact_fraction=exact_fraction,
         max_absolute_error=max_absolute_error,
+        region_mismatches=region_mismatches,
     )
 
 
@@ -238,7 +326,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
 
     print(
-        "tp\ttokens\trope\tbaseline_us\tfused_us\tspeedup\texact_fraction\tmax_abs_error"
+        "tp\ttokens\trope\tbaseline_us\tfused_us\tspeedup\texact_fraction"
+        "\tmax_abs_error\tq_first_mismatches\tq_second_mismatches"
+        "\tk_first_mismatches\tk_second_mismatches\tv_mismatches"
     )
     for result in results:
         print(
@@ -246,6 +336,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"\t{result.baseline_us:.3f}\t{result.fused_us:.3f}"
             f"\t{result.speedup:.3f}\t{result.exact_fraction:.8f}"
             f"\t{result.max_absolute_error:.8f}"
+            f"\t{result.region_mismatches.q_first_half}"
+            f"\t{result.region_mismatches.q_second_half}"
+            f"\t{result.region_mismatches.k_first_half}"
+            f"\t{result.region_mismatches.k_second_half}"
+            f"\t{result.region_mismatches.v}"
         )
 
 
