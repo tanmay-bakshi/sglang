@@ -417,6 +417,40 @@ def source_tp_ranks_for_destination(
     return (destination_tp_rank // destinations_per_source,)
 
 
+def _source_replication_for_entry(
+    source_token_bytes: int,
+    destination_token_bytes: int,
+    source_tp_size: int,
+    destination_tp_size: int,
+) -> int:
+    """Derive physical source replication from one pinned entry pair.
+
+    Packed decode currently admits TP1 and TP2 destinations whose Gemma KV
+    components are not replicated. Any excess physical source bytes therefore
+    represent equal consecutive source replicas, not additional logical data.
+
+    :param source_token_bytes: Per-rank source bytes for one token.
+    :param destination_token_bytes: Per-rank destination bytes for one token.
+    :param source_tp_size: Physical source attention TP width.
+    :param destination_tp_size: Physical destination attention TP width.
+    :returns: Consecutive physical source ranks per logical shard.
+    :raises ValueError: If the pinned geometries cannot describe exact source
+        replication of the destination.
+    """
+
+    source_physical_bytes = source_token_bytes * source_tp_size
+    destination_physical_bytes = destination_token_bytes * destination_tp_size
+    if source_physical_bytes % destination_physical_bytes != 0:
+        raise ValueError(
+            "source and destination entry geometries do not form exact "
+            "source replication"
+        )
+    replication = source_physical_bytes // destination_physical_bytes
+    if replication <= 0 or source_tp_size % replication != 0:
+        raise ValueError("source entry replication does not divide source TP width")
+    return replication
+
+
 def _canonical_writers(
     writers: tuple[StagingWriterId, ...],
     expected_source_ranks: tuple[int, ...],
@@ -693,12 +727,23 @@ def build_staging_chunk_layout(
                     destination_geometry.item_lens[pair.destination_index]
                     // destination_geometry.page_size
                 )
+                source_replication = _source_replication_for_entry(
+                    source_token_bytes,
+                    destination_token_bytes,
+                    source_tp_size,
+                    destination_tp_size,
+                )
+                if writer.source_attn_tp_rank % source_replication != 0:
+                    continue
+                logical_source_tp_size = source_tp_size // source_replication
                 shard = compute_tensor_parallel_shard(
                     source_token_bytes=source_token_bytes,
                     destination_token_bytes=destination_token_bytes,
-                    source_parallel_size=source_tp_size,
+                    source_parallel_size=logical_source_tp_size,
                     destination_parallel_size=destination_tp_size,
-                    source_rank=writer.source_attn_tp_rank,
+                    source_rank=(
+                        writer.source_attn_tp_rank // source_replication
+                    ),
                     destination_rank=destination_tp_rank,
                 )
                 geometry_key = (
@@ -751,6 +796,8 @@ def build_staging_chunk_layout(
                 group_offset += length_bytes
 
         writer_length = _align_up(group_offset - writer_offset, alignment_bytes)
+        if writer_length == 0:
+            writer_length = alignment_bytes
         writer_layouts.append(
             StagingWriterLayout(
                 writer_id=writer,

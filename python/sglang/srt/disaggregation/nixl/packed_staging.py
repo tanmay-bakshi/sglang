@@ -1,6 +1,7 @@
 import dataclasses
 import enum
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -42,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingComponentSpan,
     StagingWriterId,
     StagingWriterLayout,
+    validate_staging_component_geometry,
 )
 from sglang.srt.disaggregation.common.staging_runtime import (
     StagingComponentBuffer,
@@ -1456,39 +1458,6 @@ def destination_component_geometry(
     )
 
 
-def derive_source_geometry(
-    destination: StagingComponentGeometry,
-    source_tp_size: int,
-    destination_tp_size: int,
-) -> StagingComponentGeometry:
-    """Derive the only valid non-replicated source TP geometry.
-
-    :param destination: Decode-local component geometry.
-    :param source_tp_size: Source attention tensor-parallel width.
-    :param destination_tp_size: Destination attention tensor-parallel width.
-    :returns: Expected source per-rank geometry.
-    :raises ValueError: If aggregate bytes cannot be partitioned exactly.
-    """
-
-    if source_tp_size <= 0 or destination_tp_size <= 0:
-        raise ValueError("tensor-parallel sizes must be positive")
-    source_item_lens: list[int] = []
-    for destination_item_len in destination.item_lens:
-        aggregate_item_len = destination_item_len * destination_tp_size
-        if aggregate_item_len % source_tp_size != 0:
-            raise ValueError(
-                "destination geometry cannot be exactly partitioned by source TP: "
-                f"{aggregate_item_len} bytes across {source_tp_size} ranks"
-            )
-        source_item_lens.append(aggregate_item_len // source_tp_size)
-    return StagingComponentGeometry(
-        component_id=destination.component_id,
-        item_lens=tuple(source_item_lens),
-        layer_ids=destination.layer_ids,
-        page_size=destination.page_size,
-    )
-
-
 def build_component_buffer_registry(
     kv_args: KVArgs,
     page_arrays: dict[StagingComponentId, npt.NDArray[np.int32]],
@@ -1645,6 +1614,163 @@ def _required_final_components(
     return frozenset(required)
 
 
+def registered_source_component_geometries(
+    kv_args: KVArgs,
+) -> tuple[StagingComponentGeometry, ...]:
+    """Return the complete packed source geometry registered by one rank.
+
+    :param kv_args: Source-local registered KV metadata.
+    :returns: Main KV followed by every non-empty packed SWA component.
+    """
+
+    component_ids = [MAIN_KV_COMPONENT]
+    component_ids.extend(
+        sorted(
+            _required_final_components(kv_args),
+            key=lambda component_id: component_id.state_index
+            if component_id.state_index is not None
+            else -1,
+        )
+    )
+    return tuple(
+        local_component_geometry(kv_args, component_id)
+        for component_id in component_ids
+    )
+
+
+def _encode_source_component_geometry_values(
+    geometries: tuple[StagingComponentGeometry, ...],
+) -> str:
+    """Encode materialized source geometries as canonical JSON.
+
+    :param geometries: Canonically ordered source component geometries.
+    :returns: Canonical compact JSON document.
+    """
+
+    components: list[dict[str, object]] = []
+    for geometry in geometries:
+        component_id = geometry.component_id
+        components.append(
+            {
+                "item_lens": list(geometry.item_lens),
+                "layer_ids": list(geometry.layer_ids),
+                "page_size": geometry.page_size,
+                "state_index": component_id.state_index,
+                "state_type": (
+                    component_id.state_type.value
+                    if component_id.state_type is not None
+                    else None
+                ),
+            }
+        )
+    return json.dumps(
+        {"components": components, "schema_version": 1},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def encode_source_component_geometries(kv_args: KVArgs) -> str:
+    """Encode canonical bootstrap source geometry for cohort agreement.
+
+    :param kv_args: Source-local registered KV metadata.
+    :returns: Canonical compact JSON document.
+    """
+
+    return _encode_source_component_geometry_values(
+        registered_source_component_geometries(kv_args)
+    )
+
+
+def decode_source_component_geometries(
+    document: str,
+) -> tuple[StagingComponentGeometry, ...]:
+    """Decode and validate bootstrap-pinned source component geometry.
+
+    :param document: Canonical geometry JSON from the bootstrap cohort.
+    :returns: Immutable component geometries in canonical order.
+    :raises ValueError: If the document is malformed or noncanonical.
+    """
+
+    payload = json.loads(document)
+    if type(payload) is not dict or payload.get("schema_version") != 1:
+        raise ValueError("unsupported packed source geometry document")
+    raw_components = payload.get("components")
+    if type(raw_components) is not list or len(raw_components) == 0:
+        raise ValueError("packed source geometry must contain components")
+    geometries: list[StagingComponentGeometry] = []
+    seen_components: set[StagingComponentId] = set()
+    seen_state_indices: set[int] = set()
+    for index, raw_component in enumerate(raw_components):
+        if type(raw_component) is not dict:
+            raise ValueError(f"packed source component {index} must be an object")
+        state_index = raw_component.get("state_index")
+        state_type_value = raw_component.get("state_type")
+        if state_index is None:
+            if state_type_value is not None:
+                raise ValueError("main KV source geometry cannot declare state_type")
+            component_id = MAIN_KV_COMPONENT
+        else:
+            if type(state_index) is not int or state_index < 0:
+                raise ValueError("source geometry state_index must be non-negative")
+            if type(state_type_value) is not str:
+                raise ValueError("state source geometry must declare state_type")
+            try:
+                state_type = StateType(state_type_value)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsupported source geometry state_type {state_type_value!r}"
+                ) from error
+            if state_type is not StateType.SWA:
+                raise ValueError("packed source geometry supports only SWA state")
+            component_id = StagingComponentId(
+                state_index=state_index,
+                state_type=state_type,
+            )
+        item_lens = raw_component.get("item_lens")
+        layer_ids = raw_component.get("layer_ids")
+        page_size = raw_component.get("page_size")
+        if (
+            type(item_lens) is not list
+            or any(type(value) is not int for value in item_lens)
+            or type(layer_ids) is not list
+            or any(type(value) is not int for value in layer_ids)
+            or type(page_size) is not int
+        ):
+            raise ValueError("packed source geometry fields have invalid types")
+        if component_id in seen_components:
+            raise ValueError("packed source geometry contains a duplicate component")
+        if state_index is not None and state_index in seen_state_indices:
+            raise ValueError("packed source geometry contains a duplicate state_index")
+        geometry = StagingComponentGeometry(
+            component_id=component_id,
+            item_lens=tuple(item_lens),
+            layer_ids=tuple(layer_ids),
+            page_size=page_size,
+        )
+        validate_staging_component_geometry(geometry, "bootstrap source")
+        seen_components.add(component_id)
+        if state_index is not None:
+            seen_state_indices.add(state_index)
+        geometries.append(geometry)
+    expected_order = sorted(
+        geometries,
+        key=lambda geometry: (
+            geometry.component_id.state_index is not None,
+            geometry.component_id.state_index
+            if geometry.component_id.state_index is not None
+            else -1,
+        ),
+    )
+    if geometries != expected_order or geometries[0].component_id != MAIN_KV_COMPONENT:
+        raise ValueError("packed source geometry components are not canonical")
+    canonical = _encode_source_component_geometry_values(tuple(geometries))
+    if canonical != document:
+        raise ValueError("packed source geometry document is not canonical")
+    return tuple(geometries)
+
+
 def build_prefill_chunk(
     *,
     key: PackedChunkKey,
@@ -1732,6 +1858,7 @@ def build_decode_spec(
     is_last: bool,
     spans: tuple[StagingComponentSpan, ...],
     kv_args: KVArgs,
+    source_registration: tuple[StagingComponentGeometry, ...],
     expected_writers: tuple[StagingWriterId, ...],
     source_tp_size: int,
     destination_tp_size: int,
@@ -1743,6 +1870,7 @@ def build_decode_spec(
     :param is_last: Trusted final-chunk marker.
     :param spans: Trusted component spans derived from room metadata.
     :param kv_args: Decode-local registered KV metadata.
+    :param source_registration: Bootstrap-pinned source component geometries.
     :param expected_writers: Writers authenticated by bootstrap routing.
     :param source_tp_size: Expected source attention TP width.
     :param destination_tp_size: Decode attention TP width.
@@ -1777,19 +1905,24 @@ def build_decode_spec(
         local_component_geometry(kv_args, component_id)
         for component_id in component_ids
     )
-    source_components = tuple(
-        derive_source_geometry(
-            destination,
-            source_tp_size,
-            destination_tp_size,
-        )
-        for destination in destination_components
-    )
+    source_by_component = {
+        geometry.component_id: geometry for geometry in source_registration
+    }
+    if len(source_by_component) != len(source_registration):
+        raise ValueError("bootstrap source component geometries are duplicated")
+    source_components: list[StagingComponentGeometry] = []
+    for component_id in component_ids:
+        geometry = source_by_component.get(component_id)
+        if geometry is None:
+            raise ValueError(
+                f"bootstrap source registration omits component {component_id}"
+            )
+        source_components.append(geometry)
     return PackedLayoutSpec(
         chunk_id=chunk_id,
         is_last=is_last,
         spans=spans,
-        source_components=source_components,
+        source_components=tuple(source_components),
         destination_components=destination_components,
         writers=expected_writers,
         topology=expected_topology,

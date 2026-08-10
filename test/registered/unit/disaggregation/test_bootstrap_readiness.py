@@ -21,6 +21,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+PACKED_SOURCE_GEOMETRY = (
+    '{"components":[{"item_lens":[32768],"layer_ids":[0],"page_size":64,'
+    '"state_index":null,"state_type":null}],"schema_version":1}'
+)
+
 
 def _free_port() -> int:
     """Reserve and release one loopback port for an in-process server.
@@ -89,6 +94,10 @@ def _registration(
                 "nixl_agent_metadata_sha256": hashlib.sha256(metadata).hexdigest(),
                 "process_generation": f"00000000-0000-4000-8000-{tp_rank:012d}",
                 "transfer_source_rank": tp_rank,
+                "packed_source_geometry": PACKED_SOURCE_GEOMETRY,
+                "packed_source_geometry_sha256": hashlib.sha256(
+                    PACKED_SOURCE_GEOMETRY.encode("ascii")
+                ).hexdigest(),
             }
         )
     return registration
@@ -182,6 +191,38 @@ def test_nixl_peer_identity_round_trips_for_every_rank() -> None:
             assert payload["process_generation"] == (
                 f"00000000-0000-4000-8000-{tp_rank:012d}"
             )
+            assert payload["packed_source_geometry"] == PACKED_SOURCE_GEOMETRY
+    finally:
+        server.close()
+
+
+def test_bootstrap_rejects_cross_rank_source_geometry_disagreement() -> None:
+    """Packed source component geometry is one cohort-wide bootstrap fact."""
+
+    port = _free_port()
+    server = CommonKVBootstrapServer(host="127.0.0.1", port=port)
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        _wait_for_liveness(base_url)
+        first = _registration(0, rank_port=31000, with_nixl_identity=True)
+        first_response = requests.put(
+            f"{base_url}/route",
+            json=first,
+            timeout=1,
+        )
+        assert first_response.status_code == 200
+
+        second = _registration(1, rank_port=31001, with_nixl_identity=True)
+        divergent = PACKED_SOURCE_GEOMETRY.replace("32768", "16384")
+        second["packed_source_geometry"] = divergent
+        second["packed_source_geometry_sha256"] = hashlib.sha256(
+            divergent.encode("ascii")
+        ).hexdigest()
+        response = requests.put(f"{base_url}/route", json=second, timeout=1)
+
+        assert response.status_code == 409
+        assert "inconsistent bootstrap packed_source_geometry" in response.text
+        assert server.registered_count == 1
     finally:
         server.close()
 

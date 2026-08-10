@@ -8,7 +8,10 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLeaseAuthority,
 )
 from sglang.srt.disaggregation.common.packed_staging_wire import PackedWireMessage
-from sglang.srt.disaggregation.common.staging_layout import StagingWriterId
+from sglang.srt.disaggregation.common.staging_layout import (
+    StagingComponentGeometry,
+    StagingWriterId,
+)
 from sglang.srt.disaggregation.nixl.packed_runtime import (
     PACKED_PREPARED_GRANT_PROTOCOL,
     PackedControlSender,
@@ -142,6 +145,7 @@ class PackedNixlDecodeController:
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
         source_tp_size: int,
+        source_registration: tuple[StagingComponentGeometry, ...],
     ) -> PackedDecodeRequestTransaction:
         """Construct one actor-owned request transaction.
 
@@ -152,6 +156,7 @@ class PackedNixlDecodeController:
         :param allocation_authority: Exact allocation authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
         :param source_tp_size: Supported packed source writer width.
+        :param source_registration: Bootstrap-pinned source component geometry.
         :returns: Prepared request transaction.
         """
 
@@ -163,6 +168,7 @@ class PackedNixlDecodeController:
             allocation_authority=allocation_authority,
             lifecycle_authority=lifecycle_authority,
             source_tp_size=source_tp_size,
+            source_registration=source_registration,
         )
 
     def bind_publication(

@@ -95,6 +95,8 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedComponentPages,
     PackedDestinationRegistration,
     PackedPeerIdentity,
+    decode_source_component_geometries,
+    encode_source_component_geometries,
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
@@ -973,7 +975,7 @@ class NixlKVManager(CommonKVManager):
         :returns: Generation-bound bootstrap registration fields.
         """
 
-        return {
+        registration = {
             "transport_protocol": NIXL_BOOTSTRAP_PEER_PROTOCOL,
             "nixl_agent_name": self.agent.name,
             "nixl_agent_metadata": base64.b64encode(self.agent_metadata).decode(
@@ -985,6 +987,18 @@ class NixlKVManager(CommonKVManager):
             "process_generation": self.process_generation,
             "transfer_source_rank": self.transfer_source_rank,
         }
+        if self._packed_prefill_runtime is None:
+            return registration
+        source_geometry = encode_source_component_geometries(self.kv_args)
+        registration.update(
+            {
+                "packed_source_geometry": source_geometry,
+                "packed_source_geometry_sha256": hashlib.sha256(
+                    source_geometry.encode("ascii")
+                ).hexdigest(),
+            }
+        )
+        return registration
 
     def kv_transfer_protocol(self) -> str | None:
         """Return the live packed transfer protocol for this process role.
@@ -1051,6 +1065,7 @@ class NixlKVManager(CommonKVManager):
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
         source_tp_size: int,
+        source_component_geometry: str,
     ) -> PackedDecodeRequestTransaction | None:
         """Construct one production decode transaction when actors are live.
 
@@ -1061,6 +1076,7 @@ class NixlKVManager(CommonKVManager):
         :param allocation_authority: Exact allocation lease authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
         :param source_tp_size: Source attention tensor-parallel width.
+        :param source_component_geometry: Bootstrap-pinned source geometry.
         :returns: ``None`` while the production packed runtime is unavailable.
         """
 
@@ -1073,6 +1089,9 @@ class NixlKVManager(CommonKVManager):
             allocation_authority=allocation_authority,
             lifecycle_authority=lifecycle_authority,
             source_tp_size=source_tp_size,
+            source_registration=decode_source_component_geometries(
+                source_component_geometry
+            ),
         )
 
     def send_packed_decode_request_metadata(

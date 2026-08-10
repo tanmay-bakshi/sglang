@@ -32,8 +32,10 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedWriterVisibilityEvidence,
 )
 from sglang.srt.disaggregation.common.staging_layout import (
+    StagingChunkLayout,
     StagingComponentId,
     StagingWriterId,
+    StagingWriterLayout,
 )
 from sglang.srt.disaggregation.nixl import packed_runtime as runtime_module
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -55,6 +57,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedNixlRuntimeRoot,
     PackedPeerIdentity,
     build_prefill_chunk,
+    registered_source_component_geometries,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestTransactionState,
@@ -1040,6 +1043,7 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
         source_tp_size,
     )
     allocation_snapshot = allocation_authority.snapshot(allocation_lease)
+    source_kv_args = _packed_kv_args(item_length=1024 // source_tp_size)
     transaction = decode_runtime.prepare_transaction(
         room_id=91,
         request_owner=owner,
@@ -1048,6 +1052,7 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
         allocation_authority=allocation_authority,
         lifecycle_authority=decode_manager,
         source_tp_size=source_tp_size,
+        source_registration=registered_source_component_geometries(source_kv_args),
     )
     publication = transaction.publish()
     receipts = {
@@ -1058,7 +1063,6 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
     assert len(full_receipt.physical_pages) == 1
     assert len(swa_receipt.physical_pages) == 1
 
-    source_kv_args = _packed_kv_args(item_length=1024 // source_tp_size)
     source_manager = object.__new__(NixlKVManager)
     source_manager.kv_args = source_kv_args
     destination_swa_window = (
@@ -1165,6 +1169,7 @@ def test_tp2_rank_one_decode_runtime_uses_destination_local_writer() -> None:
         allocation_authority=allocation_authority,
         lifecycle_authority=decode_manager,
         source_tp_size=2,
+        source_registration=registered_source_component_geometries(decode_kv_args),
     )
     publication = transaction.publish()
     spec = publication.chunk_specs[0]
@@ -1212,7 +1217,23 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
         chunk_key=chunk_key,
     )
     runtime._records[plan.key] = record
-    source_transfer = object()
+    writer_layout = StagingWriterLayout(
+        writer_id=_writer(),
+        lease_offset=0,
+        length_bytes=4096,
+        copy_groups=(),
+    )
+    layout = StagingChunkLayout(
+        chunk_id=0,
+        is_last=True,
+        component_spans=(),
+        source_components=(),
+        destination_components=(),
+        writers=(writer_layout,),
+        total_bytes=4096,
+        digest=b"d" * 32,
+    )
+    source_transfer = Mock(layout=layout, length_bytes=4096)
     runtime._ready = _ReadyCoordinator(source_transfer)
     ready = PackedReady(
         key=chunk_key,
@@ -1290,6 +1311,7 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     assert plan.key not in runtime._records
     assert (
         "PackedTransferStats(room=41, role=prefill, source_rank=0, "
+        "copy_group_count=0, payload_bytes=0, transport_bytes=4096, "
         "ready_wait_duration=11.000ms, "
         "source_gather_copy_duration=5.000ms, "
         "main_transport_duration=19.000ms)"

@@ -9,7 +9,6 @@ import weakref
 import numpy as np
 import pytest
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
@@ -71,8 +70,11 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     build_decode_spec,
     build_nixl_ucx_lane_identifier,
     build_prefill_chunk,
+    decode_source_component_geometries,
     derive_destination_visibility_proof,
     derive_nixl_ucx_runtime_artifact_components,
+    encode_source_component_geometries,
+    registered_source_component_geometries,
     writer_layout_for,
 )
 from sglang.srt.disaggregation.utils import resolve_kv_layer_ids
@@ -905,6 +907,9 @@ def _decode_spec(
         is_last=is_last,
         spans=spans,
         kv_args=_kv_args(source=False),
+        source_registration=registered_source_component_geometries(
+            _kv_args(source=True)
+        ),
         expected_writers=WRITERS,
         source_tp_size=2,
         destination_tp_size=1,
@@ -1052,6 +1057,17 @@ def test_decode_rebuilds_supported_source_layouts(
     assert decode_spec.build() == source_spec.build()
 
 
+def test_bootstrap_source_geometry_round_trip_is_exact() -> None:
+    """Canonical bootstrap geometry preserves every registered component."""
+
+    source = _kv_args(source=True)
+    document = encode_source_component_geometries(source)
+    decoded = decode_source_component_geometries(document)
+
+    assert decoded == registered_source_component_geometries(source)
+    assert encode_source_component_geometries(source) == document
+
+
 @pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
     source_tp_size: int,
@@ -1141,6 +1157,7 @@ def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
         is_last=True,
         spans=source_spec.spans,
         kv_args=destination,
+        source_registration=source_spec.source_components,
         expected_writers=writers,
         source_tp_size=source_tp_size,
         destination_tp_size=1,
@@ -1178,8 +1195,8 @@ def test_decode_rejects_final_chunk_omitting_required_swa() -> None:
         )
 
 
-def test_decode_geometry_is_derived_without_trusting_source_metadata() -> None:
-    """Source-advertised byte geometry cannot become decode canonical truth."""
+def test_bootstrap_pinned_geometry_rejects_tampered_prepare() -> None:
+    """PREPARE cannot replace the source geometry pinned before allocation."""
 
     source_spec, _ = _prefill_chunk(
         (MAIN_KV_COMPONENT, SWA_COMPONENT),
@@ -1189,7 +1206,7 @@ def test_decode_geometry_is_derived_without_trusting_source_metadata() -> None:
         source_spec.source_components[0],
         item_lens=(64, 64),
     )
-    forged = dataclasses.replace(
+    forged_spec = dataclasses.replace(
         source_spec,
         source_components=(
             forged_source_geometry,
@@ -1197,12 +1214,31 @@ def test_decode_geometry_is_derived_without_trusting_source_metadata() -> None:
         ),
     )
 
-    decode_spec = _decode_spec(
-        source_spec.spans,
-        is_last=True,
+    decode_spec = _decode_spec(source_spec.spans, is_last=True)
+    destination = _kv_args(source=False)
+    registry = build_component_buffer_registry(
+        destination,
+        active_destination_page_arrays(
+            destination,
+            np.asarray((7, 8), dtype=np.int32),
+            [np.asarray((9, 10), dtype=np.int32)],
+        ),
     )
+    protocol = PackedDecodeProtocol(
+        PackedIntervalLeaseAllocator(base_address=0x800000, total_size=1 << 20)
+    )
+    protocol.register_chunk(KEY, decode_spec, registry, _writer_policy_digests())
 
-    assert forged.source_components != decode_spec.source_components
+    with pytest.raises(PackedProtocolError, match="decode-local canonical"):
+        protocol.handle_prepare(
+            PackedPrepare(
+                key=KEY,
+                writer_id=WRITERS[0],
+                spec=forged_spec,
+                digest=forged_spec.build().digest,
+            ),
+            WRITERS[0],
+        )
 
 
 def test_destination_binding_rejects_page_capacity_overflow() -> None:

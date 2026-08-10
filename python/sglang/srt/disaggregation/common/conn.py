@@ -6,6 +6,7 @@ import binascii
 import concurrent.futures
 import dataclasses
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -65,6 +66,7 @@ SERIALIZED_RANK_LIMIT = 1 << 32
 NIXL_AGENT_NAME_MAX_BYTES = 256
 NIXL_AGENT_METADATA_MAX_BYTES = 512 * 1024
 NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH = 4 * ((NIXL_AGENT_METADATA_MAX_BYTES + 2) // 3)
+PACKED_SOURCE_GEOMETRY_MAX_BYTES = 64 * 1024
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -124,6 +126,8 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    packed_source_geometry: str | None = None
+    packed_source_geometry_sha256: str | None = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -163,6 +167,8 @@ class PrefillRankInfo:
     nixl_agent_metadata: str | None = None
     nixl_agent_metadata_sha256: str | None = None
     process_generation: str | None = None
+    packed_source_geometry: str | None = None
+    packed_source_geometry_sha256: str | None = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -352,6 +358,7 @@ class CommonKVManager(BaseKVManager):
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
         source_tp_size: int,
+        source_component_geometry: str,
     ) -> PackedDecodeRequestTransaction | None:
         """Construct a request transaction before allocation publication.
 
@@ -362,9 +369,11 @@ class CommonKVManager(BaseKVManager):
         :param allocation_authority: Exact allocation lease authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
         :param source_tp_size: Source attention tensor-parallel width.
+        :param source_component_geometry: Bootstrap-pinned source geometry.
         :returns: A prepared transaction, otherwise ``None`` when unavailable.
         """
 
+        del source_component_geometry
         return None
 
     def send_packed_decode_request_metadata(
@@ -1804,6 +1813,8 @@ def _parse_bootstrap_transport_registration(
         "nixl_agent_metadata_sha256",
         "process_generation",
         "transfer_source_rank",
+        "packed_source_geometry",
+        "packed_source_geometry_sha256",
     )
     transport_protocol = data.get("transport_protocol")
     if transport_protocol is None:
@@ -1851,6 +1862,49 @@ def _parse_bootstrap_transport_registration(
     transfer_source_rank = validate_serialized_rank(
         data.get("transfer_source_rank"), "transfer_source_rank"
     )
+    packed_source_geometry = data.get("packed_source_geometry")
+    packed_source_geometry_sha256 = data.get("packed_source_geometry_sha256")
+    if packed_source_geometry is None and packed_source_geometry_sha256 is None:
+        return {
+            "transport_protocol": transport_protocol,
+            "nixl_agent_name": nixl_agent_name,
+            "nixl_agent_metadata": encoded_metadata,
+            "nixl_agent_metadata_sha256": metadata_sha256,
+            "process_generation": process_generation,
+            "transfer_source_rank": transfer_source_rank,
+            "packed_source_geometry": None,
+            "packed_source_geometry_sha256": None,
+        }
+    if type(packed_source_geometry) is not str:
+        raise ValueError("invalid bootstrap packed_source_geometry")
+    if len(packed_source_geometry.encode("utf-8")) > PACKED_SOURCE_GEOMETRY_MAX_BYTES:
+        raise ValueError("bootstrap packed_source_geometry exceeds size limit")
+    try:
+        parsed_geometry = json.loads(packed_source_geometry)
+    except json.JSONDecodeError as error:
+        raise ValueError("invalid bootstrap packed_source_geometry JSON") from error
+    canonical_geometry = json.dumps(
+        parsed_geometry,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if canonical_geometry != packed_source_geometry:
+        raise ValueError("bootstrap packed_source_geometry is not canonical")
+    if (
+        type(packed_source_geometry_sha256) is not str
+        or len(packed_source_geometry_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in packed_source_geometry_sha256
+        )
+    ):
+        raise ValueError("invalid bootstrap packed_source_geometry_sha256")
+    if (
+        hashlib.sha256(packed_source_geometry.encode("ascii")).hexdigest()
+        != packed_source_geometry_sha256
+    ):
+        raise ValueError("bootstrap packed_source_geometry digest mismatch")
 
     return {
         "transport_protocol": transport_protocol,
@@ -1859,6 +1913,8 @@ def _parse_bootstrap_transport_registration(
         "nixl_agent_metadata_sha256": metadata_sha256,
         "process_generation": process_generation,
         "transfer_source_rank": transfer_source_rank,
+        "packed_source_geometry": packed_source_geometry,
+        "packed_source_geometry_sha256": packed_source_geometry_sha256,
     }
 
 
@@ -1879,6 +1935,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.packed_source_geometry: str | None = None
+        self.packed_source_geometry_sha256: str | None = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -2107,6 +2165,36 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     enable_dsa_cache_layer_split,
                     "enable_dsa_cache_layer_split",
                 )
+                candidate_source_geometry = transport_registration[
+                    "packed_source_geometry"
+                ]
+                candidate_source_geometry_sha256 = transport_registration[
+                    "packed_source_geometry_sha256"
+                ]
+                resolved_source_geometry = self.packed_source_geometry
+                resolved_source_geometry_sha256 = (
+                    self.packed_source_geometry_sha256
+                )
+                if self.registered_count > 0 and (
+                    (candidate_source_geometry is None)
+                    != (self.packed_source_geometry is None)
+                ):
+                    raise ValueError(
+                        "inconsistent bootstrap packed source geometry presence"
+                    )
+                if candidate_source_geometry is not None:
+                    assert isinstance(candidate_source_geometry, str)
+                    assert isinstance(candidate_source_geometry_sha256, str)
+                    resolved_source_geometry = _resolve_bootstrap_str(
+                        self.packed_source_geometry,
+                        candidate_source_geometry,
+                        "packed_source_geometry",
+                    )
+                    resolved_source_geometry_sha256 = _resolve_bootstrap_str(
+                        self.packed_source_geometry_sha256,
+                        candidate_source_geometry_sha256,
+                        "packed_source_geometry_sha256",
+                    )
             except ValueError as error:
                 return web.Response(text=str(error), status=409)
 
@@ -2119,6 +2207,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.prefill_http_port = resolved_prefill_http_port
             self.follow_bootstrap_room = resolved_follow_bootstrap_room
             self.enable_dsa_cache_layer_split = resolved_dsa_cache_layer_split
+            self.packed_source_geometry = resolved_source_geometry
+            self.packed_source_geometry_sha256 = resolved_source_geometry_sha256
 
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
@@ -2203,6 +2293,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                packed_source_geometry=self.packed_source_geometry,
+                packed_source_geometry_sha256=(
+                    self.packed_source_geometry_sha256
+                ),
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

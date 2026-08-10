@@ -30,7 +30,11 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
 )
 from sglang.srt.disaggregation.common.packed_staging_wire import encode_packed_message
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
-from sglang.srt.disaggregation.common.staging_layout import StagingWriterId
+from sglang.srt.disaggregation.common.staging_layout import (
+    StagingComponentGeometry,
+    StagingComponentId,
+    StagingWriterId,
+)
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     NIXL_DIRECT_KV_MAX_COHORT_DESCRIPTORS,
@@ -3026,6 +3030,10 @@ class TestNixlPackedManagerIntegration(CustomTestCase):
         allocation_lease = object()
         allocation_authority = object()
         lifecycle_authority = object()
+        source_component_geometry = (
+            '{"components":[{"item_lens":[4],"layer_ids":[0],"page_size":1,'
+            '"state_index":null,"state_type":null}],"schema_version":1}'
+        )
         controller.prepare_transaction.return_value = transaction
         controller.poll.return_value = KVPoll.Success
         controller.cancel_unpublished.return_value = request_owner
@@ -3044,6 +3052,7 @@ class TestNixlPackedManagerIntegration(CustomTestCase):
             allocation_authority=allocation_authority,
             lifecycle_authority=lifecycle_authority,
             source_tp_size=4,
+            source_component_geometry=source_component_geometry,
         )
         polled = manager.poll_packed_decode_request_transaction(transaction)
         cancelled = manager.cancel_unpublished_packed_decode_request_transaction(
@@ -3064,6 +3073,14 @@ class TestNixlPackedManagerIntegration(CustomTestCase):
             allocation_authority=allocation_authority,
             lifecycle_authority=lifecycle_authority,
             source_tp_size=4,
+            source_registration=(
+                StagingComponentGeometry(
+                    component_id=StagingComponentId(None, None),
+                    item_lens=(4,),
+                    layer_ids=(0,),
+                    page_size=1,
+                ),
+            ),
         )
         self.assertIs(prepared, transaction)
         self.assertEqual(polled, KVPoll.Success)

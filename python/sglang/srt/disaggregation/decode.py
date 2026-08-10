@@ -877,6 +877,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "reserved asymmetric request acquired no migration lease"
                     )
                 snapshot = self.allocation_lease_authority.snapshot(lease)
+                source_component_geometry = (
+                    decode_req.kv_receiver.prefill_info.packed_source_geometry
+                )
+                if source_component_geometry is None:
+                    raise DecodeAllocationLeaseError(
+                        "packed prefill bootstrap omitted source component geometry"
+                    )
                 packed_transaction = (
                     self.kv_manager.prepare_packed_decode_request_transaction(
                         room_id=room,
@@ -886,6 +893,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         allocation_authority=self.allocation_lease_authority,
                         lifecycle_authority=self.allocation_lifecycle_authority,
                         source_tp_size=attempt.source_tp_size,
+                        source_component_geometry=source_component_geometry,
                     )
                 )
                 if packed_transaction is None:

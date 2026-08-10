@@ -305,6 +305,131 @@ class TestGemma4StagingLayout(unittest.TestCase):
         self.assertEqual(main_offsets, [0, 512, 1024, 1536])
         self.assertEqual(swa_offsets, [0, 1024, 2048, 3072])
 
+    def test_tp8_replication_is_derived_per_component_entry(self) -> None:
+        """Full KV uses even owners while every rank still carries SWA."""
+
+        source_components = (
+            StagingComponentGeometry(
+                component_id=MAIN_KV,
+                item_lens=(512, 512),
+                layer_ids=(5, 5),
+                page_size=1,
+            ),
+            StagingComponentGeometry(
+                component_id=SWA,
+                item_lens=(512, 512),
+                layer_ids=(1, 1),
+                page_size=1,
+            ),
+        )
+        destination_components = (
+            dataclasses.replace(
+                source_components[0],
+                item_lens=(2048, 2048),
+            ),
+            dataclasses.replace(
+                source_components[1],
+                item_lens=(4096, 4096),
+            ),
+        )
+        spans = (
+            StagingComponentSpan(MAIN_KV, 0, 0, 1, 1),
+            StagingComponentSpan(SWA, 0, 0, 1, 1),
+        )
+
+        layout = build_staging_chunk_layout(
+            chunk_id=0,
+            is_last=True,
+            spans=spans,
+            source_components=source_components,
+            destination_components=destination_components,
+            source_tp_size=8,
+            destination_tp_size=1,
+            destination_tp_rank=0,
+            writers=tuple(make_writer(rank) for rank in range(8)),
+        )
+
+        for rank, writer in enumerate(layout.writers):
+            component_ids = tuple(
+                group.component_id for group in writer.copy_groups
+            )
+            if rank % 2 == 0:
+                self.assertEqual(component_ids, (MAIN_KV, SWA))
+                self.assertEqual(
+                    writer.copy_groups[0].destination_offset_bytes,
+                    (rank // 2) * 512,
+                )
+            else:
+                self.assertEqual(component_ids, (SWA,))
+            self.assertEqual(
+                writer.copy_groups[-1].destination_offset_bytes,
+                rank * 512,
+            )
+
+    def test_tp8_replica_only_writer_gets_synchronization_projection(self) -> None:
+        """A writer without payload retains one aligned transport projection."""
+
+        source = StagingComponentGeometry(
+            component_id=MAIN_KV,
+            item_lens=(512, 512),
+            layer_ids=(5, 5),
+            page_size=1,
+        )
+        destination = dataclasses.replace(source, item_lens=(2048, 2048))
+        layout = build_staging_chunk_layout(
+            chunk_id=0,
+            is_last=False,
+            spans=(StagingComponentSpan(MAIN_KV, 0, 0, 1, 1),),
+            source_components=(source,),
+            destination_components=(destination,),
+            source_tp_size=8,
+            destination_tp_size=1,
+            destination_tp_rank=0,
+            writers=tuple(make_writer(rank) for rank in range(8)),
+        )
+
+        for rank, writer in enumerate(layout.writers):
+            if rank % 2 == 0:
+                self.assertEqual(len(writer.copy_groups), 1)
+                self.assertEqual(writer.length_bytes, 1024)
+                continue
+            self.assertEqual(writer.copy_groups, ())
+            self.assertEqual(writer.length_bytes, 256)
+
+    def test_tp8_replication_can_differ_within_one_component(self) -> None:
+        """Each paired registration entry derives its own physical owners."""
+
+        source = StagingComponentGeometry(
+            component_id=MAIN_KV,
+            item_lens=(512, 512, 512, 512),
+            layer_ids=(5, 7, 5, 7),
+            page_size=1,
+        )
+        destination = dataclasses.replace(
+            source,
+            item_lens=(2048, 4096, 2048, 4096),
+        )
+        layout = build_staging_chunk_layout(
+            chunk_id=0,
+            is_last=True,
+            spans=(StagingComponentSpan(MAIN_KV, 0, 0, 1, 1),),
+            source_components=(source,),
+            destination_components=(destination,),
+            source_tp_size=8,
+            destination_tp_size=1,
+            destination_tp_rank=0,
+            writers=tuple(make_writer(rank) for rank in range(8)),
+        )
+
+        for rank, writer in enumerate(layout.writers):
+            source_entries = tuple(
+                group.source_entry_indices for group in writer.copy_groups
+            )
+            if rank % 2 == 0:
+                self.assertEqual(source_entries, ((0, 2), (1, 3)))
+                continue
+            self.assertEqual(source_entries, ((1, 3),))
+
     def test_tp1_to_tp2_selects_the_destination_half_of_each_source_token(
         self,
     ) -> None:
@@ -709,7 +834,7 @@ class TestStagingLayoutValidation(unittest.TestCase):
             self.destination,
             item_lens=(48, 48),
         )
-        with self.assertRaisesRegex(ValueError, "non-replicated contiguous"):
+        with self.assertRaisesRegex(ValueError, "exact source replication"):
             self.build(destination=destination)
 
     def test_rejects_state_type_without_state_index(self) -> None:

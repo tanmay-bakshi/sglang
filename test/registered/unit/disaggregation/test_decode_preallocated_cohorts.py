@@ -291,6 +291,7 @@ class _FakePackedRuntimeManager:
         allocation_authority: _FakeAllocationAuthority,
         lifecycle_authority: object,
         source_tp_size: int,
+        source_component_geometry: str,
     ) -> _FakePackedTransaction:
         """Construct one transaction while its lease is still prepared.
 
@@ -301,12 +302,14 @@ class _FakePackedRuntimeManager:
         :param allocation_authority: Exact fake allocation authority.
         :param lifecycle_authority: Exact lifecycle transition authority.
         :param source_tp_size: Supported packed source width.
+        :param source_component_geometry: Bootstrap-pinned source geometry.
         :returns: Prepared fake transaction.
         """
 
         assert allocation_authority is self.authority
         assert lifecycle_authority is self.authority.lifecycle
-        assert source_tp_size in (1, 2, 4)
+        assert source_tp_size in (1, 2, 4, 8)
+        assert source_component_geometry == "source-geometry"
         transaction = _FakePackedTransaction(
             room_id=room_id,
             request_owner=request_owner,
@@ -374,7 +377,10 @@ class _FakeReceiver:
         :param source_tp_size: Handshake-reported source width.
         """
 
-        self.prefill_info = SimpleNamespace(attn_tp_size=source_tp_size)
+        self.prefill_info = SimpleNamespace(
+            attn_tp_size=source_tp_size,
+            packed_source_geometry="source-geometry",
+        )
         self.init_ranks = []
         self.clear_count = 0
         self.abort_count = 0
@@ -732,7 +738,7 @@ def _queue_fixture(
     )
 
 
-@pytest.mark.parametrize("source_tp_size", (1, 2, 4))
+@pytest.mark.parametrize("source_tp_size", (1, 2, 4, 8))
 def test_prepare_owns_exact_resources_without_queue_publication(
     monkeypatch: pytest.MonkeyPatch,
     source_tp_size: int,
