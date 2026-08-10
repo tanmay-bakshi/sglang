@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.decode_reservations import (
     DecodeReservationAttempt,
     DecodeReservationBootstrapEndpoint,
     DecodeReservationProcess,
+    DecodeReservationRefusalDisposition,
     DecodeReservationState,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
@@ -258,20 +259,45 @@ class _FakePackedRuntimeManager:
     """Explicit packed runtime seam consumed by the decode queue."""
 
     authority: _FakeAllocationAuthority
+    ensure_parallel_info_calls: list[str]
     metadata_publications: list[tuple[_FakePackedTransaction, object]]
+    prefill_info: SimpleNamespace
+    prefill_info_table: dict[str, SimpleNamespace]
     transactions: list[_FakePackedTransaction]
 
-    def __init__(self, authority: _FakeAllocationAuthority) -> None:
+    def __init__(
+        self,
+        authority: _FakeAllocationAuthority,
+        source_tp_size: int,
+    ) -> None:
         """Initialize an available fake runtime.
 
         :param authority: Exact fake allocation authority.
+        :param source_tp_size: Bootstrap-advertised source width.
         """
 
         self.authority = authority
         self.attn_tp_rank = 0
         self.attn_tp_size = 1
+        self.ensure_parallel_info_calls = []
         self.metadata_publications = []
+        self.prefill_info_table = {}
+        self.prefill_info = SimpleNamespace(
+            attn_tp_size=source_tp_size,
+            packed_source_geometry="source-geometry",
+        )
         self.transactions = []
+
+    def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
+        """Publish one deterministic source descriptor.
+
+        :param bootstrap_addr: Canonical prefill bootstrap address.
+        :returns: Always ``True`` for the available fake source.
+        """
+
+        self.ensure_parallel_info_calls.append(bootstrap_addr)
+        self.prefill_info_table[bootstrap_addr] = self.prefill_info
+        return True
 
     def supports_packed_decode_request_transactions(self) -> bool:
         """Return whether request-scoped packed ownership is initialized.
@@ -371,16 +397,9 @@ class _FakeReceiver:
     abort_count: int
     metadata_count: int
 
-    def __init__(self, source_tp_size: int) -> None:
-        """Initialize one receiver.
+    def __init__(self) -> None:
+        """Initialize one receiver before its asynchronous handshake."""
 
-        :param source_tp_size: Handshake-reported source width.
-        """
-
-        self.prefill_info = SimpleNamespace(
-            attn_tp_size=source_tp_size,
-            packed_source_geometry="source-geometry",
-        )
         self.init_ranks = []
         self.clear_count = 0
         self.abort_count = 0
@@ -558,11 +577,13 @@ def _queue_fixture(
     monkeypatch: pytest.MonkeyPatch,
     *,
     metadata_slots: int = 16,
+    source_tp_size: int = 2,
 ) -> _QueueFixture:
     """Build one queue with deterministic CPU-only resource ownership.
 
     :param monkeypatch: Pytest mutation fixture.
     :param metadata_slots: Available metadata slots.
+    :param source_tp_size: Bootstrap-advertised source width.
     :returns: Queue and observable fake resources.
     """
 
@@ -654,7 +675,7 @@ def _queue_fixture(
     authority = _FakeAllocationAuthority(lifecycle)
     queue.allocation_lifecycle_authority = lifecycle
     queue.allocation_lease_authority = authority
-    packed_runtime = _FakePackedRuntimeManager(authority)
+    packed_runtime = _FakePackedRuntimeManager(authority, source_tp_size)
     queue.kv_manager = packed_runtime
     receivers: list[_FakeReceiver] = []
     released_request_ids: list[str] = []
@@ -669,7 +690,7 @@ def _queue_fixture(
         """
 
         del is_rebootstrap
-        receiver = _FakeReceiver(source_tp_size=2)
+        receiver = _FakeReceiver()
         receivers.append(receiver)
         return DecodeRequest(req=req, kv_receiver=receiver)
 
@@ -745,7 +766,7 @@ def test_prepare_owns_exact_resources_without_queue_publication(
 ) -> None:
     """Prepare reserves every child atomically without starting receivers."""
 
-    fixture = _queue_fixture(monkeypatch)
+    fixture = _queue_fixture(monkeypatch, source_tp_size=source_tp_size)
     child_ids = (uuid.uuid4(), uuid.uuid4())
     requests = tuple(_request(child_id) for child_id in child_ids)
     attempt = _attempt(child_ids, source_tp_size=source_tp_size)
@@ -758,6 +779,10 @@ def test_prepare_owns_exact_resources_without_queue_publication(
 
     assert type(cohort) is DecodePreparedAllocationCohort
     assert fixture.pre_alloc_calls == [source_tp_size, source_tp_size]
+    assert fixture.packed_runtime.ensure_parallel_info_calls == [
+        "prefill.internal:8998"
+    ]
+    assert all("prefill_info" not in vars(receiver) for receiver in fixture.receivers)
     assert fixture.queue.queue == []
     assert fixture.queue.pending_reqs == []
     assert all(receiver.init_ranks == [] for receiver in fixture.receivers)
@@ -794,14 +819,65 @@ def test_simultaneous_cohorts_keep_independent_keys_and_rooms(
     )
     second_allocations, second = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
-        attempt=_attempt((second_id,), source_tp_size=4),
+        attempt=_attempt((second_id,), source_tp_size=2),
         requests=(_request(second_id),),
     )
 
     assert first is not second
     assert first_allocations[0].bootstrap_room != second_allocations[0].bootstrap_room
-    assert fixture.pre_alloc_calls == [2, 4]
+    assert fixture.pre_alloc_calls == [2, 2]
     assert len(fixture.queue._prepared_cohorts) == 2
+
+
+def test_prepare_refuses_unavailable_prefill_before_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bootstrap failure is retryable and precedes every resource mutation."""
+
+    fixture = _queue_fixture(monkeypatch)
+    fixture.packed_runtime.try_ensure_parallel_info = MagicMock(return_value=False)
+    child_id = uuid.uuid4()
+    request = _request(child_id)
+
+    with pytest.raises(DecodeReservationAdmissionRefused) as refusal:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt((child_id,), source_tp_size=2),
+            requests=(request,),
+        )
+
+    assert refusal.value.reason_code == "prefill_bootstrap_unavailable"
+    assert refusal.value.disposition is (
+        DecodeReservationRefusalDisposition.RETRY_SAME_DECODER
+    )
+    assert fixture.queue._seen_bootstrap_rooms == set()
+    assert fixture.receivers == []
+    assert fixture.pre_alloc_calls == []
+    assert fixture.metadata_allocator.allocated == []
+
+
+def test_prepare_rejects_bootstrap_source_width_drift_before_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authenticated attempt cannot override live source geometry."""
+
+    fixture = _queue_fixture(monkeypatch, source_tp_size=2)
+    child_id = uuid.uuid4()
+    request = _request(child_id)
+
+    with pytest.raises(DecodeReservationAdmissionRefused) as refusal:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt((child_id,), source_tp_size=4),
+            requests=(request,),
+        )
+
+    assert refusal.value.reason_code == "prefill_source_tp_mismatch"
+    assert refusal.value.disposition is DecodeReservationRefusalDisposition.TERMINAL
+    assert fixture.queue._seen_bootstrap_rooms == set()
+    assert fixture.receivers == []
+    assert fixture.pre_alloc_calls == []
+    assert fixture.metadata_allocator.allocated == []
 
 
 def test_child_failure_rolls_back_the_complete_cohort(
@@ -982,7 +1058,7 @@ def test_partial_transaction_publication_quarantines_the_complete_cohort(
 ) -> None:
     """A later child publication failure leaves no runnable queue visibility."""
 
-    fixture = _queue_fixture(monkeypatch)
+    fixture = _queue_fixture(monkeypatch, source_tp_size=4)
     child_ids = (uuid.uuid4(), uuid.uuid4())
     _, cohort = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
@@ -1018,7 +1094,7 @@ def test_quarantine_callback_failure_still_closes_cohort_state(
 ) -> None:
     """A failed native quarantine callback cannot leave a published cohort live."""
 
-    fixture = _queue_fixture(monkeypatch)
+    fixture = _queue_fixture(monkeypatch, source_tp_size=4)
     child_ids = (uuid.uuid4(), uuid.uuid4())
     _, cohort = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
@@ -1325,6 +1401,7 @@ def test_reserved_pop_waits_for_handshake_and_never_reallocates(
     assert fixture.queue.queue == [decode_req]
 
     decode_req.waiting_for_input = True
+    decode_req.kv_receiver.prefill_info = fixture.packed_runtime.prefill_info
     fixture.queue._build_decode_metadata_submission = MagicMock(
         return_value=_DecodeMetadataSubmission(
             decode_req=decode_req,
@@ -1389,6 +1466,7 @@ def test_prepared_l1_repeat_reuses_locked_prefix_through_publication(
     fixture.queue.attach_preallocated(cohort)
     decode_req = record.decode_reqs[0]
     decode_req.waiting_for_input = True
+    decode_req.kv_receiver.prefill_info = fixture.packed_runtime.prefill_info
     fixture.queue._resolve_pending_reqs = MagicMock()
     fixture.queue._update_handshake_waiters = MagicMock()
     fixture.queue._build_decode_metadata_submission = MagicMock(
@@ -1416,7 +1494,7 @@ def test_prepared_l2_restore_retains_restore_gap_without_transfer_ownership(
 ) -> None:
     """A host hit remains restore-owned while packed migration starts after it."""
 
-    fixture = _queue_fixture(monkeypatch)
+    fixture = _queue_fixture(monkeypatch, source_tp_size=4)
     fixture.queue.scheduler.enable_decode_hicache = True
     child_id = uuid.uuid4()
     request = _request(child_id)
@@ -1580,7 +1658,7 @@ def test_completion_with_live_transport_ownership_quarantines(
 ) -> None:
     """Completion cannot outrun packed request teardown and lease clearing."""
 
-    fixture = _queue_fixture(monkeypatch)
+    fixture = _queue_fixture(monkeypatch, source_tp_size=4)
     child_id = uuid.uuid4()
     _, cohort = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
