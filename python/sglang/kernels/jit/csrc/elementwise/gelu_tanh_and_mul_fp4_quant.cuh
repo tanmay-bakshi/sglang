@@ -1,18 +1,19 @@
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-
 #include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/tensor.h>
 #include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.h>
 #include <sgl_kernel/utils.cuh>
 
+#include <cfloat>
+
 #include <nv_internal/tensorrt_llm/kernels/quantization_utils.cuh>
+
+#include <cuda_bf16.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
-#include <cfloat>
 #include <cmath>
 #include <cstdint>
-#include <cuda_bf16.h>
 #include <limits>
 #include <type_traits>
 
@@ -21,7 +22,7 @@ namespace {
 namespace tk = tensorrt_llm::kernels;
 
 #if defined(SGL_CUDA_ARCH) && SGL_CUDA_ARCH >= 1000 && defined(__CUDACC_VER_MAJOR__) && \
-    defined(__CUDACC_VER_MINOR__) &&                                                    \
+    defined(__CUDACC_VER_MINOR__) &&                                                      \
     ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
 constexpr int kFP4ElementsPerThread = 16;
 #else
@@ -37,8 +38,10 @@ struct GeluTanhMulFP4QuantParams {
   uint32_t hidden_size;
 };
 
-SGL_DEVICE uint64_t
-fp4_scale_output_offset(const uint32_t row, const uint32_t scale_column, const uint32_t padded_scale_columns) {
+SGL_DEVICE uint64_t fp4_scale_output_offset(
+    const uint32_t row,
+    const uint32_t scale_column,
+    const uint32_t padded_scale_columns) {
   constexpr uint32_t kColumnsPerGroup = 4;
   constexpr uint32_t kRowsPerInnerGroup = 32;
   constexpr uint32_t kRowsPerGroup = 128;
@@ -49,8 +52,10 @@ fp4_scale_output_offset(const uint32_t row, const uint32_t scale_column, const u
   const uint32_t inner_row_group = (row % kRowsPerGroup) / kRowsPerInnerGroup;
   const uint32_t row_group = row / kRowsPerGroup;
 
-  return static_cast<uint64_t>(column_in_group) + static_cast<uint64_t>(column_group) * 512 +
-         static_cast<uint64_t>(row_in_inner_group) * 16 + static_cast<uint64_t>(inner_row_group) * 4 +
+  return static_cast<uint64_t>(column_in_group) +
+         static_cast<uint64_t>(column_group) * 512 +
+         static_cast<uint64_t>(row_in_inner_group) * 16 +
+         static_cast<uint64_t>(inner_row_group) * 4 +
          static_cast<uint64_t>(row_group) * kRowsPerGroup * padded_scale_columns;
 }
 
@@ -66,15 +71,21 @@ SGL_DEVICE void gelu_tanh_and_mul(
     const float2 gate_f32 = __bfloat1622float2(gate.elts[index]);
     const float2 up_f32 = __bfloat1622float2(up.elts[index]);
     const float gate_x_cdf =
-        gate_f32.x * (0.5f * (1.0f + tanhf(kBeta * (gate_f32.x + kAlpha * gate_f32.x * gate_f32.x * gate_f32.x))));
+        gate_f32.x *
+        (0.5f *
+         (1.0f + tanhf(kBeta * (gate_f32.x + kAlpha * gate_f32.x * gate_f32.x * gate_f32.x))));
     const float gate_y_cdf =
-        gate_f32.y * (0.5f * (1.0f + tanhf(kBeta * (gate_f32.y + kAlpha * gate_f32.y * gate_f32.y * gate_f32.y))));
-    gate.elts[index] = __float22bfloat162_rn(make_float2(gate_x_cdf * up_f32.x, gate_y_cdf * up_f32.y));
+        gate_f32.y *
+        (0.5f *
+         (1.0f + tanhf(kBeta * (gate_f32.y + kAlpha * gate_f32.y * gate_f32.y * gate_f32.y))));
+    gate.elts[index] = __float22bfloat162_rn(
+        make_float2(gate_x_cdf * up_f32.x, gate_y_cdf * up_f32.y));
   }
 }
 
 template <bool kUsePDL>
-__global__ void gelu_tanh_mul_fp4_quant_kernel(const __grid_constant__ GeluTanhMulFP4QuantParams params) {
+__global__ void gelu_tanh_mul_fp4_quant_kernel(
+    const __grid_constant__ GeluTanhMulFP4QuantParams params) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr int kScaleVectorSize = 16;
   constexpr int kElementsPerThread = kFP4ElementsPerThread;
@@ -97,9 +108,11 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(const __grid_constant__ GeluTanhM
   for (uint64_t work_index = thread_id; work_index < work_items; work_index += thread_stride) {
     const uint32_t row = static_cast<uint32_t>(work_index / vectors_per_row);
     const uint32_t column = static_cast<uint32_t>(work_index % vectors_per_row);
-    const uint64_t gate_offset = static_cast<uint64_t>(row) * vectors_per_row * 2 + column;
+    const uint64_t gate_offset =
+        static_cast<uint64_t>(row) * vectors_per_row * 2 + column;
 
-    const auto* input_vectors = reinterpret_cast<const InputVector*>(params.input);
+    const auto* input_vectors =
+        reinterpret_cast<const InputVector*>(params.input);
     InputVector gate = input_vectors[gate_offset];
     const InputVector up = input_vectors[gate_offset + vectors_per_row];
     gelu_tanh_and_mul(gate, up);
@@ -107,26 +120,39 @@ __global__ void gelu_tanh_mul_fp4_quant_kernel(const __grid_constant__ GeluTanhM
     uint8_t* scale_output = nullptr;
     if (column % kThreadsPerScale == 0) {
       const uint32_t scale_column = column / kThreadsPerScale;
-      scale_output = params.output_scale + fp4_scale_output_offset(row, scale_column, padded_scale_columns);
+      scale_output = params.output_scale +
+                     fp4_scale_output_offset(row, scale_column, padded_scale_columns);
     }
 
     reinterpret_cast<PackedOutput*>(params.output)[work_index] =
-        tk::cvt_warp_fp16_to_fp4<__nv_bfloat16, kScaleVectorSize, kElementsPerThread, false, false>(
-            gate, params.global_scale[0], scale_output);
+        tk::cvt_warp_fp16_to_fp4<
+            __nv_bfloat16,
+            kScaleVectorSize,
+            kElementsPerThread,
+            false,
+            false>(gate, params.global_scale[0], scale_output);
   }
 
   const uint32_t padding_scale_columns = padded_scale_columns - scale_columns;
-  const uint64_t padding_column_items = static_cast<uint64_t>(params.num_tokens) * padding_scale_columns;
-  for (uint64_t padding_index = thread_id; padding_index < padding_column_items; padding_index += thread_stride) {
+  const uint64_t padding_column_items =
+      static_cast<uint64_t>(params.num_tokens) * padding_scale_columns;
+  for (uint64_t padding_index = thread_id;
+       padding_index < padding_column_items;
+       padding_index += thread_stride) {
     const uint32_t row = static_cast<uint32_t>(padding_index / padding_scale_columns);
-    const uint32_t scale_column = scale_columns + static_cast<uint32_t>(padding_index % padding_scale_columns);
+    const uint32_t scale_column =
+        scale_columns + static_cast<uint32_t>(padding_index % padding_scale_columns);
     params.output_scale[fp4_scale_output_offset(row, scale_column, padded_scale_columns)] = 0;
   }
 
   const uint32_t padding_scale_rows = padded_scale_rows - params.num_tokens;
-  const uint64_t padding_row_items = static_cast<uint64_t>(padding_scale_rows) * padded_scale_columns;
-  for (uint64_t padding_index = thread_id; padding_index < padding_row_items; padding_index += thread_stride) {
-    const uint32_t row = params.num_tokens + static_cast<uint32_t>(padding_index / padded_scale_columns);
+  const uint64_t padding_row_items =
+      static_cast<uint64_t>(padding_scale_rows) * padded_scale_columns;
+  for (uint64_t padding_index = thread_id;
+       padding_index < padding_row_items;
+       padding_index += thread_stride) {
+    const uint32_t row =
+        params.num_tokens + static_cast<uint32_t>(padding_index / padded_scale_columns);
     const uint32_t scale_column = static_cast<uint32_t>(padding_index % padded_scale_columns);
     params.output_scale[fp4_scale_output_offset(row, scale_column, padded_scale_columns)] = 0;
   }
@@ -138,8 +164,8 @@ template <bool kUsePDL>
 struct GeluTanhMulFP4QuantKernel {
   static constexpr uint32_t kBlockSize = 512;
 
-  static void
-  run(const tvm::ffi::TensorView input,
+  static void run(
+      const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView global_scale,
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView output_scale) {
@@ -153,15 +179,25 @@ struct GeluTanhMulFP4QuantKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({num_tokens, input_width}).with_dtype<bf16_t>().with_device(device).verify(input);
-    TensorMatcher({num_tokens, output_width}).with_dtype<uint8_t>().with_device(device).verify(output);
-    TensorMatcher({scale_rows, scale_columns}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_scale);
+    TensorMatcher({num_tokens, input_width})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({num_tokens, output_width})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(output);
+    TensorMatcher({scale_rows, scale_columns})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output_scale);
 
     RuntimeCheck(global_scale.numel() == 1, "global_scale must contain one element");
     RuntimeCheck(is_type<float>(global_scale.dtype()), "global_scale must have dtype float32");
     RuntimeCheck(global_scale.device().device_type == kDLCUDA, "global_scale must be on CUDA");
     RuntimeCheck(
-        global_scale.device().device_id == device.unwrap().device_id, "all tensors must be on the same CUDA device");
+        global_scale.device().device_id == device.unwrap().device_id,
+        "all tensors must be on the same CUDA device");
 
     const uint64_t tokens = static_cast<uint64_t>(num_tokens.unwrap());
     const uint64_t fused_width = static_cast<uint64_t>(input_width.unwrap());
@@ -177,7 +213,8 @@ struct GeluTanhMulFP4QuantKernel {
     const uint64_t scale_vectors = hidden_size / 16;
     const uint64_t expected_scale_columns = div_ceil(scale_vectors, uint64_t{4}) * 4;
     RuntimeCheck(
-        static_cast<uint64_t>(scale_rows.unwrap()) == expected_scale_rows, "scale row count must be padded to 128");
+        static_cast<uint64_t>(scale_rows.unwrap()) == expected_scale_rows,
+        "scale row count must be padded to 128");
     RuntimeCheck(
         static_cast<uint64_t>(scale_columns.unwrap()) == expected_scale_columns,
         "scale column count must be padded to 4");
@@ -194,8 +231,10 @@ struct GeluTanhMulFP4QuantKernel {
 
     const auto kernel = gelu_tanh_mul_fp4_quant_kernel<kUsePDL>;
     const uint32_t blocks_per_sm = host::runtime::get_blocks_per_sm(kernel, kBlockSize);
-    const uint32_t max_blocks = host::runtime::get_sm_count(device.unwrap().device_id) * blocks_per_sm;
-    const uint32_t grid_size = std::min(div_ceil(static_cast<uint32_t>(total_work), kBlockSize), max_blocks);
+    const uint32_t max_blocks =
+        host::runtime::get_sm_count(device.unwrap().device_id) * blocks_per_sm;
+    const uint32_t grid_size = std::min(
+        div_ceil(static_cast<uint32_t>(total_work), kBlockSize), max_blocks);
     const auto params = GeluTanhMulFP4QuantParams{
         .input = static_cast<const __nv_bfloat16*>(input.data_ptr()),
         .global_scale = static_cast<const float*>(global_scale.data_ptr()),
@@ -204,7 +243,8 @@ struct GeluTanhMulFP4QuantKernel {
         .num_tokens = static_cast<uint32_t>(tokens),
         .hidden_size = static_cast<uint32_t>(hidden_size),
     };
-    LaunchKernel(grid_size, kBlockSize, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+    LaunchKernel(grid_size, kBlockSize, device.unwrap())
+        .enable_pdl(kUsePDL)(kernel, params);
   }
 };
 
