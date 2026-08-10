@@ -15,6 +15,7 @@ INTERMEDIATE_SIZE_BY_TP = {
     1: 21504,
     2: 10752,
     4: 5376,
+    8: 2688,
 }
 
 
@@ -177,7 +178,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     :param argv: Optional command-line arguments.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tp", default="1,2,4")
+    parser.add_argument("--tp", default="1,2,4,8")
     parser.add_argument("--tokens", default="1,8,1024,8192")
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--global-scale", type=float, default=1.0)
