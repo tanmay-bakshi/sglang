@@ -351,8 +351,7 @@ def _is_runtime_prefill_geometry_compatible(
 
     return all(
         extend_length > 0
-        and extend_length <= sequence_length
-        and sequence_length <= max_sequence_tokens
+        and extend_length <= sequence_length <= max_sequence_tokens
         for sequence_length, extend_length in zip(
             sequence_lengths, extend_lengths, strict=True
         )
