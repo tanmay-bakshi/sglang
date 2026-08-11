@@ -194,6 +194,171 @@ class _ChunkedPrefixCaptureBuffers:
     kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
 
 
+@dataclass(frozen=True)
+class _PrefillCaptureGeometry:
+    """Synthetic request geometry used to compile one prefill token bucket.
+
+    :ivar sequence_lengths: Per-request sequence lengths whose sum is the
+        captured token count.
+    """
+
+    sequence_lengths: tuple[int, ...]
+
+    @property
+    def request_slots(self) -> int:
+        """Return the number of synthetic request rows.
+
+        :returns: Number of request rows in this geometry.
+        """
+
+        return len(self.sequence_lengths)
+
+    @property
+    def num_tokens(self) -> int:
+        """Return the aggregate token count.
+
+        :returns: Sum of all synthetic sequence lengths.
+        """
+
+        return sum(self.sequence_lengths)
+
+    @property
+    def start_locations(self) -> tuple[int, ...]:
+        """Return the flat token offset of each synthetic request.
+
+        :returns: Exclusive-prefix sums for :attr:`sequence_lengths`.
+        """
+
+        starts: list[int] = []
+        cursor = 0
+        for sequence_length in self.sequence_lengths:
+            starts.append(cursor)
+            cursor += sequence_length
+        return tuple(starts)
+
+
+def _build_context_aware_capture_geometry(
+    num_tokens: int,
+    max_sequence_tokens: int,
+    max_request_slots: int,
+) -> _PrefillCaptureGeometry:
+    """Partition a token bucket into the fewest legal request rows.
+
+    The balanced partition minimizes the longest synthetic sequence. A bucket
+    no larger than the per-request capacity retains the historical one-row
+    geometry; larger buckets become multi-request captures without exceeding
+    the model context or request-to-token table width.
+
+    :param num_tokens: Aggregate token count of the capture bucket.
+    :param max_sequence_tokens: Maximum addressable tokens in one request row.
+    :param max_request_slots: Number of request rows available to capture.
+    :returns: Legal synthetic capture geometry.
+    :raises ValueError: If the bucket cannot be represented by positive legal
+        request rows.
+    """
+
+    if num_tokens <= 0:
+        raise ValueError("prefill capture token count must be positive")
+    if max_sequence_tokens <= 0:
+        raise ValueError("prefill capture sequence capacity must be positive")
+    if max_request_slots <= 0:
+        raise ValueError("prefill capture request-slot capacity must be positive")
+
+    request_slots = _ceil_div(num_tokens, max_sequence_tokens)
+    if request_slots > max_request_slots:
+        raise ValueError(
+            f"prefill capture bucket {num_tokens} needs {request_slots} request "
+            f"rows at the {max_sequence_tokens}-token sequence capacity, but "
+            f"only {max_request_slots} request slots are available"
+        )
+
+    base_length, longer_rows = divmod(num_tokens, request_slots)
+    sequence_lengths = tuple(
+        base_length + (1 if row < longer_rows else 0) for row in range(request_slots)
+    )
+    if max(sequence_lengths) > max_sequence_tokens:
+        raise ValueError(
+            f"prefill capture bucket {num_tokens} cannot fit the "
+            f"{max_sequence_tokens}-token sequence capacity"
+        )
+    return _PrefillCaptureGeometry(sequence_lengths=sequence_lengths)
+
+
+def _read_host_lengths(
+    values: torch.Tensor | list[int] | tuple[int, ...] | None,
+    batch_size: int,
+) -> tuple[int, ...] | None:
+    """Read a request-length vector without introducing a device sync.
+
+    :param values: CPU tensor or Python sequence containing request lengths.
+    :param batch_size: Number of live request rows to read.
+    :returns: Integer lengths, or ``None`` when the metadata is unavailable or
+        not host-resident.
+    """
+
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        if values.device.type != "cpu" or values.ndim != 1:
+            return None
+        if values.numel() < batch_size:
+            return None
+        return tuple(int(value) for value in values[:batch_size].tolist())
+    if len(values) < batch_size:
+        return None
+    return tuple(int(value) for value in values[:batch_size])
+
+
+def _is_runtime_prefill_geometry_compatible(
+    *,
+    capture_geometry: _PrefillCaptureGeometry,
+    max_sequence_tokens: int,
+    max_request_slots: int,
+    batch_size: int,
+    raw_num_tokens: int,
+    seq_lens_cpu: torch.Tensor | list[int] | tuple[int, ...] | None,
+    extend_seq_lens_cpu: list[int] | tuple[int, ...] | None,
+) -> bool:
+    """Validate live request geometry before selecting a multi-row bucket.
+
+    Tc-piecewise compute graphs are token-axis shaped and request-count
+    invariant. Attention and its page table are rebuilt out of graph, so a
+    replay need not reproduce the synthetic capture partition. It must prove
+    that the live per-request metadata is internally complete and fits the
+    same addressable sequence capacity.
+
+    :param capture_geometry: Synthetic geometry for the selected token bucket.
+    :param max_sequence_tokens: Maximum addressable tokens in one request row.
+    :param max_request_slots: Maximum number of live request rows.
+    :param batch_size: Number of live requests.
+    :param raw_num_tokens: Aggregate unpadded extend-token count.
+    :param seq_lens_cpu: Host total sequence lengths after the extension.
+    :param extend_seq_lens_cpu: Host extension lengths.
+    :returns: Whether replay metadata is compatible with the captured bucket.
+    """
+
+    if batch_size <= 0 or batch_size > max_request_slots:
+        return False
+    if raw_num_tokens <= 0 or raw_num_tokens > capture_geometry.num_tokens:
+        return False
+
+    sequence_lengths = _read_host_lengths(seq_lens_cpu, batch_size)
+    extend_lengths = _read_host_lengths(extend_seq_lens_cpu, batch_size)
+    if sequence_lengths is None or extend_lengths is None:
+        return False
+    if sum(extend_lengths) != raw_num_tokens:
+        return False
+
+    return all(
+        extend_length > 0
+        and extend_length <= sequence_length
+        and sequence_length <= max_sequence_tokens
+        for sequence_length, extend_length in zip(
+            sequence_lengths, extend_lengths, strict=True
+        )
+    )
+
+
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     numbered suggestion list. The runner is only constructed for BREAKABLE
@@ -259,6 +424,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
+        self._tc_piecewise_max_sequence_tokens: int | None = None
+        self._tc_piecewise_capture_geometries: dict[int, _PrefillCaptureGeometry] = {}
+        if self.prefill_backend_name == Backend.TC_PIECEWISE:
+            self._tc_piecewise_max_sequence_tokens = (
+                self._resolve_capture_sequence_capacity(model_runner)
+            )
+            self._tc_piecewise_capture_geometries = {
+                num_tokens: _build_context_aware_capture_geometry(
+                    num_tokens,
+                    self._tc_piecewise_max_sequence_tokens,
+                    self.max_bs,
+                )
+                for num_tokens in self.capture_num_tokens
+            }
+            multi_request_geometries = {
+                num_tokens: geometry.sequence_lengths
+                for num_tokens, geometry in (
+                    self._tc_piecewise_capture_geometries.items()
+                )
+                if geometry.request_slots > 1
+            }
+            if len(multi_request_geometries) > 0:
+                logger.info(
+                    "tc_piecewise context-aware prefill capture geometries: %s "
+                    "(per-request capacity=%d)",
+                    multi_request_geometries,
+                    self._tc_piecewise_max_sequence_tokens,
+                )
 
         # --- capture modes --------------------------------------------
         self.capture_forward_mode = ForwardMode.EXTEND
@@ -753,6 +946,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     @staticmethod
+    def _resolve_capture_sequence_capacity(model_runner: ModelRunner) -> int:
+        """Resolve the request-row capacity shared by capture and replay.
+
+        The model context bounds attention page-table rows. The request-to-token
+        table can impose a tighter storage bound, so capture uses the smaller
+        of the two rather than treating an aggregate token bucket as one
+        sequence.
+
+        :param model_runner: Model runner owning context and request-pool state.
+        :returns: Maximum addressable tokens in one request row.
+        :raises ValueError: If runtime state exposes no positive sequence
+            capacity.
+        """
+
+        context_tokens = int(model_runner.model_config.context_len)
+        request_table_tokens = int(
+            model_runner.req_to_token_pool.req_to_token.shape[1]
+        )
+        capacity = min(context_tokens, request_table_tokens)
+        if capacity <= 0:
+            raise ValueError(
+                "tc_piecewise prefill capture requires a positive model context "
+                "and request-to-token table width"
+            )
+        return capacity
+
+    @staticmethod
     def _resolve_prefix_chunk_shape(
         model_runner, capture_req_slots: int
     ) -> tuple[int, int]:
@@ -1042,6 +1262,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
+        if not self._tc_piecewise_replay_geometry_is_compatible(
+            forward_batch, padded_num_tokens
+        ):
+            return False
         # Other backends and non-MLA FullCG keep using their normal graph with
         # replay-refreshed metadata; only this extra topology has a prefix cap.
         if (
@@ -1059,6 +1283,45 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # the transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live request metadata.
         return True
+
+    def _tc_piecewise_replay_geometry_is_compatible(
+        self,
+        forward_batch: ForwardBatch,
+        padded_num_tokens: int,
+    ) -> bool:
+        """Gate replay of context-aware tc-piecewise token buckets.
+
+        Single-request capture geometries retain the established replay path.
+        A bucket that required multiple synthetic capture rows is admitted only
+        when its live host metadata proves every page-table row is legal.
+
+        :param forward_batch: Live prefill batch under consideration.
+        :param padded_num_tokens: Selected capture token bucket.
+        :returns: Whether the selected bucket can safely represent the batch.
+        """
+
+        if self.prefill_backend_name != Backend.TC_PIECEWISE:
+            return True
+        capture_geometry = self._tc_piecewise_capture_geometries.get(
+            padded_num_tokens
+        )
+        if capture_geometry is None:
+            return False
+        if capture_geometry.request_slots == 1:
+            return True
+
+        max_sequence_tokens = self._tc_piecewise_max_sequence_tokens
+        if max_sequence_tokens is None:
+            return False
+        return _is_runtime_prefill_geometry_compatible(
+            capture_geometry=capture_geometry,
+            max_sequence_tokens=max_sequence_tokens,
+            max_request_slots=self.max_bs,
+            batch_size=forward_batch.batch_size,
+            raw_num_tokens=len(forward_batch.input_ids),
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
 
     def _build_capture_spec_info(self, num_tokens: int):
         if self.static_draft_hidden_states is None:
@@ -1079,10 +1342,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        bs = self._capture_req_slots
-        # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
-        lens_cpu = [num_tokens] + [0] * (bs - 1)
-        start_loc_cpu = [0] + [num_tokens] * (bs - 1)
+        if self.prefill_backend_name == Backend.TC_PIECEWISE:
+            capture_geometry = self._tc_piecewise_capture_geometries.get(num_tokens)
+            if capture_geometry is None:
+                raise ValueError(
+                    f"tc_piecewise prefill capture has no geometry for the "
+                    f"{num_tokens}-token bucket"
+                )
+            bs = capture_geometry.request_slots
+            lens_cpu = list(capture_geometry.sequence_lengths)
+            start_loc_cpu = list(capture_geometry.start_locations)
+        else:
+            bs = self._capture_req_slots
+            # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
+            lens_cpu = [num_tokens] + [0] * (bs - 1)
+            start_loc_cpu = [0] + [num_tokens] * (bs - 1)
 
         with torch.device(self.device):
             shape_inputs = {
