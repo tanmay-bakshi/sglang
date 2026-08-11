@@ -2,6 +2,7 @@
 
 use std::{
     env,
+    ffi::CStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         OnceLock,
@@ -36,6 +37,8 @@ pub struct PdRouteTraceInput<'a> {
 pub enum RequestTraceError {
     #[error("request trace could not read CLOCK_MONOTONIC: {0}")]
     Clock(std::io::Error),
+    #[error("request trace could not read the kernel hostname: {0}")]
+    Hostname(std::io::Error),
     #[error("request trace could not parse the gateway bootstrap body: {0}")]
     RequestBody(String),
     #[error("request trace serialization failed: {0}")]
@@ -87,10 +90,7 @@ pub fn emit_pd_route(input: PdRouteTraceInput<'_>) -> Result<(), RequestTraceErr
         monotonic_ns()?,
         REQUEST_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     )?;
-    tracing::info!(
-        "{REQUEST_TRACE_PREFIX}{}",
-        serde_json::to_string(&record)?
-    );
+    tracing::info!("{REQUEST_TRACE_PREFIX}{}", serde_json::to_string(&record)?);
     Ok(())
 }
 
@@ -113,7 +113,7 @@ fn build_pd_route_record(
         role: "gateway",
         monotonic_ns,
         sequence,
-        hostname: env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()),
+        hostname: hostname()?,
         process_id: std::process::id(),
         logical_request_id: input.logical_request_id,
         request_ids: input
@@ -129,6 +129,28 @@ fn build_pd_route_record(
         prefill_load_before_dispatch: input.prefill_load_before_dispatch,
         decoder_load_before_dispatch: input.decoder_load_before_dispatch,
     })
+}
+
+fn hostname() -> Result<String, RequestTraceError> {
+    let mut buffer = [0_u8; 256];
+    let result =
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) };
+    if result != 0 {
+        return Err(RequestTraceError::Hostname(std::io::Error::last_os_error()));
+    }
+    let value = CStr::from_bytes_until_nul(&buffer).map_err(|error| {
+        RequestTraceError::Hostname(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    let value = value.to_str().map_err(|error| {
+        RequestTraceError::Hostname(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    if value.is_empty() {
+        return Err(RequestTraceError::Hostname(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel hostname is empty",
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn parse_bootstrap_rooms(body: &[u8]) -> Result<Vec<u64>, RequestTraceError> {
@@ -224,5 +246,13 @@ mod tests {
         assert!(error
             .to_string()
             .contains("2 child request ids but 1 bootstrap rooms"));
+    }
+
+    #[test]
+    fn hostname_comes_from_the_kernel_without_an_environment_dependency() {
+        let value = hostname().unwrap();
+
+        assert!(!value.is_empty());
+        assert_ne!(value, "unknown");
     }
 }
