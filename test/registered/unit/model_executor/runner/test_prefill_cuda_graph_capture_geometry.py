@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
