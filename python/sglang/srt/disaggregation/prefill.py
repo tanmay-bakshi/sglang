@@ -65,6 +65,13 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.observability.request_trace import (
+    RequestTraceEvent,
+    RequestTraceFields,
+    RequestTraceRole,
+    emit_request_trace,
+    request_trace_enabled,
+)
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
@@ -664,6 +671,21 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+
+        if request_trace_enabled():
+            emit_request_trace(
+                RequestTraceEvent.PREFILL_BATCH_COMPLETED,
+                RequestTraceRole.PREFILL_SCHEDULER,
+                request_ids=tuple(req.rid for req in batch.reqs),
+                bootstrap_rooms=tuple(req.bootstrap_room for req in batch.reqs),
+                fields=RequestTraceFields(
+                    process_rank=self.ps.tp_rank,
+                    batch_size=len(batch.reqs),
+                    batch_token_count=batch.extend_num_tokens,
+                    forward_iter=batch.forward_iter,
+                    cuda_graph_active=result.can_run_cuda_graph,
+                ),
+            )
 
         logprob_pt = 0
         assert batch.spec_info is result.next_draft_input

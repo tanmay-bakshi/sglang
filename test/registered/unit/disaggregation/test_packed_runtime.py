@@ -1190,6 +1190,7 @@ def test_tp2_rank_one_decode_runtime_uses_destination_local_writer() -> None:
 
 def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Drive READY ownership through exact source handle teardown and ACK."""
 
@@ -1304,6 +1305,17 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     record.main_transport_duration_ms = 19.0
     with caplog.at_level(logging.INFO, logger=runtime_module.__name__):
         runtime._emit_transfer_stats(record)
+    trace_emitter = Mock()
+    monkeypatch.setattr(runtime_module, "request_trace_enabled", lambda: True)
+    monkeypatch.setattr(runtime_module, "emit_request_trace", trace_emitter)
+    runtime._emit_request_trace(
+        record,
+        runtime_module.RequestTraceEvent.PACKED_TRANSFER_BEGIN,
+    )
+    runtime._emit_request_trace(
+        record,
+        runtime_module.RequestTraceEvent.PACKED_TRANSFER_END,
+    )
     teardown = PackedRequestTeardown(
         key=plan.key,
         writer_id=_writer(),
@@ -1336,6 +1348,26 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
         "source_gather_copy_duration=5.000ms, "
         "main_transport_duration=19.000ms)"
     ) in caplog.messages
+    assert [call.args[0] for call in trace_emitter.call_args_list] == [
+        runtime_module.RequestTraceEvent.PACKED_TRANSFER_BEGIN,
+        runtime_module.RequestTraceEvent.PACKED_TRANSFER_END,
+    ]
+    assert all(
+        call.args[1] == runtime_module.RequestTraceRole.PREFILL_TRANSFER
+        for call in trace_emitter.call_args_list
+    )
+    assert all(
+        call.kwargs["bootstrap_rooms"] == (41,)
+        and call.kwargs["request_generations"] == (plan.key.request_generation.hex(),)
+        and call.kwargs["fields"]
+        == runtime_module.RequestTraceFields(
+            process_rank=0,
+            copy_group_count=2,
+            payload_bytes=3072,
+            transport_bytes=8192,
+        )
+        for call in trace_emitter.call_args_list
+    )
 
 
 def test_decode_outcome_ack_commit_and_metadata_consumption() -> None:

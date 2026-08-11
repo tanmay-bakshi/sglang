@@ -261,6 +261,13 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.request_trace import (
+    RequestTraceEvent,
+    RequestTraceFields,
+    RequestTraceRole,
+    emit_request_trace,
+    request_trace_enabled,
+)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -2063,6 +2070,7 @@ class Scheduler(
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
+            process_rank=self.ps.tp_rank,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
             server_args=self.server_args,
@@ -3522,6 +3530,29 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        if (
+            request_trace_enabled()
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and batch.forward_mode.is_decode()
+        ):
+            first_issue_reqs = tuple(
+                req for req in batch.reqs if req.decode_batch_idx == 1
+            )
+            if len(first_issue_reqs) > 0:
+                emit_request_trace(
+                    RequestTraceEvent.DECODE_FIRST_ISSUE,
+                    RequestTraceRole.DECODE_SCHEDULER,
+                    request_ids=tuple(req.rid for req in first_issue_reqs),
+                    bootstrap_rooms=tuple(
+                        req.bootstrap_room for req in first_issue_reqs
+                    ),
+                    fields=RequestTraceFields(
+                        process_rank=self.ps.tp_rank,
+                        batch_size=len(batch.reqs),
+                        batch_token_count=len(batch.reqs),
+                        forward_iter=batch.forward_iter,
+                    ),
+                )
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)

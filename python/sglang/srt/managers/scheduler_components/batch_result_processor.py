@@ -27,6 +27,13 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.observability.request_trace import (
+    RequestTraceEvent,
+    RequestTraceFields,
+    RequestTraceRole,
+    emit_request_trace,
+    request_trace_enabled,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -65,6 +72,7 @@ logger = logging.getLogger(__name__)
 class SchedulerBatchResultProcessor:
     is_generation: bool
     disaggregation_mode: DisaggregationMode
+    process_rank: int
     enable_overlap: bool
     enable_overlap_mlx: bool
     server_args: ServerArgs
@@ -84,6 +92,17 @@ class SchedulerBatchResultProcessor:
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
+        if request_trace_enabled():
+            emit_request_trace(
+                RequestTraceEvent.DECODE_HANDOFF_TOKEN_READY,
+                RequestTraceRole.DECODE_SCHEDULER,
+                request_ids=tuple(req.rid for req in batch.reqs),
+                bootstrap_rooms=tuple(req.bootstrap_room for req in batch.reqs),
+                fields=RequestTraceFields(
+                    process_rank=self.process_rank,
+                    batch_size=len(batch.reqs),
+                ),
+            )
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
@@ -787,6 +806,22 @@ class SchedulerBatchResultProcessor:
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
+
+            if request_trace_enabled() and req.decode_batch_idx == 1:
+                emit_request_trace(
+                    RequestTraceEvent.DECODE_FIRST_RESULT,
+                    RequestTraceRole.DECODE_SCHEDULER,
+                    request_ids=(req.rid,),
+                    bootstrap_rooms=(req.bootstrap_room,),
+                    fields=RequestTraceFields(
+                        process_rank=self.process_rank,
+                        batch_size=len(batch.reqs),
+                        batch_token_count=len(batch.reqs),
+                        forward_iter=batch.forward_iter,
+                        cuda_graph_active=can_run_cuda_graph,
+                        accepted_token_count=len(next_token_id),
+                    ),
+                )
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)

@@ -63,6 +63,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
+        process_rank=0,
         enable_overlap=False,
         enable_overlap_mlx=False,
         server_args=SimpleNamespace(enable_metrics=False),

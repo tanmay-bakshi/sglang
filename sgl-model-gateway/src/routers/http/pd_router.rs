@@ -34,6 +34,7 @@ use crate::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
+        request_trace::{self, PdRouteTraceInput},
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
@@ -381,6 +382,24 @@ impl PDRouter {
                 );
             }
         };
+
+        if request_trace::enabled() {
+            let request_body = session.request_body();
+            let prefill_worker = session.prefill_worker();
+            let decoder_worker = session.decoder_worker();
+            if let Err(error) = request_trace::emit_pd_route(PdRouteTraceInput {
+                logical_request_id: session.logical_request_id(),
+                child_request_ids: session.child_request_ids(),
+                bootstrap_request_body: &request_body,
+                group_id: session.group_id().map(|group_id| group_id.as_str()),
+                prefill_url: prefill_worker.url(),
+                decoder_url: decoder_worker.url(),
+                prefill_load_before_dispatch: prefill_worker.load(),
+                decoder_load_before_dispatch: decoder_worker.load(),
+            }) {
+                warn!(error = %error, "Request trace routing event was not emitted");
+            }
+        }
 
         let topology_receipt = match topology_sha256 {
             Some(topology_sha256) => {

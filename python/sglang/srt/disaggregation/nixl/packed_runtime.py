@@ -97,6 +97,13 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
+from sglang.srt.observability.request_trace import (
+    RequestTraceEvent,
+    RequestTraceFields,
+    RequestTraceRole,
+    emit_request_trace,
+    request_trace_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +697,20 @@ class _PackedDecodeTransferStats:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _PackedTransferGeometry:
+    """Trace-visible geometry for one source writer.
+
+    :ivar copy_group_count: Source component-entry groups carrying payload.
+    :ivar payload_bytes: Logical KV bytes gathered from source tensors.
+    :ivar transport_bytes: Bytes submitted through the physical transport.
+    """
+
+    copy_group_count: int
+    payload_bytes: int
+    transport_bytes: int
+
+
 @dataclasses.dataclass
 class _PrefillRequestRecord:
     """Source actor state retained until authenticated decoder teardown."""
@@ -855,6 +876,10 @@ class PackedPrefillRuntime:
             record.ready_wait_duration_ms = (
                 time.perf_counter() - ready_wait_started_at
             ) * 1000.0
+            self._emit_request_trace(
+                record,
+                RequestTraceEvent.PACKED_TRANSFER_BEGIN,
+            )
             if self._writer_id == submission.plan.canonical_writer_id:
                 auxiliary_handle = self._post_auxiliary_transfer(record)
                 with record.condition:
@@ -877,6 +902,10 @@ class PackedPrefillRuntime:
                 record.main_outcome = main_outcome
                 record.auxiliary_outcome = auxiliary_outcome
                 record.outcomes_sent = True
+            self._emit_request_trace(
+                record,
+                RequestTraceEvent.PACKED_TRANSFER_END,
+            )
             submission.control.send_message(main_outcome)
             if auxiliary_outcome is not None:
                 submission.control.send_message(auxiliary_outcome)
@@ -1107,24 +1136,72 @@ class PackedPrefillRuntime:
                 record.writer_id.source_attn_tp_rank,
             )
             return
-        writer_layout = writer_layout_for(
-            source_transfer.layout,
-            record.writer_id,
-        )
+        geometry = self._transfer_geometry(record)
         logger.info(
             "%s",
             _PackedPrefillTransferStats(
                 room_id=record.chunk_key.room_id,
                 source_rank=record.writer_id.source_attn_tp_rank,
-                copy_group_count=len(writer_layout.copy_groups),
-                payload_bytes=sum(
-                    group.length_bytes for group in writer_layout.copy_groups
-                ),
-                transport_bytes=source_transfer.length_bytes,
+                copy_group_count=geometry.copy_group_count,
+                payload_bytes=geometry.payload_bytes,
+                transport_bytes=geometry.transport_bytes,
                 ready_wait_duration_ms=ready_wait_duration_ms,
                 source_gather_copy_duration_ms=source_gather_copy_duration_ms,
                 main_transport_duration_ms=main_transport_duration_ms,
             ),
+        )
+
+    def _emit_request_trace(
+        self,
+        record: _PrefillRequestRecord,
+        event: RequestTraceEvent,
+    ) -> None:
+        """Emit one request-correlated packed source boundary.
+
+        :param record: Exact retained packed request record.
+        :param event: Begin or end boundary from the closed trace schema.
+        """
+
+        if not request_trace_enabled():
+            return
+        geometry = self._transfer_geometry(record)
+        emit_request_trace(
+            event,
+            RequestTraceRole.PREFILL_TRANSFER,
+            bootstrap_rooms=(record.chunk_key.room_id,),
+            request_generations=(record.chunk_key.request_generation.hex(),),
+            fields=RequestTraceFields(
+                process_rank=record.writer_id.source_attn_tp_rank,
+                copy_group_count=geometry.copy_group_count,
+                payload_bytes=geometry.payload_bytes,
+                transport_bytes=geometry.transport_bytes,
+            ),
+        )
+
+    @staticmethod
+    def _transfer_geometry(
+        record: _PrefillRequestRecord,
+    ) -> _PackedTransferGeometry:
+        """Resolve one retained source writer's exact packed geometry.
+
+        :param record: Exact retained packed request record.
+        :returns: Logical and physical writer geometry.
+        :raises RuntimeError: If READY has not installed a source transfer.
+        """
+
+        source_transfer = record.source_transfer
+        if source_transfer is None:
+            raise RuntimeError("packed source transfer geometry is not ready")
+        writer_layout = writer_layout_for(
+            source_transfer.layout,
+            record.writer_id,
+        )
+        return _PackedTransferGeometry(
+            copy_group_count=len(writer_layout.copy_groups),
+            payload_bytes=sum(
+                group.length_bytes for group in writer_layout.copy_groups
+            ),
+            transport_bytes=source_transfer.length_bytes,
         )
 
     def _wait_for_main_outcome(
