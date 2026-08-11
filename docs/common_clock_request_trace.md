@@ -15,6 +15,12 @@ bootstrap room. Packed worker events use the room plus the 16-byte allocation
 generation, so room reuse cannot join two request lifetimes. A process-local
 sequence resolves equal timestamps and proves log order.
 
+The authoritative request scope is the exact set of gateway child UUIDs captured
+in strict routing receipts for successful pair-warmup, quality, benchmark-warmup,
+and measured requests. Startup and health traffic remains visible in the raw
+shards but is outside that hash-bound set and cannot enter an authoritative
+timeline.
+
 Schema 1 covers these boundaries:
 
 - gateway routing choice, selected prefill and decoder, group, and load snapshot;

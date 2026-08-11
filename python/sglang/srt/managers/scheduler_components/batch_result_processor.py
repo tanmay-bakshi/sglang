@@ -807,7 +807,11 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            if request_trace_enabled() and req.decode_batch_idx == 1:
+            if (
+                request_trace_enabled()
+                and req.request_trace_decode_issue_emitted
+                and not req.request_trace_decode_result_emitted
+            ):
                 emit_request_trace(
                     RequestTraceEvent.DECODE_FIRST_RESULT,
                     RequestTraceRole.DECODE_SCHEDULER,
@@ -822,6 +826,7 @@ class SchedulerBatchResultProcessor:
                         accepted_token_count=len(next_token_id),
                     ),
                 )
+                req.request_trace_decode_result_emitted = True
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)

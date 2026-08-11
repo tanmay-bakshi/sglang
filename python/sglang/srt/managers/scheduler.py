@@ -3536,7 +3536,9 @@ class Scheduler(
             and batch.forward_mode.is_decode()
         ):
             first_issue_reqs = tuple(
-                req for req in batch.reqs if req.decode_batch_idx == 1
+                req
+                for req in batch.reqs
+                if not req.request_trace_decode_issue_emitted
             )
             if len(first_issue_reqs) > 0:
                 emit_request_trace(
@@ -3553,6 +3555,8 @@ class Scheduler(
                         forward_iter=batch.forward_iter,
                     ),
                 )
+                for req in first_issue_reqs:
+                    req.request_trace_decode_issue_emitted = True
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)

@@ -88,7 +88,6 @@ pub fn emit_pd_route(input: PdRouteTraceInput<'_>) -> Result<(), RequestTraceErr
         REQUEST_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     )?;
     tracing::info!(
-        target: "sglang_request_trace",
         "{REQUEST_TRACE_PREFIX}{}",
         serde_json::to_string(&record)?
     );

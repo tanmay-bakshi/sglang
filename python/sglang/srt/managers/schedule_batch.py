@@ -798,6 +798,8 @@ class Req(ReqDllmMixin):
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.request_trace_decode_issue_emitted: bool = False
+        self.request_trace_decode_result_emitted: bool = False
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
