@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    _build_context_aware_capture_geometry,
 )
 from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
     TcPiecewiseCudaGraphBackend,
@@ -41,6 +42,14 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
+        runner.max_bs = 8
+        runner._tc_piecewise_max_sequence_tokens = 16
+        runner._tc_piecewise_capture_geometries = {
+            num_tokens: _build_context_aware_capture_geometry(
+                num_tokens, 16, runner.max_bs
+            )
+            for num_tokens in runner.capture_num_tokens
+        }
         return runner
 
     def _make_multimodal_forward_batch(self):
