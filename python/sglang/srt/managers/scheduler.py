@@ -267,6 +267,7 @@ from sglang.srt.observability.request_trace import (
     RequestTraceRole,
     emit_request_trace,
     request_trace_enabled,
+    shutdown_request_trace_writer,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -4963,11 +4964,14 @@ def run_scheduler_process(
             except Exception:
                 pass
     finally:
-        if scheduler is not None:
-            # FPM has a background ZMQ publisher thread that needs explicit
-            # teardown to flush queued metrics and close the socket cleanly.
-            scheduler.metrics_reporter._shutdown_fpm()
-            # Graceful path only: on the exception path the GPU may be wedged
-            # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+        try:
+            if scheduler is not None:
+                # FPM has a background ZMQ publisher thread that needs explicit
+                # teardown to flush queued metrics and close the socket cleanly.
+                scheduler.metrics_reporter._shutdown_fpm()
+                # Graceful path only: on the exception path the GPU may be wedged
+                # and the synchronize() in destroy() could itself hang.
+                if scheduler.gracefully_exit:
+                    scheduler.release_host_resources()
+        finally:
+            shutdown_request_trace_writer()

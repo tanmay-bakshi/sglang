@@ -2,6 +2,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -42,7 +43,9 @@ def clear_request_trace_environment(
 
     monkeypatch.delenv(request_trace.REQUEST_TRACE_ENV, raising=False)
     request_trace.request_trace_enabled.cache_clear()
+    request_trace.shutdown_request_trace_writer()
     yield
+    request_trace.shutdown_request_trace_writer()
     request_trace.request_trace_enabled.cache_clear()
 
 
@@ -92,6 +95,7 @@ def test_enabled_trace_emits_machine_monotonic_correlation_record(
                 cuda_graph_active=False,
             ),
         )
+        request_trace.flush_request_traces()
 
     assert len(caplog.messages) == 1
     message = caplog.messages[0]
@@ -139,12 +143,95 @@ def test_packed_trace_accepts_replay_safe_room_generation(
                 transport_bytes=232 * 1024 * 1024,
             ),
         )
+        request_trace.flush_request_traces()
 
     record = json.loads(caplog.messages[0].removeprefix(REQUEST_TRACE_PREFIX))
     assert record["request_ids"] == []
     assert record["bootstrap_rooms"] == [41]
     assert record["request_generations"] == ["01" * 16]
     assert record["copy_group_count"] == 2
+
+
+def test_enabled_trace_moves_log_io_off_the_calling_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not make inference threads wait for trace materialization or log I/O.
+
+    :param monkeypatch: Pytest mutation fixture.
+    """
+
+    monkeypatch.setenv(request_trace.REQUEST_TRACE_ENV, "1")
+    request_trace.request_trace_enabled.cache_clear()
+    writer_entered = threading.Event()
+    allow_writer_to_finish = threading.Event()
+    producer_finished = threading.Event()
+
+    def blocking_log(*args: object, **kwargs: object) -> None:
+        writer_entered.set()
+        assert allow_writer_to_finish.wait(1.0)
+
+    monkeypatch.setattr(request_trace.logger, "info", blocking_log)
+
+    def produce() -> None:
+        emit_request_trace(
+            RequestTraceEvent.DECODE_FIRST_RESULT,
+            RequestTraceRole.DECODE_SCHEDULER,
+            request_ids=("request-a",),
+            bootstrap_rooms=(41,),
+            fields=RequestTraceFields(
+                process_rank=0,
+                batch_size=1,
+                batch_token_count=1,
+                forward_iter=7,
+                cuda_graph_active=True,
+                accepted_token_count=16,
+            ),
+        )
+        producer_finished.set()
+
+    producer = threading.Thread(target=produce)
+    producer.start()
+    assert writer_entered.wait(1.0)
+    assert producer_finished.wait(0.1)
+    allow_writer_to_finish.set()
+    producer.join(1.0)
+    request_trace.flush_request_traces()
+
+    assert not producer.is_alive()
+
+
+def test_writer_shutdown_drains_every_accepted_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Make terminal scheduler cleanup a lossless trace barrier.
+
+    :param monkeypatch: Pytest mutation fixture.
+    """
+
+    monkeypatch.setenv(request_trace.REQUEST_TRACE_ENV, "1")
+    request_trace.request_trace_enabled.cache_clear()
+    messages: list[str] = []
+
+    def capture_log(template: str, prefix: str, payload: str) -> None:
+        messages.append(template % (prefix, payload))
+
+    monkeypatch.setattr(request_trace.logger, "info", capture_log)
+    for index in range(32):
+        emit_request_trace(
+            RequestTraceEvent.DECODE_FIRST_ISSUE,
+            RequestTraceRole.DECODE_SCHEDULER,
+            request_ids=(f"request-{index}",),
+            bootstrap_rooms=(index,),
+        )
+
+    request_trace.shutdown_request_trace_writer()
+
+    assert len(messages) == 32
+    records = [
+        json.loads(message.removeprefix(REQUEST_TRACE_PREFIX)) for message in messages
+    ]
+    assert [record["sequence"] for record in records] == list(range(32))
+    assert request_trace._request_trace_writer_instance is None
 
 
 def test_trace_rejects_misaligned_request_and_room_vectors(

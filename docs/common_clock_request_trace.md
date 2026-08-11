@@ -36,6 +36,17 @@ branch before tuple construction, clock reads, JSON construction, and logging.
 The gateway checks the same cached opt-in before cloning or parsing its request
 body. An invalid opt-in value fails closed.
 
+Enabled Python workers capture the clock, sequence, correlations, and typed
+fields at each boundary, then append that immutable record to a process-local
+lossless buffer. A daemon writer serializes and emits buffered records in FIFO
+order outside inference threads. It drains every 250 ms during service and at
+normal interpreter shutdown. Every scheduler process also drains it from the
+terminal `finally` block after scheduler resource release and before process
+logs close. The writer cache resets after `fork`, so a child never inherits a
+queue whose owner thread existed only in its parent. The JSON schema,
+timestamps, sequence semantics, log shards, and runtime environment contract
+are unchanged.
+
 ## Frozen non-perturbation measurement
 
 Tracing cannot ride an authoritative campaign until this prospective check
