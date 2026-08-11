@@ -961,9 +961,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
 
         context_tokens = int(model_runner.model_config.context_len)
-        request_table_tokens = int(
-            model_runner.req_to_token_pool.req_to_token.shape[1]
-        )
+        request_table_tokens = int(model_runner.req_to_token_pool.req_to_token.shape[1])
         capacity = min(context_tokens, request_table_tokens)
         if capacity <= 0:
             raise ValueError(
@@ -1302,9 +1300,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.prefill_backend_name != Backend.TC_PIECEWISE:
             return True
-        capture_geometry = self._tc_piecewise_capture_geometries.get(
-            padded_num_tokens
-        )
+        capture_geometry = self._tc_piecewise_capture_geometries.get(padded_num_tokens)
         if capture_geometry is None:
             return False
         if capture_geometry.request_slots == 1:
