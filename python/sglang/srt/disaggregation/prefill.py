@@ -624,7 +624,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            forward_completion = None
+            if batch and len(self.disagg_prefill_inflight_queue) > 0:
+                forward_completion = torch.cuda.Event()
+                forward_completion.record(self.forward_stream)
+            self.progress_disagg_prefill_transfers_during_forward(
+                forward_completion
+            )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -632,6 +638,33 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def progress_disagg_prefill_transfers_during_forward(
+        self: Scheduler,
+        forward_completion: torch.cuda.Event | None,
+    ) -> None:
+        """Observe completed transfers while the next prefill uses the GPU.
+
+        Overlap scheduling submits the current forward before it resolves the
+        previous batch and starts that batch's KV transfer. A single immediate
+        poll commonly observes the transfer in progress, then the scheduler
+        blocks on the current forward before checking again. Polling during
+        that already-enqueued forward lets transfer completion become visible
+        without serializing either operation.
+
+        :param forward_completion: Event recorded after the current forward,
+            or ``None`` when no forward is available to hide progress work.
+        """
+
+        self.process_disagg_prefill_inflight_queue()
+        if forward_completion is None:
+            return
+
+        while (
+            len(self.disagg_prefill_inflight_queue) > 0
+            and not forward_completion.query()
+        ):
+            self.process_disagg_prefill_inflight_queue()
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
