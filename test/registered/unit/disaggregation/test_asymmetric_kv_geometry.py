@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 from sglang.srt.disaggregation.common.asymmetric_kv_geometry import (
     require_uniform_asymmetric_kv_entry_geometry,
 )
+from sglang.srt.disaggregation.common.decode_allocation_lease import (
+    DecodeWriterManifest,
+)
 from sglang.srt.disaggregation.nixl.conn import KVArgsRegisterInfo, NixlKVManager
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -92,7 +95,11 @@ class TestNixlAsymmetricKVGeometryAdmission(CustomTestCase):
             kv_layer_ids=[5, 5, 0, 0],
         )
         manager.disaggregation_mode = DisaggregationMode.PREFILL
-        manager._packed_prefill_runtime = object()
+        manager._packed_prefill_runtime = SimpleNamespace(
+            writer_id=DecodeWriterManifest.for_tensor_parallel(
+                source_tp_size
+            ).writers[0]
+        )
         manager._prefill_peer_lock = threading.RLock()
         manager._quarantined_remote_handles = set()
         manager.decode_kv_args_table = {}
