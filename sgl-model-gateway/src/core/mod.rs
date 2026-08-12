@@ -23,6 +23,7 @@ pub mod pd_decoder_directory;
 pub mod pd_decoder_grant;
 pub mod pd_decoder_pool;
 mod pd_discovery;
+pub mod pd_prefill_scheduler;
 pub mod pd_process;
 pub mod pd_request_session;
 pub mod pd_topology;
@@ -44,6 +45,10 @@ pub use model_card::{ModelCard, ProviderType};
 pub use pd_decoder_directory::{
     PdGroupRequest, PdTopologyDecoderStatus, PdTopologyGroupStatus, PdTopologyPrefillStatus,
     PdTopologyStatus,
+};
+pub use pd_prefill_scheduler::{
+    PdPrefillCandidate, PdPrefillCompletionModel, PdPrefillOutstandingCharge, PdPrefillReservation,
+    PdPrefillRoute, PdPrefillScheduler, PdPrefillSchedulerError,
 };
 pub use pd_process::{
     KvTransferProtocol, PdMetadataSchema, PdProcessAdvertisement, PdProcessAdvertisementError,
