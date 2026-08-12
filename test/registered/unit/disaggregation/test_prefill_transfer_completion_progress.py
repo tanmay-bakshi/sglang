@@ -8,6 +8,7 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.prefill import (
     DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS,
     DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS,
+    DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS,
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,7 +38,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             if terminal_poll == scheduler.poll_count:
                 scheduler.disagg_prefill_inflight_queue.clear()
 
-        def forward_pending(
+        def progress_may_continue(
             forward_completion: Mock,
             progress_deadline: float,
         ) -> bool:
@@ -48,7 +49,9 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             )
 
         scheduler.process_disagg_prefill_inflight_queue = process
-        scheduler.disagg_prefill_forward_pending_on_all_ranks = forward_pending
+        scheduler.disagg_prefill_progress_may_continue_on_all_ranks = (
+            progress_may_continue
+        )
         return scheduler
 
     def test_active_forward_hides_repeated_polls_until_transfer_completes(
@@ -60,14 +63,19 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         forward_completion = Mock()
         forward_completion.query.return_value = False
 
-        SchedulerDisaggregationPrefillMixin.progress_disagg_prefill_transfers_during_forward(
-            scheduler,
-            forward_completion,
-        )
+        with patch("sglang.srt.disaggregation.prefill.time.sleep") as sleep:
+            SchedulerDisaggregationPrefillMixin.progress_disagg_prefill_transfers_during_forward(
+                scheduler,
+                forward_completion,
+            )
 
         self.assertEqual(scheduler.poll_count, 3)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
         self.assertEqual(forward_completion.query.call_count, 2)
+        self.assertEqual(
+            sleep.call_args_list,
+            [call(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)] * 2,
+        )
 
     def test_rank_consensus_prevents_an_asymmetric_collective_exit(self) -> None:
         """The decision reduces local event state across both rank dimensions."""
@@ -103,7 +111,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         ):
             method = (
                 SchedulerDisaggregationPrefillMixin
-                .disagg_prefill_forward_pending_on_all_ranks
+                .disagg_prefill_progress_may_continue_on_all_ranks
             )
             pending = method(scheduler, forward_completion, 2.0)
 
@@ -115,6 +123,43 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         self.assertTrue(
             all(op is dist.ReduceOp.MIN for _, op, _ in groups)
         )
+
+    def test_empty_local_queue_still_participates_in_exit_consensus(self) -> None:
+        """Queue skew cannot make one rank skip the exit collectives."""
+
+        scheduler = SimpleNamespace(
+            attn_tp_cpu_group=object(),
+            attn_cp_cpu_group=object(),
+            disagg_prefill_inflight_queue=[],
+        )
+        forward_completion = Mock()
+        groups: list[object] = []
+
+        def all_reduce(
+            tensor: torch.Tensor,
+            *,
+            op: object,
+            group: object,
+        ) -> None:
+            del tensor, op
+            groups.append(group)
+
+        with patch(
+            "sglang.srt.disaggregation.prefill.dist.all_reduce",
+            side_effect=all_reduce,
+        ):
+            method = (
+                SchedulerDisaggregationPrefillMixin
+                .disagg_prefill_progress_may_continue_on_all_ranks
+            )
+            pending = method(scheduler, forward_completion, 2.0)
+
+        self.assertFalse(pending)
+        self.assertEqual(
+            groups,
+            [scheduler.attn_tp_cpu_group, scheduler.attn_cp_cpu_group],
+        )
+        forward_completion.query.assert_not_called()
 
     def test_completed_forward_bounds_nonterminal_transfer_progress(self) -> None:
         """Polling returns control as soon as the current forward completes."""
@@ -134,8 +179,26 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         self.assertEqual(forward_completion.query.call_count, 2)
         self.assertEqual(
             sleep.call_args_list,
-            [call(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)] * 2,
+            [call(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)],
         )
+
+    def test_terminal_initial_poll_does_not_sleep(self) -> None:
+        """A transfer completed by the initial poll returns without delay."""
+
+        scheduler = self._scheduler(terminal_poll=1)
+        forward_completion = Mock()
+        forward_completion.query.return_value = False
+
+        with patch("sglang.srt.disaggregation.prefill.time.sleep") as sleep:
+            SchedulerDisaggregationPrefillMixin.progress_disagg_prefill_transfers_during_forward(
+                scheduler,
+                forward_completion,
+            )
+
+        self.assertEqual(scheduler.poll_count, 1)
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        forward_completion.query.assert_not_called()
+        sleep.assert_not_called()
 
     def test_expired_time_budget_still_reaches_rank_consensus(self) -> None:
         """Every rank enters the decision collective before a timed exit."""
@@ -169,7 +232,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         ):
             method = (
                 SchedulerDisaggregationPrefillMixin
-                .disagg_prefill_forward_pending_on_all_ranks
+                .disagg_prefill_progress_may_continue_on_all_ranks
             )
             pending = method(scheduler, forward_completion, 1.0)
 
@@ -219,6 +282,18 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1,
         )
         self.assertEqual(len(scheduler.disagg_prefill_inflight_queue), 1)
+
+    def test_progress_budgets_have_one_consistent_upper_bound(self) -> None:
+        """The poll cadence cannot outlive either registered budget."""
+
+        repeated_poll_budget = (
+            (DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1)
+            * DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS
+        )
+        self.assertLessEqual(
+            repeated_poll_budget,
+            DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS,
+        )
 
 
 if __name__ == "__main__":

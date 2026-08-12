@@ -672,25 +672,33 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         for _ in range(DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1):
-            time.sleep(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)
-            if not self.disagg_prefill_forward_pending_on_all_ranks(
+            if not self.disagg_prefill_progress_may_continue_on_all_ranks(
                 forward_completion,
                 progress_deadline,
             ):
                 return
+            time.sleep(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)
             self.process_disagg_prefill_inflight_queue()
 
-    def disagg_prefill_forward_pending_on_all_ranks(
+        logger.debug(
+            "Prefill transfer progress exhausted its %d-poll budget with "
+            "%d requests still in flight",
+            DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS,
+            len(self.disagg_prefill_inflight_queue),
+        )
+
+    def disagg_prefill_progress_may_continue_on_all_ranks(
         self: Scheduler,
         forward_completion: torch.cuda.Event,
         progress_deadline: float,
     ) -> bool:
-        """Agree whether transfer polling may continue behind the forward.
+        """Agree whether every rank may execute one more transfer poll.
 
         Every polling iteration contains TP/CP collectives. A rank-local event
-        decision could let one participant leave while another enters the next
-        collective, so the loop continues only while every participant still
-        observes its forward as incomplete.
+        or queue decision could let one participant leave while another enters
+        the next collective. A local time deadline is safe only as an input to
+        this consensus. The loop continues only while every rank has work,
+        time, and an incomplete forward.
 
         :param forward_completion: Event recorded after the current forward.
         :param progress_deadline: Monotonic deadline for opportunistic polling.
