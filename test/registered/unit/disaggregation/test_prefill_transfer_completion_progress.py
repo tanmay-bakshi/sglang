@@ -42,7 +42,10 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             progress_deadline: float,
         ) -> bool:
             del progress_deadline
-            return not forward_completion.query()
+            return (
+                len(scheduler.disagg_prefill_inflight_queue) > 0
+                and not forward_completion.query()
+            )
 
         scheduler.process_disagg_prefill_inflight_queue = process
         scheduler.disagg_prefill_forward_pending_on_all_ranks = forward_pending
