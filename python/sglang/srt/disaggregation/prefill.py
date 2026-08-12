@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -78,7 +79,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS = 512
+DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS = 64
+DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS = 0.0005
+DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS = 0.032
 
 
 def should_force_retry(req: Req) -> bool:
@@ -652,22 +655,27 @@ class SchedulerDisaggregationPrefillMixin:
         poll commonly observes the transfer in progress, then the scheduler
         blocks on the current forward before checking again. Polling during
         that already-enqueued forward lets transfer completion become visible
-        without serializing either operation. The fixed total poll budget
-        bounds CPU and Gloo pressure even if the forward is anomalously long.
+        without serializing either operation. A fixed cadence plus count and
+        wall-time budgets bound CPU and Gloo pressure even if the forward is
+        anomalously long.
 
         :param forward_completion: Event recorded after the current forward,
             or ``None`` when no forward is available to hide progress work.
         """
 
+        progress_deadline = (
+            time.monotonic()
+            + DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS
+        )
         self.process_disagg_prefill_inflight_queue()
         if forward_completion is None:
             return
 
         for _ in range(DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1):
-            if len(self.disagg_prefill_inflight_queue) == 0:
-                return
+            time.sleep(DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS)
             if not self.disagg_prefill_forward_pending_on_all_ranks(
-                forward_completion
+                forward_completion,
+                progress_deadline,
             ):
                 return
             self.process_disagg_prefill_inflight_queue()
@@ -675,6 +683,7 @@ class SchedulerDisaggregationPrefillMixin:
     def disagg_prefill_forward_pending_on_all_ranks(
         self: Scheduler,
         forward_completion: torch.cuda.Event,
+        progress_deadline: float,
     ) -> bool:
         """Agree whether transfer polling may continue behind the forward.
 
@@ -684,11 +693,17 @@ class SchedulerDisaggregationPrefillMixin:
         observes its forward as incomplete.
 
         :param forward_completion: Event recorded after the current forward.
+        :param progress_deadline: Monotonic deadline for opportunistic polling.
         :returns: Whether all TP/CP participants may enter another poll.
         """
 
+        locally_pending = (
+            len(self.disagg_prefill_inflight_queue) > 0
+            and time.monotonic() < progress_deadline
+            and not forward_completion.query()
+        )
         pending = torch.tensor(
-            [0 if forward_completion.query() else 1],
+            [int(locally_pending)],
             dtype=torch.uint8,
             device="cpu",
         )
