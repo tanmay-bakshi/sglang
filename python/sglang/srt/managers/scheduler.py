@@ -1200,6 +1200,7 @@ class Scheduler(
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_inflight_queue = None
+        self.disagg_prefill_deferred_producer_events = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1316,6 +1317,9 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            self.disagg_prefill_deferred_producer_events: dict[
+                str, torch.cuda.Event
+            ] = {}
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 

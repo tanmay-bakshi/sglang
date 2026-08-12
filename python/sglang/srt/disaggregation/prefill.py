@@ -470,6 +470,42 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def bind_disagg_prefill_producer_event(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        event: torch.cuda.Event,
+    ) -> None:
+        """Bind exact packed-transfer completion to its producing batch.
+
+        :param batch: Batch whose forward produced the source KV writes.
+        :param event: Event recorded immediately after that exact forward.
+        """
+
+        protocol = self.disagg_prefill_bootstrap_queue.kv_manager.kv_transfer_protocol()
+        if protocol != "packed-v4":
+            return
+        if not isinstance(event, torch.cuda.Event):
+            raise TypeError("packed prefill producer dependency must be a CUDA event")
+        batch.disagg_kv_producer_event = event
+
+    def record_disagg_prefill_producer_event(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Record exact packed-transfer completion after one prefill forward.
+
+        :param batch: Batch whose forward produced the source KV writes.
+        :param stream: CUDA stream on which that forward was enqueued.
+        """
+
+        protocol = self.disagg_prefill_bootstrap_queue.kv_manager.kv_transfer_protocol()
+        if protocol != "packed-v4":
+            return
+        event = torch.cuda.Event()
+        event.record(stream)
+        self.bind_disagg_prefill_producer_event(batch, event)
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -577,6 +613,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
+                self.record_disagg_prefill_producer_event(
+                    batch,
+                    torch.cuda.current_stream(device=self.device),
+                )
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -616,6 +656,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self.record_disagg_prefill_producer_event(
+                    batch,
+                    self.forward_stream,
+                )
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -759,6 +803,7 @@ class SchedulerDisaggregationPrefillMixin:
         logprob_pt = 0
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
+        producer_event = batch.disagg_kv_producer_event
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -824,7 +869,15 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=True,
+                        producer_event=producer_event,
+                    )
+                elif producer_event is not None:
+                    self.disagg_prefill_deferred_producer_events[req.rid] = (
+                        producer_event
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -884,7 +937,12 @@ class SchedulerDisaggregationPrefillMixin:
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=False,
+                        end_idx=req.tmp_end_idx,
+                        producer_event=producer_event,
+                    )
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -1006,6 +1064,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
+        self.disagg_prefill_deferred_producer_events.pop(req.rid, None)
         error_message = (
             f"Prefill transfer failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1050,6 +1109,7 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+        self.disagg_prefill_deferred_producer_events.pop(req.rid, None)
         error_message = (
             f"Prefill bootstrap failed for request rank={self.ps.tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1139,7 +1199,12 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
-                self.send_kv_chunk(req)
+                producer_event = (
+                    last_batch.disagg_kv_producer_event
+                    if last_batch is not None
+                    else None
+                )
+                self.send_kv_chunk(req, producer_event=producer_event)
 
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
@@ -1174,21 +1239,36 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
+        producer_event = None
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+            producer_event = ev
+        self.send_kv_chunk(
+            req,
+            last_chunk=False,
+            end_idx=cached_end,
+            producer_event=producer_event,
+        )
 
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        producer_event: torch.cuda.Event | None = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
         """
+        if last_chunk:
+            deferred_event = self.disagg_prefill_deferred_producer_events.pop(
+                req.rid,
+                None,
+            )
+            if producer_event is None:
+                producer_event = deferred_event
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
@@ -1321,11 +1401,16 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(
+            page_indices,
+            state_indices,
+            producer_event=producer_event,
+        )
         req.start_send_idx = end_idx
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
+        self.disagg_prefill_deferred_producer_events.pop(req.rid, None)
         max_attempts = self.server_args.optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)

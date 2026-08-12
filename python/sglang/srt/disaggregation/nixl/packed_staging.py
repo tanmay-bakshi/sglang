@@ -3485,27 +3485,21 @@ class PackedCopyExecutor:
         *,
         transfer: PackedSourceTransfer,
         source_lane: PackedTransferLane,
-        producer_event: torch.cuda.Event | None = None,
-        producer_stream: torch.cuda.Stream | None = None,
+        producer_event: torch.cuda.Event,
     ) -> int:
         """Gather one writer projection and wait until NIC-visible.
 
-        Exactly one producer dependency is required. The caller owns the lane
-        from successful return until exact transport terminality. This method
-        synchronizes gather work, not a later NIXL read.
+        The caller owns the lane from successful return until exact transport
+        terminality. This method synchronizes gather work, not a later NIXL
+        read.
 
         :param transfer: Canonical work produced by validated READY.
         :param source_lane: Presized route-owned registered staging lane.
         :param producer_event: Event recorded after every source KV write.
-        :param producer_stream: Stream containing every source KV write.
         :returns: Exact contiguous DMA length.
         :raises PackedGatherError: If no destination DMA was submitted.
         """
 
-        if (producer_event is None) == (producer_stream is None):
-            raise ValueError(
-                "packed gather requires exactly one producer event or stream"
-            )
         writer_layout = writer_layout_for(transfer.layout, transfer.writer_id)
         if transfer.length_bytes != writer_layout.length_bytes:
             raise ValueError("source transfer length differs from canonical writer")
@@ -3513,12 +3507,7 @@ class PackedCopyExecutor:
         retained: list[torch.Tensor] = []
         try:
             with torch.cuda.stream(self._source_stream):
-                if producer_event is not None:
-                    self._source_stream.wait_event(producer_event)
-                else:
-                    if producer_stream is None:
-                        raise RuntimeError("producer dependency validation drifted")
-                    self._source_stream.wait_stream(producer_stream)
+                self._source_stream.wait_event(producer_event)
                 source_lane.tensor[: writer_layout.length_bytes].zero_()
                 for group in writer_layout.copy_groups:
                     active = transfer.source_binding.require(group.component_id)

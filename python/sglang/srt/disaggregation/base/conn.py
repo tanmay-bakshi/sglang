@@ -12,6 +12,8 @@ from sglang.srt.disaggregation.runtime_capabilities import KvTransferProtocol
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
@@ -144,6 +146,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        producer_event: torch.cuda.Event | None = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.

@@ -1,10 +1,13 @@
 import concurrent.futures
+import contextlib
 import dataclasses
 import enum
 import gc
 import sys
 import threading
 import weakref
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -38,6 +41,7 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 from sglang.srt.disaggregation.nixl.packed_staging import (
     MAIN_KV_COMPONENT,
     PackedComponentPages,
+    PackedCopyExecutor,
     PackedCudaDeviceAttribute,
     PackedDestinationCapability,
     PackedDestinationOutcomeCoordinator,
@@ -90,6 +94,48 @@ KEY = PackedChunkKey(
     chunk_id=2,
     request_generation=REQUEST_GENERATION,
 )
+
+
+def test_packed_gather_waits_on_exact_producer_event() -> None:
+    """Gather has no mutable-stream fallback after event ownership is sealed."""
+
+    producer_event = object()
+    source_stream = Mock()
+    source_lane = MagicMock()
+    transfer = SimpleNamespace(
+        layout=object(),
+        writer_id=object(),
+        length_bytes=4096,
+    )
+    writer_layout = SimpleNamespace(
+        length_bytes=4096,
+        lease_offset=0,
+        copy_groups=(),
+    )
+    executor = object.__new__(PackedCopyExecutor)
+    executor._source_stream = source_stream
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.writer_layout_for",
+            return_value=writer_layout,
+        ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.stream",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        length_bytes = executor.gather(
+            transfer=transfer,
+            source_lane=source_lane,
+            producer_event=producer_event,
+        )
+
+    assert length_bytes == 4096
+    source_stream.wait_event.assert_called_once_with(producer_event)
+    source_stream.wait_stream.assert_not_called()
+
+
 WRITERS = tuple(
     StagingWriterId(
         transfer_source_rank=rank,

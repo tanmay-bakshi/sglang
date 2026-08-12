@@ -907,9 +907,9 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     lane = Mock(data_ptr=0x100000)
     lane.abort_before_submit.return_value = outcome
     executor = Mock()
-    producer_stream = object()
+    producer_event = object()
     record = Mock()
-    record.submission.producer_stream = producer_stream
+    record.submission.producer_event = producer_event
     transfer = Mock(
         destination_address=0x200000,
         length_bytes=4096,
@@ -949,7 +949,7 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     executor.gather.assert_called_once_with(
         transfer=transfer,
         source_lane=lane,
-        producer_stream=producer_stream,
+        producer_event=producer_event,
     )
     lane.abort_before_submit.assert_called_once_with(
         "packed main transfer initialization failed"

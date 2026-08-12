@@ -215,7 +215,7 @@ class PackedPrefillSubmission:
     :ivar control: Exact decoder control and native data route.
     :ivar components: Main-KV and SWA source/destination page projections.
     :ivar auxiliary_source_index: Source metadata row copied by the canonical writer.
-    :ivar producer_stream: CUDA stream containing every source cache write.
+    :ivar producer_event: Event recorded after the exact source cache writes.
     """
 
     plan: PackedAuxiliaryPlan
@@ -224,7 +224,7 @@ class PackedPrefillSubmission:
     control: PackedDecodeControlSender
     components: tuple[PackedComponentPages, ...]
     auxiliary_source_index: int
-    producer_stream: torch.cuda.Stream
+    producer_event: torch.cuda.Event
 
     def __post_init__(self) -> None:
         """Own and validate one immutable source submission."""
@@ -251,8 +251,8 @@ class PackedPrefillSubmission:
             raise TypeError("packed auxiliary source index must be an integer")
         if self.auxiliary_source_index < 0:
             raise ValueError("packed auxiliary source index must be non-negative")
-        if not isinstance(self.producer_stream, torch.cuda.Stream):
-            raise TypeError("packed source producer stream must be a CUDA stream")
+        if not isinstance(self.producer_event, torch.cuda.Event):
+            raise TypeError("packed source producer event must be a CUDA event")
         if self.destination.request_generation != self.plan.key.request_generation:
             raise ValueError(
                 "packed source capability generation differs from auxiliary plan"
@@ -1026,7 +1026,7 @@ class PackedPrefillRuntime:
         executor.gather(
             transfer=transfer,
             source_lane=lane,
-            producer_stream=record.submission.producer_stream,
+            producer_event=record.submission.producer_event,
         )
         record.source_gather_copy_duration_ms = (
             time.perf_counter() - gather_started_at

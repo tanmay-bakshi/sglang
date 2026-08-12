@@ -867,7 +867,6 @@ class NixlKVManager(CommonKVManager):
         self._packed_control_send_lock = threading.Lock()
         self._packed_decode_controller: PackedNixlDecodeController | None = None
         self._packed_prefill_runtime: PackedPrefillRuntime | None = None
-        self._packed_producer_streams: dict[int, torch.cuda.Stream] = {}
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
@@ -2036,7 +2035,7 @@ class NixlKVManager(CommonKVManager):
         source_main_pages: npt.NDArray[np.int32],
         auxiliary_source_index: int,
         state_indices: Optional[List],
-        producer_stream: torch.cuda.Stream,
+        producer_event: torch.cuda.Event,
     ) -> None:
         """Execute one complete source request through the packed actor.
 
@@ -2045,7 +2044,7 @@ class NixlKVManager(CommonKVManager):
         :param source_main_pages: Complete source KV page projection.
         :param auxiliary_source_index: Source auxiliary metadata row.
         :param state_indices: Complete final source state page arrays.
-        :param producer_stream: CUDA stream containing source cache writes.
+        :param producer_event: Event recorded after the exact source cache writes.
         """
 
         runtime = self._packed_prefill_runtime
@@ -2109,7 +2108,7 @@ class NixlKVManager(CommonKVManager):
                     state_indices,
                 ),
                 auxiliary_source_index=auxiliary_source_index,
-                producer_stream=producer_stream,
+                producer_event=producer_event,
             )
         )
 
@@ -2121,7 +2120,6 @@ class NixlKVManager(CommonKVManager):
 
         self.transfer_infos.pop(room, None)
         self.req_to_decode_prefix_len.pop(room, None)
-        self._packed_producer_streams.pop(room, None)
         if not self.enable_staging or self._staging_ctx is None:
             return
         self._staging_ctx.prefetched_rooms.discard(room)
@@ -2236,10 +2234,10 @@ class NixlKVManager(CommonKVManager):
                         continue
                     if kv_chunk.prefill_aux_index is None:
                         raise RuntimeError("packed source request has no auxiliary row")
-                    producer_stream = self._packed_producer_streams.get(room)
-                    if producer_stream is None:
+                    producer_event = kv_chunk.producer_event
+                    if producer_event is None:
                         raise RuntimeError(
-                            "packed source request has no producer stream"
+                            "packed source request has no producer event"
                         )
                     source_main_pages = np.concatenate(page_chunks)
                     self._execute_packed_source_request(
@@ -2248,7 +2246,7 @@ class NixlKVManager(CommonKVManager):
                         source_main_pages=source_main_pages,
                         auxiliary_source_index=kv_chunk.prefill_aux_index,
                         state_indices=kv_chunk.state_indices,
-                        producer_stream=producer_stream,
+                        producer_event=producer_event,
                     )
                     packed_source_page_chunks.pop(room, None)
                     self.update_status(room, KVPoll.Success)
@@ -2453,7 +2451,6 @@ class NixlKVManager(CommonKVManager):
                     )
                 self._notify_decode_transfer_failure(room)
                 packed_source_page_chunks.pop(room, None)
-                self._packed_producer_streams.pop(room, None)
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
@@ -4267,16 +4264,15 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        producer_event: torch.cuda.Event | None = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         packed_route = self._packed_source_route(bootstrap_room)
-        if packed_route is not None:
-            self._packed_producer_streams[bootstrap_room] = torch.cuda.current_stream(
-                device=self.kv_args.gpu_id
-            )
-        elif self.enable_staging:
+        if packed_route is not None and is_last_chunk and producer_event is None:
+            raise RuntimeError("packed source final chunk has no producer event")
+        if packed_route is None and self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
 
         # Transfer is async: just enqueue the chunk; the per-queue worker
@@ -4295,6 +4291,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                producer_event=producer_event,
             )
         )
         return None
@@ -5061,6 +5058,7 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        producer_event: torch.cuda.Event | None = None,
     ):
         if self._send_failed:
             return
@@ -5084,6 +5082,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            producer_event,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1

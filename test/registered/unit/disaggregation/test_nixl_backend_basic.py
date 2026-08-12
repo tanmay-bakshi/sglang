@@ -1170,6 +1170,113 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
+    def test_sender_preserves_producer_event_in_manager_submission(self) -> None:
+        """The sender cannot replace the exact scheduler-owned event."""
+
+        producer_event = object()
+        manager = SimpleNamespace(
+            enable_all_cp_ranks_for_transfer=False,
+            server_args=SimpleNamespace(enable_dsa_cache_layer_split=False),
+            is_dummy_cp_rank=False,
+            add_transfer_request=MagicMock(),
+        )
+        sender = object.__new__(NixlKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = 41
+        sender.curr_idx = 0
+        sender.num_kv_indices = 1
+        sender.chunk_id = 0
+        sender.aux_index = 7
+        sender._send_failed = False
+        sender._transfer_start_time = None
+        sender._transfer_num_kv_indices = 0
+        sender._transfer_num_state_indices = 0
+
+        sender.send(
+            np.array([3], dtype=np.int32),
+            producer_event=producer_event,
+        )
+
+        manager.add_transfer_request.assert_called_once()
+        self.assertIs(
+            manager.add_transfer_request.call_args.args[-1],
+            producer_event,
+        )
+
+
+class TestNixlProducerEventQueue(CustomTestCase):
+    def _make_manager(self) -> NixlKVManager:
+        """Build a packed source manager without starting worker threads.
+
+        :returns: Manager double with one observable transfer queue.
+        """
+
+        manager = object.__new__(NixlKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager._packed_source_route = MagicMock(return_value=(object(), object()))
+        manager.enable_staging = False
+        manager.transfer_queues = [SimpleNamespace(put=MagicMock())]
+        return manager
+
+    def test_final_chunk_queue_owns_the_exact_producer_event(self) -> None:
+        """The in-process worker queue retains immutable event identity."""
+
+        manager = self._make_manager()
+        producer_event = object()
+
+        manager.add_transfer_request(
+            41,
+            np.array([3], dtype=np.int32),
+            slice(0, 1),
+            True,
+            0,
+            7,
+            None,
+            producer_event,
+        )
+
+        queued = manager.transfer_queues[0].put.call_args.args[0]
+        self.assertIs(queued.producer_event, producer_event)
+
+    def test_final_packed_chunk_without_event_fails_before_enqueue(self) -> None:
+        """Packed transfer cannot fall back to sampling a mutable stream."""
+
+        manager = self._make_manager()
+
+        with self.assertRaisesRegex(RuntimeError, "no producer event"):
+            manager.add_transfer_request(
+                41,
+                np.array([3], dtype=np.int32),
+                slice(0, 1),
+                True,
+                0,
+                7,
+                None,
+                None,
+            )
+
+        manager.transfer_queues[0].put.assert_not_called()
+
+    def test_nonpacked_final_chunk_remains_valid_without_event(self) -> None:
+        """The new dependency is required only by the packed source actor."""
+
+        manager = self._make_manager()
+        manager._packed_source_route.return_value = None
+
+        manager.add_transfer_request(
+            41,
+            np.array([3], dtype=np.int32),
+            slice(0, 1),
+            True,
+            0,
+            7,
+            None,
+            None,
+        )
+
+        queued = manager.transfer_queues[0].put.call_args.args[0]
+        self.assertIsNone(queued.producer_event)
+
 
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
@@ -1489,7 +1596,6 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
         mgr._packed_prefill_runtime = None
-        mgr._packed_producer_streams = {}
 
         def check_xfer_state(_handle):
             mgr.update_status(room, KVPoll.Failed)
@@ -1517,6 +1623,29 @@ class TestNixlTransferWorker(CustomTestCase):
         queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
         with self.assertRaises(SystemExit):
             mgr.transfer_worker(queue)
+
+    def test_packed_worker_passes_final_chunk_event_to_source_actor(self) -> None:
+        """Worker dispatch preserves the event owned by the final work unit."""
+
+        room = 28
+        manager = self._make_manager(room)
+        transfer_info = object()
+        registration = object()
+        manager._packed_source_route = MagicMock(
+            return_value=(transfer_info, registration)
+        )
+        manager._execute_packed_source_request = MagicMock()
+        producer_event = object()
+        chunk = self._make_chunk(room, [4, 5], is_last_chunk=True)
+        chunk.producer_event = producer_event
+
+        self._run_worker_once(manager, chunk)
+
+        submission = manager._execute_packed_source_request.call_args.kwargs
+        self.assertIs(submission["transfer_info"], transfer_info)
+        self.assertIs(submission["registration"], registration)
+        self.assertIs(submission["producer_event"], producer_event)
+        self.assertNotIn(room, manager.transfer_infos)
 
     def test_transfer_handles_are_released_once_after_all_complete(self) -> None:
         """Completed outer transfer handles remain valid until every handle is done."""
@@ -3364,7 +3493,7 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
         manager.agent = SimpleNamespace(name="prefill-agent")
         manager.process_generation = source_generation
         manager._send_packed_control_frames = MagicMock()
-        producer_stream = object()
+        producer_event = object()
         submission = object()
 
         with patch(
@@ -3377,7 +3506,7 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
                 source_main_pages=np.array([1, 2], dtype=np.int32),
                 auxiliary_source_index=7,
                 state_indices=None,
-                producer_stream=producer_stream,
+                producer_event=producer_event,
             )
 
         runtime.build_destination_capability.assert_called_once_with(
@@ -3392,7 +3521,7 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
         submission_kwargs = submission_factory.call_args.kwargs
         self.assertIs(submission_kwargs["plan"], plan)
         self.assertIs(submission_kwargs["destination"], destination)
-        self.assertIs(submission_kwargs["producer_stream"], producer_stream)
+        self.assertIs(submission_kwargs["producer_event"], producer_event)
         self.assertEqual(submission_kwargs["auxiliary_source_index"], 7)
         self.assertEqual(
             submission_kwargs["destination_registration"].main_item_lens,

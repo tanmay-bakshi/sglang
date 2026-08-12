@@ -3,6 +3,7 @@ from typing import List, Optional
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVManager,
@@ -78,6 +79,7 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        producer_event: torch.cuda.Event | None = None,
     ):
         self.has_sent = True
         logger.debug(
