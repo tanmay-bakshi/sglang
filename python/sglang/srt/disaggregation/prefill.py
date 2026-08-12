@@ -633,9 +633,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch and len(self.disagg_prefill_inflight_queue) > 0:
                 forward_completion = torch.cuda.Event()
                 forward_completion.record(self.forward_stream)
-            self.progress_disagg_prefill_transfers_during_forward(
-                forward_completion
-            )
+            self.progress_disagg_prefill_transfers_during_forward(forward_completion)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -664,8 +662,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
 
         progress_deadline = (
-            time.monotonic()
-            + DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS
+            time.monotonic() + DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS
         )
         self.process_disagg_prefill_inflight_queue()
         if forward_completion is None:

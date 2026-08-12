@@ -110,8 +110,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             ),
         ):
             method = (
-                SchedulerDisaggregationPrefillMixin
-                .disagg_prefill_progress_may_continue_on_all_ranks
+                SchedulerDisaggregationPrefillMixin.disagg_prefill_progress_may_continue_on_all_ranks
             )
             pending = method(scheduler, forward_completion, 2.0)
 
@@ -120,9 +119,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             [group for _, _, group in groups],
             [scheduler.attn_tp_cpu_group, scheduler.attn_cp_cpu_group],
         )
-        self.assertTrue(
-            all(op is dist.ReduceOp.MIN for _, op, _ in groups)
-        )
+        self.assertTrue(all(op is dist.ReduceOp.MIN for _, op, _ in groups))
 
     def test_empty_local_queue_still_participates_in_exit_consensus(self) -> None:
         """Queue skew cannot make one rank skip the exit collectives."""
@@ -149,8 +146,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             side_effect=all_reduce,
         ):
             method = (
-                SchedulerDisaggregationPrefillMixin
-                .disagg_prefill_progress_may_continue_on_all_ranks
+                SchedulerDisaggregationPrefillMixin.disagg_prefill_progress_may_continue_on_all_ranks
             )
             pending = method(scheduler, forward_completion, 2.0)
 
@@ -231,8 +227,7 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             ),
         ):
             method = (
-                SchedulerDisaggregationPrefillMixin
-                .disagg_prefill_progress_may_continue_on_all_ranks
+                SchedulerDisaggregationPrefillMixin.disagg_prefill_progress_may_continue_on_all_ranks
             )
             pending = method(scheduler, forward_completion, 1.0)
 
@@ -287,9 +282,8 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         """The poll cadence cannot outlive either registered budget."""
 
         repeated_poll_budget = (
-            (DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1)
-            * DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS
-        )
+            DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1
+        ) * DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS
         self.assertLessEqual(
             repeated_poll_budget,
             DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS,
