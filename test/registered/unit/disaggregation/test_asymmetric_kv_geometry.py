@@ -96,9 +96,9 @@ class TestNixlAsymmetricKVGeometryAdmission(CustomTestCase):
         )
         manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager._packed_prefill_runtime = SimpleNamespace(
-            writer_id=DecodeWriterManifest.for_tensor_parallel(
-                source_tp_size
-            ).writers[0]
+            writer_id=DecodeWriterManifest.for_tensor_parallel(source_tp_size).writers[
+                0
+            ]
         )
         manager._prefill_peer_lock = threading.RLock()
         manager._quarantined_remote_handles = set()
