@@ -78,6 +78,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS = 512
 
 
 def should_force_retry(req: Req) -> bool:
@@ -651,7 +652,8 @@ class SchedulerDisaggregationPrefillMixin:
         poll commonly observes the transfer in progress, then the scheduler
         blocks on the current forward before checking again. Polling during
         that already-enqueued forward lets transfer completion become visible
-        without serializing either operation.
+        without serializing either operation. The fixed total poll budget
+        bounds CPU and Gloo pressure even if the forward is anomalously long.
 
         :param forward_completion: Event recorded after the current forward,
             or ``None`` when no forward is available to hide progress work.
@@ -661,12 +663,13 @@ class SchedulerDisaggregationPrefillMixin:
         if forward_completion is None:
             return
 
-        while (
-            len(self.disagg_prefill_inflight_queue) > 0
-            and self.disagg_prefill_forward_pending_on_all_ranks(
+        for _ in range(DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1):
+            if len(self.disagg_prefill_inflight_queue) == 0:
+                return
+            if not self.disagg_prefill_forward_pending_on_all_ranks(
                 forward_completion
-            )
-        ):
+            ):
+                return
             self.process_disagg_prefill_inflight_queue()
 
     def disagg_prefill_forward_pending_on_all_ranks(

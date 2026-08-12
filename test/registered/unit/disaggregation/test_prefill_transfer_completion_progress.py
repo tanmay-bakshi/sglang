@@ -5,7 +5,10 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -125,6 +128,28 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         )
 
         self.assertEqual(scheduler.poll_count, 1)
+        self.assertEqual(len(scheduler.disagg_prefill_inflight_queue), 1)
+
+    def test_poll_budget_bounds_an_anomalously_long_forward(self) -> None:
+        """A nonterminal transfer cannot poll Gloo without a fixed bound."""
+
+        scheduler = self._scheduler(terminal_poll=None)
+        forward_completion = Mock()
+        forward_completion.query.return_value = False
+
+        SchedulerDisaggregationPrefillMixin.progress_disagg_prefill_transfers_during_forward(
+            scheduler,
+            forward_completion,
+        )
+
+        self.assertEqual(
+            scheduler.poll_count,
+            DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS,
+        )
+        self.assertEqual(
+            forward_completion.query.call_count,
+            DISAGG_PREFILL_TRANSFER_PROGRESS_MAX_POLLS - 1,
+        )
         self.assertEqual(len(scheduler.disagg_prefill_inflight_queue), 1)
 
 
