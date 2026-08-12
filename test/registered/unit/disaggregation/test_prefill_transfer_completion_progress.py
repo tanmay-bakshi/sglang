@@ -1,6 +1,9 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,7 +33,11 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
             if terminal_poll == scheduler.poll_count:
                 scheduler.disagg_prefill_inflight_queue.clear()
 
+        def forward_pending(forward_completion: Mock) -> bool:
+            return not forward_completion.query()
+
         scheduler.process_disagg_prefill_inflight_queue = process
+        scheduler.disagg_prefill_forward_pending_on_all_ranks = forward_pending
         return scheduler
 
     def test_active_forward_hides_repeated_polls_until_transfer_completes(
@@ -50,6 +57,46 @@ class TestPrefillTransferCompletionProgress(unittest.TestCase):
         self.assertEqual(scheduler.poll_count, 3)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
         self.assertEqual(forward_completion.query.call_count, 2)
+
+    def test_rank_consensus_prevents_an_asymmetric_collective_exit(self) -> None:
+        """The decision reduces local event state across both rank dimensions."""
+
+        scheduler = SimpleNamespace(
+            attn_tp_cpu_group=object(),
+            attn_cp_cpu_group=object(),
+        )
+        forward_completion = Mock()
+        forward_completion.query.return_value = False
+        groups: list[tuple[torch.Tensor, object, object]] = []
+
+        def all_reduce(
+            tensor: torch.Tensor,
+            *,
+            op: object,
+            group: object,
+        ) -> None:
+            groups.append((tensor.clone(), op, group))
+            if group is scheduler.attn_cp_cpu_group:
+                tensor.fill_(0)
+
+        with patch(
+            "sglang.srt.disaggregation.prefill.dist.all_reduce",
+            side_effect=all_reduce,
+        ):
+            method = (
+                SchedulerDisaggregationPrefillMixin
+                .disagg_prefill_forward_pending_on_all_ranks
+            )
+            pending = method(scheduler, forward_completion)
+
+        self.assertFalse(pending)
+        self.assertEqual(
+            [group for _, _, group in groups],
+            [scheduler.attn_tp_cpu_group, scheduler.attn_cp_cpu_group],
+        )
+        self.assertTrue(
+            all(op is dist.ReduceOp.MIN for _, op, _ in groups)
+        )
 
     def test_completed_forward_bounds_nonterminal_transfer_progress(self) -> None:
         """Polling returns control as soon as the current forward completes."""

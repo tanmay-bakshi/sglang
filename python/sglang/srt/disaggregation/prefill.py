@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -662,9 +663,43 @@ class SchedulerDisaggregationPrefillMixin:
 
         while (
             len(self.disagg_prefill_inflight_queue) > 0
-            and not forward_completion.query()
+            and self.disagg_prefill_forward_pending_on_all_ranks(
+                forward_completion
+            )
         ):
             self.process_disagg_prefill_inflight_queue()
+
+    def disagg_prefill_forward_pending_on_all_ranks(
+        self: Scheduler,
+        forward_completion: torch.cuda.Event,
+    ) -> bool:
+        """Agree whether transfer polling may continue behind the forward.
+
+        Every polling iteration contains TP/CP collectives. A rank-local event
+        decision could let one participant leave while another enters the next
+        collective, so the loop continues only while every participant still
+        observes its forward as incomplete.
+
+        :param forward_completion: Event recorded after the current forward.
+        :returns: Whether all TP/CP participants may enter another poll.
+        """
+
+        pending = torch.tensor(
+            [0 if forward_completion.query() else 1],
+            dtype=torch.uint8,
+            device="cpu",
+        )
+        dist.all_reduce(
+            pending,
+            op=dist.ReduceOp.MIN,
+            group=self.attn_tp_cpu_group,
+        )
+        dist.all_reduce(
+            pending,
+            op=dist.ReduceOp.MIN,
+            group=self.attn_cp_cpu_group,
+        )
+        return int(pending.item()) == 1
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
