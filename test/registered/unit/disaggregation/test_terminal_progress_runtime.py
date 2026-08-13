@@ -272,8 +272,20 @@ def _drain_observations(runtime: NativeTerminalRuntime) -> None:
     :param runtime: Runtime being prepared for exact clean close.
     """
 
-    if runtime.observations.snapshot().queued_count > 0:
-        runtime.observations.drain()
+    expires_at = time.monotonic() + _WAIT_SECONDS
+    while True:
+        if runtime.observations.snapshot().queued_count > 0:
+            runtime.observations.drain()
+        if runtime.snapshot().owner.queued_output_count == 0:
+            if runtime.observations.snapshot().queued_count > 0:
+                continue
+            return
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("terminal observations did not reach quiescence")
+        with selectors.DefaultSelector() as selector:
+            selector.register(runtime.observations.fileno(), selectors.EVENT_READ)
+            selector.select(remaining)
 
 
 def _retire_all_producers(runtime: NativeTerminalRuntime) -> None:
