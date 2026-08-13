@@ -424,6 +424,7 @@ class PackedTerminalOutputPublisher:
     _admission_open: bool
     _started: bool
     _thread_launched: bool
+    _startup_complete: threading.Event
     _stop_requested: bool
     _shutdown_deadline: BoundTerminalDeadline | None
     _fatal_reason: str | None
@@ -505,6 +506,7 @@ class PackedTerminalOutputPublisher:
         self._admission_open = False
         self._started = False
         self._thread_launched = False
+        self._startup_complete = threading.Event()
         self._stop_requested = False
         self._shutdown_deadline = None
         self._fatal_reason = None
@@ -518,26 +520,49 @@ class PackedTerminalOutputPublisher:
         )
 
     def start(self) -> None:
-        """Start the publisher exactly once."""
+        """Start the publisher exactly once after its thread owns a live sink."""
 
+        start_error: BaseException | None = None
+        start_traceback: str | None = None
+        should_notify = False
+        should_wake = False
         with self._transition_lock:
             with self._lock:
                 if self._started:
                     raise TerminalGatewayPublisherError("publisher cannot restart")
                 self._started = True
-                self._admission_open = True
-                self._disposition = TerminalGatewayPublisherDisposition.RUNNING
             try:
                 self._thread.start()
-            except BaseException:
-                formatted_traceback = traceback.format_exc()
-                self._enter_fatal(
-                    "gateway publisher thread failed to start",
-                    formatted_traceback,
-                )
-                raise
-            with self._lock:
-                self._thread_launched = True
+            # A failed launch permanently consumes this process-lifetime owner.
+            except BaseException as error:  # noqa: BLE001
+                start_error = error
+                start_traceback = traceback.format_exc()
+                with self._lock:
+                    should_notify, should_wake = self._record_fatal_locked(
+                        "gateway publisher thread failed to start",
+                        start_traceback,
+                        (),
+                    )
+            else:
+                with self._lock:
+                    self._thread_launched = True
+        if start_error is not None:
+            self._startup_complete.set()
+            self._finish_fatal_transition(
+                should_notify,
+                should_wake,
+                "gateway publisher thread failed to start",
+                start_traceback,
+            )
+            raise start_error
+        self._startup_complete.wait()
+        with self._lock:
+            if self._disposition is TerminalGatewayPublisherDisposition.RUNNING:
+                return
+            reason = self._fatal_reason
+        if reason is None:
+            reason = "gateway publisher failed during startup"
+        raise TerminalGatewayPublisherError(reason)
 
     def submit(self, publication: FrozenTerminalGatewayPublication) -> bool:
         """Submit one publication or coalesce its exact retransmission.
@@ -606,6 +631,10 @@ class PackedTerminalOutputPublisher:
         with self._transition_lock, self._lock:
             if not self._started:
                 raise TerminalGatewayPublisherError("publisher was never started")
+            if self._disposition is TerminalGatewayPublisherDisposition.CREATED:
+                raise TerminalGatewayPublisherError(
+                    "publisher startup has not completed"
+                )
             if self._disposition is TerminalGatewayPublisherDisposition.STOPPED:
                 return True
             if self._shutdown_deadline is None:
@@ -664,6 +693,14 @@ class PackedTerminalOutputPublisher:
         current: FrozenTerminalGatewayPublication | None = None
         try:
             sink = self._sink_factory.create()
+            with self._lock:
+                if self._disposition is not TerminalGatewayPublisherDisposition.CREATED:
+                    raise TerminalGatewayPublisherError(
+                        "publisher startup lost its created disposition"
+                    )
+                self._admission_open = True
+                self._disposition = TerminalGatewayPublisherDisposition.RUNNING
+            self._startup_complete.set()
             while True:
                 item = self._queue.get()
                 if item is _PUBLISHER_STOP:
@@ -736,6 +773,7 @@ class PackedTerminalOutputPublisher:
             if len(additional_tracebacks) > 0:
                 self._append_fatal_traceback("\n".join(additional_tracebacks))
         finally:
+            self._startup_complete.set()
             with self._lock:
                 disposition = self._disposition
             if disposition not in (
