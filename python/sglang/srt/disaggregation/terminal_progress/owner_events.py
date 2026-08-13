@@ -32,6 +32,36 @@ class TerminalOwnerClosedError(TerminalOwnerError):
 class TerminalOwnerOverflowError(TerminalOwnerError):
     """A bounded owner queue could not accept another immutable value."""
 
+    source_name: str | None
+    pending_envelopes: tuple["TerminalOwnerEventEnvelope", ...]
+    rejected_envelope: "TerminalOwnerEventEnvelope | None"
+
+    def __init__(
+        self,
+        message: str,
+        source_name: str | None = None,
+        pending_envelopes: tuple["TerminalOwnerEventEnvelope", ...] = (),
+        rejected_envelope: "TerminalOwnerEventEnvelope | None" = None,
+    ) -> None:
+        """Retain the complete bounded-queue failure inventory.
+
+        :param message: Reader-facing overflow evidence.
+        :param source_name: Stable source identity, when known.
+        :param pending_envelopes: Commands accepted before the overflow.
+        :param rejected_envelope: Exact command which crossed the bound.
+        """
+
+        super().__init__(message)
+        if source_name is not None and (
+            type(source_name) is not str or len(source_name) == 0
+        ):
+            raise ValueError("source_name must be a non-empty string")
+        if type(pending_envelopes) is not tuple:
+            raise TypeError("pending_envelopes must be a tuple")
+        self.source_name = source_name
+        self.pending_envelopes = pending_envelopes
+        self.rejected_envelope = rejected_envelope
+
 
 class TerminalOwnerDisposition(enum.StrEnum):
     """Process-lifetime reactor disposition."""

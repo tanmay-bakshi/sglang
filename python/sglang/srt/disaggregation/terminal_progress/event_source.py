@@ -34,6 +34,7 @@ class TerminalOwnerQueueEventSource(TerminalOwnerEventSource):
     _wake_armed: bool
     _closed: bool
     _overflowed: bool
+    _rejected_envelope: TerminalOwnerEventEnvelope | None
     _lock: threading.Lock
     _clock: SystemTerminalOwnerClock
 
@@ -62,6 +63,7 @@ class TerminalOwnerQueueEventSource(TerminalOwnerEventSource):
         self._wake_armed = False
         self._closed = False
         self._overflowed = False
+        self._rejected_envelope = None
         self._lock = threading.Lock()
         self._clock = SystemTerminalOwnerClock()
 
@@ -126,13 +128,26 @@ class TerminalOwnerQueueEventSource(TerminalOwnerEventSource):
                 raise TerminalOwnerClosedError("event source is closed")
             if self._overflowed:
                 raise TerminalOwnerOverflowError(
-                    f"event source {self._name} previously overflowed"
+                    f"event source {self._name} previously overflowed",
+                    source_name=self._name,
+                    pending_envelopes=tuple(self._pending),
+                    rejected_envelope=self._rejected_envelope,
                 )
             if len(self._pending) >= self._capacity:
+                rejected_envelope = TerminalOwnerEventEnvelope(
+                    producer_sequence=self._next_sequence,
+                    enqueued_ns=timestamp_ns,
+                    command=command,
+                )
+                self._next_sequence += 1
                 self._overflowed = True
+                self._rejected_envelope = rejected_envelope
                 self._signal_locked()
                 raise TerminalOwnerOverflowError(
-                    f"event source {self._name} exceeded capacity {self._capacity}"
+                    f"event source {self._name} exceeded capacity {self._capacity}",
+                    source_name=self._name,
+                    pending_envelopes=tuple(self._pending),
+                    rejected_envelope=rejected_envelope,
                 )
             envelope = TerminalOwnerEventEnvelope(
                 producer_sequence=self._next_sequence,
@@ -159,9 +174,13 @@ class TerminalOwnerQueueEventSource(TerminalOwnerEventSource):
             self._pending.clear()
             self._wake_armed = False
             overflowed = self._overflowed
+            rejected_envelope = self._rejected_envelope
         if overflowed:
             raise TerminalOwnerOverflowError(
-                f"event source {self._name} crossed its bounded capacity"
+                f"event source {self._name} crossed its bounded capacity",
+                source_name=self._name,
+                pending_envelopes=envelopes,
+                rejected_envelope=rejected_envelope,
             )
         return envelopes
 

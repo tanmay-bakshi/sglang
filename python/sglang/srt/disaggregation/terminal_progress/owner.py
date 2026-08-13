@@ -262,11 +262,7 @@ class PackedTerminalProgressOwner:
                 (RegisterSourceLifecycle, RegisterDecodeLifecycle),
             ):
                 raise TerminalOwnerClosedError("request admission is closed")
-        try:
-            return self._submission_source.publish(command, enqueued_ns=enqueued_ns)
-        except TerminalOwnerOverflowError:
-            self._deadline_pulse_source.signal()
-            raise
+        return self._submission_source.publish(command, enqueued_ns=enqueued_ns)
 
     def begin_shutdown(self, started_ns: int | None = None) -> None:
         """Close admission and begin explicit fail-closed drain.
@@ -465,18 +461,12 @@ class PackedTerminalProgressOwner:
         :param source: Exact registered event-source adapter.
         """
 
-        if source is self._deadline_pulse_source and self._submission_source.overflowed:
-            with self._condition:
-                self._enter_fatal_locked(
-                    cause=TerminalOwnerFatalCause.SUBMISSION_QUEUE_OVERFLOW,
-                    reason="terminal owner submission queue overflowed",
-                )
-            return
         try:
             envelopes = source.drain()
-        except TerminalOwnerOverflowError:
+        except TerminalOwnerOverflowError as error:
             formatted_traceback = traceback.format_exc()
             with self._condition:
+                self._inventory_overflow_registrations_locked(error)
                 self._enter_fatal_locked(
                     cause=TerminalOwnerFatalCause.SUBMISSION_QUEUE_OVERFLOW,
                     reason=f"event source {source.name} overflowed",
@@ -592,6 +582,48 @@ class PackedTerminalProgressOwner:
             receipt_ledger=TerminalReceiptLedger(authorities=authorities),
         )
         self._known_bindings.add(command.binding)
+
+    def _inventory_overflow_registrations_locked(
+        self, error: TerminalOwnerOverflowError
+    ) -> None:
+        """Retain resources whose registration was accepted or rejected at overflow.
+
+        The event-source emergency slot is not work capacity. It exists solely
+        so fail-closed ownership can account for the command which crossed the
+        bound instead of losing its generation and leased-resource identity.
+
+        :param error: Sticky overflow carrying accepted and rejected envelopes.
+        """
+
+        envelopes = error.pending_envelopes
+        if error.rejected_envelope is not None:
+            envelopes = (*envelopes, error.rejected_envelope)
+        for envelope in envelopes:
+            command = envelope.command
+            if type(command) is RegisterSourceLifecycle:
+                if command.binding in self._known_bindings:
+                    continue
+                authorities = command.trusted_authorities | frozenset(
+                    (self._receipt_issuer.authority,)
+                )
+                self._source_lifecycles[command.binding] = create_source_lifecycle(
+                    binding=command.binding,
+                    publication_identity=command.publication_identity,
+                    receipt_ledger=TerminalReceiptLedger(authorities=authorities),
+                )
+                self._known_bindings.add(command.binding)
+                continue
+            if type(command) is RegisterDecodeLifecycle:
+                if command.binding in self._known_bindings:
+                    continue
+                authorities = command.trusted_authorities | frozenset(
+                    (self._receipt_issuer.authority,)
+                )
+                self._decode_lifecycles[command.binding] = create_decode_lifecycle(
+                    binding=command.binding,
+                    receipt_ledger=TerminalReceiptLedger(authorities=authorities),
+                )
+                self._known_bindings.add(command.binding)
 
     def _require_admission_locked(self, binding: TerminalRequestBinding) -> None:
         """Require open admission and a never-before-seen generation.

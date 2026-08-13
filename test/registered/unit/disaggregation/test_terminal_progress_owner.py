@@ -267,9 +267,23 @@ def test_bounded_event_source_overflow_is_process_fatal() -> None:
     """The owner converts a sticky producer overflow into lifecycle failure."""
 
     source = TerminalOwnerQueueEventSource(name="bounded-native", capacity=1)
-    source.publish(TerminalOwnerPulse(), enqueued_ns=0)
+    first_binding = _binding(TerminalOwnerRole.DECODE, room_id=20)
+    rejected_binding = _binding(TerminalOwnerRole.DECODE, room_id=21)
+    source.publish(
+        RegisterDecodeLifecycle(
+            binding=first_binding,
+            trusted_authorities=frozenset(),
+        ),
+        enqueued_ns=0,
+    )
     with pytest.raises(TerminalOwnerOverflowError):
-        source.publish(TerminalOwnerPulse(), enqueued_ns=1)
+        source.publish(
+            RegisterDecodeLifecycle(
+                binding=rejected_binding,
+                trusted_authorities=frozenset(),
+            ),
+            enqueued_ns=1,
+        )
     owner = PackedTerminalProgressOwner(
         submission_capacity=16,
         output_capacity=16,
@@ -286,6 +300,10 @@ def test_bounded_event_source_overflow_is_process_fatal() -> None:
         timeout_seconds=2.0,
     )
     assert fatal.fatal_cause is TerminalOwnerFatalCause.SUBMISSION_QUEUE_OVERFLOW
+    assert {entry.binding for entry in fatal.quarantined} == {
+        first_binding,
+        rejected_binding,
+    }
     assert owner.join(timeout_seconds=2.0)
 
 
