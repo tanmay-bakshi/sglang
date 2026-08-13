@@ -1,0 +1,340 @@
+import dataclasses
+import enum
+
+GIL_QUALIFICATION_LIVE_MACHINE_COUNT = 16
+GIL_QUALIFICATION_MINIMUM_TRANSITIONS = 100_000
+GIL_QUALIFICATION_MINIMUM_DURATION_SECONDS = 60.0
+GIL_QUALIFICATION_SWITCH_INTERVAL_SECONDS = 0.005
+GIL_QUALIFICATION_OWNER_HOP_COUNT = 7
+GIL_QUALIFICATION_PER_HOP_P99_LIMIT_NS = 2_000_000
+GIL_QUALIFICATION_SEVEN_HOP_P99_LIMIT_NS = 16_000_000
+
+
+class GILQualificationProducer(enum.StrEnum):
+    """Execution context producing owner work during qualification."""
+
+    NATIVE_OR_GIL_RELEASING = "native_or_gil_releasing"
+    PYTHON_THREAD = "python_thread"
+
+
+class GILSchedulerPressure(enum.StrEnum):
+    """Scheduler-side contention applied throughout qualification."""
+
+    GIL_HOGGING_PYTHON_THREAD = "gil_hogging_python_thread"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GILQualificationConfig:
+    """Frozen sustained-event-storm qualification contract.
+
+    :ivar live_machine_count: Concurrent closed-loop lifecycle machines.
+    :ivar closed_loop_replacement: Whether retirement immediately admits a
+        replacement lifecycle.
+    :ivar minimum_transition_count: Minimum owner transitions observed.
+    :ivar minimum_duration_seconds: Minimum sustained exercise duration.
+    :ivar switch_interval_seconds: Process-global Python thread switch interval.
+    :ivar owner_hop_count: Correlated owner transitions in one completion path.
+    :ivar per_hop_p99_limit_ns: Maximum p99 for every individual owner hop.
+    :ivar seven_hop_p99_limit_ns: Maximum p99 for the correlated full path.
+    """
+
+    live_machine_count: int = GIL_QUALIFICATION_LIVE_MACHINE_COUNT
+    closed_loop_replacement: bool = True
+    minimum_transition_count: int = GIL_QUALIFICATION_MINIMUM_TRANSITIONS
+    minimum_duration_seconds: float = GIL_QUALIFICATION_MINIMUM_DURATION_SECONDS
+    switch_interval_seconds: float = GIL_QUALIFICATION_SWITCH_INTERVAL_SECONDS
+    owner_hop_count: int = GIL_QUALIFICATION_OWNER_HOP_COUNT
+    per_hop_p99_limit_ns: int = GIL_QUALIFICATION_PER_HOP_P99_LIMIT_NS
+    seven_hop_p99_limit_ns: int = GIL_QUALIFICATION_SEVEN_HOP_P99_LIMIT_NS
+
+    def __post_init__(self) -> None:
+        """Reject any silent mutation of the frozen qualification contract."""
+
+        exact_values = (
+            (
+                self.live_machine_count,
+                GIL_QUALIFICATION_LIVE_MACHINE_COUNT,
+                "live_machine_count",
+            ),
+            (
+                self.minimum_transition_count,
+                GIL_QUALIFICATION_MINIMUM_TRANSITIONS,
+                "minimum_transition_count",
+            ),
+            (
+                self.owner_hop_count,
+                GIL_QUALIFICATION_OWNER_HOP_COUNT,
+                "owner_hop_count",
+            ),
+            (
+                self.per_hop_p99_limit_ns,
+                GIL_QUALIFICATION_PER_HOP_P99_LIMIT_NS,
+                "per_hop_p99_limit_ns",
+            ),
+            (
+                self.seven_hop_p99_limit_ns,
+                GIL_QUALIFICATION_SEVEN_HOP_P99_LIMIT_NS,
+                "seven_hop_p99_limit_ns",
+            ),
+        )
+        for observed, expected, label in exact_values:
+            if type(observed) is not int or observed != expected:
+                raise ValueError(f"{label} is frozen at {expected}")
+        if self.closed_loop_replacement is not True:
+            raise ValueError("closed_loop_replacement is frozen as enabled")
+
+        exact_float_values = (
+            (
+                self.minimum_duration_seconds,
+                GIL_QUALIFICATION_MINIMUM_DURATION_SECONDS,
+                "minimum_duration_seconds",
+            ),
+            (
+                self.switch_interval_seconds,
+                GIL_QUALIFICATION_SWITCH_INTERVAL_SECONDS,
+                "switch_interval_seconds",
+            ),
+        )
+        for observed, expected, label in exact_float_values:
+            if type(observed) is not float or observed != expected:
+                raise ValueError(f"{label} is frozen at {expected}")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GILStressPlan:
+    """Native-free description of one GIL-contention qualification run.
+
+    A Python-thread producer may exercise state and arithmetic, but cannot
+    qualify enqueue production because it shares the scheduler's contested GIL.
+    Authoritative production requires native code or a GIL-releasing extension.
+
+    :ivar config: Exact frozen qualification contract.
+    :ivar producer: Work-production implementation under qualification.
+    :ivar scheduler_pressure: Synthetic scheduler load held during the storm.
+    """
+
+    config: GILQualificationConfig
+    producer: GILQualificationProducer
+    scheduler_pressure: GILSchedulerPressure = (
+        GILSchedulerPressure.GIL_HOGGING_PYTHON_THREAD
+    )
+
+    def __post_init__(self) -> None:
+        """Validate one qualification plan."""
+
+        if type(self.config) is not GILQualificationConfig:
+            raise TypeError("config must be GILQualificationConfig")
+        if type(self.producer) is not GILQualificationProducer:
+            raise TypeError("producer must be GILQualificationProducer")
+        if (
+            self.scheduler_pressure
+            is not GILSchedulerPressure.GIL_HOGGING_PYTHON_THREAD
+        ):
+            raise ValueError("scheduler_pressure must be the frozen GIL-hogging thread")
+
+    @property
+    def authoritative_producer(self) -> bool:
+        """Return whether enqueue production can yield authoritative evidence.
+
+        :returns: Whether production is native or explicitly GIL releasing.
+        """
+
+        return self.producer is GILQualificationProducer.NATIVE_OR_GIL_RELEASING
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GILHopLatencySample:
+    """One correlated seven-hop owner completion path.
+
+    :ivar machine_index: Closed-loop machine producing the sample.
+    :ivar hop_latencies_ns: Ordered latency for every owner transition.
+    """
+
+    machine_index: int
+    hop_latencies_ns: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        """Validate one complete correlated latency sample."""
+
+        if (
+            type(self.machine_index) is not int
+            or self.machine_index < 0
+            or self.machine_index >= GIL_QUALIFICATION_LIVE_MACHINE_COUNT
+        ):
+            raise ValueError("machine_index must identify one frozen live machine")
+        if type(self.hop_latencies_ns) is not tuple:
+            raise TypeError("hop_latencies_ns must be a tuple")
+        if len(self.hop_latencies_ns) != GIL_QUALIFICATION_OWNER_HOP_COUNT:
+            raise ValueError(
+                "hop_latencies_ns must contain exactly "
+                f"{GIL_QUALIFICATION_OWNER_HOP_COUNT} values"
+            )
+        for latency_ns in self.hop_latencies_ns:
+            if type(latency_ns) is not int or latency_ns < 0:
+                raise ValueError("hop_latencies_ns must contain non-negative integers")
+
+    @property
+    def full_path_latency_ns(self) -> int:
+        """Return the correlated seven-hop path latency.
+
+        :returns: Sum of every owner hop in this sample.
+        """
+
+        return sum(self.hop_latencies_ns)
+
+
+def _p99_nearest_rank(values: tuple[int, ...]) -> int:
+    """Return deterministic nearest-rank p99 for non-empty integer values.
+
+    :param values: Non-empty immutable latency sample.
+    :returns: Nearest-rank 99th percentile.
+    """
+
+    if type(values) is not tuple or len(values) == 0:
+        raise ValueError("values must be a non-empty tuple")
+    ordered = tuple(sorted(values))
+    rank = (99 * len(ordered) + 99) // 100
+    return ordered[rank - 1]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GILQualificationResult:
+    """Computed population, latency, and authority verdict.
+
+    :ivar plan: Exact plan used to collect the samples.
+    :ivar elapsed_seconds: Sustained event-storm wall duration.
+    :ivar sample_count: Correlated full-path sample count.
+    :ivar transition_count: Total individual owner transitions.
+    :ivar observed_machine_indices: Closed-loop machines represented.
+    :ivar per_hop_p99_ns: P99 latency independently for all seven hops.
+    :ivar seven_hop_p99_ns: P99 of correlated full-path latency.
+    """
+
+    plan: GILStressPlan
+    elapsed_seconds: float
+    sample_count: int
+    transition_count: int
+    observed_machine_indices: frozenset[int]
+    per_hop_p99_ns: tuple[int, ...]
+    seven_hop_p99_ns: int
+
+    def __post_init__(self) -> None:
+        """Validate result arithmetic and immutable population evidence."""
+
+        if type(self.plan) is not GILStressPlan:
+            raise TypeError("plan must be GILStressPlan")
+        if type(self.elapsed_seconds) is not float or self.elapsed_seconds <= 0.0:
+            raise ValueError("elapsed_seconds must be a positive float")
+        if type(self.sample_count) is not int or self.sample_count <= 0:
+            raise ValueError("sample_count must be a positive integer")
+        if (
+            type(self.transition_count) is not int
+            or self.transition_count
+            != self.sample_count * self.plan.config.owner_hop_count
+        ):
+            raise ValueError("transition_count must equal sample_count times hops")
+        if type(self.observed_machine_indices) is not frozenset:
+            raise TypeError("observed_machine_indices must be a frozenset")
+        if (
+            len(self.observed_machine_indices) == 0
+            or len(self.observed_machine_indices) > self.sample_count
+        ):
+            raise ValueError("observed_machine_indices must cover one or more samples")
+        for machine_index in self.observed_machine_indices:
+            if (
+                type(machine_index) is not int
+                or machine_index < 0
+                or machine_index >= self.plan.config.live_machine_count
+            ):
+                raise ValueError("observed machine index is outside the plan")
+        if type(self.per_hop_p99_ns) is not tuple:
+            raise TypeError("per_hop_p99_ns must be a tuple")
+        if len(self.per_hop_p99_ns) != self.plan.config.owner_hop_count:
+            raise ValueError("per_hop_p99_ns must report every owner hop")
+        for latency_ns in self.per_hop_p99_ns:
+            if type(latency_ns) is not int or latency_ns < 0:
+                raise ValueError("per_hop_p99_ns values must be non-negative")
+        if type(self.seven_hop_p99_ns) is not int or self.seven_hop_p99_ns < 0:
+            raise ValueError("seven_hop_p99_ns must be a non-negative integer")
+
+    @property
+    def population_complete(self) -> bool:
+        """Return whether duration, volume, and machine coverage are complete.
+
+        :returns: Whether the frozen stress population was observed.
+        """
+
+        config = self.plan.config
+        return (
+            self.elapsed_seconds >= config.minimum_duration_seconds
+            and self.transition_count >= config.minimum_transition_count
+            and len(self.observed_machine_indices) == config.live_machine_count
+        )
+
+    @property
+    def latency_within_bounds(self) -> bool:
+        """Return whether individual and correlated p99 limits pass.
+
+        :returns: Whether all frozen latency inequalities hold.
+        """
+
+        return (
+            max(self.per_hop_p99_ns) <= self.plan.config.per_hop_p99_limit_ns
+            and self.seven_hop_p99_ns <= self.plan.config.seven_hop_p99_limit_ns
+        )
+
+    @property
+    def qualified(self) -> bool:
+        """Return the complete authoritative qualification verdict.
+
+        :returns: Whether authority, population, and latency all pass.
+        """
+
+        return (
+            self.plan.authoritative_producer
+            and self.population_complete
+            and self.latency_within_bounds
+        )
+
+
+def evaluate_gil_qualification(
+    plan: GILStressPlan,
+    samples: tuple[GILHopLatencySample, ...],
+    elapsed_seconds: float,
+) -> GILQualificationResult:
+    """Compute frozen p99 and authority arithmetic from collected samples.
+
+    :param plan: Exact sustained-event-storm qualification plan.
+    :param samples: Correlated owner-hop latency samples.
+    :param elapsed_seconds: Sustained event-storm wall duration.
+    :returns: Immutable qualification result.
+    """
+
+    if type(plan) is not GILStressPlan:
+        raise TypeError("plan must be GILStressPlan")
+    if type(samples) is not tuple or len(samples) == 0:
+        raise ValueError("samples must be a non-empty tuple")
+    if type(elapsed_seconds) is not float or elapsed_seconds <= 0.0:
+        raise ValueError("elapsed_seconds must be a positive float")
+    for sample in samples:
+        if type(sample) is not GILHopLatencySample:
+            raise TypeError("samples entries must be GILHopLatencySample")
+
+    hop_p99_ns = tuple(
+        _p99_nearest_rank(
+            tuple(sample.hop_latencies_ns[hop_index] for sample in samples)
+        )
+        for hop_index in range(plan.config.owner_hop_count)
+    )
+    seven_hop_p99_ns = _p99_nearest_rank(
+        tuple(sample.full_path_latency_ns for sample in samples)
+    )
+    return GILQualificationResult(
+        plan=plan,
+        elapsed_seconds=elapsed_seconds,
+        sample_count=len(samples),
+        transition_count=len(samples) * plan.config.owner_hop_count,
+        observed_machine_indices=frozenset(sample.machine_index for sample in samples),
+        per_hop_p99_ns=hop_p99_ns,
+        seven_hop_p99_ns=seven_hop_p99_ns,
+    )
