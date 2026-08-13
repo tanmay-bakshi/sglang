@@ -126,6 +126,9 @@ class _NativeTerminalOwnerBridge(Protocol):
     def expire_deadlines_for_test(self) -> None:
         """Evaluate all armed deadlines at deterministic test time."""
 
+    def abort_active_qualification_for_test(self) -> None:
+        """Synchronously stop an active qualification test population."""
+
     def start_qualification(
         self,
         machine_count: int,
@@ -426,6 +429,20 @@ class NativeTerminalOwner:
         if not self._testing:
             raise RuntimeError("deterministic clocks require a native test build")
         self._native.expire_deadlines_for_test()
+
+    def abort_active_qualification_for_testing(self) -> None:
+        """Synchronously stop an active native qualification population.
+
+        This test-only hook proves that destructor-equivalent shutdown cannot
+        race the closed-loop producer into replenishing its input queue.
+
+        :raises RuntimeError: If this owner is not a test build.
+        """
+
+        if not self._testing:
+            raise RuntimeError("qualification abort requires a native test build")
+        self._native.abort_active_qualification_for_test()
+        self._closed = True
 
     def submit(self, event: NativeTerminalOwnerEvent) -> None:
         """Submit one exact event or surface the native errno result.

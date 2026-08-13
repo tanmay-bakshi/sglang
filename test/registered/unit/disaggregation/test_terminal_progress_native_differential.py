@@ -1,6 +1,11 @@
 import sys
+import time
 
 import pytest
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
+    TerminalProcessIdentity,
+)
 from sglang.srt.disaggregation.terminal_progress.lifecycle import (
     DecodeLifecycleEventKind,
     SourceLifecycleEventKind,
@@ -9,9 +14,13 @@ from sglang.srt.disaggregation.terminal_progress.lifecycle import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NATIVE_SOURCE_RECLAIMABLE_MASK,
     NativeSourceLifecyclePhase,
+    NativeTerminalProcessIdentity,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerFatalCode,
     NativeTerminalResource,
+)
+from sglang.srt.disaggregation.terminal_progress.native_owner import (
+    NativeTerminalOwner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.terminal_progress_native_differential import (
@@ -231,6 +240,37 @@ def test_request_failure_after_publication_quarantine_is_notification_idempotent
         | result.observed.before.quarantined_resources
     )
     assert result.observed.actions == ()
+
+
+def test_active_qualification_abort_is_bounded_and_closes_the_reactor() -> None:
+    identity = NativeTerminalProcessIdentity.from_identity(
+        TerminalProcessIdentity(
+            process_generation=b"q" * 16,
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=0,
+            tp_size=1,
+        )
+    )
+    owner = NativeTerminalOwner(
+        input_capacity=64,
+        output_capacity=64,
+        owner_identity=identity,
+        testing=True,
+    )
+    owner.start()
+    owner.start_qualification(
+        machine_count=16,
+        minimum_duration_seconds=60.0,
+        minimum_transition_count=100_000,
+    )
+
+    started = time.monotonic()
+    owner.abort_active_qualification_for_testing()
+
+    assert time.monotonic() - started < 2.0
+    inventory = owner.inventory()
+    assert inventory.closed
+    assert inventory.queued_input_count == 0
 
 
 def _assert_no_mismatches(results: tuple[NativeDifferentialResult, ...]) -> None:

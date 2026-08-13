@@ -2259,6 +2259,34 @@ public:
     }
     expire_deadlines_locked(*owner_);
   }
+
+  void abort_active_qualification_for_test() {
+    std::thread reactor;
+    {
+      std::lock_guard<std::mutex> lock(owner_->mutex);
+      if (!owner_->started || !owner_->qualification.running ||
+          owner_->closed) {
+        throw std::runtime_error(
+            "qualification abort requires an active test population");
+      }
+      owner_->admission_open = false;
+      owner_->qualification.running = false;
+      owner_->stop_requested = true;
+      owner_->producers_joined = true;
+      owner_->input_queue.clear();
+      for (auto &entry : owner_->lifecycles) {
+        quarantine_live(entry.second);
+      }
+      signal_fd_locked(*owner_, owner_->shutdown_fd);
+      reactor = std::move(owner_->reactor);
+    }
+    if (reactor.joinable()) {
+      reactor.join();
+    }
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    close_fds_locked();
+    owner_->closed = true;
+  }
 #endif
 
   void start_qualification(std::size_t machine_count,
@@ -2488,6 +2516,11 @@ public:
       }
       owner_->stop_requested = true;
       owner_->qualification.running = false;
+      owner_->producers_joined = true;
+      owner_->input_queue.clear();
+      for (auto &entry : owner_->lifecycles) {
+        quarantine_live(entry.second);
+      }
       signal_fd_locked(*owner_, owner_->shutdown_fd);
       reactor = std::move(owner_->reactor);
     }
@@ -2711,6 +2744,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("now_ns"))
       .def("expire_deadlines_for_test",
            &NativeTerminalOwnerBridge::expire_deadlines_for_test)
+      .def("abort_active_qualification_for_test",
+           &NativeTerminalOwnerBridge::abort_active_qualification_for_test,
+           py::call_guard<py::gil_scoped_release>())
 #endif
       .def("start_qualification",
            &NativeTerminalOwnerBridge::start_qualification,
