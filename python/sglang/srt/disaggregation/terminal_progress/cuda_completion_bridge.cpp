@@ -591,9 +591,11 @@ private:
   void set_fatal(FatalCode code, int system_error, const CompletionToken &token,
                  bool has_token = true, bool signal = true) const noexcept {
     std::uint32_t expected = 0;
+    bool first_fatal = false;
     if (fatal_publication_state_.compare_exchange_strong(
             expected, 1, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+      first_fatal = true;
       fatal_code_.store(static_cast<std::uint32_t>(code),
                         std::memory_order_relaxed);
       fatal_system_error_.store(system_error, std::memory_order_relaxed);
@@ -605,7 +607,7 @@ private:
       fatal_has_token_.store(has_token, std::memory_order_relaxed);
       fatal_publication_state_.store(2, std::memory_order_release);
     }
-    if (signal) {
+    if (signal && first_fatal) {
       const_cast<CompletionState *>(this)->signal_eventfd();
     }
   }
