@@ -12,8 +12,10 @@ from sglang.srt.disaggregation.terminal_progress.gil_qualification import (
     GILQualificationConfig,
     GILQualificationProducer,
     GILSchedulerPressure,
+    GILStressCollection,
     GILStressPlan,
     evaluate_gil_qualification,
+    execute_gil_stress_plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -200,3 +202,48 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
         GILHopLatencySample(machine_index=0, hop_latencies_ns=(1,) * 6)
     with pytest.raises(ValueError):
         evaluate_gil_qualification(plan=plan, samples=(), elapsed_seconds=1.0)
+
+
+def test_executable_scaffold_preserves_collector_authority() -> None:
+    """A concrete collector cannot upgrade a Python feeder to authority."""
+
+    samples = _complete_samples(latency_ns=1_000_000)
+    python_plan = GILStressPlan(
+        config=GILQualificationConfig(),
+        producer=GILQualificationProducer.PYTHON_THREAD,
+    )
+
+    def collect(plan: GILStressPlan) -> GILStressCollection:
+        """Return deterministic samples while preserving the supplied plan.
+
+        :param plan: Exact frozen stress plan.
+        :returns: Complete deterministic sample population.
+        """
+
+        assert plan is python_plan
+        return GILStressCollection(samples=samples, elapsed_seconds=60.0)
+
+    result = execute_gil_stress_plan(python_plan, collect)
+    assert result.population_complete
+    assert result.latency_within_bounds
+    assert not result.qualified
+
+
+def test_executable_scaffold_accepts_native_collector_results() -> None:
+    """A native producer can furnish the real population without API shims."""
+
+    native_plan = GILStressPlan(
+        config=GILQualificationConfig(),
+        producer=GILQualificationProducer.NATIVE_OR_GIL_RELEASING,
+    )
+    result = execute_gil_stress_plan(
+        native_plan,
+        lambda plan: GILStressCollection(
+            samples=_complete_samples(latency_ns=1_000_000),
+            elapsed_seconds=plan.config.minimum_duration_seconds,
+        ),
+    )
+    assert result.qualified
+
+    with pytest.raises(TypeError):
+        execute_gil_stress_plan(native_plan, lambda plan: object())  # type: ignore[arg-type,return-value]
