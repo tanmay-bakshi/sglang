@@ -37,6 +37,7 @@ def _complete_samples(
     return tuple(
         GILHopLatencySample(
             machine_index=index % GIL_QUALIFICATION_LIVE_MACHINE_COUNT,
+            generation_index=index // GIL_QUALIFICATION_LIVE_MACHINE_COUNT,
             hop_latencies_ns=(latency_ns,) * GIL_QUALIFICATION_OWNER_HOP_COUNT,
         )
         for index in range(sample_count)
@@ -109,6 +110,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=(
             GILHopLatencySample(
                 machine_index=0,
+                generation_index=0,
                 hop_latencies_ns=(1_000_000,) * 7,
             ),
         ),
@@ -123,6 +125,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=tuple(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=(
                     GIL_QUALIFICATION_PER_HOP_P99_LIMIT_NS + 1,
                     1,
@@ -144,6 +147,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=tuple(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=(2_000_000,) * 7,
             )
             for index in range(100)
@@ -161,6 +165,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         distributed_tail_samples.append(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=tuple(hop_latencies),
             )
         )
@@ -184,6 +189,7 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
     samples = tuple(
         GILHopLatencySample(
             machine_index=index % 16,
+            generation_index=index // 16,
             hop_latencies_ns=((10_000_000 if index >= 98 else 1_000_000),) * 7,
         )
         for index in range(100)
@@ -197,11 +203,45 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
     assert result.seven_hop_p99_ns == 70_000_000
 
     with pytest.raises(ValueError):
-        GILHopLatencySample(machine_index=16, hop_latencies_ns=(1,) * 7)
+        GILHopLatencySample(
+            machine_index=16,
+            generation_index=0,
+            hop_latencies_ns=(1,) * 7,
+        )
     with pytest.raises(ValueError):
-        GILHopLatencySample(machine_index=0, hop_latencies_ns=(1,) * 6)
+        GILHopLatencySample(
+            machine_index=0,
+            generation_index=0,
+            hop_latencies_ns=(1,) * 6,
+        )
     with pytest.raises(ValueError):
         evaluate_gil_qualification(plan=plan, samples=(), elapsed_seconds=1.0)
+
+
+def test_closed_loop_generations_must_be_unique_and_gap_free() -> None:
+    """Duplicate or skipped replacements cannot inflate the event population."""
+
+    plan = GILStressPlan(
+        config=GILQualificationConfig(),
+        producer=GILQualificationProducer.PYTHON_THREAD,
+    )
+    base = GILHopLatencySample(
+        machine_index=0,
+        generation_index=0,
+        hop_latencies_ns=(1,) * GIL_QUALIFICATION_OWNER_HOP_COUNT,
+    )
+    with pytest.raises(ValueError, match="unique and gap-free"):
+        evaluate_gil_qualification(
+            plan=plan,
+            samples=(base, base),
+            elapsed_seconds=1.0,
+        )
+    with pytest.raises(ValueError, match="unique and gap-free"):
+        evaluate_gil_qualification(
+            plan=plan,
+            samples=(dataclasses.replace(base, generation_index=1),),
+            elapsed_seconds=1.0,
+        )
 
 
 def test_executable_scaffold_preserves_collector_authority() -> None:

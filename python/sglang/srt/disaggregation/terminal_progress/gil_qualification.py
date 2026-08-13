@@ -148,10 +148,12 @@ class GILHopLatencySample:
     """One correlated seven-hop owner completion path.
 
     :ivar machine_index: Closed-loop machine producing the sample.
+    :ivar generation_index: Gap-free replacement generation within the machine.
     :ivar hop_latencies_ns: Ordered latency for every owner transition.
     """
 
     machine_index: int
+    generation_index: int
     hop_latencies_ns: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -163,6 +165,8 @@ class GILHopLatencySample:
             or self.machine_index >= GIL_QUALIFICATION_LIVE_MACHINE_COUNT
         ):
             raise ValueError("machine_index must identify one frozen live machine")
+        if type(self.generation_index) is not int or self.generation_index < 0:
+            raise ValueError("generation_index must be a non-negative integer")
         if type(self.hop_latencies_ns) is not tuple:
             raise TypeError("hop_latencies_ns must be a tuple")
         if len(self.hop_latencies_ns) != GIL_QUALIFICATION_OWNER_HOP_COUNT:
@@ -320,6 +324,15 @@ def evaluate_gil_qualification(
     for sample in samples:
         if type(sample) is not GILHopLatencySample:
             raise TypeError("samples entries must be GILHopLatencySample")
+    samples_by_machine: dict[int, list[GILHopLatencySample]] = {}
+    for sample in samples:
+        samples_by_machine.setdefault(sample.machine_index, []).append(sample)
+    for machine_index, machine_samples in samples_by_machine.items():
+        generations = sorted(sample.generation_index for sample in machine_samples)
+        if generations != list(range(len(generations))):
+            raise ValueError(
+                f"machine {machine_index} generations must be unique and gap-free"
+            )
 
     hop_p99_ns = tuple(
         _p99_nearest_rank(

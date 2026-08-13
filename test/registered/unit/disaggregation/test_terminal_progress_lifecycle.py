@@ -337,6 +337,96 @@ def test_publisher_death_is_process_fatal_and_preserves_proved_reclaim() -> None
     )
 
 
+def test_publisher_death_preserves_completed_publication_and_allows_reclaim() -> None:
+    """Publisher process death cannot revoke already-issued terminal proof."""
+
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.GATEWAY_PUBLISHED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.GATEWAY_PUBLISHED,
+            ),
+        ),
+    ).current
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited after publication",
+        ),
+    ).current
+
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.gateway_published
+    assert failed.inventory.safely_retired == frozenset(
+        (TerminalResourceKind.PUBLICATION_IDENTITY,)
+    )
+    assert failed.inventory.live == SOURCE_RECLAIMABLE_RESOURCES
+
+    retired = reduce_source_lifecycle(
+        failed,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.RECLAIM_CONSUMED,
+            receipt=issue_receipt(
+                issuer,
+                failed.binding,
+                TerminalReceiptKind.RECLAIM_CONSUMED,
+            ),
+        ),
+    ).current
+    assert retired.phase is SourceLifecyclePhase.RETIRED
+    assert retired.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert retired.inventory.safely_retired == SOURCE_RESOURCE_KINDS
+
+
+def test_owner_death_after_publication_quarantine_preserves_closed_inventory() -> None:
+    """A fatal owner loss remains representable after every resource is closed."""
+
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.RECLAIM_CONSUMED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.RECLAIM_CONSUMED,
+            ),
+        ),
+    ).current
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLICATION_FAILED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.FAILURE,
+                outcome=TerminalReceiptOutcome.FAILURE,
+            ),
+            reason="gateway publication failed",
+        ),
+    ).current
+    assert len(current.inventory.live) == 0
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.OWNER_DIED,
+            reason="owner exited during fail-closed drain",
+        ),
+    ).current
+    assert failed.phase is SourceLifecyclePhase.PUBLICATION_QUARANTINED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory == current.inventory
+
+
 @pytest.mark.parametrize(
     "fatal_kind",
     (
@@ -557,6 +647,18 @@ def test_resource_inventory_rejects_missing_overlap_and_double_transition() -> N
             safely_retired=publication,
             quarantined=frozenset(),
         )
+
+
+def test_dflash_auxiliary_rows_are_explicit_vram_lifetime_resources() -> None:
+    """Neither owner can hide DFlash auxiliary rows in generic metadata."""
+
+    assert TerminalResourceKind.SOURCE_DFLASH_AUX_VRAM_ROWS in (
+        SOURCE_RECLAIMABLE_RESOURCES
+    )
+    assert TerminalResourceKind.DECODE_DFLASH_AUX_VRAM_ROWS in (DECODE_RESOURCE_KINDS)
+    assert all(
+        "metadata_row" not in resource.value for resource in TerminalResourceKind
+    )
 
 
 def test_generated_source_join_interleavings_preserve_conservation() -> None:
