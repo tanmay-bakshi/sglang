@@ -1292,19 +1292,51 @@ void quarantine_all_locked(SharedOwner &owner, FatalCode code,
   owner.qualification_condition.notify_all();
 }
 
-void publisher_death_locked(SharedOwner &owner, const Event &event) {
+void apply_publication_owner_loss_locked(Lifecycle &lifecycle) {
+  const SourcePhase source_phase = static_cast<SourcePhase>(lifecycle.phase);
+  const bool publication_already_terminal =
+      lifecycle.role == OwnerRole::kSource &&
+      lifecycle.publication_authorized &&
+      (lifecycle.gateway_published || lifecycle.publication_quarantined);
+  const bool decode_adoption_proven =
+      lifecycle.role == OwnerRole::kSource &&
+      (source_phase == SourcePhase::kRequestReadyReceived ||
+       source_phase == SourcePhase::kPublicationQuarantined) &&
+      lifecycle.publication_authorized && !lifecycle.gateway_published;
+  if (publication_already_terminal) {
+    // Decode has adopted its pages, and the publication identity already has
+    // an exact terminal disposition. Losing its owner changes only process
+    // liveness; it cannot make proven source storage ambiguous again.
+    return;
+  }
+  if (!decode_adoption_proven) {
+    quarantine_live(lifecycle);
+    return;
+  }
+  if (!lifecycle.publication_quarantined) {
+    lifecycle.live_resources &= ~(1ULL << 8);
+    lifecycle.quarantined_resources |= 1ULL << 8;
+    lifecycle.publication_quarantined = true;
+    cancel_deadline_locked(lifecycle, DeadlineKind::kOwnerGatewayPublication);
+  }
+  lifecycle.phase =
+      static_cast<std::uint8_t>(SourcePhase::kPublicationQuarantined);
+}
+
+void publication_owner_failure_locked(SharedOwner &owner, FatalCode code,
+                                      const Event &trigger,
+                                      const std::string &reason) {
   if (owner.fatal_code != FatalCode::kNone) {
     return;
   }
-  owner.fatal_code = FatalCode::kDependencyDeath;
-  owner.fatal_reason = event.reason.empty() ? "terminal publisher died"
-                                            : event.reason;
+  owner.fatal_code = code;
+  owner.fatal_reason = reason;
   owner.admission_open = false;
-  owner.fatal_binding = event.binding_digest;
-  owner.fatal_producer_id = event.producer_id;
-  owner.fatal_producer_sequence = event.producer_sequence;
-  owner.fatal_reason_code = event.reason_code;
-  owner.fatal_backend_status = event.backend_status;
+  owner.fatal_binding = trigger.binding_digest;
+  owner.fatal_producer_id = trigger.producer_id;
+  owner.fatal_producer_sequence = trigger.producer_sequence;
+  owner.fatal_reason_code = trigger.reason_code;
+  owner.fatal_backend_status = trigger.backend_status;
   const std::uint64_t completed_ns = owner_now_ns_locked(owner);
   for (auto &entry : owner.lifecycles) {
     Lifecycle &lifecycle = entry.second;
@@ -1312,46 +1344,16 @@ void publisher_death_locked(SharedOwner &owner, const Event &event) {
       continue;
     }
     const std::uint8_t previous_phase = lifecycle.phase;
-    const SourcePhase source_phase =
-        static_cast<SourcePhase>(lifecycle.phase);
-    const bool publication_already_terminal =
-        lifecycle.role == OwnerRole::kSource &&
-        lifecycle.publication_authorized &&
-        (lifecycle.gateway_published || lifecycle.publication_quarantined);
-    const bool decode_adoption_proven =
-        lifecycle.role == OwnerRole::kSource &&
-        (source_phase == SourcePhase::kRequestReadyReceived ||
-         source_phase == SourcePhase::kPublicationQuarantined) &&
-        lifecycle.publication_authorized &&
-        !lifecycle.gateway_published;
-    if (publication_already_terminal) {
-      // Decode has adopted its pages, and the publication identity already has
-      // an exact terminal disposition. Publisher death changes only process
-      // liveness; it cannot make proven source storage ambiguous again.
-    } else if (decode_adoption_proven) {
-      if (!lifecycle.gateway_published &&
-          !lifecycle.publication_quarantined) {
-        lifecycle.live_resources &= ~(1ULL << 8);
-        lifecycle.quarantined_resources |= 1ULL << 8;
-        lifecycle.publication_quarantined = true;
-        lifecycle.phase =
-            static_cast<std::uint8_t>(SourcePhase::kPublicationQuarantined);
-        cancel_deadline_locked(lifecycle,
-                               DeadlineKind::kOwnerGatewayPublication);
-      }
-      lifecycle.phase =
-          static_cast<std::uint8_t>(SourcePhase::kPublicationQuarantined);
-    } else {
-      quarantine_live(lifecycle);
-    }
+    apply_publication_owner_loss_locked(lifecycle);
+    verify_conservation(lifecycle);
     Output output{};
     output.binding = lifecycle.binding;
     output.owner_sequence = owner.next_owner_sequence++;
-    output.producer_id = event.producer_id;
-    output.producer_sequence = event.producer_sequence;
-    output.enqueued_ns = event.enqueued_ns;
+    output.producer_id = trigger.producer_id;
+    output.producer_sequence = trigger.producer_sequence;
+    output.enqueued_ns = trigger.enqueued_ns;
     output.completed_ns = completed_ns;
-    output.event_kind = event.kind;
+    output.event_kind = trigger.kind;
     output.role = lifecycle.role;
     output.previous_phase = previous_phase;
     output.phase = lifecycle.phase;
@@ -1370,6 +1372,12 @@ void publisher_death_locked(SharedOwner &owner, const Event &event) {
   signal_fd_locked(owner, owner.output_fd);
   owner.condition.notify_all();
   owner.qualification_condition.notify_all();
+}
+
+void publisher_death_locked(SharedOwner &owner, const Event &event) {
+  publication_owner_failure_locked(
+      owner, FatalCode::kDependencyDeath, event,
+      event.reason.empty() ? "terminal publisher died" : event.reason);
 }
 
 void configure_timer_locked(SharedOwner &owner) {
@@ -1420,8 +1428,14 @@ void expire_deadlines_locked(SharedOwner &owner) {
         Event trigger{};
         trigger.binding_digest = lifecycle.binding.digest;
         trigger.enqueued_ns = expiry;
-        quarantine_all_locked(owner, FatalCode::kDeadlineExpiry, &trigger,
-                              "process-fatal owner deadline expired");
+        if (spec.kind == DeadlineKind::kOwnerGatewayPublication) {
+          publication_owner_failure_locked(
+              owner, FatalCode::kDeadlineExpiry, trigger,
+              "process-fatal owner deadline expired");
+        } else {
+          quarantine_all_locked(owner, FatalCode::kDeadlineExpiry, &trigger,
+                                "process-fatal owner deadline expired");
+        }
         return;
       }
       const std::uint8_t previous_phase = lifecycle.phase;
