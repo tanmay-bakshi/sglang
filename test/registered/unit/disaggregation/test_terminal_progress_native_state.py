@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalReceiptKind,
     NativeTerminalReceiptOutcome,
     NativeTerminalRequestBinding,
+    NativeTerminalResource,
     canonical_native_terminal_deadlines,
     native_terminal_deadline_table_digest,
 )
@@ -143,6 +144,13 @@ def test_native_deadline_table_is_exactly_the_packaged_hash_bound_table() -> Non
         spec.timeout_outcome for spec in PACKED_TERMINAL_DEADLINES
     )
     assert native_terminal_deadline_table_digest() == terminal_deadline_table_digest()
+
+
+def test_native_resource_vocabulary_matches_canonical_dflash_lifetimes() -> None:
+    assert NativeTerminalResource.SOURCE_DFLASH_AUX_VRAM_ROWS.value == 1 << 7
+    assert NativeTerminalResource.DECODE_DFLASH_AUX_VRAM_ROWS.value == 1 << 13
+    assert "SOURCE_METADATA" not in NativeTerminalResource.__members__
+    assert "DECODE_METADATA_ROW" not in NativeTerminalResource.__members__
 
 
 def test_native_registration_enforces_role_specific_publication_identity() -> None:
