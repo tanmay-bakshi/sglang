@@ -77,6 +77,7 @@ def _shell() -> FrozenPrefillGatewayOutputShell:
         video_tokens=0,
         retraction_count=0,
         dp_rank=0,
+        speculative=True,
         spec_verify_ct=0,
         spec_num_correct_drafts=0,
         spec_num_block_accept_tokens=0,
@@ -179,22 +180,23 @@ def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> Non
     """Pre-forward projection must not mutate incremental detokenizer state."""
 
     request = _request()
-    request.output_ids.extend((31, 32))
     before_output_ids = tuple(request.output_ids)
 
     shell = freeze_prefill_gateway_output_shell(
         request,
         cached_tokens_details={"host": 0, "device": 4},
         dp_rank=2,
+        speculative=True,
     )
 
     assert shell.rid == "request-17"
-    assert shell.origin_tail_ids == (12, 13, 14, 15, 16, 31, 32)
+    assert shell.origin_tail_ids == (12, 13, 14, 15, 16)
     assert shell.read_offset == 5
     assert shell.prompt_tokens == 7
     assert shell.cached_tokens_details == (("device", 4), ("host", 0))
     assert shell.reasoning_tokens == 2
     assert shell.dp_rank == 2
+    assert shell.speculative is True
     assert shell.spec_verify_ct == 3
     assert shell.spec_correct_drafts_histogram == (7, 8)
     assert shell.spaces_between_special_tokens is False
@@ -215,7 +217,41 @@ def test_shell_builder_rejects_result_modes_without_stable_slots() -> None:
             request,
             cached_tokens_details=None,
             dp_rank=0,
+            speculative=True,
         )
+
+
+def test_shell_builder_rejects_a_prior_output_boundary() -> None:
+    """The immutable one-token payload cannot reinterpret streamed history."""
+
+    request = _request()
+    request.output_ids.append(31)
+
+    with pytest.raises(ValueError, match="first output boundary"):
+        freeze_prefill_gateway_output_shell(
+            request,
+            cached_tokens_details=None,
+            dp_rank=0,
+            speculative=True,
+        )
+
+
+def test_encoder_omits_speculative_fields_for_non_speculative_serving() -> None:
+    """Payload shape must match the active scheduler's speculative mode."""
+
+    projection = dataclasses.replace(
+        _projection(),
+        shell=dataclasses.replace(_shell(), speculative=False),
+    )
+    payload = _decode_payload(
+        PrefillTerminalGatewayPayloadEncoder().encode(projection).encoded_payload
+    )
+
+    assert payload.spec_verify_ct == []
+    assert payload.spec_num_correct_drafts == []
+    assert payload.spec_correct_drafts_histogram == []
+    assert payload.input_token_logprobs_val is None
+    assert payload.output_token_logprobs_val is None
 
 
 def test_projection_digest_binds_shell_slot_and_producer_generations() -> None:

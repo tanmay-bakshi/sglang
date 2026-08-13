@@ -152,6 +152,8 @@ class FrozenPrefillGatewayOutputShell:
     :ivar video_tokens: Expanded video-token count.
     :ivar retraction_count: Number of prior scheduler retractions.
     :ivar dp_rank: Data-parallel rank which produced the request.
+    :ivar speculative: Whether speculative counters are present in the active
+        output schema.
     :ivar spec_verify_ct: Speculative verification count.
     :ivar spec_num_correct_drafts: Accepted draft-token count.
     :ivar spec_num_block_accept_tokens: Block-accepted draft-token count.
@@ -177,6 +179,7 @@ class FrozenPrefillGatewayOutputShell:
     video_tokens: int
     retraction_count: int
     dp_rank: int
+    speculative: bool
     spec_verify_ct: int
     spec_num_correct_drafts: int
     spec_num_block_accept_tokens: int
@@ -211,6 +214,8 @@ class FrozenPrefillGatewayOutputShell:
         )
         if any(type(value) is not bool for value in boolean_values):
             raise TypeError("tokenizer controls must be booleans")
+        if type(self.speculative) is not bool:
+            raise TypeError("speculative must be a boolean")
         counters = (
             self.prompt_tokens,
             self.reasoning_tokens,
@@ -276,6 +281,7 @@ def freeze_prefill_gateway_output_shell(
     *,
     cached_tokens_details: CachedTokensDetails | None,
     dp_rank: int,
+    speculative: bool,
 ) -> FrozenPrefillGatewayOutputShell:
     """Freeze scheduler-owned response state without mutating the request.
 
@@ -288,6 +294,8 @@ def freeze_prefill_gateway_output_shell(
     :param cached_tokens_details: Exact cache-tier breakdown reported for the
         request.
     :param dp_rank: Data-parallel rank producing the response.
+    :param speculative: Whether the active scheduler emits speculative
+        counters.
     :returns: Immutable non-logprob gateway response shell.
     :raises ValueError: If the request uses an unsupported result mode or has
         already crossed an output-streaming boundary.
@@ -308,36 +316,28 @@ def freeze_prefill_gateway_output_shell(
         )
     if req.finished_reason is not None or req.finished_output is not None:
         raise ValueError("terminal prefill shell must be frozen before completion")
+    if type(speculative) is not bool:
+        raise TypeError("speculative must be a boolean")
+    if (
+        len(req.output_ids_through_stop) != 0
+        or req.send_token_offset != 0
+        or req.send_decode_id_offset != 0
+        or req.send_output_token_logprobs_offset != 0
+        or req.send_output_sampling_mask_offset != 0
+        or req.surr_offset is not None
+        or req.read_offset is not None
+    ):
+        raise ValueError(
+            "terminal prefill shell requires the first output boundary"
+        )
 
-    first_detokenizer_boundary = req.surr_offset is None and req.read_offset is None
-    partially_initialized_boundary = (req.surr_offset is None) != (
-        req.read_offset is None
+    absolute_read_offset = len(req.origin_input_ids_unpadded)
+    surrounding_offset = max(
+        absolute_read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
+        0,
     )
-    if partially_initialized_boundary:
-        raise ValueError("incremental detokenizer offsets are partially initialized")
-
-    output_ids = tuple(req.output_ids_through_stop)
-    if first_detokenizer_boundary:
-        absolute_read_offset = len(req.origin_input_ids_unpadded)
-        surrounding_offset = max(
-            absolute_read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
-            0,
-        )
-        decode_ids = (
-            tuple(req.origin_input_ids_unpadded[surrounding_offset:]) + output_ids
-        )
-        read_offset = absolute_read_offset - surrounding_offset
-    else:
-        if req.cur_decode_ids_len > len(output_ids):
-            raise ValueError("incremental detokenizer length exceeds output length")
-        decode_ids = tuple(req.surr_and_decode_ids) + output_ids[
-            req.cur_decode_ids_len :
-        ]
-        read_offset = req.read_offset - req.surr_offset
-
-    if req.send_decode_id_offset < 0 or req.send_decode_id_offset > len(decode_ids):
-        raise ValueError("send_decode_id_offset does not index the decode tail")
-    origin_tail_ids = decode_ids[req.send_decode_id_offset :]
+    origin_tail_ids = tuple(req.origin_input_ids_unpadded[surrounding_offset:])
+    read_offset = absolute_read_offset - surrounding_offset
 
     frozen_cache_details = None
     if cached_tokens_details is not None:
@@ -380,6 +380,7 @@ def freeze_prefill_gateway_output_shell(
         video_tokens=video_tokens,
         retraction_count=req.retraction_count,
         dp_rank=dp_rank,
+        speculative=speculative,
         spec_verify_ct=req.spec_verify_ct,
         spec_num_correct_drafts=req.spec_num_correct_drafts,
         spec_num_block_accept_tokens=req.spec_num_block_accept_tokens,
@@ -459,6 +460,24 @@ class PrefillTerminalGatewayPayloadEncoder(TerminalGatewayPayloadEncoder):
         cached_tokens_details = None
         if shell.cached_tokens_details is not None:
             cached_tokens_details = [dict(shell.cached_tokens_details)]
+        spec_verify_ct = [shell.spec_verify_ct] if shell.speculative else []
+        spec_num_correct_drafts = (
+            [shell.spec_num_correct_drafts] if shell.speculative else []
+        )
+        spec_num_block_accept_tokens = (
+            [shell.spec_num_block_accept_tokens] if shell.speculative else []
+        )
+        spec_num_cap_tokens = (
+            [shell.spec_num_cap_tokens] if shell.speculative else []
+        )
+        spec_correct_drafts_histogram = (
+            [list(shell.spec_correct_drafts_histogram)]
+            if shell.speculative
+            else []
+        )
+        spec_cap_lens_histogram = (
+            [list(shell.spec_cap_lens_histogram)] if shell.speculative else []
+        )
         payload = BatchTokenIDOutput(
             rids=[shell.rid],
             http_worker_ipcs=[shell.http_worker_ipc],
@@ -478,18 +497,18 @@ class PrefillTerminalGatewayPayloadEncoder(TerminalGatewayPayloadEncoder):
             image_tokens=[shell.image_tokens],
             audio_tokens=[shell.audio_tokens],
             video_tokens=[shell.video_tokens],
-            input_token_logprobs_val=[[]],
-            input_token_logprobs_idx=[[]],
-            output_token_logprobs_val=[[]],
-            output_token_logprobs_idx=[[]],
-            input_top_logprobs_val=[[]],
-            input_top_logprobs_idx=[[]],
-            output_top_logprobs_val=[[]],
-            output_top_logprobs_idx=[[]],
-            input_token_ids_logprobs_val=[[]],
-            input_token_ids_logprobs_idx=[[]],
-            output_token_ids_logprobs_val=[[]],
-            output_token_ids_logprobs_idx=[[]],
+            input_token_logprobs_val=None,
+            input_token_logprobs_idx=None,
+            output_token_logprobs_val=None,
+            output_token_logprobs_idx=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_idx=None,
+            output_top_logprobs_val=None,
+            output_top_logprobs_idx=None,
+            input_token_ids_logprobs_val=None,
+            input_token_ids_logprobs_idx=None,
+            output_token_ids_logprobs_val=None,
+            output_token_ids_logprobs_idx=None,
             output_token_entropy_val=None,
             output_token_sampling_mask=None,
             output_token_sampling_logprobs=None,
@@ -503,14 +522,12 @@ class PrefillTerminalGatewayPayloadEncoder(TerminalGatewayPayloadEncoder):
             customized_info=None,
             dp_ranks=[shell.dp_rank],
             time_stats=None,
-            spec_verify_ct=[shell.spec_verify_ct],
-            spec_num_correct_drafts=[shell.spec_num_correct_drafts],
-            spec_num_block_accept_tokens=[shell.spec_num_block_accept_tokens],
-            spec_num_cap_tokens=[shell.spec_num_cap_tokens],
-            spec_correct_drafts_histogram=[
-                list(shell.spec_correct_drafts_histogram)
-            ],
-            spec_cap_lens_histogram=[list(shell.spec_cap_lens_histogram)],
+            spec_verify_ct=spec_verify_ct,
+            spec_num_correct_drafts=spec_num_correct_drafts,
+            spec_num_block_accept_tokens=spec_num_block_accept_tokens,
+            spec_num_cap_tokens=spec_num_cap_tokens,
+            spec_correct_drafts_histogram=spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=spec_cap_lens_histogram,
         )
         return EncodedTerminalGatewayPayload(
             projection_digest=projection.digest,
