@@ -1,5 +1,7 @@
 import dataclasses
 import enum
+import threading
+from collections.abc import Callable
 from typing import ClassVar, Final, Protocol
 
 from nixl._api import (
@@ -16,13 +18,28 @@ from nixl._api import (
     nixl_terminal_event_channel,
     nixl_terminal_event_kind_t,
     nixl_terminal_event_subscription,
+    nixl_terminal_owner_producer,
+    nixl_terminal_owner_producer_inventory,
+    nixl_terminal_owner_subscription,
     nixl_terminal_source_delivery,
     nixl_terminal_subscription_info,
+    nixl_xfer_completion_receipt,
     nixl_xfer_handle,
 )
 from nixl._bindings import NIXL_IN_PROG, NIXL_SUCCESS, nixl_status_t
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
+)
+from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalNativeProducerBinding,
+    NativeTerminalRuntime,
+)
 
 QUALIFIED_NIXL_REVISION: Final[str] = "b7e05f416c2ad50376a626a8aa25c2907f47e7c6"
+QUALIFIED_NIXL_DIRECT_OWNER_REVISION: Final[str] = (
+    "f04c03c7c0b6b51e67d743b5e13192524cf6b58a"
+)
 
 
 class NixlTerminalEventKind(enum.StrEnum):
@@ -1225,3 +1242,903 @@ class NixlTerminalEventAdapter:
             or inventory.eventfd_error != 0
         ):
             raise NixlTerminalProcessFatalError(reason, inventory)
+
+
+class NixlDirectTerminalTransferPhase(enum.StrEnum):
+    """Adapter-owned lifecycle of one direct terminal transfer."""
+
+    ARMED = "armed"
+    POSTING = "posting"
+    POSTED = "posted"
+    AMBIGUOUS = "ambiguous"
+    SETTLED = "settled"
+
+
+class NixlDirectTerminalAdapterDisposition(enum.StrEnum):
+    """Process-lifetime disposition of one direct terminal adapter."""
+
+    OPEN = "open"
+    DRAINING = "draining"
+    JOINED = "joined"
+    CLOSED = "closed"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NixlDirectTerminalTransfer:
+    """Opaque exact-generation transfer authority retained by the adapter.
+
+    :ivar binding_digest: Exact immutable owner lifecycle binding.
+    :ivar handle_identity: Native transfer-handle identity.
+    :ivar generation: Exact armed transfer generation.
+    """
+
+    binding_digest: bytes
+    handle_identity: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        """Validate the public exact-generation identity."""
+
+        if type(self.binding_digest) is not bytes or len(self.binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        _require_positive(self.handle_identity, "direct transfer handle identity")
+        _require_positive(self.generation, "direct transfer generation")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NixlDirectTerminalProducerInventory:
+    """Immutable direct native-producer lifecycle inventory.
+
+    :ivar registering_count: Bindings whose native registration is returning.
+    :ivar submitted_count: Bindings awaiting direct terminal delivery.
+    :ivar active_callback_count: Terminal callbacks still outstanding.
+    :ivar active_registration_count: Backend subscription calls still returning.
+    :ivar total_subscriptions: Exact transfer generations armed since creation.
+    :ivar total_delivered: Terminal events admitted into the immutable owner.
+    :ivar successful_terminal_event_count: Successful terminal deliveries.
+    :ivar failure_terminal_event_count: Failed terminal deliveries.
+    :ivar owner_submission_failure_count: Rejected native owner submissions.
+    :ivar admission_open: Whether new transfer generations may be armed.
+    :ivar retirement_requested: Whether ordered producer retirement began.
+    :ivar joined: Whether native callbacks and retirement joined.
+    :ivar closed: Whether exact-zero producer closure completed.
+    :ivar fatal_code: Normalized sticky native fatal code.
+    :ivar fatal_status: Native errno or NIXL status for the first fatal.
+    :ivar fatal_binding: Exact binding associated with the first fatal.
+    """
+
+    registering_count: int
+    submitted_count: int
+    active_callback_count: int
+    active_registration_count: int
+    total_subscriptions: int
+    total_delivered: int
+    successful_terminal_event_count: int
+    failure_terminal_event_count: int
+    owner_submission_failure_count: int
+    admission_open: bool
+    retirement_requested: bool
+    joined: bool
+    closed: bool
+    fatal_code: str
+    fatal_status: int
+    fatal_binding: bytes | None
+
+    @property
+    def retained_count(self) -> int:
+        """Return every exact native owner binding still retained.
+
+        :returns: Registering and submitted binding count.
+        """
+
+        return self.registering_count + self.submitted_count
+
+    @property
+    def is_healthy(self) -> bool:
+        """Return whether the producer carries no sticky fatal evidence.
+
+        :returns: Whether native producer health is clean.
+        """
+
+        return (
+            self.fatal_code == "none"
+            and self.fatal_status == 0
+            and self.fatal_binding is None
+            and self.owner_submission_failure_count == 0
+        )
+
+    @property
+    def has_zero_live_authority(self) -> bool:
+        """Return whether callbacks and exact bindings are absent.
+
+        :returns: Whether all live native producer counters are zero.
+        """
+
+        return (
+            self.registering_count == 0
+            and self.submitted_count == 0
+            and self.active_callback_count == 0
+            and self.active_registration_count == 0
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NixlDirectTerminalAdapterInventory:
+    """Immutable local and native direct-owner inventory.
+
+    :ivar disposition: Adapter process-lifetime disposition.
+    :ivar transfer_count: Exact locally retained transfer count.
+    :ivar armed_count: Transfers subscribed but not posted.
+    :ivar posting_count: Transfers currently inside the post call.
+    :ivar posted_count: Transfers awaiting authoritative owner terminality.
+    :ivar ambiguous_count: Transfers whose submission outcome is ambiguous.
+    :ivar settled_count: Terminal transfers retaining release authority.
+    :ivar orphaned_subscription_count: Native wrappers retained after a failed
+        subscription-schema validation.
+    :ivar producer: Exact native producer inventory.
+    """
+
+    disposition: NixlDirectTerminalAdapterDisposition
+    transfer_count: int
+    armed_count: int
+    posting_count: int
+    posted_count: int
+    ambiguous_count: int
+    settled_count: int
+    orphaned_subscription_count: int
+    producer: NixlDirectTerminalProducerInventory
+
+    @property
+    def has_zero_local_authority(self) -> bool:
+        """Return whether the adapter retains no transfer authority.
+
+        :returns: Whether all local strong-retention inventories are zero.
+        """
+
+        return self.transfer_count == 0 and self.orphaned_subscription_count == 0
+
+    @property
+    def is_clean_closed(self) -> bool:
+        """Return whether ordered shutdown restored exact zero authority.
+
+        :returns: Whether both local and native close invariants hold.
+        """
+
+        return (
+            self.disposition is NixlDirectTerminalAdapterDisposition.CLOSED
+            and self.has_zero_local_authority
+            and self.producer.has_zero_live_authority
+            and self.producer.is_healthy
+            and not self.producer.admission_open
+            and self.producer.retirement_requested
+            and self.producer.joined
+            and self.producer.closed
+        )
+
+
+class NixlDirectTransferHandleBoundary(Protocol):
+    """Transfer-handle lifetime surface owned by the direct adapter."""
+
+    def release(self) -> None:
+        """Release one terminal or provably unposted transfer handle."""
+
+        ...
+
+
+class NixlDirectTerminalAgentBoundary(Protocol):
+    """Qualified direct NIXL-to-owner API consumed by the adapter."""
+
+    def create_terminal_owner_producer(
+        self,
+        producer_api: object,
+        producer_context: object,
+    ) -> nixl_terminal_owner_producer:
+        """Bind one registered native owner producer.
+
+        :param producer_api: Versioned producer API capsule.
+        :param producer_context: Registered producer context capsule.
+        :returns: Process-lifetime native producer.
+        """
+
+        ...
+
+    def subscribe_xfer_terminal_owner(
+        self,
+        producer: nixl_terminal_owner_producer,
+        handle: nixl_xfer_handle,
+        binding_digest: bytes,
+    ) -> nixl_terminal_owner_subscription:
+        """Arm direct owner delivery for an exact transfer generation.
+
+        :param producer: Capsule-bound direct owner producer.
+        :param handle: Agent-owned transfer handle.
+        :param binding_digest: Exact 32-byte lifecycle binding.
+        :returns: Retained exact-generation subscription.
+        """
+
+        ...
+
+    def take_xfer_completion_receipt(
+        self,
+        handle: nixl_xfer_handle,
+    ) -> nixl_xfer_completion_receipt | None:
+        """Take successful completion authority exactly once.
+
+        :param handle: Exact terminal transfer handle.
+        :returns: Take-once receipt, or ``None`` while incomplete.
+        """
+
+        ...
+
+
+@dataclasses.dataclass(slots=True)
+class _NixlDirectOwnedTransfer:
+    """Strongly retained native authority for one exact transfer generation.
+
+    :ivar public: Opaque caller-facing identity.
+    :ivar handle: Exact agent-owned transfer handle.
+    :ivar subscription: Exact native callback subscription until release.
+    :ivar phase: Current adapter lifecycle phase.
+    :ivar settlement_action_id: Owner action first presented for settlement.
+    :ivar completion_receipt: Successful take-once authority after consumption.
+    """
+
+    public: NixlDirectTerminalTransfer
+    handle: NixlDirectTransferHandleBoundary
+    subscription: nixl_terminal_owner_subscription | None
+    phase: NixlDirectTerminalTransferPhase
+    settlement_action_id: int | None = None
+    completion_receipt: nixl_xfer_completion_receipt | None = None
+    completion_validated: bool = False
+    cancel_requested: bool = False
+
+
+def _project_direct_producer_inventory(
+    value: nixl_terminal_owner_producer_inventory,
+) -> NixlDirectTerminalProducerInventory:
+    """Project and validate one native direct-producer inventory.
+
+    :param value: Native high-level inventory value.
+    :returns: Immutable validated adapter inventory.
+    """
+
+    fatal_binding = value.fatal_binding
+    if fatal_binding is not None and (
+        type(fatal_binding) is not bytes or len(fatal_binding) != 32
+    ):
+        raise NixlTerminalLifecycleError(
+            "direct producer fatal binding must contain 32 bytes"
+        )
+    inventory = NixlDirectTerminalProducerInventory(
+        registering_count=_require_nonnegative(
+            int(value.registering_count), "direct registering count"
+        ),
+        submitted_count=_require_nonnegative(
+            int(value.submitted_count), "direct submitted count"
+        ),
+        active_callback_count=_require_nonnegative(
+            int(value.active_callback_count), "direct active callback count"
+        ),
+        active_registration_count=_require_nonnegative(
+            int(value.active_registration_count),
+            "direct active registration count",
+        ),
+        total_subscriptions=_require_nonnegative(
+            int(value.total_subscriptions), "direct total subscriptions"
+        ),
+        total_delivered=_require_nonnegative(
+            int(value.total_delivered), "direct total delivered"
+        ),
+        successful_terminal_event_count=_require_nonnegative(
+            int(value.successful_terminal_event_count),
+            "direct successful terminal count",
+        ),
+        failure_terminal_event_count=_require_nonnegative(
+            int(value.failure_terminal_event_count),
+            "direct failure terminal count",
+        ),
+        owner_submission_failure_count=_require_nonnegative(
+            int(value.owner_submission_failure_count),
+            "direct owner submission failure count",
+        ),
+        admission_open=bool(value.admission_open),
+        retirement_requested=bool(value.retirement_requested),
+        joined=bool(value.joined),
+        closed=bool(value.closed),
+        fatal_code=str(value.fatal_code).lower(),
+        fatal_status=int(value.fatal_status),
+        fatal_binding=fatal_binding,
+    )
+    if inventory.total_delivered > inventory.total_subscriptions:
+        raise NixlTerminalLifecycleError(
+            "direct producer delivered more events than it subscribed"
+        )
+    terminal_count = (
+        inventory.successful_terminal_event_count
+        + inventory.failure_terminal_event_count
+    )
+    if terminal_count != inventory.total_delivered:
+        raise NixlTerminalLifecycleError(
+            "direct producer terminal counts disagree with delivered events"
+        )
+    return inventory
+
+
+class NixlDirectTerminalOwnerAdapter:
+    """Typed ownership boundary for direct NIXL terminal publication."""
+
+    _agent: NixlDirectTerminalAgentBoundary
+    _binding: NativeTerminalNativeProducerBinding
+    _producer: nixl_terminal_owner_producer
+    _disposition: NixlDirectTerminalAdapterDisposition
+    _transfers: dict[NixlDirectTerminalTransfer, _NixlDirectOwnedTransfer]
+    _orphaned_subscriptions: list[nixl_terminal_owner_subscription]
+    _lock: threading.RLock
+
+    def __init__(
+        self,
+        agent: NixlDirectTerminalAgentBoundary,
+        binding: NativeTerminalNativeProducerBinding,
+    ) -> None:
+        """Bind one qualified NIXL agent to a registered native producer.
+
+        :param agent: Qualified high-level NIXL agent.
+        :param binding: Runtime-owned API and producer-context capsules.
+        """
+
+        if type(binding) is not NativeTerminalNativeProducerBinding:
+            raise TypeError("binding must be NativeTerminalNativeProducerBinding")
+        self._agent = agent
+        self._binding = binding
+        self._producer = agent.create_terminal_owner_producer(
+            binding.producer_api,
+            binding.producer_context,
+        )
+        self._disposition = NixlDirectTerminalAdapterDisposition.OPEN
+        self._transfers = {}
+        self._orphaned_subscriptions = []
+        self._lock = threading.RLock()
+        inventory = self.query_inventory().producer
+        if (
+            not inventory.has_zero_live_authority
+            or not inventory.admission_open
+            or inventory.retirement_requested
+            or inventory.joined
+            or inventory.closed
+        ):
+            raise NixlTerminalLifecycleError(
+                "new direct producer did not begin at clean open inventory"
+            )
+
+    @classmethod
+    def from_runtime(
+        cls,
+        agent: NixlDirectTerminalAgentBoundary,
+        runtime: NativeTerminalRuntime,
+        producer_name: str,
+    ) -> "NixlDirectTerminalOwnerAdapter":
+        """Construct from one runtime-registered native producer.
+
+        :param agent: Qualified concrete high-level NIXL agent.
+        :param runtime: Running immutable owner runtime.
+        :param producer_name: Stable pre-registered native producer name.
+        :returns: Bound direct terminal adapter.
+        """
+
+        if type(runtime) is not NativeTerminalRuntime:
+            raise TypeError("runtime must be NativeTerminalRuntime")
+        return cls(agent, runtime.native_producer_binding(producer_name))
+
+    @property
+    def producer_id(self) -> int:
+        """Return the exact native owner producer namespace.
+
+        :returns: Runtime-registered producer ID.
+        """
+
+        return self._binding.producer_id
+
+    def query_inventory(self) -> NixlDirectTerminalAdapterInventory:
+        """Return exact local and native direct-owner inventory.
+
+        :returns: Immutable adapter inventory.
+        :raises NixlTerminalLifecycleError: If native inventory is fatal or
+            violates its qualified schema.
+        """
+
+        with self._lock:
+            producer = _project_direct_producer_inventory(self._producer.inventory())
+            if not producer.is_healthy:
+                raise NixlTerminalLifecycleError(
+                    "direct terminal producer carries process-fatal evidence"
+                )
+            phases = tuple(record.phase for record in self._transfers.values())
+            return NixlDirectTerminalAdapterInventory(
+                disposition=self._disposition,
+                transfer_count=len(phases),
+                armed_count=phases.count(NixlDirectTerminalTransferPhase.ARMED),
+                posting_count=phases.count(NixlDirectTerminalTransferPhase.POSTING),
+                posted_count=phases.count(NixlDirectTerminalTransferPhase.POSTED),
+                ambiguous_count=phases.count(NixlDirectTerminalTransferPhase.AMBIGUOUS),
+                settled_count=phases.count(NixlDirectTerminalTransferPhase.SETTLED),
+                orphaned_subscription_count=len(self._orphaned_subscriptions),
+                producer=producer,
+            )
+
+    def arm_transfer(
+        self,
+        handle: nixl_xfer_handle,
+        binding_digest: bytes,
+    ) -> NixlDirectTerminalTransfer:
+        """Arm and strongly retain owner delivery before transfer posting.
+
+        :param handle: Initialized but unposted transfer handle.
+        :param binding_digest: Exact registered source lifecycle digest.
+        :returns: Opaque exact-generation transfer authority.
+        """
+
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        if handle is None:
+            raise ValueError("handle must not be None")
+        with self._lock:
+            self._require_open_locked()
+            native = self._agent.subscribe_xfer_terminal_owner(
+                self._producer,
+                handle,
+                binding_digest,
+            )
+            try:
+                info = native.query()
+                if info.kind != nixl_terminal_event_kind_t.TRANSFER:
+                    raise NixlTerminalLifecycleError(
+                        "direct owner subscription is not a transfer"
+                    )
+                if not bool(info.active):
+                    raise NixlTerminalLifecycleError(
+                        "new direct owner subscription is not active"
+                    )
+                public = NixlDirectTerminalTransfer(
+                    binding_digest=binding_digest,
+                    handle_identity=_require_positive(
+                        int(info.identity), "direct subscription identity"
+                    ),
+                    generation=_require_positive(
+                        int(info.generation), "direct subscription generation"
+                    ),
+                )
+                if public in self._transfers:
+                    raise NixlTerminalLifecycleError(
+                        "direct transfer generation is already armed"
+                    )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                self._orphaned_subscriptions.append(native)
+                raise
+            self._transfers[public] = _NixlDirectOwnedTransfer(
+                public=public,
+                handle=handle,
+                subscription=native,
+                phase=NixlDirectTerminalTransferPhase.ARMED,
+            )
+            return public
+
+    def post_transfer(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+        post: Callable[[object], object],
+    ) -> object:
+        """Post only an exact transfer whose subscription is already armed.
+
+        Terminal delivery may race ahead of the posting call's return. The
+        settlement path may therefore consume a ``POSTING`` record, while this
+        method never overwrites a concurrently committed terminal state.
+
+        :param transfer: Exact adapter-owned armed transfer.
+        :param post: Existing transfer-post operation.
+        :returns: Existing post operation result.
+        """
+
+        if not callable(post):
+            raise TypeError("post must be callable")
+        with self._lock:
+            self._require_open_locked()
+            record = self._require_transfer_locked(transfer)
+            if record.phase is not NixlDirectTerminalTransferPhase.ARMED:
+                raise NixlTerminalLifecycleError(
+                    "direct transfer can be posted exactly once after arming"
+                )
+            record.phase = NixlDirectTerminalTransferPhase.POSTING
+            handle = record.handle
+        post_returned = False
+        try:
+            result = post(handle)
+            post_returned = True
+            return result
+        finally:
+            with self._lock:
+                if record.phase is NixlDirectTerminalTransferPhase.POSTING:
+                    record.phase = (
+                        NixlDirectTerminalTransferPhase.POSTED
+                        if post_returned
+                        else NixlDirectTerminalTransferPhase.AMBIGUOUS
+                    )
+
+    def settle_success(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+        action: NativeTerminalOwnerAction,
+    ) -> nixl_xfer_completion_receipt:
+        """Consume success only after authoritative owner terminality.
+
+        ``SOURCE_NATIVE_TERMINAL`` is a local producer event and deliberately
+        carries no wire receipt. The exact completion receipt is taken here,
+        after the owner emitted the matching ``SOURCE_OUTCOME_READY`` action.
+
+        :param transfer: Exact adapter-owned terminal transfer.
+        :param action: Matching one-shot owner outcome action.
+        :returns: Native take-once completion receipt.
+        """
+
+        with self._lock:
+            record = self._prepare_settlement_locked(
+                transfer,
+                action,
+                (NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,),
+            )
+            receipt = record.completion_receipt
+            if receipt is None:
+                receipt = self._agent.take_xfer_completion_receipt(record.handle)
+                if receipt is None:
+                    raise NixlTerminalLifecycleError(
+                        "owner terminality has no NIXL completion receipt"
+                    )
+                record.completion_receipt = receipt
+            if not record.completion_validated:
+                self._validate_completion_receipt(record.public, receipt)
+                record.completion_validated = True
+            self._release_terminal_subscription_locked(record)
+            record.phase = NixlDirectTerminalTransferPhase.SETTLED
+            return receipt
+
+    def settle_failure(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Settle terminal failure without manufacturing success authority.
+
+        :param transfer: Exact adapter-owned failed transfer.
+        :param action: Matching quarantine or process-fatal owner action.
+        """
+
+        with self._lock:
+            record = self._prepare_settlement_locked(
+                transfer,
+                action,
+                (
+                    NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+                    NativeTerminalOwnerActionKind.PROCESS_FATAL,
+                ),
+            )
+            if record.completion_receipt is not None:
+                raise NixlTerminalLifecycleError(
+                    "failed transfer retained successful completion authority"
+                )
+            self._release_terminal_subscription_locked(record)
+            record.phase = NixlDirectTerminalTransferPhase.SETTLED
+
+    def cancel_transfer(self, transfer: NixlDirectTerminalTransfer) -> None:
+        """Request cancellation while retaining every pending authority.
+
+        A posted transfer normally returns ``NIXL_IN_PROG`` and remains owned
+        until native terminal failure reaches the immutable owner. Immediate
+        release is accepted only for an ``ARMED`` transfer, which proves that
+        no transfer post began.
+
+        :param transfer: Exact adapter-owned transfer generation.
+        """
+
+        with self._lock:
+            record = self._require_transfer_locked(transfer)
+            if record.phase not in (
+                NixlDirectTerminalTransferPhase.ARMED,
+                NixlDirectTerminalTransferPhase.POSTING,
+                NixlDirectTerminalTransferPhase.POSTED,
+                NixlDirectTerminalTransferPhase.AMBIGUOUS,
+            ):
+                raise NixlTerminalLifecycleError(
+                    "direct transfer cancellation is illegal in its current phase"
+                )
+            subscription = record.subscription
+            if subscription is None:
+                raise NixlTerminalLifecycleError(
+                    "direct transfer cancellation lost its subscription"
+                )
+            if record.cancel_requested:
+                raise NixlTerminalLifecycleError(
+                    "direct transfer cancellation was already requested"
+                )
+            record.cancel_requested = True
+            status = subscription.release()
+            if status == NIXL_IN_PROG:
+                record.phase = NixlDirectTerminalTransferPhase.AMBIGUOUS
+                return
+            if status == NIXL_SUCCESS:
+                record.subscription = None
+                record.phase = (
+                    NixlDirectTerminalTransferPhase.SETTLED
+                    if record.phase is NixlDirectTerminalTransferPhase.ARMED
+                    else NixlDirectTerminalTransferPhase.AMBIGUOUS
+                )
+                return
+            raise NixlTerminalLifecycleError(
+                "direct transfer cancellation returned an invalid lifecycle "
+                f"status: {status}"
+            )
+
+    def release_transfer(self, transfer: NixlDirectTerminalTransfer) -> None:
+        """Release the exact handle after terminal settlement.
+
+        :param transfer: Settled adapter-owned transfer.
+        """
+
+        with self._lock:
+            record = self._require_transfer_locked(transfer)
+            if record.phase is not NixlDirectTerminalTransferPhase.SETTLED:
+                raise NixlTerminalLifecycleError(
+                    "direct transfer release requires terminal settlement"
+                )
+            if record.subscription is not None:
+                raise NixlTerminalLifecycleError(
+                    "direct transfer release retained its native subscription"
+                )
+            record.handle.release()
+            del self._transfers[transfer]
+
+    def discard_unposted(self, transfer: NixlDirectTerminalTransfer) -> None:
+        """Release a provably unposted exact transfer generation.
+
+        :param transfer: Adapter-owned transfer still in ``ARMED`` state.
+        """
+
+        with self._lock:
+            record = self._require_transfer_locked(transfer)
+            if record.phase is not NixlDirectTerminalTransferPhase.ARMED:
+                raise NixlTerminalLifecycleError(
+                    "only a provably unposted direct transfer may be discarded"
+                )
+            subscription = record.subscription
+            if subscription is None:
+                raise NixlTerminalLifecycleError(
+                    "armed direct transfer lost its subscription"
+                )
+            status = subscription.release()
+            if status != NIXL_SUCCESS:
+                raise NixlTerminalLifecycleError(
+                    "unposted direct subscription did not release immediately: "
+                    f"{status}"
+                )
+            record.subscription = None
+            record.phase = NixlDirectTerminalTransferPhase.SETTLED
+            record.handle.release()
+            del self._transfers[transfer]
+
+    def stop_admission(self) -> None:
+        """Permanently stop new exact-generation bindings."""
+
+        with self._lock:
+            self._require_disposition_locked(NixlDirectTerminalAdapterDisposition.OPEN)
+            self._producer.stop_admission()
+            self._disposition = NixlDirectTerminalAdapterDisposition.DRAINING
+
+    def join(self, timeout_seconds: float) -> bool:
+        """Join native callbacks and ordered producer retirement.
+
+        :param timeout_seconds: Positive native wait bound.
+        :returns: Whether producer retirement joined within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        with self._lock:
+            if self._disposition is NixlDirectTerminalAdapterDisposition.JOINED:
+                return True
+            self._require_disposition_locked(
+                NixlDirectTerminalAdapterDisposition.DRAINING
+            )
+        joined = self._producer.join(timeout_seconds)
+        if not joined:
+            return False
+        with self._lock:
+            self._disposition = NixlDirectTerminalAdapterDisposition.JOINED
+        return True
+
+    def close(self) -> NixlDirectTerminalAdapterInventory:
+        """Close only after joined and exact-zero local/native authority.
+
+        :returns: Exact clean post-close inventory.
+        """
+
+        with self._lock:
+            self._require_disposition_locked(
+                NixlDirectTerminalAdapterDisposition.JOINED
+            )
+            before = self.query_inventory()
+            if not before.has_zero_local_authority:
+                raise NixlTerminalLifecycleError(
+                    "direct adapter cannot close with local transfer authority"
+                )
+            producer = before.producer
+            if (
+                not producer.has_zero_live_authority
+                or producer.admission_open
+                or not producer.retirement_requested
+                or not producer.joined
+                or producer.closed
+            ):
+                raise NixlTerminalLifecycleError(
+                    "direct adapter cannot close with native producer authority"
+                )
+            self._producer.close()
+            self._disposition = NixlDirectTerminalAdapterDisposition.CLOSED
+            after = self.query_inventory()
+            if not after.is_clean_closed:
+                raise NixlTerminalLifecycleError(
+                    "direct adapter did not close at exact zero inventory"
+                )
+            return after
+
+    def shutdown(self, timeout_seconds: float) -> NixlDirectTerminalAdapterInventory:
+        """Perform ordered stop, join, and exact-zero close.
+
+        :param timeout_seconds: Positive native producer join bound.
+        :returns: Exact clean post-close inventory.
+        """
+
+        with self._lock:
+            if self._disposition is NixlDirectTerminalAdapterDisposition.OPEN:
+                self.stop_admission()
+        if not self.join(timeout_seconds):
+            raise NixlTerminalLifecycleError(
+                "direct terminal producer did not join before its deadline"
+            )
+        return self.close()
+
+    def _prepare_settlement_locked(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+        action: NativeTerminalOwnerAction,
+        allowed_kinds: tuple[NativeTerminalOwnerActionKind, ...],
+    ) -> _NixlDirectOwnedTransfer:
+        """Validate one owner action before any native authority is consumed.
+
+        :param transfer: Exact adapter-owned terminal transfer.
+        :param action: One-shot authoritative owner action.
+        :param allowed_kinds: Closed action kinds accepted by the settlement.
+        :returns: Exact retained transfer record.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in allowed_kinds:
+            raise NixlTerminalLifecycleError(
+                "owner action does not authorize this transfer settlement"
+            )
+        record = self._require_transfer_locked(transfer)
+        if action.binding.digest != record.public.binding_digest:
+            raise NixlTerminalLifecycleError(
+                "owner action belongs to another transfer binding"
+            )
+        if record.phase not in (
+            NixlDirectTerminalTransferPhase.POSTING,
+            NixlDirectTerminalTransferPhase.POSTED,
+            NixlDirectTerminalTransferPhase.AMBIGUOUS,
+        ):
+            raise NixlTerminalLifecycleError(
+                "direct transfer settlement requires a posted generation"
+            )
+        if record.settlement_action_id is None:
+            record.settlement_action_id = action.action_id
+        elif record.settlement_action_id != action.action_id:
+            raise NixlTerminalLifecycleError(
+                "direct transfer settlement changed owner action authority"
+            )
+        return record
+
+    @staticmethod
+    def _validate_completion_receipt(
+        transfer: NixlDirectTerminalTransfer,
+        receipt: nixl_xfer_completion_receipt,
+    ) -> None:
+        """Validate take-once NIXL success authority against its subscription.
+
+        :param transfer: Exact adapter-owned transfer generation.
+        :param receipt: Native take-once completion receipt.
+        """
+
+        if int(receipt.handleIdentity) != transfer.handle_identity:
+            raise NixlTerminalLifecycleError(
+                "completion receipt changed transfer handle identity"
+            )
+        if int(receipt.generation) != transfer.generation:
+            raise NixlTerminalLifecycleError(
+                "completion receipt changed subscribed generation"
+            )
+        if not bool(receipt.submissionSealed) or not bool(receipt.completionClaimed):
+            raise NixlTerminalLifecycleError(
+                "completion receipt lacks sealed take-once authority"
+            )
+        if receipt.status.name != "NIXL_SUCCESS":
+            raise NixlTerminalLifecycleError(
+                "completion receipt does not carry successful terminal status"
+            )
+
+    @staticmethod
+    def _release_terminal_subscription_locked(
+        record: _NixlDirectOwnedTransfer,
+    ) -> None:
+        """Consume one exact terminal subscription wrapper.
+
+        :param record: Exact terminal transfer record.
+        """
+
+        subscription = record.subscription
+        if subscription is None:
+            return
+        info = subscription.query()
+        if bool(info.active):
+            raise NixlTerminalLifecycleError(
+                "authoritative owner terminality left subscription active"
+            )
+        if (
+            int(info.identity) != record.public.handle_identity
+            or int(info.generation) != record.public.generation
+        ):
+            raise NixlTerminalLifecycleError(
+                "terminal subscription changed exact transfer generation"
+            )
+        status = subscription.release()
+        if status != NIXL_SUCCESS:
+            raise NixlTerminalLifecycleError(
+                f"terminal direct subscription release returned {status}"
+            )
+        record.subscription = None
+
+    def _require_transfer_locked(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+    ) -> _NixlDirectOwnedTransfer:
+        """Resolve one exact public token to its strongly retained record.
+
+        :param transfer: Candidate public transfer token.
+        :returns: Exact retained transfer record.
+        """
+
+        if type(transfer) is not NixlDirectTerminalTransfer:
+            raise TypeError("transfer must be NixlDirectTerminalTransfer")
+        record = self._transfers.get(transfer)
+        if record is None or record.public is not transfer:
+            raise NixlTerminalLifecycleError(
+                "direct transfer is not owned by this adapter"
+            )
+        return record
+
+    def _require_open_locked(self) -> None:
+        """Require open transfer-generation admission."""
+
+        self._require_disposition_locked(NixlDirectTerminalAdapterDisposition.OPEN)
+
+    def _require_disposition_locked(
+        self,
+        expected: NixlDirectTerminalAdapterDisposition,
+    ) -> None:
+        """Require one exact process-lifetime disposition.
+
+        :param expected: Required current adapter disposition.
+        """
+
+        if self._disposition is not expected:
+            raise NixlTerminalLifecycleError(
+                "direct adapter disposition is "
+                f"{self._disposition.value}, expected {expected.value}"
+            )
