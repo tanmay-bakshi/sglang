@@ -2694,6 +2694,10 @@ public:
       owner_->event_admission_open = false;
       owner_->qualification.running = false;
       owner_->stop_requested = true;
+      for (auto &entry : owner_->producers) {
+        entry.second.retirement_requested = true;
+        entry.second.retired = true;
+      }
       owner_->producers_joined = true;
       owner_->input_queue.clear();
       for (auto &entry : owner_->lifecycles) {
