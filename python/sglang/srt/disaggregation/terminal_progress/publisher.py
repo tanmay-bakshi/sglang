@@ -2,12 +2,18 @@ import abc
 import dataclasses
 import enum
 import hashlib
+import math
 import queue
 import threading
 import traceback
 from collections.abc import Callable
 
 import zmq
+from sglang.srt.disaggregation.terminal_progress.deadlines import (
+    BoundTerminalDeadline,
+    TerminalDeadlineKind,
+    start_terminal_deadline,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalPublicationIdentity,
@@ -86,6 +92,11 @@ class FrozenTerminalGatewayPublication:
         request_key = self.identity.request_key
         if self.canonical_binding.request_key != request_key:
             raise ValueError("canonical binding belongs to another request")
+        if (
+            self.identity.publisher_process_generation
+            != self.canonical_binding.owner.process_generation
+        ):
+            raise ValueError("publication identity belongs to another publisher")
         if self.canonical_binding.owner.role is not TerminalOwnerRole.SOURCE:
             raise ValueError("canonical binding must belong to a source owner")
         if self.canonical_binding.owner.tp_rank != 0:
@@ -165,8 +176,10 @@ class TerminalGatewayPublicationSuccess:
             wire_receipt = receipt.wire_receipt
             if (
                 wire_receipt.binding != binding
+                or wire_receipt.issuer != self.publication.canonical_binding.owner
                 or wire_receipt.kind is not TerminalReceiptKind.GATEWAY_PUBLISHED
                 or wire_receipt.outcome is not TerminalReceiptOutcome.SUCCESS
+                or wire_receipt.terminal_timestamp_ns != self.completed_ns
             ):
                 raise ValueError("gateway receipt differs from its source binding")
 
@@ -232,15 +245,69 @@ class TerminalGatewayPublisherSnapshot:
     fatal_reason: str | None = None
     fatal_traceback: str | None = None
 
+    def __post_init__(self) -> None:
+        """Validate one conservation-complete publisher snapshot."""
+
+        if type(self.disposition) is not TerminalGatewayPublisherDisposition:
+            raise TypeError("disposition must be TerminalGatewayPublisherDisposition")
+        if type(self.admission_open) is not bool:
+            raise TypeError("admission_open must be bool")
+        if type(self.thread_alive) is not bool:
+            raise TypeError("thread_alive must be bool")
+        inventories = (
+            self.pending_identities,
+            self.completed_identities,
+            self.failed_identities,
+        )
+        if any(type(inventory) is not tuple for inventory in inventories):
+            raise TypeError("publisher inventories must be tuples")
+        if any(
+            type(identity) is not TerminalPublicationIdentity
+            for inventory in inventories
+            for identity in inventory
+        ):
+            raise TypeError("publisher inventories contain an invalid identity")
+        inventory_digests = tuple(
+            frozenset(identity.digest for identity in inventory)
+            for inventory in inventories
+        )
+        if any(
+            len(digests) != len(inventory)
+            for digests, inventory in zip(inventory_digests, inventories, strict=True)
+        ):
+            raise ValueError("publisher inventory contains a duplicate identity")
+        pending, completed, failed = inventory_digests
+        if (
+            len(pending & completed) > 0
+            or len(pending & failed) > 0
+            or len(completed & failed) > 0
+        ):
+            raise ValueError("publisher inventories are not disjoint")
+        if self.admission_open and (
+            self.disposition is not TerminalGatewayPublisherDisposition.RUNNING
+        ):
+            raise ValueError("publisher admission requires running disposition")
+        if self.disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL:
+            if type(self.fatal_reason) is not str or len(self.fatal_reason) == 0:
+                raise ValueError("process-fatal publisher requires a reason")
+            if (
+                self.fatal_traceback is not None
+                and type(self.fatal_traceback) is not str
+            ):
+                raise TypeError("fatal_traceback must be a string or None")
+        elif self.fatal_reason is not None or self.fatal_traceback is not None:
+            raise ValueError("healthy publisher cannot retain fatal evidence")
+
 
 class TerminalGatewaySink(abc.ABC):
     """Thread-owned byte sink for frozen scheduler IPC payloads."""
 
     @abc.abstractmethod
-    def send(self, encoded_payload: bytes) -> None:
+    def send(self, encoded_payload: bytes, timeout_seconds: float) -> None:
         """Publish one already-serialized output.
 
         :param encoded_payload: Bytes accepted by the downstream IPC receiver.
+        :param timeout_seconds: Remaining hash-bound publication deadline.
         """
 
     @abc.abstractmethod
@@ -283,12 +350,17 @@ class _ZmqTerminalGatewaySink(TerminalGatewaySink):
             raise RuntimeError("explicit gateway endpoint returned no socket")
         self._socket = socket
 
-    def send(self, encoded_payload: bytes) -> None:
+    def send(self, encoded_payload: bytes, timeout_seconds: float) -> None:
         """Send one frozen payload without touching scheduler-owned objects.
 
         :param encoded_payload: Complete active-mode IPC encoding.
+        :param timeout_seconds: Remaining hash-bound publication deadline.
         """
 
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        timeout_ms = max(1, math.ceil(timeout_seconds * 1_000.0))
+        self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
         self._socket.send(encoded_payload)
 
     def close(self) -> None:
@@ -345,15 +417,18 @@ class PackedTerminalOutputPublisher:
     _queue: queue.SimpleQueue[FrozenTerminalGatewayPublication | object]
     _known_digests: dict[bytes, bytes]
     _known_ready_tokens: dict[bytes, TerminalReceiptToken]
-    _pending: dict[bytes, TerminalPublicationIdentity]
+    _pending: dict[bytes, FrozenTerminalGatewayPublication]
     _completed: dict[bytes, TerminalPublicationIdentity]
     _failed: dict[bytes, TerminalPublicationIdentity]
     _disposition: TerminalGatewayPublisherDisposition
     _admission_open: bool
     _started: bool
+    _thread_launched: bool
     _stop_requested: bool
+    _shutdown_deadline: BoundTerminalDeadline | None
     _fatal_reason: str | None
     _fatal_traceback: str | None
+    _transition_lock: threading.RLock
     _lock: threading.Lock
     _thread: threading.Thread
 
@@ -429,9 +504,12 @@ class PackedTerminalOutputPublisher:
         self._disposition = TerminalGatewayPublisherDisposition.CREATED
         self._admission_open = False
         self._started = False
+        self._thread_launched = False
         self._stop_requested = False
+        self._shutdown_deadline = None
         self._fatal_reason = None
         self._fatal_traceback = None
+        self._transition_lock = threading.RLock()
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
@@ -442,13 +520,24 @@ class PackedTerminalOutputPublisher:
     def start(self) -> None:
         """Start the publisher exactly once."""
 
-        with self._lock:
-            if self._started:
-                raise TerminalGatewayPublisherError("publisher cannot restart")
-            self._started = True
-            self._admission_open = True
-            self._disposition = TerminalGatewayPublisherDisposition.RUNNING
-        self._thread.start()
+        with self._transition_lock:
+            with self._lock:
+                if self._started:
+                    raise TerminalGatewayPublisherError("publisher cannot restart")
+                self._started = True
+                self._admission_open = True
+                self._disposition = TerminalGatewayPublisherDisposition.RUNNING
+            try:
+                self._thread.start()
+            except BaseException:
+                formatted_traceback = traceback.format_exc()
+                self._enter_fatal(
+                    "gateway publisher thread failed to start",
+                    formatted_traceback,
+                )
+                raise
+            with self._lock:
+                self._thread_launched = True
 
     def submit(self, publication: FrozenTerminalGatewayPublication) -> bool:
         """Submit one publication or coalesce its exact retransmission.
@@ -465,7 +554,9 @@ class PackedTerminalOutputPublisher:
         publication_digest = publication.digest
         ready_token = terminal_receipt_token(publication.request_ready_receipt)
         fatal_reason: str | None = None
-        with self._lock:
+        should_notify = False
+        should_wake = False
+        with self._transition_lock, self._lock:
             if not self._admission_open:
                 raise TerminalGatewayPublisherError("publisher admission is closed")
             existing_digest = self._known_digests.get(identity_digest)
@@ -479,34 +570,50 @@ class PackedTerminalOutputPublisher:
             elif len(self._pending) >= self._capacity:
                 self._known_digests[identity_digest] = publication_digest
                 self._known_ready_tokens[identity_digest] = ready_token
-                self._failed[identity_digest] = publication.identity
                 fatal_reason = (
                     f"gateway publication queue exceeded capacity {self._capacity}"
                 )
             else:
                 self._known_digests[identity_digest] = publication_digest
                 self._known_ready_tokens[identity_digest] = ready_token
-                self._pending[identity_digest] = publication.identity
+                self._pending[identity_digest] = publication
                 self._queue.put(publication)
+            if fatal_reason is not None:
+                additional_failed = ()
+                if identity_digest not in self._completed:
+                    additional_failed = (publication,)
+                should_notify, should_wake = self._record_fatal_locked(
+                    fatal_reason,
+                    None,
+                    additional_failed,
+                )
         if fatal_reason is not None:
-            self._enter_fatal(fatal_reason, None)
+            self._finish_fatal_transition(
+                should_notify,
+                should_wake,
+                fatal_reason,
+                None,
+            )
             raise TerminalGatewayPublisherError(fatal_reason)
         return True
 
-    def stop_admission_and_join(self, timeout_seconds: float) -> bool:
-        """Drain accepted publications and join without polling.
+    def stop_admission_and_join(self) -> bool:
+        """Drain accepted publications under the frozen shutdown deadline.
 
-        :param timeout_seconds: Positive thread-join bound.
-        :returns: Whether the publisher stopped within the bound.
+        :returns: Whether the publisher stopped within the hash-bound deadline.
         """
 
-        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
-            raise ValueError("timeout_seconds must be a positive float")
-        with self._lock:
+        with self._transition_lock, self._lock:
             if not self._started:
                 raise TerminalGatewayPublisherError("publisher was never started")
             if self._disposition is TerminalGatewayPublisherDisposition.STOPPED:
                 return True
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = start_terminal_deadline(
+                    TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN,
+                    self._clock_ns(),
+                )
+            shutdown_deadline = self._shutdown_deadline
             if self._disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL:
                 should_enqueue_stop = False
             elif not self._stop_requested:
@@ -516,10 +623,19 @@ class PackedTerminalOutputPublisher:
                 should_enqueue_stop = True
             else:
                 should_enqueue_stop = False
+            thread_launched = self._thread_launched
         if should_enqueue_stop:
             self._queue.put(_PUBLISHER_STOP)
-        self._thread.join(timeout=timeout_seconds)
-        return not self._thread.is_alive()
+        if not thread_launched:
+            return True
+        timeout_seconds = self._remaining_deadline_seconds(shutdown_deadline)
+        if timeout_seconds > 0.0:
+            self._thread.join(timeout=timeout_seconds)
+        if not self._thread.is_alive():
+            return True
+        reason = shutdown_deadline.spec.timeout_outcome
+        self._enter_fatal(reason, None)
+        return False
 
     def snapshot(self) -> TerminalGatewayPublisherSnapshot:
         """Return exact publisher liveness and retained identity inventory.
@@ -532,7 +648,9 @@ class PackedTerminalOutputPublisher:
                 disposition=self._disposition,
                 admission_open=self._admission_open,
                 thread_alive=self._thread.is_alive(),
-                pending_identities=tuple(self._pending.values()),
+                pending_identities=tuple(
+                    publication.identity for publication in self._pending.values()
+                ),
                 completed_identities=tuple(self._completed.values()),
                 failed_identities=tuple(self._failed.values()),
                 fatal_reason=self._fatal_reason,
@@ -563,8 +681,9 @@ class PackedTerminalOutputPublisher:
                 current = item
                 self._publish_one(sink, current)
                 current = None
-            sink.close()
+            closing_sink = sink
             sink = None
+            closing_sink.close()
             with self._lock:
                 if (
                     self._disposition
@@ -576,33 +695,57 @@ class PackedTerminalOutputPublisher:
                         "publisher stopped with pending identities"
                     )
                 self._disposition = TerminalGatewayPublisherDisposition.STOPPED
-        except Exception:
+        # SystemExit from an injected sink or listener is still publisher death.
+        except BaseException:  # noqa: BLE001
             formatted_traceback = traceback.format_exc()
+            additional_tracebacks: list[str] = []
             reason = "gateway publisher thread failed"
+            self._enter_fatal(reason, formatted_traceback)
             if current is not None:
-                failed_ns = self._clock_ns()
+                try:
+                    failed_ns = max(current.enqueued_ns, self._clock_ns())
+                except BaseException:  # noqa: BLE001
+                    timestamp_traceback = (
+                        "failure timestamp error:\n" + traceback.format_exc()
+                    )
+                    additional_tracebacks.append(timestamp_traceback)
+                    formatted_traceback += "\n" + timestamp_traceback
+                    failed_ns = current.enqueued_ns
                 failure = TerminalGatewayPublicationFailure(
                     publication=current,
                     failed_ns=failed_ns,
                     reason=reason,
                     formatted_traceback=formatted_traceback,
                 )
-                identity_digest = current.identity.digest
-                with self._lock:
-                    self._pending.pop(identity_digest, None)
-                    self._failed[identity_digest] = current.identity
                 try:
-                    self._result_listener(failure)
-                except Exception:
-                    formatted_traceback += "\nresult listener failure:\n"
-                    formatted_traceback += traceback.format_exc()
+                    with self._transition_lock:
+                        self._result_listener(failure)
+                except BaseException:  # noqa: BLE001
+                    additional_tracebacks.append(
+                        "result listener failure:\n" + traceback.format_exc()
+                    )
             if sink is not None:
+                closing_sink = sink
+                sink = None
                 try:
-                    sink.close()
-                except Exception:
-                    formatted_traceback += "\nsink close failure:\n"
-                    formatted_traceback += traceback.format_exc()
-            self._enter_fatal(reason, formatted_traceback)
+                    closing_sink.close()
+                except BaseException:  # noqa: BLE001
+                    additional_tracebacks.append(
+                        "sink close failure:\n" + traceback.format_exc()
+                    )
+            if len(additional_tracebacks) > 0:
+                self._append_fatal_traceback("\n".join(additional_tracebacks))
+        finally:
+            with self._lock:
+                disposition = self._disposition
+            if disposition not in (
+                TerminalGatewayPublisherDisposition.STOPPED,
+                TerminalGatewayPublisherDisposition.PROCESS_FATAL,
+            ):
+                self._enter_fatal(
+                    "gateway publisher thread exited without a terminal disposition",
+                    None,
+                )
 
     def _publish_one(
         self,
@@ -619,14 +762,33 @@ class PackedTerminalOutputPublisher:
             raise TerminalGatewayPublisherError(
                 "gateway receipt issuer differs from the canonical source owner"
             )
+        identity_digest = publication.identity.digest
+        with self._lock:
+            if self._disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL:
+                raise TerminalGatewayPublisherError(
+                    "publisher entered process-fatal state before publication"
+                )
+            if self._pending.get(identity_digest) is not publication:
+                raise TerminalGatewayPublisherError(
+                    "queued identity differs from pending publication authority"
+                )
         self._request_ready_ledger = self._request_ready_ledger.consume(
             publication.request_ready_receipt,
             publication.canonical_binding,
             TerminalReceiptKind.REQUEST_READY,
             TerminalReceiptOutcome.SUCCESS,
         )
-        sink.send(publication.encoded_payload)
+        deadline = start_terminal_deadline(
+            TerminalDeadlineKind.OWNER_GATEWAY_PUBLICATION,
+            publication.enqueued_ns,
+        )
+        timeout_seconds = self._remaining_deadline_seconds(deadline)
+        if timeout_seconds <= 0.0:
+            raise TerminalGatewayPublisherError(deadline.spec.timeout_outcome)
+        sink.send(publication.encoded_payload, timeout_seconds)
         completed_ns = self._clock_ns()
+        if completed_ns >= deadline.expires_ns:
+            raise TerminalGatewayPublisherError(deadline.spec.timeout_outcome)
         receipts = tuple(
             self._wire_issuer.issue(
                 binding=binding,
@@ -641,14 +803,33 @@ class PackedTerminalOutputPublisher:
             completed_ns=completed_ns,
             source_receipts=receipts,
         )
-        self._result_listener(success)
-        identity_digest = publication.identity.digest
-        with self._lock:
-            if self._pending.pop(identity_digest, None) is None:
-                raise TerminalGatewayPublisherError(
-                    "published identity was absent from pending inventory"
-                )
-            self._completed[identity_digest] = publication.identity
+        with self._transition_lock:
+            with self._lock:
+                if (
+                    self._disposition
+                    is TerminalGatewayPublisherDisposition.PROCESS_FATAL
+                ):
+                    raise TerminalGatewayPublisherError(
+                        "publication completed after a process-fatal transition"
+                    )
+                if self._pending.get(identity_digest) is not publication:
+                    raise TerminalGatewayPublisherError(
+                        "published identity lost pending authority"
+                    )
+            self._result_listener(success)
+            with self._lock:
+                if (
+                    self._disposition
+                    is TerminalGatewayPublisherDisposition.PROCESS_FATAL
+                ):
+                    raise TerminalGatewayPublisherError(
+                        "publication result delivery entered process-fatal state"
+                    )
+                if self._pending.pop(identity_digest, None) is not publication:
+                    raise TerminalGatewayPublisherError(
+                        "published identity was absent from pending inventory"
+                    )
+                self._completed[identity_digest] = publication.identity
 
     def _enter_fatal(
         self,
@@ -661,29 +842,114 @@ class PackedTerminalOutputPublisher:
         :param formatted_traceback: Complete traceback when failure was raised.
         """
 
-        should_notify = False
-        should_wake = False
-        with self._lock:
-            if (
-                self._disposition
-                is not TerminalGatewayPublisherDisposition.PROCESS_FATAL
-            ):
-                self._admission_open = False
-                self._disposition = TerminalGatewayPublisherDisposition.PROCESS_FATAL
-                self._fatal_reason = reason
-                self._fatal_traceback = formatted_traceback
-                should_notify = True
-                should_wake = self._started
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        if formatted_traceback is not None and type(formatted_traceback) is not str:
+            raise TypeError("formatted_traceback must be a string or None")
+        with self._transition_lock, self._lock:
+            should_notify, should_wake = self._record_fatal_locked(
+                reason,
+                formatted_traceback,
+                (),
+            )
+        self._finish_fatal_transition(
+            should_notify,
+            should_wake,
+            reason,
+            formatted_traceback,
+        )
+
+    def _record_fatal_locked(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+        additional_failed: tuple[FrozenTerminalGatewayPublication, ...],
+    ) -> tuple[bool, bool]:
+        """Record one atomic fatal transition while lifecycle locks are held.
+
+        :param reason: Stable first-failure reason.
+        :param formatted_traceback: Complete traceback when failure was raised.
+        :param additional_failed: Rejected publications not in pending inventory.
+        :returns: Whether to notify lifecycle ownership and wake the thread.
+        """
+
+        if self._disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL:
+            return (False, False)
+        self._admission_open = False
+        self._disposition = TerminalGatewayPublisherDisposition.PROCESS_FATAL
+        self._fatal_reason = reason
+        self._fatal_traceback = formatted_traceback
+        for identity_digest, publication in self._pending.items():
+            self._failed[identity_digest] = publication.identity
+        self._pending.clear()
+        for publication in additional_failed:
+            identity_digest = publication.identity.digest
+            if identity_digest in self._completed:
+                continue
+            self._failed[identity_digest] = publication.identity
+        return (True, self._thread_launched)
+
+    def _finish_fatal_transition(
+        self,
+        should_notify: bool,
+        should_wake: bool,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Wake and notify after a fatal inventory transition releases locks.
+
+        :param should_notify: Whether this is the first fatal transition.
+        :param should_wake: Whether the publisher thread was launched.
+        :param reason: Stable first-failure reason.
+        :param formatted_traceback: Complete traceback when failure was raised.
+        """
+
         if should_wake:
             self._queue.put(_PUBLISHER_STOP)
-        if should_notify:
-            try:
-                self._fatal_listener(reason, formatted_traceback)
-            except Exception:
-                listener_traceback = traceback.format_exc()
-                with self._lock:
-                    existing = self._fatal_traceback
-                    prefix = "" if existing is None else existing + "\n"
-                    self._fatal_traceback = (
-                        prefix + "fatal listener failure:\n" + listener_traceback
-                    )
+        if not should_notify:
+            return
+        try:
+            self._fatal_listener(reason, formatted_traceback)
+        # A lifecycle callback cannot silently kill the publication owner.
+        except BaseException:  # noqa: BLE001
+            listener_traceback = traceback.format_exc()
+            self._append_fatal_traceback(
+                "fatal listener failure:\n" + listener_traceback
+            )
+
+    def _append_fatal_traceback(self, formatted_traceback: str) -> None:
+        """Retain additional fatal-path evidence without changing first cause.
+
+        :param formatted_traceback: Additional complete failure context.
+        """
+
+        if type(formatted_traceback) is not str or len(formatted_traceback) == 0:
+            raise ValueError("formatted_traceback must be a non-empty string")
+        with self._lock:
+            existing = self._fatal_traceback
+            if existing is None:
+                self._fatal_traceback = formatted_traceback
+                return
+            if formatted_traceback == existing:
+                return
+            self._fatal_traceback = existing + "\n" + formatted_traceback
+
+    def _remaining_deadline_seconds(
+        self,
+        deadline: BoundTerminalDeadline,
+    ) -> float:
+        """Return a nonnegative remainder without resetting a frozen deadline.
+
+        :param deadline: One-shot hash-bound phase deadline.
+        :returns: Remaining seconds, or zero after expiry.
+        """
+
+        if type(deadline) is not BoundTerminalDeadline:
+            raise TypeError("deadline must be BoundTerminalDeadline")
+        now_ns = self._clock_ns()
+        if now_ns < deadline.started_ns:
+            raise TerminalGatewayPublisherError(
+                "publisher clock precedes the frozen deadline anchor"
+            )
+        remaining_ns = max(0, deadline.expires_ns - now_ns)
+        return float(remaining_ns) / 1_000_000_000.0
