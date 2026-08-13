@@ -1651,7 +1651,8 @@ class NativeTerminalRuntime:
 
         if self._fatal_reason is None:
             self._fatal_reason = reason
-        self._disposition = NativeTerminalRuntimeDisposition.PROCESS_FATAL
+        if self._disposition is not NativeTerminalRuntimeDisposition.ABORT_DRAINING:
+            self._disposition = NativeTerminalRuntimeDisposition.PROCESS_FATAL
         self._scheduler_actions._mark_fatal(self._fatal_reason)
         self._coordinator_actions._mark_fatal(self._fatal_reason)
         self._lifecycle_actions._mark_fatal(self._fatal_reason)
