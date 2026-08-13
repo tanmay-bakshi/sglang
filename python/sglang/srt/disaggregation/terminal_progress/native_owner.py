@@ -548,9 +548,11 @@ class NativeTerminalOwner:
             raise RuntimeError("lifecycle snapshots require a native test build")
         if type(binding_digest) is not bytes or len(binding_digest) != 32:
             raise ValueError("binding_digest must contain 32 bytes")
-        return NativeTerminalLifecycleSnapshot.from_native(
-            self._native.lifecycle_snapshot(binding_digest)
-        )
+        try:
+            native_snapshot = self._native.lifecycle_snapshot(binding_digest)
+        except ValueError as error:
+            raise KeyError("native lifecycle snapshot binding is unknown") from error
+        return NativeTerminalLifecycleSnapshot.from_native(native_snapshot)
 
     def wait_for_lifecycle_registration(
         self, binding_digest: bytes, timeout_seconds: float

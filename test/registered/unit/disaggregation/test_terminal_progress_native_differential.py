@@ -314,6 +314,15 @@ def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
         owner.abort_and_close()
 
 
+def test_unknown_lifecycle_snapshot_uses_public_key_error_contract() -> None:
+    owner, _ = _make_dynamic_source_owner(start=True)
+    try:
+        with pytest.raises(KeyError, match="snapshot binding is unknown"):
+            owner.lifecycle_snapshot_for_testing(b"\xff" * 32)
+    finally:
+        owner.abort_and_close()
+
+
 def test_event_ordered_before_registration_fails_closed_as_unknown_binding() -> None:
     owner, identity = _make_dynamic_source_owner(start=False)
     registration = _make_dynamic_source_registration(identity, room_id=803)
