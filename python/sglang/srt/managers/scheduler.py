@@ -78,6 +78,11 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.runtime_capabilities import (
     PdProcessRuntimeCapabilities,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
+    PackedTerminalDecodeSchedulerInventory,
+    PackedTerminalDecodeSchedulerRegistration,
+    PackedTerminalDecodeServingComposition,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
@@ -392,6 +397,9 @@ class Scheduler(
     ):
         self.is_initializing = True
         self.terminal_scheduler_serving: TerminalSchedulerServing | None = None
+        self.terminal_decode_serving_composition: (
+            PackedTerminalDecodeServingComposition | None
+        ) = None
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -1382,6 +1390,69 @@ class Scheduler(
         if self.idle_sleeper is not None:
             self.idle_sleeper.register_file_descriptor(serving.fileno())
 
+    def bind_terminal_decode_serving_composition(
+        self,
+        composition: PackedTerminalDecodeServingComposition,
+    ) -> None:
+        """Bind the concrete decode consumer and its qualified inbox together.
+
+        :param composition: Process-lifetime decode serving composition.
+        """
+
+        if type(composition) is not PackedTerminalDecodeServingComposition:
+            raise TypeError(
+                "composition must be PackedTerminalDecodeServingComposition"
+            )
+        if self.disaggregation_mode is not DisaggregationMode.DECODE:
+            raise RuntimeError("decode serving composition requires decode mode")
+        if self.terminal_decode_serving_composition is not None:
+            raise RuntimeError("terminal decode serving is already bound")
+        self.bind_terminal_scheduler_serving(composition.scheduler_serving)
+        self.terminal_decode_serving_composition = composition
+
+    def register_terminal_decode_scheduler_adoption(
+        self,
+        registration: PackedTerminalDecodeSchedulerRegistration,
+    ) -> None:
+        """Retain one exact request across native and scheduler ownership.
+
+        :param registration: Complete decode request ownership and callbacks.
+        """
+
+        composition = self.terminal_decode_serving_composition
+        if composition is None:
+            raise RuntimeError("terminal decode serving composition is not bound")
+        composition.register(registration)
+
+    def cancel_unpublished_terminal_decode_scheduler_adoption(
+        self,
+        binding: TerminalRequestBinding,
+        reason: str,
+    ) -> None:
+        """Pair safe decode rollback with scheduler-inbox cancellation.
+
+        :param binding: Exact unpublished decode lifecycle identity.
+        :param reason: Stable cancellation evidence.
+        """
+
+        composition = self.terminal_decode_serving_composition
+        if composition is None:
+            raise RuntimeError("terminal decode serving composition is not bound")
+        composition.cancel_unpublished(binding, reason)
+
+    def terminal_decode_scheduler_inventory(
+        self,
+    ) -> PackedTerminalDecodeSchedulerInventory | None:
+        """Return concrete decode request conservation evidence.
+
+        :returns: Decode consumer inventory when the composition is bound.
+        """
+
+        composition = self.terminal_decode_serving_composition
+        if composition is None:
+            return None
+        return composition.consumer.inventory()
+
     def register_terminal_scheduler_request(
         self,
         binding: TerminalRequestBinding | NativeTerminalRequestBinding,
@@ -1518,6 +1589,9 @@ class Scheduler(
             else:
                 serving.close()
         finally:
+            composition = self.terminal_decode_serving_composition
+            if composition is not None and composition.scheduler_serving is serving:
+                self.terminal_decode_serving_composition = None
             self.terminal_scheduler_serving = None
 
     def init_decode_reservation_control(self) -> None:
@@ -4370,8 +4444,6 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash() and self.draft_worker is not None:
             ret.update(self.draft_worker.cuda_graph_profile())
-
-
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0
