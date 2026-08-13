@@ -78,6 +78,7 @@ def test_prefill_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
         pd_terminal_cohort_manifest=str(path),
         pd_terminal_cohort_sha256=digest,
         pd_terminal_local_service="prefill-a",
+        pd_terminal_startup_timeout_seconds=60.0,
     )
 
     args._handle_pd_disaggregation()
@@ -85,6 +86,8 @@ def test_prefill_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
     assert args.pd_terminal_deployment_cohort == _cohort()
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "prefill-a"
+    assert args.pd_terminal_startup_expectation is not None
+    assert args.pd_terminal_startup_expectation.expected_rank_count == 3
 
 
 def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
@@ -102,12 +105,15 @@ def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
         pd_terminal_cohort_manifest=str(path),
         pd_terminal_cohort_sha256=digest,
         pd_terminal_local_service="decode-a",
+        pd_terminal_startup_timeout_seconds=60.0,
     )
 
     args._handle_pd_disaggregation()
 
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "decode-a"
+    assert args.pd_terminal_startup_expectation is not None
+    assert args.pd_terminal_startup_expectation.expected_rank_count == 3
 
 
 def test_terminal_cohort_arguments_are_all_or_none(tmp_path: Path) -> None:
@@ -139,6 +145,7 @@ def test_terminal_cohort_rejects_local_and_digest_drift(tmp_path: Path) -> None:
         pd_terminal_cohort_manifest=str(path),
         pd_terminal_cohort_sha256="ff" * 32,
         pd_terminal_local_service="decode-a",
+        pd_terminal_startup_timeout_seconds=60.0,
     )
     with pytest.raises(ValueError, match="digest differs"):
         digest_drift._handle_pd_disaggregation()
@@ -155,6 +162,7 @@ def test_terminal_cohort_rejects_local_and_digest_drift(tmp_path: Path) -> None:
         pd_terminal_cohort_manifest=str(path),
         pd_terminal_cohort_sha256=digest,
         pd_terminal_local_service="decode-a",
+        pd_terminal_startup_timeout_seconds=60.0,
     )
     with pytest.raises(ValueError, match="differs"):
         identity_drift._handle_pd_disaggregation()

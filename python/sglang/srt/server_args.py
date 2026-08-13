@@ -58,6 +58,12 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentRole,
     load_terminal_deployment_cohort,
 )
+from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
+    build_terminal_startup_cohort_expectation,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortExpectation,
+)
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -3023,6 +3029,11 @@ class ServerArgs:
         "Exact local service ID selected from the packed-terminal cohort.",
         NS("disagg"),
     ] = None
+    pd_terminal_startup_timeout_seconds: A[
+        Optional[float],
+        "Hash-bound maximum duration of the immutable packed-terminal startup join.",
+        NS("disagg"),
+    ] = None
     pd_terminal_deployment_cohort: A[
         TerminalDeploymentCohort | None,
         Arg(no_cli=True),
@@ -3030,6 +3041,11 @@ class ServerArgs:
     ] = dataclasses.field(default=None, init=False, repr=False)
     pd_terminal_local_membership: A[
         TerminalDeploymentLocalService | None,
+        Arg(no_cli=True),
+        NS("disagg"),
+    ] = dataclasses.field(default=None, init=False, repr=False)
+    pd_terminal_startup_expectation: A[
+        TerminalStartupCohortExpectation | None,
         Arg(no_cli=True),
         NS("disagg"),
     ] = dataclasses.field(default=None, init=False, repr=False)
@@ -3840,6 +3856,7 @@ class ServerArgs:
             self.pd_terminal_cohort_manifest,
             self.pd_terminal_cohort_sha256,
             self.pd_terminal_local_service,
+            self.pd_terminal_startup_timeout_seconds,
         )
         if all(value is None for value in values):
             return
@@ -3850,6 +3867,12 @@ class ServerArgs:
             )
         if self.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError("packed-terminal cohort requires PD disaggregation")
+        startup_timeout_seconds = self.pd_terminal_startup_timeout_seconds
+        assert startup_timeout_seconds is not None
+        if not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0.0:
+            raise ValueError(
+                "packed-terminal startup timeout must be a positive finite value"
+            )
         digest_hex = self.pd_terminal_cohort_sha256
         assert digest_hex is not None
         if len(digest_hex) != 64:
@@ -3901,6 +3924,9 @@ class ServerArgs:
             raise ValueError("local KV-layout fingerprint differs from terminal cohort")
         self.pd_terminal_deployment_cohort = cohort
         self.pd_terminal_local_membership = membership
+        self.pd_terminal_startup_expectation = (
+            build_terminal_startup_cohort_expectation(cohort, membership)
+        )
 
     def pd_process_advertisement(
         self, runtime_capabilities: PdProcessRuntimeCapabilities | None

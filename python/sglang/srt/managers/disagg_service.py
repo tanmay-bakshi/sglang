@@ -3,6 +3,11 @@
 import os
 
 from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
+from sglang.srt.disaggregation.nixl import NixlKVBootstrapServer
+from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortExpectation,
+    TerminalStartupCohortRegistry,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -20,6 +25,28 @@ def start_disagg_service(
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
     if disagg_mode == DisaggregationMode.PREFILL:
+        startup_expectation = server_args.pd_terminal_startup_expectation
+        if startup_expectation is not None:
+            if type(startup_expectation) is not TerminalStartupCohortExpectation:
+                raise TypeError(
+                    "pd_terminal_startup_expectation has an invalid type"
+                )
+            if transfer_backend != TransferBackend.NIXL:
+                raise ValueError(
+                    "packed-terminal startup requires the NIXL transfer backend"
+                )
+            timeout_seconds = server_args.pd_terminal_startup_timeout_seconds
+            if timeout_seconds is None:
+                raise ValueError("packed-terminal startup timeout is absent")
+            registry = TerminalStartupCohortRegistry(
+                startup_expectation,
+                timeout_seconds=timeout_seconds,
+            )
+            return NixlKVBootstrapServer(
+                host=server_args.host,
+                port=server_args.disaggregation_bootstrap_port,
+                terminal_startup_registry=registry,
+            )
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
