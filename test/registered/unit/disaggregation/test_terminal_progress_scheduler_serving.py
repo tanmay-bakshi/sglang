@@ -573,6 +573,7 @@ def test_scheduler_process_fatal_teardown_unregisters_and_closes_inbox() -> None
     sleeper.register_file_descriptor(file_descriptor)
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.terminal_scheduler_serving = serving
+    scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = sleeper
 
     Scheduler.close_terminal_scheduler_serving(scheduler, process_fatal=True)
@@ -594,6 +595,7 @@ def test_graceful_scheduler_teardown_quarantines_live_generation() -> None:
     serving.register_request(binding)
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.terminal_scheduler_serving = serving
+    scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = None
 
     Scheduler.close_terminal_scheduler_serving(scheduler, process_fatal=False)
