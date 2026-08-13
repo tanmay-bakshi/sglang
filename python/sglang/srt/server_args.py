@@ -30,6 +30,7 @@ import stat
 import tempfile
 import uuid
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -50,6 +51,12 @@ from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_b
 from sglang.srt.connector import ConnectorType
 from sglang.srt.disaggregation.runtime_capabilities import (
     PdProcessRuntimeCapabilities,
+)
+from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
+    TerminalDeploymentCohort,
+    TerminalDeploymentLocalService,
+    TerminalDeploymentRole,
+    load_terminal_deployment_cohort,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
@@ -3001,6 +3008,31 @@ class ServerArgs:
         "Explicit non-local bootstrap host advertised by a PD prefill process.",
         NS("disagg"),
     ] = None
+    pd_terminal_cohort_manifest: A[
+        Optional[str],
+        "Path to the immutable per-group packed-terminal deployment cohort.",
+        NS("disagg"),
+    ] = None
+    pd_terminal_cohort_sha256: A[
+        Optional[str],
+        "Lowercase SHA-256 of the exact packed-terminal cohort bytes.",
+        NS("disagg"),
+    ] = None
+    pd_terminal_local_service: A[
+        Optional[str],
+        "Exact local service ID selected from the packed-terminal cohort.",
+        NS("disagg"),
+    ] = None
+    pd_terminal_deployment_cohort: A[
+        TerminalDeploymentCohort | None,
+        Arg(no_cli=True),
+        NS("disagg"),
+    ] = dataclasses.field(default=None, init=False, repr=False)
+    pd_terminal_local_membership: A[
+        TerminalDeploymentLocalService | None,
+        Arg(no_cli=True),
+        NS("disagg"),
+    ] = dataclasses.field(default=None, init=False, repr=False)
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
@@ -3799,6 +3831,76 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         handle_pd_disaggregation(self)
+        self._handle_terminal_deployment_cohort()
+
+    def _handle_terminal_deployment_cohort(self) -> None:
+        """Load and bind the exact local packed-terminal cohort member."""
+
+        values = (
+            self.pd_terminal_cohort_manifest,
+            self.pd_terminal_cohort_sha256,
+            self.pd_terminal_local_service,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise ValueError(
+                "packed-terminal cohort manifest, SHA-256, and local service "
+                "must be configured together"
+            )
+        if self.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError("packed-terminal cohort requires PD disaggregation")
+        digest_hex = self.pd_terminal_cohort_sha256
+        assert digest_hex is not None
+        if len(digest_hex) != 64:
+            raise ValueError(
+                "packed-terminal cohort SHA-256 must contain 64 hex digits"
+            )
+        try:
+            digest = bytes.fromhex(digest_hex)
+        except ValueError as error:
+            raise ValueError(
+                "packed-terminal cohort SHA-256 must be lowercase hexadecimal"
+            ) from error
+        if digest.hex() != digest_hex:
+            raise ValueError(
+                "packed-terminal cohort SHA-256 must be lowercase hexadecimal"
+            )
+        manifest = self.pd_terminal_cohort_manifest
+        local_service = self.pd_terminal_local_service
+        assert manifest is not None
+        assert local_service is not None
+        cohort = load_terminal_deployment_cohort(Path(manifest), digest)
+        role = TerminalDeploymentRole(self.disaggregation_mode)
+        origin = f"http://127.0.0.1:{self.port}"
+        bootstrap_endpoint = None
+        if role is TerminalDeploymentRole.PREFILL:
+            bootstrap_endpoint = cohort.prefill.bootstrap_endpoint
+            if (
+                self.disaggregation_bootstrap_port != bootstrap_endpoint.port
+                or self.pd_prefill_bootstrap_advertise_host
+                != bootstrap_endpoint.host
+            ):
+                raise ValueError(
+                    "local prefill bootstrap differs from packed-terminal cohort"
+                )
+        membership = cohort.require_local_service(
+            service_id=local_service,
+            role=role,
+            launch_instance_id=uuid.UUID(self.launch_instance_id),
+            tensor_parallel_size=self.tp_size,
+            origin=origin,
+            bootstrap_endpoint=bootstrap_endpoint,
+        )
+        if self.pd_model_fingerprint != cohort.model_fingerprint:
+            raise ValueError("local model fingerprint differs from terminal cohort")
+        if (
+            self.pd_logical_kv_layout_fingerprint
+            != cohort.logical_kv_layout_fingerprint
+        ):
+            raise ValueError("local KV-layout fingerprint differs from terminal cohort")
+        self.pd_terminal_deployment_cohort = cohort
+        self.pd_terminal_local_membership = membership
 
     def pd_process_advertisement(
         self, runtime_capabilities: PdProcessRuntimeCapabilities | None
