@@ -89,6 +89,7 @@ class PackedTerminalProgressOwner:
 
     _submission_source: TerminalOwnerQueueEventSource
     _deadline_pulse_source: TerminalOwnerPulseEventSource
+    _output_pulse_source: TerminalOwnerPulseEventSource
     _registrations: tuple[TerminalOwnerEventSourceRegistration, ...]
     _sources_by_name: dict[str, TerminalOwnerEventSource]
     _source_next_sequence: dict[str, int]
@@ -160,6 +161,9 @@ class PackedTerminalProgressOwner:
         deadline_pulse_source = TerminalOwnerPulseEventSource(
             name="packed-terminal-owner-deadline-pulse"
         )
+        output_pulse_source = TerminalOwnerPulseEventSource(
+            name="packed-terminal-owner-output-pulse"
+        )
         registrations = (
             TerminalOwnerEventSourceRegistration(
                 source=submission_source,
@@ -176,14 +180,17 @@ class PackedTerminalProgressOwner:
         if len(set(names)) != len(names):
             submission_source.close()
             deadline_pulse_source.close()
+            output_pulse_source.close()
             raise ValueError("event source names must be unique")
         if len(set(fds)) != len(fds):
             submission_source.close()
             deadline_pulse_source.close()
+            output_pulse_source.close()
             raise ValueError("event source file descriptors must be unique")
 
         self._submission_source = submission_source
         self._deadline_pulse_source = deadline_pulse_source
+        self._output_pulse_source = output_pulse_source
         self._registrations = registrations
         self._sources_by_name = {
             registration.source.name: registration.source
@@ -296,6 +303,10 @@ class PackedTerminalProgressOwner:
             type(maximum_items) is not int or maximum_items <= 0
         ):
             raise ValueError("maximum_items must be a positive integer")
+        try:
+            self._output_pulse_source.drain()
+        except TerminalOwnerClosedError:
+            pass
         should_wake = False
         with self._condition:
             count = len(self._outputs)
@@ -310,6 +321,19 @@ class PackedTerminalProgressOwner:
             except TerminalOwnerClosedError:
                 pass
         return outputs
+
+    def output_fileno(self) -> int:
+        """Return the fd signalling newly queued immutable outputs.
+
+        Queue insertion is authoritative and the fd is only a coalesced wake
+        hint. Consumers drain all available outputs whenever it becomes
+        readable, then dispatch each receipt to its exact scheduler, publisher,
+        coordinator, or metrics inbox.
+
+        :returns: Open readable output-notification descriptor.
+        """
+
+        return self._output_pulse_source.fileno()
 
     def snapshot(self) -> TerminalOwnerSnapshot:
         """Return an immutable process-lifetime inventory snapshot.
@@ -442,6 +466,7 @@ class PackedTerminalProgressOwner:
             for registration in self._registrations:
                 if registration.close_on_shutdown:
                     registration.source.close()
+            self._output_pulse_source.close()
             with self._condition:
                 self._reactor_alive = False
                 self._admission_open = False
@@ -747,6 +772,7 @@ class PackedTerminalProgressOwner:
                 owner_sequence=owner_sequence,
             )
         )
+        self._output_pulse_source.signal()
 
     def _emit_timing_locked(
         self,
@@ -779,6 +805,7 @@ class PackedTerminalProgressOwner:
                 owner_sequence=owner_sequence,
             )
         )
+        self._output_pulse_source.signal()
 
     def _require_output_capacity_locked(self) -> None:
         """Fail before silently dropping one owner output."""
