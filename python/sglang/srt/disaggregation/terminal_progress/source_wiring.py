@@ -9,19 +9,13 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
 )
-from sglang.srt.disaggregation.terminal_progress.native_owner import (
-    NativeTerminalOwner,
-)
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
-    NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
-    NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
-    NativeTerminalProducerRegistration,
     NativeTerminalPublicationIdentity,
     NativeTerminalReceipt,
     NativeTerminalRequestBinding,
@@ -51,6 +45,125 @@ logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
+class NativeTerminalSourceRuntime(Protocol):
+    """Process-lifetime native runtime surface consumed by source wiring."""
+
+    def python_producer_id(
+        self,
+        producer_class: NativeTerminalProducerClass,
+        authenticated_issuer: NativeTerminalProcessIdentity | None = None,
+    ) -> int:
+        """Resolve one pre-registered Python producer authority.
+
+        :param producer_class: Required local, control, or receipt authority.
+        :param authenticated_issuer: Route-authenticated issuer when required.
+        :returns: Exact registered producer identity.
+        """
+
+    def register_lifecycle(
+        self,
+        registration: NativeTerminalLifecycleRegistration,
+    ) -> None:
+        """Register one source lifecycle before its first event.
+
+        :param registration: Complete native source registration.
+        """
+
+    def submit(
+        self,
+        producer_id: int,
+        binding_digest: bytes,
+        kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Submit one producer-ordered event to the native owner.
+
+        :param producer_id: Exact registered producer identity.
+        :param binding_digest: Exact lifecycle lookup identity.
+        :param kind: Closed native event kind.
+        :param receipt: Authenticated authority when required.
+        :param reason: Stable failure evidence when required.
+        :param enqueued_ns: Optional exact native-clock timestamp.
+        """
+
+    def submit_imported_receipt(
+        self,
+        producer_id: int,
+        receipt: NativeTerminalReceipt,
+        kind: NativeTerminalOwnerEventKind,
+        *,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Submit route-authenticated imported receipt authority.
+
+        :param producer_id: Producer bound to the receipt issuer.
+        :param receipt: Exact imported native receipt.
+        :param kind: Receipt-consuming source transition.
+        :param reason: Stable failure evidence when required.
+        :param enqueued_ns: Optional exact native-clock timestamp.
+        """
+
+    def complete_work_action(
+        self,
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Complete one source or publication work action exactly once.
+
+        :param producer_id: Producer owning the continuation transition.
+        :param action: Exact action previously drained from the runtime.
+        :param followup_kind: Exact success or failure transition.
+        :param receipt: Publication authority when required.
+        :param reason: Stable failure evidence when required.
+        :param enqueued_ns: Optional exact native-clock timestamp.
+        """
+
+    def complete_scheduler_action(
+        self,
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        completion_receipt: NativeTerminalReceipt | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Complete scheduler-affine reclaim under exact authority.
+
+        :param producer_id: Local receipt producer identity.
+        :param action: Exact reclaim action previously drained.
+        :param followup_kind: Reclaim-consumed transition.
+        :param completion_receipt: Scheduler-minted consumption authority.
+        :param enqueued_ns: Optional exact native-clock timestamp.
+        """
+
+    def fail_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> None:
+        """Fail one ambiguous scheduler action without losing its authority.
+
+        :param action: Exact scheduler action which could not complete.
+        :param reason: Stable process-fatal failure evidence.
+        """
+
+    def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Release runtime accounting after terminal action consumption.
+
+        :param action: Exact terminal action accepted by source wiring.
+        """
+
+
+@runtime_checkable
 class PackedTerminalSourceMetricsSink(Protocol):
     """Non-gating sink for source lifecycle timing projections."""
 
@@ -71,173 +184,6 @@ class PackedTerminalSourcePublisher(Protocol):
         :param publication: Exact output handoff earned by native readiness.
         :returns: Whether a new publication was enqueued.
         """
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class PackedTerminalSourceProducer:
-    """One exact Python producer registered with the native source owner.
-
-    :ivar producer_id: Stable process-lifetime native producer namespace.
-    :ivar name: Evidence-facing producer name.
-    :ivar producer_class: Authority class accepted from this producer.
-    :ivar authenticated_issuer: Exact route-authenticated issuer, when required.
-    """
-
-    producer_id: int
-    name: str
-    producer_class: NativeTerminalProducerClass
-    authenticated_issuer: TerminalProcessIdentity | None
-
-    def __post_init__(self) -> None:
-        """Validate producer identity without inventing an authority mapping."""
-
-        if type(self.producer_id) is not int or self.producer_id < 0:
-            raise ValueError("producer_id must be a non-negative integer")
-        if type(self.name) is not str or len(self.name) == 0:
-            raise ValueError("name must be a non-empty string")
-        if type(self.producer_class) is not NativeTerminalProducerClass:
-            raise TypeError("producer_class must be NativeTerminalProducerClass")
-        if self.authenticated_issuer is not None and (
-            type(self.authenticated_issuer) is not TerminalProcessIdentity
-        ):
-            raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
-        if self.producer_class is NativeTerminalProducerClass.LOCAL:
-            if self.authenticated_issuer is not None:
-                raise ValueError("local producers cannot authenticate a wire issuer")
-            return
-        if self.producer_class is NativeTerminalProducerClass.QUALIFICATION:
-            raise ValueError("serving wiring cannot own qualification producers")
-        if self.authenticated_issuer is None:
-            raise ValueError("non-local producers require an authenticated issuer")
-
-    @property
-    def authority_key(
-        self,
-    ) -> tuple[NativeTerminalProducerClass, bytes | None]:
-        """Return the exact authority lookup key.
-
-        :returns: Producer class paired with the authenticated issuer digest.
-        """
-
-        issuer = self.authenticated_issuer
-        return (
-            self.producer_class,
-            None if issuer is None else issuer.digest,
-        )
-
-    def native_registration(self) -> NativeTerminalProducerRegistration:
-        """Build the exact native producer registration.
-
-        :returns: Fixed native authority registration.
-        """
-
-        issuer = self.authenticated_issuer
-        return NativeTerminalProducerRegistration(
-            producer_id=self.producer_id,
-            name=self.name,
-            producer_class=self.producer_class,
-            allowed_role=NativeTerminalOwnerRole.SOURCE,
-            authenticated_issuer=(
-                None
-                if issuer is None
-                else NativeTerminalProcessIdentity.from_identity(issuer)
-            ),
-        )
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class PackedTerminalSourceProducerDirectory:
-    """Immutable source authority to registered-producer mapping.
-
-    :ivar local_identity: Exact source process owning the native reactor.
-    :ivar producers: Complete Python producer registry in registration order.
-    """
-
-    local_identity: TerminalProcessIdentity
-    producers: tuple[PackedTerminalSourceProducer, ...]
-
-    def __post_init__(self) -> None:
-        """Validate complete, collision-free source producer authority."""
-
-        if type(self.local_identity) is not TerminalProcessIdentity:
-            raise TypeError("local_identity must be TerminalProcessIdentity")
-        if self.local_identity.role is not TerminalOwnerRole.SOURCE:
-            raise ValueError("local_identity must belong to a source owner")
-        if type(self.producers) is not tuple or len(self.producers) == 0:
-            raise ValueError("producers must be a non-empty tuple")
-        if any(
-            type(producer) is not PackedTerminalSourceProducer
-            for producer in self.producers
-        ):
-            raise TypeError("producers must contain PackedTerminalSourceProducer")
-        producer_ids = tuple(producer.producer_id for producer in self.producers)
-        if tuple(sorted(producer_ids)) != producer_ids:
-            raise ValueError("producers must use ascending producer-id order")
-        if len(set(producer_ids)) != len(producer_ids):
-            raise ValueError("producer ids must be unique")
-        authority_keys = tuple(producer.authority_key for producer in self.producers)
-        if len(set(authority_keys)) != len(authority_keys):
-            raise ValueError("producer authority mappings must be unique")
-        local_key = (NativeTerminalProducerClass.LOCAL, None)
-        if authority_keys.count(local_key) != 1:
-            raise ValueError("producer directory requires one local event producer")
-        local_receipt_key = (
-            NativeTerminalProducerClass.RECEIPT,
-            self.local_identity.digest,
-        )
-        if authority_keys.count(local_receipt_key) != 1:
-            raise ValueError("producer directory requires one local receipt producer")
-
-    def register(self, owner: NativeTerminalOwner) -> None:
-        """Register every Python producer before the native reactor starts.
-
-        :param owner: Exact process-lifetime native source owner.
-        """
-
-        if type(owner) is not NativeTerminalOwner:
-            raise TypeError("owner must be NativeTerminalOwner")
-        for producer in self.producers:
-            owner.register_producer(producer.native_registration())
-
-    def producer_id(
-        self,
-        producer_class: NativeTerminalProducerClass,
-        authenticated_issuer: TerminalProcessIdentity | None,
-    ) -> int:
-        """Resolve one exact registered authority without guessed ids.
-
-        :param producer_class: Required native authority class.
-        :param authenticated_issuer: Independently authenticated route identity.
-        :returns: Exact registered producer id.
-        """
-
-        if type(producer_class) is not NativeTerminalProducerClass:
-            raise TypeError("producer_class must be NativeTerminalProducerClass")
-        if authenticated_issuer is not None and (
-            type(authenticated_issuer) is not TerminalProcessIdentity
-        ):
-            raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
-        key = (
-            producer_class,
-            None if authenticated_issuer is None else authenticated_issuer.digest,
-        )
-        matching = tuple(
-            producer.producer_id
-            for producer in self.producers
-            if producer.authority_key == key
-        )
-        if len(matching) != 1:
-            raise RuntimeError("producer directory has no exact authority mapping")
-        return matching[0]
-
-    @property
-    def producer_ids(self) -> tuple[int, ...]:
-        """Return the ordered Python producer identities.
-
-        :returns: Producer ids in registration and retirement order.
-        """
-
-        return tuple(producer.producer_id for producer in self.producers)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -345,6 +291,7 @@ class _SourceRecord:
     """Side-effect inventory keyed by native-owned lifecycle identity."""
 
     submission: PackedTerminalSourceSubmission
+    lifecycle_published: bool = False
     request_ready_receipt: TerminalReceipt | None = None
     publication_action: NativeTerminalOwnerAction | None = None
     publication_submitted: bool = False
@@ -356,16 +303,17 @@ class _SourceRecord:
 
 
 class PackedTerminalSourceWiring:
-    """Dispatch source side effects under one concrete native owner.
+    """Dispatch source side effects through one process-lifetime runtime.
 
-    The native owner alone reduces lifecycle state and assigns producer
-    sequences. This component retains immutable serving payloads, performs only
-    actions explicitly earned by the owner, and returns the corresponding event
-    before acknowledging each one-shot native action.
+    The native runtime alone owns the reducer, producer namespaces, native
+    action routing, and conservation. This component retains immutable serving
+    payloads and performs only side effects explicitly earned by runtime actions.
     """
 
-    _owner: NativeTerminalOwner
-    _producers: PackedTerminalSourceProducerDirectory
+    _runtime: NativeTerminalSourceRuntime
+    _local_identity: TerminalProcessIdentity
+    _local_producer_id: int
+    _local_receipt_producer_id: int
     _reclaim_issuer: TerminalWireReceiptIssuer
     _publisher: PackedTerminalSourcePublisher | None
     _metrics_sink: PackedTerminalSourceMetricsSink
@@ -377,25 +325,27 @@ class PackedTerminalSourceWiring:
     def __init__(
         self,
         *,
-        owner: NativeTerminalOwner,
-        producers: PackedTerminalSourceProducerDirectory,
+        runtime: NativeTerminalSourceRuntime,
+        local_identity: TerminalProcessIdentity,
         publisher: PackedTerminalSourcePublisher | None,
         metrics_sink: PackedTerminalSourceMetricsSink,
         clock_ns: Callable[[], int],
     ) -> None:
-        """Construct source wiring and freeze its Python producer registry.
+        """Construct source wiring over the sole process-lifetime runtime.
 
-        :param owner: Sole authoritative process-lifetime native owner.
-        :param producers: Exact authority-to-producer directory.
+        :param runtime: Sole authoritative native lifecycle runtime.
+        :param local_identity: Exact source process owned by this wiring.
         :param publisher: Canonical-rank publisher, otherwise ``None``.
         :param metrics_sink: Non-gating metric projection sink.
         :param clock_ns: Local monotonic nanosecond clock.
         """
 
-        if type(owner) is not NativeTerminalOwner:
-            raise TypeError("owner must be NativeTerminalOwner")
-        if type(producers) is not PackedTerminalSourceProducerDirectory:
-            raise TypeError("producers must be PackedTerminalSourceProducerDirectory")
+        if not isinstance(runtime, NativeTerminalSourceRuntime):
+            raise TypeError("runtime must satisfy NativeTerminalSourceRuntime")
+        if type(local_identity) is not TerminalProcessIdentity:
+            raise TypeError("local_identity must be TerminalProcessIdentity")
+        if local_identity.role is not TerminalOwnerRole.SOURCE:
+            raise ValueError("local_identity must belong to a source owner")
         if publisher is not None and not isinstance(
             publisher,
             PackedTerminalSourcePublisher,
@@ -405,14 +355,21 @@ class PackedTerminalSourceWiring:
             raise TypeError("metrics_sink must satisfy PackedTerminalSourceMetricsSink")
         if not callable(clock_ns):
             raise TypeError("clock_ns must be callable")
-        if producers.local_identity.tp_rank == 0 and publisher is None:
+        if local_identity.tp_rank == 0 and publisher is None:
             raise ValueError("canonical source rank requires a gateway publisher")
-        if producers.local_identity.tp_rank != 0 and publisher is not None:
+        if local_identity.tp_rank != 0 and publisher is not None:
             raise ValueError("only canonical source rank may own a gateway publisher")
-        producers.register(owner)
-        self._owner = owner
-        self._producers = producers
-        self._reclaim_issuer = TerminalWireReceiptIssuer(producers.local_identity)
+        native_identity = NativeTerminalProcessIdentity.from_identity(local_identity)
+        self._runtime = runtime
+        self._local_identity = local_identity
+        self._local_producer_id = runtime.python_producer_id(
+            NativeTerminalProducerClass.LOCAL
+        )
+        self._local_receipt_producer_id = runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            native_identity,
+        )
+        self._reclaim_issuer = TerminalWireReceiptIssuer(local_identity)
         self._publisher = publisher
         self._metrics_sink = metrics_sink
         self._clock_ns = clock_ns
@@ -430,8 +387,8 @@ class PackedTerminalSourceWiring:
             raise TypeError("submission must be PackedTerminalSourceSubmission")
         identity = submission.identity
         binding = identity.local_binding
-        if binding.owner != self._producers.local_identity:
-            raise RuntimeError("source submission belongs to another native owner")
+        if binding.owner != self._local_identity:
+            raise RuntimeError("source submission belongs to another runtime")
         digest = binding.digest
         record = _SourceRecord(submission=submission)
         with self._lock:
@@ -440,28 +397,60 @@ class PackedTerminalSourceWiring:
             # Once accepted, this record is retained on every downstream error;
             # silently removing it could make scheduler-owned pages look reusable.
             self._records[digest] = record
-        self._owner.register_lifecycle(
-            NativeTerminalLifecycleRegistration(
-                binding=NativeTerminalRequestBinding.from_binding(binding),
-                publication_identity=NativeTerminalPublicationIdentity.from_identity(
-                    identity.publication_identity
-                ),
-                trusted_issuers=tuple(
-                    NativeTerminalProcessIdentity.from_identity(issuer)
-                    for issuer in identity.trusted_issuers
-                ),
-            )
+        registration = NativeTerminalLifecycleRegistration(
+            binding=NativeTerminalRequestBinding.from_binding(binding),
+            publication_identity=NativeTerminalPublicationIdentity.from_identity(
+                identity.publication_identity
+            ),
+            trusted_issuers=tuple(
+                NativeTerminalProcessIdentity.from_identity(issuer)
+                for issuer in identity.trusted_issuers
+            ),
         )
-        self._submit_event(
-            producer_class=NativeTerminalProducerClass.LOCAL,
-            authenticated_issuer=None,
-            binding_digest=digest,
-            kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        self._runtime.register_lifecycle(registration)
+        with self._lock:
+            current = self._records.get(digest)
+            if current is not record:
+                raise RuntimeError("source registry changed during lifecycle publish")
+            current.lifecycle_published = True
+        self._runtime.submit(
+            self._local_producer_id,
+            digest,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=self._clock_ns(),
         )
         self._emit_metric_once(
             digest,
             NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
         )
+
+    def lifecycle_published(self, binding_digest: bytes) -> bool:
+        """Return whether a lifecycle crossed the native publication boundary.
+
+        :param binding_digest: Exact source lifecycle identity.
+        :returns: Whether runtime registration completed.
+        """
+
+        return self._record(binding_digest).lifecycle_published
+
+    def cancel_unpublished(
+        self, binding_digest: bytes
+    ) -> PackedTerminalSourceSubmission:
+        """Remove one submission which never reached native registration.
+
+        :param binding_digest: Exact unpublished source lifecycle identity.
+        :returns: Immutable submission released from the source registry.
+        """
+
+        record = self._record(binding_digest)
+        with self._lock:
+            current = self._records.get(binding_digest)
+            if current is not record:
+                raise RuntimeError("source registry changed during cancellation")
+            if current.lifecycle_published:
+                raise RuntimeError("published source lifecycle cannot be cancelled")
+            del self._records[binding_digest]
+        return record.submission
 
     def producer_completed(self, binding_digest: bytes) -> None:
         """Commit completion of the exact producer event and stable slots.
@@ -604,12 +593,15 @@ class PackedTerminalSourceWiring:
             if current.request_ready_receipt is not None:
                 raise RuntimeError("request-ready authority was delivered twice")
             current.request_ready_receipt = local_receipt
-        self._submit_event(
-            producer_class=NativeTerminalProducerClass.RECEIPT,
-            authenticated_issuer=authenticated_issuer,
-            binding_digest=binding_digest,
-            kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
-            receipt=NativeTerminalReceipt.from_wire_receipt(wire_receipt),
+        producer_id = self._runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            NativeTerminalProcessIdentity.from_identity(authenticated_issuer),
+        )
+        self._runtime.submit_imported_receipt(
+            producer_id,
+            NativeTerminalReceipt.from_wire_receipt(wire_receipt),
+            NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
+            enqueued_ns=self._clock_ns(),
         )
         self._emit_metric_once(
             binding_digest,
@@ -642,16 +634,17 @@ class PackedTerminalSourceWiring:
                 outcome=TerminalReceiptOutcome.SUCCESS,
                 terminal_timestamp_ns=self._clock_ns(),
             )
-            self._submit_event(
-                producer_class=NativeTerminalProducerClass.RECEIPT,
-                authenticated_issuer=self._producers.local_identity,
-                binding_digest=action.binding.digest,
-                kind=NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
-                receipt=NativeTerminalReceipt.from_wire_receipt(issued.wire_receipt),
+            self._runtime.complete_scheduler_action(
+                self._local_receipt_producer_id,
+                action,
+                NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+                completion_receipt=NativeTerminalReceipt.from_wire_receipt(
+                    issued.wire_receipt
+                ),
+                enqueued_ns=self._clock_ns(),
             )
-            self._owner.acknowledge_action(action)
         except Exception as error:
-            self._fail_action_delivery(
+            self._fail_scheduler_action(
                 action,
                 "source reclaim consumption failed",
                 error,
@@ -684,12 +677,15 @@ class PackedTerminalSourceWiring:
         )
         ready_receipt = record.request_ready_receipt
         if ready_receipt is None:
-            self._fail_action_delivery(
-                action,
-                "gateway publication preceded stored request readiness",
-                RuntimeError("request-ready receipt is absent"),
+            error = RuntimeError("request-ready receipt is absent")
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label="gateway publication preceded stored request readiness",
+                error=error,
             )
-            raise RuntimeError("gateway publication preceded stored request readiness")
+            raise error
         with self._lock:
             if record.publication_action is not None:
                 raise RuntimeError("source publication action was retained twice")
@@ -697,16 +693,20 @@ class PackedTerminalSourceWiring:
             # authenticated result. Acknowledging at enqueue would permit a
             # publication timeout to lose its fail-closed owner.
             record.publication_action = action
-        if self._producers.local_identity.tp_rank != 0:
+        if self._local_identity.tp_rank != 0:
             return None
         publisher = self._publisher
         if publisher is None:
-            self._fail_action_delivery(
-                action,
-                "canonical source rank has no gateway publisher",
-                RuntimeError("gateway publisher is absent"),
+            error = RuntimeError("gateway publisher is absent")
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label="canonical source rank has no gateway publisher",
+                error=error,
             )
-            raise RuntimeError("canonical source rank has no gateway publisher")
+            self._mark_publication_action_failed(record, action)
+            raise error
         submission = record.submission
         identity = submission.identity
         try:
@@ -724,11 +724,14 @@ class PackedTerminalSourceWiring:
             if not accepted:
                 raise RuntimeError("gateway publisher rejected a new publication")
         except Exception as error:
-            self._fail_action_delivery(
-                action,
-                "gateway publication enqueue failed",
-                error,
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label="gateway publication enqueue failed",
+                error=error,
             )
+            self._mark_publication_action_failed(record, action)
             raise
         return publication
 
@@ -759,22 +762,29 @@ class PackedTerminalSourceWiring:
             kind = NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED
             reason = result.reason
             publication_failed = True
+        producer_id = self._runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            NativeTerminalProcessIdentity.from_identity(local_receipt.issuer),
+        )
+        native_receipt = NativeTerminalReceipt.from_wire_receipt(local_receipt)
         try:
-            self._submit_event(
-                producer_class=NativeTerminalProducerClass.RECEIPT,
-                authenticated_issuer=local_receipt.issuer,
-                binding_digest=local_receipt.binding.digest,
-                kind=kind,
-                receipt=NativeTerminalReceipt.from_wire_receipt(local_receipt),
-                reason=reason,
-            )
-            self._owner.acknowledge_action(action)
-        except Exception as error:
-            self._fail_action_delivery(
+            self._runtime.complete_work_action(
+                producer_id,
                 action,
-                "gateway publication result delivery failed",
-                error,
+                kind,
+                receipt=native_receipt,
+                reason=reason,
+                enqueued_ns=self._clock_ns(),
             )
+        except Exception as error:
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label="gateway publication result delivery failed",
+                error=error,
+            )
+            self._mark_publication_action_failed(record, action)
             raise
         with self._lock:
             current = self._records.get(local_receipt.binding.digest)
@@ -830,7 +840,7 @@ class PackedTerminalSourceWiring:
         if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
             with self._lock:
                 record.quarantined = True
-            self._owner.acknowledge_action(action)
+            self._runtime.acknowledge_consumed_action(action)
             return None
         with self._lock:
             if (
@@ -840,7 +850,7 @@ class PackedTerminalSourceWiring:
                 or record.publication_action is not None
             ):
                 raise RuntimeError("native retirement preceded joined side effects")
-        self._owner.acknowledge_action(action)
+        self._runtime.acknowledge_consumed_action(action)
         with self._lock:
             current = self._records.get(action.binding.digest)
             if current is not record:
@@ -875,28 +885,6 @@ class PackedTerminalSourceWiring:
             pending_publication_action_count=pending_publication_count,
         )
 
-    def retire_python_producers(self, timeout_seconds: float) -> None:
-        """Retire every wiring-owned producer behind its accepted events.
-
-        Native event-channel producers must retire through their own ABI before
-        the process-level caller invokes :meth:`NativeTerminalOwner.join_producers`.
-
-        :param timeout_seconds: Positive bound applied to each retirement fence.
-        """
-
-        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
-            raise ValueError("timeout_seconds must be a positive float")
-        for producer_id in self._producers.producer_ids:
-            self._owner.retire_python_producer(producer_id)
-        for producer_id in self._producers.producer_ids:
-            if not self._owner.wait_for_producer_retirement(
-                producer_id,
-                timeout_seconds,
-            ):
-                raise TimeoutError(
-                    f"source producer {producer_id} did not retire within the bound"
-                )
-
     def _consume_followup_action(
         self,
         *,
@@ -920,15 +908,20 @@ class PackedTerminalSourceWiring:
         record = self._claim_action(action, expected_kind)
         try:
             side_effect(record.submission)
-            self._submit_event(
-                producer_class=NativeTerminalProducerClass.LOCAL,
-                authenticated_issuer=None,
-                binding_digest=action.binding.digest,
-                kind=followup_kind,
+            self._runtime.complete_work_action(
+                self._local_producer_id,
+                action,
+                followup_kind,
+                enqueued_ns=self._clock_ns(),
             )
-            self._owner.acknowledge_action(action)
         except Exception as error:
-            self._fail_action_delivery(action, failure_label, error)
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label=failure_label,
+                error=error,
+            )
             raise
         self._emit_metric_once(action.binding.digest, followup_kind)
 
@@ -1051,19 +1044,22 @@ class PackedTerminalSourceWiring:
         :param reason: Stable failure evidence when required.
         """
 
-        producer_id = self._producers.producer_id(
-            producer_class,
-            authenticated_issuer,
+        native_issuer = (
+            None
+            if authenticated_issuer is None
+            else NativeTerminalProcessIdentity.from_identity(authenticated_issuer)
         )
-        self._owner.submit(
-            NativeTerminalOwnerEvent(
-                producer_id=producer_id,
-                binding_digest=binding_digest,
-                kind=kind,
-                enqueued_ns=self._clock_ns(),
-                receipt=receipt,
-                reason=reason,
-            )
+        producer_id = self._runtime.python_producer_id(
+            producer_class,
+            native_issuer,
+        )
+        self._runtime.submit(
+            producer_id,
+            binding_digest,
+            kind,
+            receipt=receipt,
+            reason=reason,
+            enqueued_ns=self._clock_ns(),
         )
 
     def _record(self, binding_digest: bytes) -> _SourceRecord:
@@ -1081,30 +1077,89 @@ class PackedTerminalSourceWiring:
             raise RuntimeError("source operation targets an unknown binding")
         return record
 
-    def _fail_action_delivery(
+    def _complete_failed_work(
         self,
+        *,
         action: NativeTerminalOwnerAction,
+        producer_id: int,
+        followup_kind: NativeTerminalOwnerEventKind,
         label: str,
         error: BaseException,
+        receipt: NativeTerminalReceipt | None = None,
     ) -> None:
-        """Enter native fail-closed authority after an accepted action fails.
+        """Return one failed work action to the authoritative runtime.
 
         :param action: Exact one-shot action whose side effect did not complete.
+        :param producer_id: Exact producer authorized to report the failure.
+        :param followup_kind: Failure transition earned by the action.
         :param label: Stable evidence prefix.
         :param error: Original serving-boundary failure.
+        :param receipt: Authenticated publication authority when required.
         """
 
         formatted_traceback = traceback.format_exc()
         logger.error("%s:\n%s", label, formatted_traceback)
         reason = f"{label}: {type(error).__name__}: {error}"
         try:
-            self._owner.fail_action_delivery(action, reason)
+            self._runtime.complete_work_action(
+                producer_id,
+                action,
+                followup_kind,
+                receipt=receipt,
+                reason=reason,
+                enqueued_ns=self._clock_ns(),
+            )
         except Exception:
             logger.critical(
-                "Native owner also rejected fail-closed action delivery:\n%s",
+                "Native runtime also rejected fail-closed work completion:\n%s",
                 traceback.format_exc(),
             )
             raise
+
+    def _fail_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        label: str,
+        error: BaseException,
+    ) -> None:
+        """Enter process-fatal runtime state for ambiguous scheduler cleanup.
+
+        :param action: Exact reclaim action whose cleanup did not complete.
+        :param label: Stable evidence prefix.
+        :param error: Original scheduler-boundary failure.
+        """
+
+        logger.error("%s:\n%s", label, traceback.format_exc())
+        reason = f"{label}: {type(error).__name__}: {error}"
+        try:
+            self._runtime.fail_scheduler_action(action, reason)
+        except Exception:
+            logger.critical(
+                "Native runtime also rejected scheduler failure:\n%s",
+                traceback.format_exc(),
+            )
+            raise
+
+    def _mark_publication_action_failed(
+        self,
+        record: _SourceRecord,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Release retained publication accounting after fail-closed return.
+
+        :param record: Exact source record holding publication authority.
+        :param action: Exact publication action returned as failed.
+        """
+
+        with self._lock:
+            current = self._records.get(action.binding.digest)
+            if current is not record or current.publication_action != action:
+                raise RuntimeError(
+                    "publication action changed during failed completion"
+                )
+            current.publication_action = None
+            current.publication_terminal = True
+            current.publication_failed = True
 
     def _emit_metric_once(
         self,

@@ -1,8 +1,6 @@
 import dataclasses
 import hashlib
-import select
-import sys
-import time
+import inspect
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -12,17 +10,17 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalPublicationIdentity,
     TerminalRequestBinding,
 )
-from sglang.srt.disaggregation.terminal_progress.native_owner import (
-    NativeTerminalOwner,
-)
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
-    NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
-    NativeTerminalOwnerFatalCode,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
+    NativeTerminalReceipt,
+    NativeTerminalReceiptKind,
+    NativeTerminalReceiptOutcome,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
@@ -39,8 +37,6 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
 )
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceMetric,
-    PackedTerminalSourceProducer,
-    PackedTerminalSourceProducerDirectory,
     PackedTerminalSourceSubmission,
     PackedTerminalSourceWiring,
 )
@@ -49,19 +45,13 @@ from sglang.srt.disaggregation.terminal_progress.wire import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="native terminal owner requires Linux eventfd and timerfd",
-)
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _LOCAL_PRODUCER_ID = 10
 _LOCAL_RECEIPT_PRODUCER_ID = 11
 _DECODER_CONTROL_PRODUCER_ID = 12
 _DECODER_RECEIPT_PRODUCER_ID = 13
 _PUBLISHER_RECEIPT_PRODUCER_ID = 14
-_WAIT_SECONDS = 3.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -133,7 +123,7 @@ class _Publisher:
         """Record one exact publication.
 
         :param publication: Immutable gateway handoff.
-        :returns: Always ``True`` for a new fixture publication.
+        :returns: Whether the publication was newly accepted.
         """
 
         self.publications.append(publication)
@@ -160,44 +150,240 @@ class _Clock:
         return self.value
 
 
+class _Runtime:
+    """Strict process-runtime double with exact authority accounting."""
+
+    authorities: dict[tuple[NativeTerminalProducerClass, bytes | None], int]
+    operations: list[tuple[object, ...]]
+    registrations: list[NativeTerminalLifecycleRegistration]
+    fail_registration: bool
+    fail_work_completion: bool
+    fail_scheduler_completion: bool
+
+    def __init__(
+        self,
+        identity: PackedTerminalSourceIdentityPlan,
+    ) -> None:
+        """Freeze every producer route before wiring construction.
+
+        :param identity: Exact source identity graph.
+        """
+
+        local = identity.local_binding.owner
+        self.authorities = {
+            (NativeTerminalProducerClass.LOCAL, None): _LOCAL_PRODUCER_ID,
+            (NativeTerminalProducerClass.RECEIPT, local.digest): (
+                _LOCAL_RECEIPT_PRODUCER_ID
+            ),
+            (
+                NativeTerminalProducerClass.CONTROL,
+                identity.request_ready_issuer.digest,
+            ): _DECODER_CONTROL_PRODUCER_ID,
+            (
+                NativeTerminalProducerClass.RECEIPT,
+                identity.request_ready_issuer.digest,
+            ): _DECODER_RECEIPT_PRODUCER_ID,
+        }
+        if local != identity.publisher_issuer:
+            self.authorities[
+                (
+                    NativeTerminalProducerClass.RECEIPT,
+                    identity.publisher_issuer.digest,
+                )
+            ] = _PUBLISHER_RECEIPT_PRODUCER_ID
+        self.operations = []
+        self.registrations = []
+        self.fail_registration = False
+        self.fail_work_completion = False
+        self.fail_scheduler_completion = False
+
+    def python_producer_id(
+        self,
+        producer_class: NativeTerminalProducerClass,
+        authenticated_issuer: NativeTerminalProcessIdentity | None = None,
+    ) -> int:
+        """Resolve one frozen producer route.
+
+        :param producer_class: Required producer authority.
+        :param authenticated_issuer: Exact route issuer when required.
+        :returns: Stable fixture producer identity.
+        """
+
+        issuer_digest = (
+            None if authenticated_issuer is None else authenticated_issuer.digest
+        )
+        return self.authorities[(producer_class, issuer_digest)]
+
+    def register_lifecycle(
+        self,
+        registration: NativeTerminalLifecycleRegistration,
+    ) -> None:
+        """Record one lifecycle registration.
+
+        :param registration: Complete native registration.
+        """
+
+        self.operations.append(("register", registration.binding.digest))
+        if self.fail_registration:
+            raise RuntimeError("synthetic registration failure")
+        self.registrations.append(registration)
+
+    def submit(
+        self,
+        producer_id: int,
+        binding_digest: bytes,
+        kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Record one local or control event.
+
+        :param producer_id: Exact producer identity.
+        :param binding_digest: Exact lifecycle digest.
+        :param kind: Native event kind.
+        :param receipt: Optional receipt authority.
+        :param reason: Optional failure reason.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        self.operations.append(
+            ("submit", producer_id, binding_digest, kind, receipt, reason, enqueued_ns)
+        )
+
+    def submit_imported_receipt(
+        self,
+        producer_id: int,
+        receipt: NativeTerminalReceipt,
+        kind: NativeTerminalOwnerEventKind,
+        *,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Record one imported receipt event.
+
+        :param producer_id: Exact producer identity.
+        :param receipt: Imported native authority.
+        :param kind: Receipt-consuming event.
+        :param reason: Optional failure reason.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        self.operations.append(
+            ("import", producer_id, receipt, kind, reason, enqueued_ns)
+        )
+
+    def complete_work_action(
+        self,
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Record one exact work completion.
+
+        :param producer_id: Exact producer identity.
+        :param action: Work action being consumed.
+        :param followup_kind: Earned lifecycle event.
+        :param receipt: Optional publication authority.
+        :param reason: Optional failure reason.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        if self.fail_work_completion:
+            self.fail_work_completion = False
+            raise RuntimeError("synthetic work completion failure")
+        self.operations.append(
+            (
+                "work",
+                producer_id,
+                action,
+                followup_kind,
+                receipt,
+                reason,
+                enqueued_ns,
+            )
+        )
+
+    def complete_scheduler_action(
+        self,
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        completion_receipt: NativeTerminalReceipt | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Record one exact scheduler completion.
+
+        :param producer_id: Exact receipt producer identity.
+        :param action: Scheduler action being consumed.
+        :param followup_kind: Reclaim-consumed event.
+        :param completion_receipt: Scheduler-minted receipt authority.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        if self.fail_scheduler_completion:
+            raise RuntimeError("synthetic scheduler completion failure")
+        self.operations.append(
+            (
+                "scheduler",
+                producer_id,
+                action,
+                followup_kind,
+                completion_receipt,
+                enqueued_ns,
+            )
+        )
+
+    def fail_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> None:
+        """Record exact fail-closed scheduler ownership.
+
+        :param action: Ambiguous scheduler action.
+        :param reason: Stable process-fatal reason.
+        """
+
+        self.operations.append(("scheduler-failed", action, reason))
+
+    def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Record one consumed terminal action.
+
+        :param action: Exact retirement or quarantine action.
+        """
+
+        self.operations.append(("ack", action))
+
+
 @dataclasses.dataclass(slots=True)
 class _Harness:
-    """Live native source-wiring integration fixture.
+    """Source wiring fixture with one process-lifetime runtime."""
 
-    :ivar owner: Concrete process-lifetime native owner.
-    :ivar wiring: Source side-effect dispatcher under test.
-    :ivar identity: Exact local source identity graph.
-    :ivar producers: Immutable producer authority directory.
-    :ivar metrics: Non-gating metric ledger.
-    :ivar publisher: Canonical publisher, when local rank zero.
-    :ivar clock: Deterministic producer clock.
-    """
-
-    owner: NativeTerminalOwner
+    runtime: _Runtime
     wiring: PackedTerminalSourceWiring
     identity: PackedTerminalSourceIdentityPlan
-    producers: PackedTerminalSourceProducerDirectory
+    submission: PackedTerminalSourceSubmission
     metrics: _Metrics
     publisher: _Publisher | None
     clock: _Clock
 
 
-def _identities(
-    *,
-    local_rank: int = 0,
-) -> tuple[
-    PackedTerminalSourceIdentityPlan,
-    TerminalProcessIdentity,
-    TerminalProcessIdentity,
-]:
+def _identities(*, local_rank: int = 0) -> PackedTerminalSourceIdentityPlan:
     """Build one TP2 source and TP1 decode identity graph.
 
     :param local_rank: Source rank selected as local.
-    :returns: Source plan, decode coordinator, and canonical publisher.
+    :returns: Exact rank-local source identity plan.
     """
 
     key = PackedRequestKey(room_id=71, request_generation=bytes.fromhex("71" * 16))
-    source_processes = tuple(
+    sources = tuple(
         TerminalProcessIdentity(
             process_generation=bytes((0x10 + rank,)) * 16,
             role=TerminalOwnerRole.SOURCE,
@@ -212,82 +398,26 @@ def _identities(
         tp_rank=0,
         tp_size=1,
     )
-    manifest = bytes.fromhex("41" * 32)
-    allocation = bytes.fromhex("51" * 32)
     bindings = tuple(
         TerminalRequestBinding(
             request_key=key,
-            owner=process,
-            rank_manifest_digest=manifest,
-            allocation_digest=allocation,
+            owner=source,
+            rank_manifest_digest=bytes.fromhex("41" * 32),
+            allocation_digest=bytes.fromhex("51" * 32),
         )
-        for process in source_processes
+        for source in sources
     )
     publication = TerminalPublicationIdentity(
         request_key=key,
-        publisher_process_generation=source_processes[0].process_generation,
+        publisher_process_generation=sources[0].process_generation,
         publication_generation=bytes.fromhex("61" * 16),
     )
-    return (
-        PackedTerminalSourceIdentityPlan(
-            local_binding=bindings[local_rank],
-            source_bindings=bindings,
-            publication_identity=publication,
-            request_ready_issuer=decoder,
-            publisher_issuer=source_processes[0],
-        ),
-        decoder,
-        source_processes[0],
-    )
-
-
-def _producer_directory(
-    identity: PackedTerminalSourceIdentityPlan,
-) -> PackedTerminalSourceProducerDirectory:
-    """Build the complete exact producer map for one source rank.
-
-    :param identity: Rank-local source identity graph.
-    :returns: Immutable authority-to-producer directory.
-    """
-
-    producers = [
-        PackedTerminalSourceProducer(
-            producer_id=_LOCAL_PRODUCER_ID,
-            name="source-local",
-            producer_class=NativeTerminalProducerClass.LOCAL,
-            authenticated_issuer=None,
-        ),
-        PackedTerminalSourceProducer(
-            producer_id=_LOCAL_RECEIPT_PRODUCER_ID,
-            name="source-local-receipt",
-            producer_class=NativeTerminalProducerClass.RECEIPT,
-            authenticated_issuer=identity.local_binding.owner,
-        ),
-        PackedTerminalSourceProducer(
-            producer_id=_DECODER_CONTROL_PRODUCER_ID,
-            name="decode-control",
-            producer_class=NativeTerminalProducerClass.CONTROL,
-            authenticated_issuer=identity.request_ready_issuer,
-        ),
-        PackedTerminalSourceProducer(
-            producer_id=_DECODER_RECEIPT_PRODUCER_ID,
-            name="decode-receipt",
-            producer_class=NativeTerminalProducerClass.RECEIPT,
-            authenticated_issuer=identity.request_ready_issuer,
-        ),
-    ]
-    if identity.local_binding.owner != identity.publisher_issuer:
-        producers.append(
-            PackedTerminalSourceProducer(
-                producer_id=_PUBLISHER_RECEIPT_PRODUCER_ID,
-                name="publisher-receipt",
-                producer_class=NativeTerminalProducerClass.RECEIPT,
-                authenticated_issuer=identity.publisher_issuer,
-            )
-        )
-    return PackedTerminalSourceProducerDirectory(
-        local_identity=identity.local_binding.owner,
-        producers=tuple(producers),
+    return PackedTerminalSourceIdentityPlan(
+        local_binding=bindings[local_rank],
+        source_bindings=bindings,
+        publication_identity=publication,
+        request_ready_issuer=decoder,
+        publisher_issuer=sources[0],
     )
 
 
@@ -308,180 +438,94 @@ def _submission(
     )
 
 
-def _start_harness(
-    *,
-    local_rank: int = 0,
-    failing_metrics: bool = False,
-) -> _Harness:
-    """Start one concrete native owner with an accepted source request.
+def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
+    """Construct source wiring and accept one immutable submission.
 
-    :param local_rank: Source rank selected as local.
+    :param local_rank: Exact source TP rank.
     :param failing_metrics: Whether metrics reject every projection.
-    :returns: Live integration fixture.
+    :returns: Complete source test fixture.
     """
 
-    identity, _, _ = _identities(local_rank=local_rank)
-    producers = _producer_directory(identity)
-    owner = NativeTerminalOwner(
-        input_capacity=128,
-        output_capacity=128,
-        owner_identity=NativeTerminalProcessIdentity.from_identity(
-            identity.local_binding.owner
-        ),
-        testing=True,
-    )
+    identity = _identities(local_rank=local_rank)
+    runtime = _Runtime(identity)
     metrics = _Metrics(fail=failing_metrics)
     publisher = _Publisher() if local_rank == 0 else None
     clock = _Clock()
     wiring = PackedTerminalSourceWiring(
-        owner=owner,
-        producers=producers,
+        runtime=runtime,
+        local_identity=identity.local_binding.owner,
         publisher=publisher,
         metrics_sink=metrics,
         clock_ns=clock.now_ns,
     )
-    owner.start()
-    wiring.accept_submission(_submission(identity))
+    submission = _submission(identity)
+    wiring.accept_submission(submission)
     return _Harness(
-        owner=owner,
+        runtime=runtime,
         wiring=wiring,
         identity=identity,
-        producers=producers,
+        submission=submission,
         metrics=metrics,
         publisher=publisher,
         clock=clock,
     )
 
 
-def _wait_for_actions(
-    owner: NativeTerminalOwner,
-    expected_kinds: tuple[NativeTerminalOwnerActionKind, ...],
-) -> tuple[NativeTerminalOwnerAction, ...]:
-    """Wait on the real owner eventfd for one exact action population.
-
-    :param owner: Concrete native owner.
-    :param expected_kinds: Exact action sequence expected from one event.
-    :returns: Native actions in commit order.
-    """
-
-    deadline = time.monotonic() + _WAIT_SECONDS
-    actions: list[NativeTerminalOwnerAction] = []
-    while len(actions) < len(expected_kinds):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("native owner did not publish the expected actions")
-        readable, _, _ = select.select([owner.output_fileno()], [], [], remaining)
-        if len(readable) == 0:
-            raise TimeoutError("native owner eventfd did not become readable")
-        for output in owner.drain_outputs():
-            if output.process_fatal:
-                raise RuntimeError(
-                    f"native owner became fatal: {output.fatal_code.name}"
-                )
-            actions.extend(output.actions)
-    observed_kinds = tuple(action.kind for action in actions)
-    if observed_kinds != expected_kinds:
-        raise AssertionError(
-            f"native action sequence {observed_kinds} differs from {expected_kinds}"
-        )
-    return tuple(actions)
-
-
-def _wait_for_fatal(owner: NativeTerminalOwner) -> NativeTerminalOwnerAction:
-    """Wait for the native process-fatal action.
-
-    :param owner: Concrete native owner.
-    :returns: Exact process-fatal action.
-    """
-
-    deadline = time.monotonic() + _WAIT_SECONDS
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("native owner did not enter process-fatal authority")
-        readable, _, _ = select.select([owner.output_fileno()], [], [], remaining)
-        if len(readable) == 0:
-            raise TimeoutError("native owner eventfd did not become readable")
-        for output in owner.drain_outputs():
-            matching = tuple(
-                action
-                for action in output.actions
-                if action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
-            )
-            if len(matching) == 1:
-                return matching[0]
-
-
-def _submit_native_terminal(harness: _Harness) -> None:
-    """Submit the native event-channel terminality fixture.
-
-    :param harness: Live source integration fixture.
-    """
-
-    harness.owner.submit(
-        NativeTerminalOwnerEvent(
-            producer_id=harness.producers.producer_id(
-                NativeTerminalProducerClass.LOCAL,
-                None,
-            ),
-            binding_digest=harness.identity.local_binding.digest,
-            kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
-            enqueued_ns=harness.clock.now_ns(),
-        )
-    )
-
-
-def _drive_to_request_ready(
+def _action(
     harness: _Harness,
-) -> tuple[NativeTerminalOwnerAction, NativeTerminalOwnerAction]:
-    """Drive one request through the action-owned source completion path.
+    kind: NativeTerminalOwnerActionKind,
+    action_id: int,
+) -> NativeTerminalOwnerAction:
+    """Build one exact owner action for the local lifecycle.
 
-    :param harness: Live source integration fixture.
-    :returns: Reclaim and gateway-publication actions.
+    :param harness: Source lifecycle fixture.
+    :param kind: Exact action kind.
+    :param action_id: Stable one-shot identity.
+    :returns: Native action matching the local binding.
     """
 
-    digest = harness.identity.local_binding.digest
-    harness.wiring.producer_completed(digest)
-    (gather_action,) = _wait_for_actions(
-        harness.owner,
-        (NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,),
+    native_binding = NativeTerminalRequestBinding.from_binding(
+        harness.identity.local_binding
     )
-    harness.wiring.consume_gather_ready(gather_action, lambda submission: None)
-    _submit_native_terminal(harness)
-    (outcome_action,) = _wait_for_actions(
-        harness.owner,
-        (NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,),
+    receipt = None
+    if kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED:
+        receipt = NativeTerminalReceipt(
+            binding=native_binding,
+            issuer=NativeTerminalProcessIdentity.from_identity(
+                harness.identity.local_binding.owner
+            ),
+            kind=NativeTerminalReceiptKind.RECLAIM_AUTHORIZED,
+            outcome=NativeTerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=action_id,
+            nonce=action_id.to_bytes(16, "big"),
+        )
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=kind,
+        binding=native_binding,
+        commit_timestamp_ns=action_id,
+        receipt=receipt,
     )
-    harness.wiring.consume_outcome_ready(outcome_action, lambda submission: None)
-    harness.wiring.teardown_received(
-        digest,
-        harness.identity.request_ready_issuer,
-    )
-    (ack_action,) = _wait_for_actions(
-        harness.owner,
-        (NativeTerminalOwnerActionKind.SOURCE_ACK_READY,),
-    )
-    harness.wiring.consume_ack_ready(ack_action, lambda submission: None)
-    ready = TerminalWireReceiptIssuer(harness.identity.request_ready_issuer).issue(
+
+
+def _ready(harness: _Harness) -> None:
+    """Deliver one authenticated request-ready receipt.
+
+    :param harness: Source lifecycle fixture.
+    """
+
+    issued = TerminalWireReceiptIssuer(harness.identity.request_ready_issuer).issue(
         binding=harness.identity.local_binding,
         kind=TerminalReceiptKind.REQUEST_READY,
         outcome=TerminalReceiptOutcome.SUCCESS,
         terminal_timestamp_ns=harness.clock.now_ns(),
     )
     harness.wiring.request_ready(
-        binding_digest=digest,
-        wire_receipt=ready.wire_receipt,
-        local_receipt=ready.local_receipt,
+        binding_digest=harness.identity.local_binding.digest,
+        wire_receipt=issued.wire_receipt,
+        local_receipt=issued.local_receipt,
         authenticated_issuer=harness.identity.request_ready_issuer,
     )
-    reclaim, publication = _wait_for_actions(
-        harness.owner,
-        (
-            NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
-            NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
-        ),
-    )
-    return reclaim, publication
 
 
 def _publication_result(
@@ -490,15 +534,15 @@ def _publication_result(
     *,
     success: bool,
 ) -> TerminalGatewayPublicationSuccess | TerminalGatewayPublicationFailure:
-    """Build one authenticated canonical publication result.
+    """Build one authenticated canonical publisher result.
 
-    :param harness: Live source integration fixture.
+    :param harness: Source lifecycle fixture.
     :param publication: Exact immutable publication attempt.
-    :param success: Whether to construct success or functional failure.
-    :returns: Complete canonical publisher result.
+    :param success: Whether publication succeeded.
+    :returns: Complete publisher result.
     """
 
-    publisher_issuer = TerminalWireReceiptIssuer(harness.identity.publisher_issuer)
+    issuer = TerminalWireReceiptIssuer(harness.identity.publisher_issuer)
     kind = TerminalReceiptKind.GATEWAY_PUBLISHED
     outcome = TerminalReceiptOutcome.SUCCESS
     if not success:
@@ -506,7 +550,7 @@ def _publication_result(
         outcome = TerminalReceiptOutcome.FAILURE
     timestamp_ns = harness.clock.now_ns()
     receipts = tuple(
-        publisher_issuer.issue(
+        issuer.issue(
             binding=binding,
             kind=kind,
             outcome=outcome,
@@ -529,328 +573,262 @@ def _publication_result(
     )
 
 
-def _close_clean(harness: _Harness) -> None:
-    """Exercise ordered producer retirement, quiescence, and exact close.
+def test_runtime_registration_precedes_first_source_event() -> None:
+    """Publish lifecycle identity before any producer can target it."""
 
-    :param harness: Fully retired source integration fixture.
-    """
-
-    harness.owner.stop_admission()
-    harness.wiring.retire_python_producers(_WAIT_SECONDS)
-    assert harness.owner.join_producers()
-    assert harness.owner.wait_for_output_quiescence(_WAIT_SECONDS)
-    harness.owner.close()
-
-
-def test_producer_directory_requires_exact_frozen_authority() -> None:
-    """Reject ambiguous producer ids, issuers, and ordering before startup."""
-
-    identity, _, _ = _identities()
-    directory = _producer_directory(identity)
-    assert directory.producer_id(NativeTerminalProducerClass.LOCAL, None) == (
-        _LOCAL_PRODUCER_ID
+    harness = _harness()
+    operations = harness.runtime.operations
+    assert operations[0] == ("register", harness.identity.local_binding.digest)
+    assert operations[1][0:4] == (
+        "submit",
+        _LOCAL_PRODUCER_ID,
+        harness.identity.local_binding.digest,
+        NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
     )
-    with pytest.raises(RuntimeError, match="no exact authority"):
-        directory.producer_id(
-            NativeTerminalProducerClass.CONTROL,
-            identity.publisher_issuer,
-        )
-    duplicate = dataclasses.replace(
-        directory.producers[-1],
-        producer_id=directory.producers[-1].producer_id + 1,
+    assert harness.wiring.lifecycle_published(harness.identity.local_binding.digest)
+
+
+def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
+    """Permit paired scheduler rollback only before native publication."""
+
+    identity = _identities()
+    runtime = _Runtime(identity)
+    runtime.fail_registration = True
+    wiring = PackedTerminalSourceWiring(
+        runtime=runtime,
+        local_identity=identity.local_binding.owner,
+        publisher=_Publisher(),
+        metrics_sink=_Metrics(),
+        clock_ns=_Clock().now_ns,
     )
-    with pytest.raises(ValueError, match="authority mappings must be unique"):
-        PackedTerminalSourceProducerDirectory(
-            local_identity=directory.local_identity,
-            producers=(*directory.producers, duplicate),
-        )
+    submission = _submission(identity)
+    with pytest.raises(RuntimeError, match="synthetic registration failure"):
+        wiring.accept_submission(submission)
+    assert not wiring.lifecycle_published(identity.local_binding.digest)
+    assert wiring.cancel_unpublished(identity.local_binding.digest) == submission
+    assert wiring.inventory().active_binding_digests == ()
 
 
-def test_producer_registrations_are_frozen_before_owner_start() -> None:
-    """Make post-start source-wiring construction fail at native registration."""
+def test_full_source_success_uses_runtime_completion_surfaces() -> None:
+    """Join reclaim and publication before exact runtime retirement."""
 
-    identity, _, _ = _identities()
-    owner = NativeTerminalOwner(
-        input_capacity=32,
-        output_capacity=32,
-        owner_identity=NativeTerminalProcessIdentity.from_identity(
-            identity.local_binding.owner
-        ),
-        testing=True,
+    harness = _harness()
+    digest = harness.identity.local_binding.digest
+    harness.wiring.producer_completed(digest)
+    harness.wiring.consume_gather_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 1),
+        lambda submission: None,
     )
-    owner.start()
-    try:
-        with pytest.raises(RuntimeError):
-            PackedTerminalSourceWiring(
-                owner=owner,
-                producers=_producer_directory(identity),
-                publisher=_Publisher(),
-                metrics_sink=_Metrics(),
-                clock_ns=_Clock().now_ns,
-            )
-    finally:
-        owner.abort_and_close()
+    harness.wiring.consume_outcome_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY, 2),
+        lambda submission: None,
+    )
+    harness.wiring.teardown_received(digest, harness.identity.request_ready_issuer)
+    harness.wiring.consume_ack_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 3),
+        lambda submission: None,
+    )
+    _ready(harness)
+    reclaim = _action(
+        harness,
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        4,
+    )
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        5,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(publication_action)
+    assert publication is not None
+    reclaim_receipt = harness.wiring.consume_reclaim_authorized(
+        reclaim,
+        lambda submission: None,
+    )
+    assert reclaim_receipt.wire_receipt.kind is TerminalReceiptKind.RECLAIM_CONSUMED
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=True)
+    )
+    retired = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        6,
+    )
+    assert harness.wiring.consume_terminal_action(retired) == harness.submission
+    assert harness.wiring.inventory().active_binding_digests == ()
+    assert any(operation[0] == "scheduler" for operation in harness.runtime.operations)
+    assert any(operation[0] == "work" for operation in harness.runtime.operations)
+    assert harness.runtime.operations[-1] == ("ack", retired)
 
 
-def test_full_source_success_path_uses_owner_actions_and_retires_cleanly() -> None:
-    """Join reclaim and publication before the sole record-removal authority."""
+def test_reclaim_failure_enters_explicit_runtime_fatal_boundary() -> None:
+    """Never lose scheduler authority behind a failed cleanup callback."""
 
-    harness = _start_harness()
-    try:
-        reclaim_action, publication_action = _drive_to_request_ready(harness)
-        publication = harness.wiring.consume_gateway_publication_ready(
-            publication_action
-        )
-        assert publication is not None
-        assert harness.publisher is not None
-        assert harness.publisher.publications == [publication]
-        assert harness.wiring.inventory().pending_publication_action_count == 1
-        reclaim_receipt = harness.wiring.consume_reclaim_authorized(
-            reclaim_action,
-            lambda submission: None,
-        )
-        assert reclaim_receipt.wire_receipt.kind is (
-            TerminalReceiptKind.RECLAIM_CONSUMED
-        )
-        assert harness.wiring.inventory().active_binding_digests == (
-            harness.identity.local_binding.digest,
-        )
-        harness.wiring.publisher_result(
-            _publication_result(harness, publication, success=True)
-        )
-        (retired_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.REQUEST_RETIRED,),
-        )
-        retired = harness.wiring.consume_terminal_action(retired_action)
-        assert retired == _submission(harness.identity)
-        assert harness.wiring.inventory().active_binding_digests == ()
-        inventory = harness.owner.inventory()
-        assert inventory.safely_retired_count == 1
-        assert inventory.pending_action_count == 0
-        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
-        _close_clean(harness)
-    finally:
-        harness.owner.abort_and_close()
+    harness = _harness()
+    reclaim = _action(
+        harness,
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        20,
+    )
+
+    def fail_release(submission: PackedTerminalSourceSubmission) -> None:
+        """Reject one synthetic scheduler-affine release.
+
+        :param submission: Exact immutable source submission.
+        """
+
+        raise RuntimeError("synthetic release failure")
+
+    with pytest.raises(RuntimeError, match="synthetic release failure"):
+        harness.wiring.consume_reclaim_authorized(reclaim, fail_release)
+    failure = harness.runtime.operations[-1]
+    assert failure[0:2] == ("scheduler-failed", reclaim)
+    assert "source reclaim consumption failed" in failure[2]
 
 
-def test_publication_action_remains_pending_until_authenticated_result() -> None:
-    """Do not acknowledge publication authority merely because enqueue succeeded."""
+def test_source_work_failure_returns_request_failure_to_runtime() -> None:
+    """Return failed off-loop work through the same runtime action ledger."""
 
-    harness = _start_harness()
-    try:
-        reclaim_action, publication_action = _drive_to_request_ready(harness)
-        harness.wiring.consume_reclaim_authorized(
-            reclaim_action,
-            lambda submission: None,
-        )
-        publication = harness.wiring.consume_gateway_publication_ready(
-            publication_action
-        )
-        assert publication is not None
-        assert harness.owner.inventory().pending_action_count == 1
-        harness.wiring.publisher_result(
-            _publication_result(harness, publication, success=True)
-        )
-        assert harness.wiring.inventory().pending_publication_action_count == 0
-        (retired_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.REQUEST_RETIRED,),
-        )
-        harness.wiring.consume_terminal_action(retired_action)
-        _close_clean(harness)
-    finally:
-        harness.owner.abort_and_close()
+    harness = _harness()
+    action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        30,
+    )
 
+    def fail_gather(submission: PackedTerminalSourceSubmission) -> None:
+        """Reject one synthetic gather.
 
-def test_noncanonical_rank_consumes_its_own_publication_receipt() -> None:
-    """Require rank-local authority instead of inferring canonical completion."""
+        :param submission: Exact immutable source submission.
+        """
 
-    harness = _start_harness(local_rank=1)
-    try:
-        reclaim_action, publication_action = _drive_to_request_ready(harness)
-        assert (
-            harness.wiring.consume_gateway_publication_ready(publication_action) is None
-        )
-        harness.wiring.consume_reclaim_authorized(
-            reclaim_action,
-            lambda submission: None,
-        )
-        canonical_identity, _, _ = _identities(local_rank=0)
-        canonical_publication = FrozenTerminalGatewayPublication(
-            identity=harness.identity.publication_identity,
-            canonical_binding=harness.identity.source_bindings[0],
-            source_bindings=harness.identity.source_bindings,
-            request_ready_receipt=TerminalWireReceiptIssuer(
-                harness.identity.request_ready_issuer
-            )
-            .issue(
-                binding=canonical_identity.local_binding,
-                kind=TerminalReceiptKind.REQUEST_READY,
-                outcome=TerminalReceiptOutcome.SUCCESS,
-                terminal_timestamp_ns=harness.clock.now_ns(),
-            )
-            .local_receipt,
-            output_projection=_Projection(payload=b"output"),
-            enqueued_ns=harness.clock.now_ns(),
-        )
-        harness.wiring.publisher_result(
-            _publication_result(harness, canonical_publication, success=True)
-        )
-        (retired_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.REQUEST_RETIRED,),
-        )
-        harness.wiring.consume_terminal_action(retired_action)
-        _close_clean(harness)
-    finally:
-        harness.owner.abort_and_close()
+        raise RuntimeError("synthetic gather failure")
+
+    with pytest.raises(RuntimeError, match="synthetic gather failure"):
+        harness.wiring.consume_gather_ready(action, fail_gather)
+    completion = harness.runtime.operations[-1]
+    assert completion[0:4] == (
+        "work",
+        _LOCAL_PRODUCER_ID,
+        action,
+        NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+    )
+    assert "source gather publication failed" in completion[5]
 
 
-def test_functional_publication_failure_quarantines_identity_after_reclaim() -> None:
-    """Keep storage reusable while retaining failed publication identity."""
+def test_noncanonical_rank_consumes_its_exact_publication_receipt() -> None:
+    """Keep per-rank authority instead of inferring canonical completion."""
 
-    harness = _start_harness()
-    try:
-        reclaim_action, publication_action = _drive_to_request_ready(harness)
-        harness.wiring.consume_reclaim_authorized(
-            reclaim_action,
-            lambda submission: None,
-        )
-        publication = harness.wiring.consume_gateway_publication_ready(
-            publication_action
-        )
-        assert publication is not None
-        harness.wiring.publisher_result(
-            _publication_result(harness, publication, success=False)
-        )
-        (quarantined_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,),
-        )
-        assert harness.wiring.consume_terminal_action(quarantined_action) is None
-        inventory = harness.wiring.inventory()
-        assert inventory.active_binding_digests == (
-            harness.identity.local_binding.digest,
-        )
-        assert inventory.quarantined_binding_digests == (
-            harness.identity.local_binding.digest,
-        )
-        native_inventory = harness.owner.inventory()
-        assert native_inventory.safely_retired_count == 0
-        assert native_inventory.quarantined_count == 1
-    finally:
-        harness.owner.abort_and_close()
-
-
-def test_publisher_thread_death_enters_process_fatal_native_lifecycle() -> None:
-    """Keep publisher death distinct from authenticated functional failure."""
-
-    harness = _start_harness()
-    try:
-        harness.wiring.publisher_died(
-            harness.identity.local_binding.digest,
-            "synthetic publisher death",
-        )
-        fatal_action = _wait_for_fatal(harness.owner)
-        assert fatal_action.binding.digest == harness.identity.local_binding.digest
-        inventory = harness.owner.inventory()
-        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-        assert inventory.quarantined_count == 1
-    finally:
-        harness.owner.abort_and_close()
+    harness = _harness(local_rank=1)
+    _ready(harness)
+    action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        40,
+    )
+    assert harness.wiring.consume_gateway_publication_ready(action) is None
+    canonical = _identities(local_rank=0)
+    canonical_ready = TerminalWireReceiptIssuer(
+        harness.identity.request_ready_issuer
+    ).issue(
+        binding=canonical.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    publication = FrozenTerminalGatewayPublication(
+        identity=harness.identity.publication_identity,
+        canonical_binding=harness.identity.source_bindings[0],
+        source_bindings=harness.identity.source_bindings,
+        request_ready_receipt=canonical_ready.local_receipt,
+        output_projection=_Projection(payload=b"output"),
+        enqueued_ns=harness.clock.now_ns(),
+    )
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=True)
+    )
+    completion = harness.runtime.operations[-1]
+    assert completion[0:4] == (
+        "work",
+        _PUBLISHER_RECEIPT_PRODUCER_ID,
+        action,
+        NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+    )
 
 
-def test_duplicate_and_wrong_kind_actions_run_no_second_side_effect() -> None:
-    """Reject stale or mistyped actions before touching serving resources."""
+def test_publication_failure_quarantines_identity_after_safe_reclaim() -> None:
+    """Retain failed publication identity while storage is already reusable."""
 
-    harness = _start_harness()
-    calls: list[str] = []
-    try:
-        harness.wiring.producer_completed(harness.identity.local_binding.digest)
-        (gather_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,),
-        )
-        with pytest.raises(ValueError, match="SOURCE_OUTCOME_READY"):
-            harness.wiring.consume_outcome_ready(
-                gather_action,
-                lambda submission: calls.append("wrong"),
-            )
-        harness.wiring.consume_gather_ready(
-            gather_action,
-            lambda submission: calls.append("gather"),
-        )
-        with pytest.raises(RuntimeError, match="delivered twice"):
-            harness.wiring.consume_gather_ready(
-                gather_action,
-                lambda submission: calls.append("duplicate"),
-            )
-        assert calls == ["gather"]
-    finally:
-        harness.owner.abort_and_close()
-
-
-def test_side_effect_failure_enters_native_fail_closed_action_delivery() -> None:
-    """Turn an accepted-but-undeliverable action into process-fatal authority."""
-
-    harness = _start_harness()
-    try:
-        harness.wiring.producer_completed(harness.identity.local_binding.digest)
-        (gather_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,),
-        )
-
-        def fail_gather(submission: PackedTerminalSourceSubmission) -> None:
-            raise RuntimeError("synthetic gather failure")
-
-        with pytest.raises(RuntimeError, match="synthetic gather failure"):
-            harness.wiring.consume_gather_ready(gather_action, fail_gather)
-        _wait_for_fatal(harness.owner)
-        assert harness.owner.inventory().fatal_code is (
-            NativeTerminalOwnerFatalCode.OUTPUT_QUEUE_OVERFLOW
-        )
-    finally:
-        harness.owner.abort_and_close()
+    harness = _harness()
+    _ready(harness)
+    reclaim = _action(
+        harness,
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        50,
+    )
+    harness.wiring.consume_reclaim_authorized(reclaim, lambda submission: None)
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        51,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(publication_action)
+    assert publication is not None
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=False)
+    )
+    quarantine = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        52,
+    )
+    assert harness.wiring.consume_terminal_action(quarantine) is None
+    inventory = harness.wiring.inventory()
+    assert inventory.active_binding_digests == (harness.identity.local_binding.digest,)
+    assert inventory.quarantined_binding_digests == (
+        harness.identity.local_binding.digest,
+    )
+    assert harness.runtime.operations[-1] == ("ack", quarantine)
 
 
-def test_metrics_failure_never_gates_native_progress() -> None:
+def test_metrics_failure_never_gates_runtime_progress() -> None:
     """Keep observability failure outside lifecycle authority."""
 
-    harness = _start_harness(failing_metrics=True)
-    try:
-        harness.wiring.producer_completed(harness.identity.local_binding.digest)
-        (gather_action,) = _wait_for_actions(
-            harness.owner,
-            (NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,),
+    harness = _harness(failing_metrics=True)
+    harness.wiring.producer_completed(harness.identity.local_binding.digest)
+    assert harness.metrics.values == []
+    assert harness.runtime.operations[-1][3] is (
+        NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED
+    )
+
+
+def test_request_ready_rejects_wrong_issuer_before_runtime_submission() -> None:
+    """Reject valid-looking authority from an unauthenticated route."""
+
+    harness = _harness()
+    wrong_issuer = harness.identity.publisher_issuer
+    ready = TerminalWireReceiptIssuer(wrong_issuer).issue(
+        binding=harness.identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    operation_count = len(harness.runtime.operations)
+    with pytest.raises(RuntimeError, match="authenticated another issuer"):
+        harness.wiring.request_ready(
+            binding_digest=harness.identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=wrong_issuer,
         )
-        assert gather_action.binding.digest == harness.identity.local_binding.digest
-        assert harness.metrics.values == []
-        assert harness.owner.inventory().fatal_code is NativeTerminalOwnerFatalCode.NONE
-    finally:
-        harness.owner.abort_and_close()
+    assert len(harness.runtime.operations) == operation_count
 
 
-def test_request_ready_rejects_wrong_issuer_before_native_submission() -> None:
-    """Reject valid-looking authority from an unauthenticated producer route."""
+def test_source_wiring_has_no_raw_owner_or_dynamic_registration() -> None:
+    """Keep native ownership and producer registration in the runtime only."""
 
-    harness = _start_harness()
-    try:
-        wrong_issuer = harness.identity.publisher_issuer
-        ready = TerminalWireReceiptIssuer(wrong_issuer).issue(
-            binding=harness.identity.local_binding,
-            kind=TerminalReceiptKind.REQUEST_READY,
-            outcome=TerminalReceiptOutcome.SUCCESS,
-            terminal_timestamp_ns=harness.clock.now_ns(),
-        )
-        with pytest.raises(RuntimeError, match="authenticated another issuer"):
-            harness.wiring.request_ready(
-                binding_digest=harness.identity.local_binding.digest,
-                wire_receipt=ready.wire_receipt,
-                local_receipt=ready.local_receipt,
-                authenticated_issuer=wrong_issuer,
-            )
-        assert harness.owner.inventory().fatal_code is NativeTerminalOwnerFatalCode.NONE
-    finally:
-        harness.owner.abort_and_close()
+    source = inspect.getsource(PackedTerminalSourceWiring)
+    assert "NativeTerminalOwner(" not in source
+    assert "self._owner" not in source
+    assert "register_producer" not in source
+    assert "retire_python_producer" not in source

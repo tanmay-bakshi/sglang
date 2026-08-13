@@ -754,6 +754,29 @@ class NativeTerminalRuntime:
 
         return self._publisher_actions
 
+    @property
+    def python_producer_ids(self) -> tuple[int, ...]:
+        """Return every Python-owned producer in registration order.
+
+        :returns: Stable producer identities owned by Python execution contexts.
+        """
+
+        return tuple(
+            producer_id
+            for producer_id, producer in self._producers.items()
+            if producer.delivery is NativeTerminalProducerDelivery.PYTHON
+        )
+
+    @property
+    def disposition(self) -> NativeTerminalRuntimeDisposition:
+        """Return the current process-lifetime runtime disposition.
+
+        :returns: Exact open, draining, fatal, or stopped state.
+        """
+
+        with self._condition:
+            return self._disposition
+
     def start(self) -> None:
         """Start the native owner and its sole output consumer exactly once."""
 
@@ -983,6 +1006,69 @@ class NativeTerminalRuntime:
             enqueued_ns=enqueued_ns,
         )
 
+    def fail_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> None:
+        """Fail one ambiguous scheduler action and retain resources closed.
+
+        A scheduler callback may fail before or after mutating resource state.
+        It therefore cannot be acknowledged as consumed. The runtime publishes
+        an exact request failure, releases only the immutable action accounting,
+        and enters process-fatal drain so the scheduler consumer retains its
+        resource owner until quarantine is observed.
+
+        :param action: Exact adoption or reclaim action which could not complete.
+        :param reason: Stable process-fatal failure evidence.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in _SCHEDULER_ACTIONS or action.receipt is None:
+            raise ValueError("action does not carry scheduler authority")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        binding_digest = action.binding.digest
+        with self._condition:
+            pending = self._scheduler_pending.get(binding_digest)
+            if pending != action:
+                raise NativeTerminalRuntimeError(
+                    "scheduler action is absent, stale, or already completed"
+                )
+        failure_kind = NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED
+        if action.kind is NativeTerminalOwnerActionKind.ADOPTION_READY:
+            failure_kind = NativeTerminalOwnerEventKind.DECODE_REQUEST_FAILED
+        producer = self._producers[self._fatal_producer_id]
+        try:
+            self._submit_with_producer(
+                producer=producer,
+                binding_digest=binding_digest,
+                kind=failure_kind,
+                receipt=None,
+                reason=reason,
+                enqueued_ns=None,
+            )
+        except Exception:
+            with self._condition:
+                self._enter_runtime_fatal_locked(
+                    f"{reason}\nScheduler failure publication also failed:\n"
+                    f"{traceback.format_exc()}"
+                )
+            raise
+        with self._condition:
+            current = self._scheduler_pending.get(binding_digest)
+            if current != action:
+                self._enter_runtime_fatal_locked(
+                    "scheduler action changed during failed consumption"
+                )
+                raise NativeTerminalRuntimeError(
+                    "scheduler action changed during failed consumption"
+                )
+            del self._scheduler_pending[binding_digest]
+            self._consumer_pending.pop(action.action_id)
+            self._enter_runtime_fatal_locked(reason)
+
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Retire one non-scheduler action after downstream acceptance.
 
@@ -1106,6 +1192,7 @@ class NativeTerminalRuntime:
                 (
                     NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
                     NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED,
+                    NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
                 )
             ),
         }
