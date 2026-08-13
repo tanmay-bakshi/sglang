@@ -35,6 +35,7 @@ PACKED_NATIVE_ATTESTATION_DIGEST_BYTES = 32
 MAX_PACKED_AUXILIARY_DESTINATION_SEGMENTS = 4096
 MAX_PACKED_WRITER_ERROR_BYTES = 4096
 MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES = 512
+MAX_PACKED_TERMINAL_RECEIPT_BYTES = 512
 
 
 def _validate_visibility_policy_digest(value: bytes, label: str) -> None:
@@ -433,6 +434,37 @@ class PackedRequestTeardownAck:
             teardown_generation=self.teardown_generation,
             auxiliary_handle_generation=self.auxiliary_handle_generation,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedTerminalReceipt:
+    """Authenticated-route envelope carrying terminal owner authority.
+
+    The packed control route authenticates the sending process independently.
+    The opaque receipt payload is decoded and joined with that route identity
+    by the terminal-progress import namespace, never by this framing layer.
+
+    :ivar key: Exact packed request identity used for bounded routing.
+    :ivar receipt_payload: Canonical fixed-width terminal receipt bytes.
+    """
+
+    key: PackedRequestKey
+    receipt_payload: bytes
+
+    def __post_init__(self) -> None:
+        """Validate bounded terminal receipt framing."""
+
+        if type(self.key) is not PackedRequestKey:
+            raise TypeError("terminal receipt key must be PackedRequestKey")
+        if type(self.receipt_payload) is not bytes:
+            raise TypeError("terminal receipt payload must be bytes")
+        if len(self.receipt_payload) == 0:
+            raise ValueError("terminal receipt payload must not be empty")
+        if len(self.receipt_payload) > MAX_PACKED_TERMINAL_RECEIPT_BYTES:
+            raise ValueError(
+                "terminal receipt payload exceeds "
+                f"{MAX_PACKED_TERMINAL_RECEIPT_BYTES} bytes"
+            )
 
 
 @dataclasses.dataclass(frozen=True)

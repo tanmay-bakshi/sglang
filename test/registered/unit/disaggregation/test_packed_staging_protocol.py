@@ -5,7 +5,6 @@ import weakref
 import msgspec
 import numpy as np
 import pytest
-
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
@@ -21,6 +20,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedProtocolError,
     PackedProtocolState,
     PackedRequestKey,
+    PackedTerminalReceipt,
     PackedTopology,
     PackedTransportPath,
     PackedWriterCompletionMechanism,
@@ -1529,6 +1529,22 @@ def test_wire_rejects_unknown_kind_version_and_fields() -> None:
     unknown_field["surprise"] = 1
     with pytest.raises(PackedWireError, match="invalid packed wire"):
         decode_packed_message(msgspec.msgpack.encode(unknown_field))
+
+
+def test_terminal_receipt_wire_round_trip_is_opaque_and_bounded() -> None:
+    """Packed framing preserves terminal authority without interpreting it."""
+
+    message = PackedTerminalReceipt(
+        key=PackedRequestKey.from_chunk_key(KEY),
+        receipt_payload=b"terminal-authority",
+    )
+
+    payload = encode_packed_message(message)
+
+    assert decode_packed_message(payload) == message
+    assert encode_packed_message(decode_packed_message(payload)) == payload
+    with pytest.raises(ValueError, match="must not be empty"):
+        PackedTerminalReceipt(key=message.key, receipt_payload=b"")
 
 
 def test_wire_rejects_invalid_domain_values_and_frame_bounds() -> None:

@@ -1,5 +1,4 @@
 import msgspec
-
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryDestinationSegment,
@@ -12,6 +11,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
     PackedRequestTeardown,
     PackedRequestTeardownAck,
+    PackedTerminalReceipt,
     PackedTopology,
     PackedTransportPath,
     PackedWriterCompletionMechanism,
@@ -27,7 +27,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
 )
 
-PACKED_WIRE_VERSION: int = 6
+PACKED_WIRE_VERSION: int = 7
 MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
 
 
@@ -307,6 +307,20 @@ class _WireRequestTeardownAck(
     auxiliary_handle_generation: int | None
 
 
+class _WireTerminalReceipt(
+    msgspec.Struct,
+    tag="terminal_receipt",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned terminal-owner receipt envelope."""
+
+    version: int
+    key: _WireRequestKey
+    receipt_payload: bytes
+
+
 PackedWireMessage = (
     PackedAuxiliaryPlan
     | PackedAuxiliaryOutcome
@@ -315,6 +329,7 @@ PackedWireMessage = (
     | PackedWriterOutcome
     | PackedRequestTeardown
     | PackedRequestTeardownAck
+    | PackedTerminalReceipt
 )
 _WireMessage = (
     _WireAuxiliaryPlan
@@ -324,6 +339,7 @@ _WireMessage = (
     | _WireWriterOutcome
     | _WireRequestTeardown
     | _WireRequestTeardownAck
+    | _WireTerminalReceipt
 )
 _ENCODER = msgspec.msgpack.Encoder()
 _DECODER = msgspec.msgpack.Decoder(_WireMessage, strict=True)
@@ -769,6 +785,12 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
             teardown_generation=message.teardown_generation,
             auxiliary_handle_generation=message.auxiliary_handle_generation,
         )
+    elif type(message) is PackedTerminalReceipt:
+        wire_message = _WireTerminalReceipt(
+            version=PACKED_WIRE_VERSION,
+            key=_encode_request_key(message.key),
+            receipt_payload=message.receipt_payload,
+        )
     else:
         raise TypeError(f"unsupported packed wire message: {type(message)!r}")
 
@@ -868,6 +890,11 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
                 allocation_digest=wire_message.allocation_digest,
                 teardown_generation=wire_message.teardown_generation,
                 auxiliary_handle_generation=wire_message.auxiliary_handle_generation,
+            )
+        if type(wire_message) is _WireTerminalReceipt:
+            return PackedTerminalReceipt(
+                key=_decode_request_key(wire_message.key),
+                receipt_payload=wire_message.receipt_payload,
             )
         raise PackedWireError(
             f"unsupported packed wire message: {type(wire_message)!r}"
