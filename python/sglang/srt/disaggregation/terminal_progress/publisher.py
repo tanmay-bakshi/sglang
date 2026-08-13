@@ -251,12 +251,14 @@ class TerminalGatewayPublicationFailure:
 
     :ivar publication: Exact immutable handoff which failed.
     :ivar failed_ns: Publisher-process monotonic failure timestamp.
+    :ivar source_receipts: One authenticated failure authority per source rank.
     :ivar reason: Stable reader-facing failure context.
     :ivar formatted_traceback: Complete send-path traceback.
     """
 
     publication: FrozenTerminalGatewayPublication
     failed_ns: int
+    source_receipts: tuple[IssuedTerminalWireReceipt, ...]
     reason: str
     formatted_traceback: str
 
@@ -269,6 +271,28 @@ class TerminalGatewayPublicationFailure:
             raise TypeError("failed_ns must be an integer")
         if self.failed_ns < self.publication.enqueued_ns:
             raise ValueError("publication failure precedes enqueue")
+        if type(self.source_receipts) is not tuple:
+            raise TypeError("source_receipts must be a tuple")
+        if len(self.source_receipts) != len(self.publication.source_bindings):
+            raise ValueError("publication failure receipt fan-out is incomplete")
+        for binding, receipt in zip(
+            self.publication.source_bindings,
+            self.source_receipts,
+            strict=True,
+        ):
+            if type(receipt) is not IssuedTerminalWireReceipt:
+                raise TypeError("source_receipts must contain issued wire receipts")
+            wire_receipt = receipt.wire_receipt
+            if (
+                wire_receipt.binding != binding
+                or wire_receipt.issuer != self.publication.canonical_binding.owner
+                or wire_receipt.kind is not TerminalReceiptKind.FAILURE
+                or wire_receipt.outcome is not TerminalReceiptOutcome.FAILURE
+                or wire_receipt.terminal_timestamp_ns != self.failed_ns
+            ):
+                raise ValueError(
+                    "publication failure receipt differs from its source binding"
+                )
         if type(self.reason) is not str or len(self.reason) == 0:
             raise ValueError("reason must be a non-empty string")
         if (
@@ -819,18 +843,29 @@ class PackedTerminalOutputPublisher:
                     additional_tracebacks.append(timestamp_traceback)
                     formatted_traceback += "\n" + timestamp_traceback
                     failed_ns = current.enqueued_ns
-                failure = TerminalGatewayPublicationFailure(
-                    publication=current,
-                    failed_ns=failed_ns,
-                    reason=reason,
-                    formatted_traceback=formatted_traceback,
-                )
                 try:
+                    failure_receipts = tuple(
+                        self._wire_issuer.issue(
+                            binding=binding,
+                            kind=TerminalReceiptKind.FAILURE,
+                            outcome=TerminalReceiptOutcome.FAILURE,
+                            terminal_timestamp_ns=failed_ns,
+                        )
+                        for binding in current.source_bindings
+                    )
+                    failure = TerminalGatewayPublicationFailure(
+                        publication=current,
+                        failed_ns=failed_ns,
+                        source_receipts=failure_receipts,
+                        reason=reason,
+                        formatted_traceback=formatted_traceback,
+                    )
                     with self._transition_lock:
                         self._result_listener(failure)
                 except BaseException:  # noqa: BLE001
                     additional_tracebacks.append(
-                        "result listener failure:\n" + traceback.format_exc()
+                        "publication failure fan-out failure:\n"
+                        + traceback.format_exc()
                     )
             if sink is not None:
                 closing_sink = sink
