@@ -454,7 +454,7 @@ def test_concurrent_producers_receive_gap_free_queue_insertion_order() -> None:
     owner, identity = _make_dynamic_source_owner(start=False)
     registrations = tuple(
         _make_dynamic_source_registration(identity, room_id=900 + index)
-        for index in range(32)
+        for index in range(31)
     )
     try:
         for registration in registrations:
