@@ -319,11 +319,10 @@ class NativeTerminalObservationInbox(_BoundedFdInbox[NativeTerminalOwnerOutput])
 
 
 class _RuntimeProducer:
-    """Runtime-owned gap-free sequence for one Python producer."""
+    """Runtime-owned lifecycle for one Python producer."""
 
     registration: NativeTerminalProducerRegistration
     delivery: NativeTerminalProducerDelivery
-    _next_sequence: int
     _retirement_requested: bool
     _lock: threading.Lock
 
@@ -335,7 +334,6 @@ class _RuntimeProducer:
 
         self.registration = spec.registration
         self.delivery = spec.delivery
-        self._next_sequence = 0
         self._retirement_requested = False
         self._lock = threading.Lock()
 
@@ -1425,7 +1423,6 @@ class NativeTerminalRuntime:
                 )
             event = NativeTerminalOwnerEvent(
                 producer_id=registration.producer_id,
-                producer_sequence=producer._next_sequence,
                 binding_digest=binding_digest,
                 kind=kind,
                 enqueued_ns=timestamp_ns,
@@ -1433,7 +1430,6 @@ class NativeTerminalRuntime:
                 reason=reason,
             )
             self._owner.submit(event)
-            producer._next_sequence += 1
 
     def _run_output_reactor(self) -> None:
         """Drain native actions into bounded execution-context inboxes."""
