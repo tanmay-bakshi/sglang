@@ -43,7 +43,6 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
     PackedControlSender,
     PackedDecodeControlSender,
-    PackedDecodeOwnerSignal,
     PackedDecodeRuntime,
     PackedPrefillRuntime,
     PackedPrefillSubmission,
@@ -69,6 +68,9 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalProcessIdentity,
     TerminalPublicationIdentity,
     TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerEventKind,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourcePlan,
@@ -1712,10 +1714,14 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
     runtime._consumer_authority = object()
     source_plan = _terminal_source_plan(plan.key, writer)
     binding = _terminal_decode_binding(source_plan)
-    runtime.bind_terminal_owner(
+    registration = runtime.bind_terminal_owner(
         transaction,
         binding,
         source_plan,
+    )
+    assert registration.binding == binding
+    assert registration.trusted_issuers == tuple(
+        writer_identity.process_identity for writer_identity in source_plan.writers
     )
     assert runtime.terminal_owner_transaction(binding.digest) is transaction
     transaction.state = PackedRequestTransactionState.PUBLISHED
@@ -1723,12 +1729,12 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
     monkeypatch.setattr(runtime_module.time, "perf_counter", lambda: next(timestamps))
     caplog.set_level(logging.INFO, logger=runtime_module.__name__)
 
-    assert (
-        runtime.handle_control(
-            writer,
-            _unvalidated_prepare(chunk_key, writer),
-        )
-        is None
+    prepare_signals = runtime.handle_control(
+        writer,
+        _unvalidated_prepare(chunk_key, writer),
+    )
+    assert tuple(signal.kind for signal in prepare_signals) == (
+        NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
     )
     visibility = PackedWriterVisibilityEvidence(
         policy_digest=policy.digest,
@@ -1748,11 +1754,11 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
         status=PackedWriterOutcomeStatus.DONE,
         visibility=visibility,
     )
-    assert (
-        runtime.handle_control(writer, outcome)
-        is PackedDecodeOwnerSignal.WRITER_MANIFEST_COMPLETED
+    outcome_signals = runtime.handle_control(writer, outcome)
+    assert tuple(signal.kind for signal in outcome_signals) == (
+        NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
     )
-    assert runtime.handle_control(writer, outcome) is None
+    assert runtime.handle_control(writer, outcome) == ()
     with pytest.raises(RuntimeError, match="cannot advance through polling"):
         runtime.poll(transaction)
 
@@ -1762,7 +1768,8 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
     assert batch.stream_handle == executor.scatter_stream_handle
     assert len(executor.submissions) == 1
     event.complete = True
-    runtime.complete_terminal_owner_scatter(transaction, batch.chunk_keys)
+    runtime.confirm_terminal_owner_scatter_callback(transaction, batch)
+    runtime.complete_terminal_owner_scatter(transaction)
     runtime.begin_terminal_owner_teardown(transaction)
 
     assert sent_messages == [ready, teardown]
@@ -1775,9 +1782,10 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
         teardown_generation=teardown.teardown_generation,
         auxiliary_handle_generation=teardown.auxiliary_handle_generation,
     )
-    assert (
-        runtime.handle_control(writer, acknowledgement)
-        is PackedDecodeOwnerSignal.ACK_MANIFEST_COMPLETED
+    acknowledgement_signals = runtime.handle_control(writer, acknowledgement)
+    assert tuple(signal.kind for signal in acknowledgement_signals) == (
+        NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+        NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
     )
     assert runtime.consume_terminal_owner_adoption(transaction) is request_owner
     runtime.complete_terminal_owner_metadata_consumption(transaction)
@@ -1803,8 +1811,8 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
         runtime.terminal_owner_transaction(binding.digest)
 
 
-def test_terminal_owner_rejects_a_conflicting_scatter_callback() -> None:
-    """A stale callback generation quarantines the sole mutable actor record."""
+def test_terminal_owner_rejects_scatter_terminality_before_callback_attachment() -> None:
+    """Terminality without a confirmed callback quarantines the actor record."""
 
     manager = _FakeManager()
     writer = _writer()
@@ -1867,14 +1875,9 @@ def test_terminal_owner_rejects_a_conflicting_scatter_callback() -> None:
     transaction.state = PackedRequestTransactionState.WRITERS_COMPLETED
     record.writer_manifest_reported = True
     batch = runtime.begin_terminal_owner_scatter(transaction)
-    stale_key = PackedChunkKey(
-        room_id=chunk_key.room_id,
-        chunk_id=chunk_key.chunk_id,
-        request_generation=b"x" * 16,
-    )
 
-    with pytest.raises(RuntimeError, match="differs from its chunk manifest"):
-        runtime.complete_terminal_owner_scatter(transaction, (stale_key,))
+    with pytest.raises(RuntimeError, match="lacks callback attachment"):
+        runtime.complete_terminal_owner_scatter(transaction)
 
     inventory = runtime.terminal_owner_inventory()
     assert inventory.active_bindings == (binding.digest,)
