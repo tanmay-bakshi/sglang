@@ -435,53 +435,96 @@ def test_publication_identity_must_name_the_canonical_publisher() -> None:
         dataclasses.replace(publication, identity=stale_identity)
 
 
-def test_factory_death_quarantines_every_accepted_publication() -> None:
-    """A publisher that cannot own its sink fails all accepted identities."""
+def test_factory_death_fails_startup_before_publication_admission() -> None:
+    """A publisher cannot report readiness before its thread owns a sink."""
 
-    first_bindings = _source_bindings()
-    second_bindings = _source_bindings(
-        room_id=32,
-        request_generation_byte=0x32,
-    )
+    bindings = _source_bindings()
     request_ready_issuer = TerminalReceiptIssuer()
-    release = threading.Event()
-    factory = _RecordingSinkFactory(
-        create_release=release,
-        fail_create=True,
-    )
+    factory = _RecordingSinkFactory(fail_create=True)
     results: list[TerminalGatewayPublicationResult] = []
     fatals: list[tuple[str, str | None]] = []
     publisher = _publisher(
         factory,
-        first_bindings,
+        bindings,
         request_ready_issuer,
         results,
         fatals,
         _Clock(),
     )
-    first = _publication(first_bindings, request_ready_issuer)
-    second = _publication(
-        second_bindings,
-        request_ready_issuer,
-        publication_generation_byte=0xC4,
-    )
+    publication = _publication(bindings, request_ready_issuer)
 
-    publisher.start()
-    assert factory.create_entered.wait(timeout=2.0)
-    assert publisher.submit(first)
-    assert publisher.submit(second)
-    release.set()
+    with pytest.raises(
+        TerminalGatewayPublisherError,
+        match="gateway publisher thread failed",
+    ):
+        publisher.start()
+    with pytest.raises(
+        TerminalGatewayPublisherError,
+        match="publisher admission is closed",
+    ):
+        publisher.submit(publication)
     assert publisher.stop_admission_and_join()
 
     snapshot = publisher.snapshot()
     assert snapshot.disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL
     assert snapshot.pending_identities == ()
     assert snapshot.completed_identities == ()
-    assert snapshot.failed_identities == (first.identity, second.identity)
+    assert snapshot.failed_identities == ()
     assert results == []
     assert len(fatals) == 1
     assert fatals[0][1] is not None
     assert "synthetic gateway factory failure" in fatals[0][1]
+
+
+def test_startup_opens_admission_only_after_sink_ownership() -> None:
+    """Publisher readiness waits for thread-local sink construction."""
+
+    bindings = _source_bindings()
+    request_ready_issuer = TerminalReceiptIssuer()
+    create_release = threading.Event()
+    factory = _RecordingSinkFactory(create_release=create_release)
+    results: list[TerminalGatewayPublicationResult] = []
+    fatals: list[tuple[str, str | None]] = []
+    publisher = _publisher(
+        factory,
+        bindings,
+        request_ready_issuer,
+        results,
+        fatals,
+        _Clock(),
+    )
+    publication = _publication(bindings, request_ready_issuer)
+    start_returned = threading.Event()
+
+    def start_publisher() -> None:
+        """Start the publisher and expose its synchronous return."""
+
+        publisher.start()
+        start_returned.set()
+
+    starter = threading.Thread(target=start_publisher, daemon=False)
+    starter.start()
+    assert factory.create_entered.wait(timeout=2.0)
+    assert not start_returned.is_set()
+    starting_snapshot = publisher.snapshot()
+    assert starting_snapshot.disposition is TerminalGatewayPublisherDisposition.CREATED
+    assert not starting_snapshot.admission_open
+    assert starting_snapshot.thread_alive
+    with pytest.raises(
+        TerminalGatewayPublisherError,
+        match="publisher admission is closed",
+    ):
+        publisher.submit(publication)
+
+    create_release.set()
+    assert start_returned.wait(timeout=2.0)
+    starter.join(timeout=2.0)
+    assert not starter.is_alive()
+    running_snapshot = publisher.snapshot()
+    assert running_snapshot.disposition is TerminalGatewayPublisherDisposition.RUNNING
+    assert running_snapshot.admission_open
+    assert publisher.stop_admission_and_join()
+    assert fatals == []
 
 
 def test_queue_overflow_fails_the_new_and_every_unpublished_identity() -> None:
