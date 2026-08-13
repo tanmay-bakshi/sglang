@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 import zmq
 from aiohttp import web
-
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -34,6 +33,13 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLease,
     DecodeAllocationLeaseAuthority,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortRegistry,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_http import (
+    TERMINAL_STARTUP_ROUTE,
+    handle_terminal_startup_join,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -1865,9 +1871,22 @@ def _parse_bootstrap_transport_registration(
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, host: str, port: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        terminal_startup_registry: TerminalStartupCohortRegistry | None = None,
+    ):
         self.host = host
         self.port = port
+        if (
+            terminal_startup_registry is not None
+            and type(terminal_startup_registry) is not TerminalStartupCohortRegistry
+        ):
+            raise TypeError(
+                "terminal_startup_registry must be TerminalStartupCohortRegistry"
+            )
+        self.terminal_startup_registry = terminal_startup_registry
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -1956,10 +1975,30 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
+        if self.terminal_startup_registry is not None:
+            self.app.router.add_post(
+                TERMINAL_STARTUP_ROUTE,
+                self._handle_terminal_startup_join,
+            )
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
         self.app.router.add_get("/ready", self._handle_readiness_check)
+
+    async def _handle_terminal_startup_join(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        """Join one native rank to the configured immutable cohort.
+
+        :param request: Exact canonical startup advertisement.
+        :returns: Complete sealed matrix or bounded rejection evidence.
+        """
+
+        registry = self.terminal_startup_registry
+        if registry is None:
+            return web.Response(text="terminal startup is not configured", status=404)
+        return await handle_terminal_startup_join(registry, request)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
