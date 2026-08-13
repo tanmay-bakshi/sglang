@@ -647,34 +647,46 @@ def _source_publisher_failure(
     :returns: Pure failure transition result.
     """
 
-    if (
-        lifecycle.phase is not SourceLifecyclePhase.REQUEST_READY_RECEIVED
-        or not lifecycle.publication_authorized
-        or lifecycle.gateway_published
-        or lifecycle.publication_identity_quarantined
-    ):
-        if process_fatal:
-            return _source_quarantine_all(lifecycle, process_fatal=True)
-        raise TerminalLifecycleError(
-            "publication failure requires request-global publication authority"
-        )
-    inventory = lifecycle.inventory.quarantine(
-        frozenset((TerminalResourceKind.PUBLICATION_IDENTITY,))
-    )
     disposition = lifecycle.process_disposition
     if process_fatal:
         disposition = TerminalProcessDisposition.PROCESS_FATAL
-    current = dataclasses.replace(
-        lifecycle,
-        phase=SourceLifecyclePhase.PUBLICATION_QUARANTINED,
-        inventory=inventory,
-        receipt_ledger=(
-            receipt_ledger if receipt_ledger is not None else lifecycle.receipt_ledger
-        ),
-        publication_identity_quarantined=True,
-        process_disposition=disposition,
+
+    if lifecycle.publication_authorized:
+        publication_resolved = (
+            lifecycle.gateway_published or lifecycle.publication_identity_quarantined
+        )
+        if process_fatal and publication_resolved:
+            current = dataclasses.replace(
+                lifecycle,
+                process_disposition=disposition,
+            )
+            return SourceTransitionResult(previous=lifecycle, current=current)
+        if publication_resolved:
+            raise TerminalLifecycleError(
+                "publication failure requires an unresolved publication identity"
+            )
+        inventory = lifecycle.inventory.quarantine(
+            frozenset((TerminalResourceKind.PUBLICATION_IDENTITY,))
+        )
+        current = dataclasses.replace(
+            lifecycle,
+            phase=SourceLifecyclePhase.PUBLICATION_QUARANTINED,
+            inventory=inventory,
+            receipt_ledger=(
+                receipt_ledger
+                if receipt_ledger is not None
+                else lifecycle.receipt_ledger
+            ),
+            publication_identity_quarantined=True,
+            process_disposition=disposition,
+        )
+        return SourceTransitionResult(previous=lifecycle, current=current)
+
+    if process_fatal:
+        return _source_quarantine_all(lifecycle, process_fatal=True)
+    raise TerminalLifecycleError(
+        "publication failure requires request-global publication authority"
     )
-    return SourceTransitionResult(previous=lifecycle, current=current)
 
 
 def _illegal_source_transition(

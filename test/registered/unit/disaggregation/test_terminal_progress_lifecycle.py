@@ -331,10 +331,178 @@ def test_publisher_death_is_process_fatal_and_preserves_proved_reclaim() -> None
     ).current
 
     assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.phase is SourceLifecyclePhase.PUBLICATION_QUARANTINED
     assert failed.inventory.safely_retired == SOURCE_RECLAIMABLE_RESOURCES
     assert failed.inventory.quarantined == frozenset(
         (TerminalResourceKind.PUBLICATION_IDENTITY,)
     )
+
+
+def test_publisher_death_before_request_ready_quarantines_all_live_resources() -> None:
+    issuer = TerminalReceiptIssuer()
+    current = make_source(issuer)
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited",
+        ),
+    ).current
+
+    assert failed.phase is SourceLifecyclePhase.QUARANTINED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory.quarantined == SOURCE_RESOURCE_KINDS
+    assert len(failed.inventory.live) == 0
+    assert len(failed.inventory.safely_retired) == 0
+    assert_conserved(failed.inventory)
+
+
+def test_publisher_death_after_request_ready_preserves_live_source_storage() -> None:
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited",
+        ),
+    ).current
+
+    assert failed.phase is SourceLifecyclePhase.PUBLICATION_QUARANTINED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory.live == SOURCE_RECLAIMABLE_RESOURCES
+    assert failed.inventory.quarantined == frozenset(
+        (TerminalResourceKind.PUBLICATION_IDENTITY,)
+    )
+    assert len(failed.inventory.safely_retired) == 0
+    assert_conserved(failed.inventory)
+
+
+def test_publisher_death_preserves_an_existing_publication_quarantine() -> None:
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLICATION_FAILED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.FAILURE,
+                outcome=TerminalReceiptOutcome.FAILURE,
+                timestamp_ns=11,
+            ),
+            reason="gateway socket failed",
+        ),
+    ).current
+    inventory_before_death = current.inventory
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited",
+        ),
+    ).current
+
+    assert failed.phase is SourceLifecyclePhase.PUBLICATION_QUARANTINED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory == inventory_before_death
+    assert failed.inventory.live == SOURCE_RECLAIMABLE_RESOURCES
+    assert failed.inventory.quarantined == frozenset(
+        (TerminalResourceKind.PUBLICATION_IDENTITY,)
+    )
+    assert_conserved(failed.inventory)
+
+
+def test_publisher_death_preserves_reclaimed_storage_after_publication_failure() -> (
+    None
+):
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.RECLAIM_CONSUMED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.RECLAIM_CONSUMED,
+                timestamp_ns=11,
+            ),
+        ),
+    ).current
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLICATION_FAILED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.FAILURE,
+                outcome=TerminalReceiptOutcome.FAILURE,
+                timestamp_ns=12,
+            ),
+            reason="gateway socket failed",
+        ),
+    ).current
+    inventory_before_death = current.inventory
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited",
+        ),
+    ).current
+
+    assert failed.phase is SourceLifecyclePhase.PUBLICATION_QUARANTINED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory == inventory_before_death
+    assert failed.inventory.safely_retired == SOURCE_RECLAIMABLE_RESOURCES
+    assert failed.inventory.quarantined == frozenset(
+        (TerminalResourceKind.PUBLICATION_IDENTITY,)
+    )
+    assert len(failed.inventory.live) == 0
+    assert_conserved(failed.inventory)
+
+
+def test_publisher_death_preserves_a_published_identity_and_source_storage() -> None:
+    issuer = TerminalReceiptIssuer()
+    current = advance_source_to_ready(make_source(issuer), issuer)
+    current = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.GATEWAY_PUBLISHED,
+            receipt=issue_receipt(
+                issuer,
+                current.binding,
+                TerminalReceiptKind.GATEWAY_PUBLISHED,
+                timestamp_ns=11,
+            ),
+        ),
+    ).current
+    inventory_before_death = current.inventory
+
+    failed = reduce_source_lifecycle(
+        current,
+        SourceLifecycleEvent(
+            kind=SourceLifecycleEventKind.PUBLISHER_DIED,
+            reason="publisher thread exited",
+        ),
+    ).current
+
+    assert failed.phase is SourceLifecyclePhase.REQUEST_READY_RECEIVED
+    assert failed.process_disposition is TerminalProcessDisposition.PROCESS_FATAL
+    assert failed.inventory == inventory_before_death
+    assert failed.inventory.live == SOURCE_RECLAIMABLE_RESOURCES
+    assert failed.inventory.safely_retired == frozenset(
+        (TerminalResourceKind.PUBLICATION_IDENTITY,)
+    )
+    assert len(failed.inventory.quarantined) == 0
+    assert_conserved(failed.inventory)
 
 
 @pytest.mark.parametrize(
