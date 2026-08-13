@@ -2,7 +2,6 @@ import gc
 import select
 
 import pytest
-
 from sglang.srt.disaggregation.terminal_progress.cuda_bridge import (
     CudaCompletionBridge,
     CudaCompletionFatalCode,
@@ -13,7 +12,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _identity(cookie: int, generation_byte: int | None = None) -> CudaCompletionIdentity:
+def _identity(
+    cookie: int, generation_byte: int | None = None
+) -> CudaCompletionIdentity:
     """Build one deterministic exact-generation identity.
 
     :param cookie: Process-local owner cookie.
@@ -87,9 +88,7 @@ def test_close_with_armed_identity_fails_closed() -> None:
     failed = bridge.inventory()
     assert failed.armed_count == 1
     assert failed.active_callback_count == 0
-    assert (
-        failed.fatal_code is CudaCompletionFatalCode.CLOSE_WITH_RETAINED_INVENTORY
-    )
+    assert failed.fatal_code is CudaCompletionFatalCode.CLOSE_WITH_RETAINED_INVENTORY
 
 
 def test_wrapper_destruction_with_armed_identity_preserves_memory_safety() -> None:
@@ -112,7 +111,7 @@ def test_eventfd_coalesces_multiple_native_producers() -> None:
     identities = tuple(_identity(index + 10) for index in range(8))
     for identity in identities:
         bridge.arm(identity)
-        bridge.complete_synchronously_for_test(identity)
+    bridge.complete_concurrently_for_test(identities)
 
     _assert_readable(bridge.fileno())
     drained = bridge.drain()

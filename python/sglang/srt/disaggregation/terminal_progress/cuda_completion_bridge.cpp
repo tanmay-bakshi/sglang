@@ -14,6 +14,7 @@
 #include <string>
 #include <sys/eventfd.h>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -472,6 +473,22 @@ public:
     publish_from_callback(token);
   }
 
+  void
+  complete_concurrently_for_test(const std::vector<CompletionToken> &tokens) {
+    for (const CompletionToken &token : tokens) {
+      begin_submission(token);
+      callback_registration_succeeded();
+    }
+    std::vector<std::thread> producers;
+    producers.reserve(tokens.size());
+    for (const CompletionToken &token : tokens) {
+      producers.emplace_back([this, token]() { publish_from_callback(token); });
+    }
+    for (std::thread &producer : producers) {
+      producer.join();
+    }
+  }
+
   void break_eventfd_for_test() {
     const int fd = event_fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) {
@@ -734,6 +751,21 @@ public:
   }
 
   void break_eventfd_for_test() { state_->break_eventfd_for_test(); }
+
+  void complete_concurrently_for_test(const py::list &values) {
+    std::vector<CompletionToken> tokens;
+    tokens.reserve(values.size());
+    for (const py::handle value : values) {
+      const py::tuple token = py::cast<py::tuple>(value);
+      if (token.size() != 2) {
+        throw py::value_error("test token must contain cookie and generation");
+      }
+      tokens.push_back(CompletionToken{
+          py::cast<std::uint64_t>(token[0]),
+          generation_from_python(py::cast<py::bytes>(token[1]))});
+    }
+    state_->complete_concurrently_for_test(tokens);
+  }
 #endif
 
 private:
@@ -761,6 +793,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("cookie"), py::arg("generation"))
       .def("_break_eventfd_for_test",
            &NativeCudaCompletionBridge::break_eventfd_for_test)
+      .def("_complete_concurrently_for_test",
+           &NativeCudaCompletionBridge::complete_concurrently_for_test,
+           py::arg("tokens"))
 #endif
       ;
 }

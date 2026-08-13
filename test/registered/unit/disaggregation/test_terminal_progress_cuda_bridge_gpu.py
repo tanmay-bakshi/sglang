@@ -3,7 +3,6 @@ import select
 
 import pytest
 import torch
-
 from sglang.srt.disaggregation.terminal_progress.cuda_bridge import (
     CudaCompletionBridge,
     CudaCompletionFatalCode,
