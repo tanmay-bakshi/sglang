@@ -16,6 +16,7 @@ TERMINAL_DEPLOYMENT_COHORT_DIGEST_BYTES: int = hashlib.sha256().digest_size
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _BOOTSTRAP_HOST = re.compile(r"[A-Za-z0-9._:\[\]-]+")
 _LOOPBACK_ORIGIN = re.compile(r"http://127\.0\.0\.1:(?P<port>[1-9][0-9]{0,4})")
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _PREFILL_TP_SIZES = frozenset((1, 2, 4, 8))
 _DECODE_TP_SIZES = frozenset((1, 2))
 
@@ -210,11 +211,15 @@ class TerminalDeploymentCohort:
     """Complete immutable membership of one isolated prefill group.
 
     :ivar group_id: Stable topology-local ownership identifier.
+    :ivar model_fingerprint: Exact model-weights compatibility fingerprint.
+    :ivar logical_kv_layout_fingerprint: Exact TP-independent KV layout.
     :ivar bootstrap_endpoint: Exact group prefill bootstrap endpoint.
     :ivar services: Prefill-first complete service membership.
     """
 
     group_id: str
+    model_fingerprint: str
+    logical_kv_layout_fingerprint: str
     bootstrap_endpoint: TerminalDeploymentBootstrapEndpoint
     services: tuple[TerminalDeploymentService, ...]
 
@@ -226,6 +231,16 @@ class TerminalDeploymentCohort:
             or _IDENTIFIER.fullmatch(self.group_id) is None
         ):
             raise ValueError("group_id is not canonical")
+        fingerprints = (
+            ("model_fingerprint", self.model_fingerprint),
+            (
+                "logical_kv_layout_fingerprint",
+                self.logical_kv_layout_fingerprint,
+            ),
+        )
+        for label, value in fingerprints:
+            if type(value) is not str or _FINGERPRINT.fullmatch(value) is None:
+                raise ValueError(f"{label} must be a lowercase SHA-256")
         if type(self.bootstrap_endpoint) is not TerminalDeploymentBootstrapEndpoint:
             raise TypeError(
                 "bootstrap_endpoint must be TerminalDeploymentBootstrapEndpoint"
@@ -403,6 +418,8 @@ def _cohort_payload(cohort: TerminalDeploymentCohort) -> dict[str, object]:
     return {
         "schema": TERMINAL_DEPLOYMENT_COHORT_SCHEMA,
         "group_id": cohort.group_id,
+        "model_fingerprint": cohort.model_fingerprint,
+        "logical_kv_layout_fingerprint": cohort.logical_kv_layout_fingerprint,
         "bootstrap_endpoint": {
             "host": cohort.bootstrap_endpoint.host,
             "port": cohort.bootstrap_endpoint.port,
@@ -585,7 +602,16 @@ def _decode_cohort_payload(value: object) -> TerminalDeploymentCohort:
 
     root = _mapping(
         value,
-        frozenset(("schema", "group_id", "bootstrap_endpoint", "services")),
+        frozenset(
+            (
+                "schema",
+                "group_id",
+                "model_fingerprint",
+                "logical_kv_layout_fingerprint",
+                "bootstrap_endpoint",
+                "services",
+            )
+        ),
         "cohort",
     )
     if root["schema"] != TERMINAL_DEPLOYMENT_COHORT_SCHEMA:
@@ -593,6 +619,14 @@ def _decode_cohort_payload(value: object) -> TerminalDeploymentCohort:
     group_id = root["group_id"]
     if type(group_id) is not str:
         raise TerminalDeploymentCohortError("group_id must be a string")
+    model_fingerprint = root["model_fingerprint"]
+    logical_kv_layout_fingerprint = root["logical_kv_layout_fingerprint"]
+    if type(model_fingerprint) is not str:
+        raise TerminalDeploymentCohortError("model_fingerprint must be a string")
+    if type(logical_kv_layout_fingerprint) is not str:
+        raise TerminalDeploymentCohortError(
+            "logical_kv_layout_fingerprint must be a string"
+        )
     raw_services = root["services"]
     if type(raw_services) is not list or len(raw_services) < 2:
         raise TerminalDeploymentCohortError(
@@ -600,6 +634,8 @@ def _decode_cohort_payload(value: object) -> TerminalDeploymentCohort:
         )
     return TerminalDeploymentCohort(
         group_id=group_id,
+        model_fingerprint=model_fingerprint,
+        logical_kv_layout_fingerprint=logical_kv_layout_fingerprint,
         bootstrap_endpoint=_decode_bootstrap(root["bootstrap_endpoint"]),
         services=tuple(
             _decode_service(raw_service, index)

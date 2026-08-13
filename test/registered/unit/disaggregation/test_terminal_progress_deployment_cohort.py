@@ -70,6 +70,8 @@ def _cohort() -> TerminalDeploymentCohort:
 
     return TerminalDeploymentCohort(
         group_id="group-a",
+        model_fingerprint="11" * 32,
+        logical_kv_layout_fingerprint="22" * 32,
         bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
             host="gemma-dev-1",
             port=32150,
@@ -137,6 +139,8 @@ def test_cohort_matches_launcher_schema_bytes() -> None:
     expected = {
         "schema": "pd-terminal-deployment-cohort-v1",
         "group_id": "group-a",
+        "model_fingerprint": "11" * 32,
+        "logical_kv_layout_fingerprint": "22" * 32,
         "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32150},
         "services": [
             {
