@@ -75,8 +75,7 @@ class PackedTerminalSourceIdentityPlan:
             if owner.tp_size != source_tp_size:
                 raise ValueError("source bindings disagree on TP size")
             if (
-                binding.rank_manifest_digest
-                != self.local_binding.rank_manifest_digest
+                binding.rank_manifest_digest != self.local_binding.rank_manifest_digest
                 or binding.allocation_digest != self.local_binding.allocation_digest
             ):
                 raise ValueError("source bindings disagree on request allocation")
@@ -173,7 +172,9 @@ class PackedTerminalSourcePlan:
             raise TypeError("request_key must be PackedRequestKey")
         if type(self.writers) is not tuple or len(self.writers) == 0:
             raise ValueError("writers must be a non-empty tuple")
-        if any(type(writer) is not PackedTerminalSourceWriter for writer in self.writers):
+        if any(
+            type(writer) is not PackedTerminalSourceWriter for writer in self.writers
+        ):
             raise TypeError("writers must contain PackedTerminalSourceWriter")
         for label, value in (
             ("rank_manifest_digest", self.rank_manifest_digest),
@@ -249,7 +250,9 @@ class PackedTerminalSourcePlan:
 
         if type(writer_id) is not StagingWriterId:
             raise TypeError("writer_id must be StagingWriterId")
-        matching = tuple(writer for writer in self.writers if writer.writer_id == writer_id)
+        matching = tuple(
+            writer for writer in self.writers if writer.writer_id == writer_id
+        )
         if len(matching) != 1:
             raise PackedTerminalSourcePlanError(
                 "terminal source plan does not contain exactly one local writer"
@@ -441,9 +444,7 @@ def encode_packed_terminal_source_plan(plan: PackedTerminalSourcePlan) -> bytes:
         allocation_digest=plan.allocation_digest,
         publication_identity=_WirePublicationIdentity(
             request_key=_encode_request_key(publication.request_key),
-            publisher_process_generation=(
-                publication.publisher_process_generation
-            ),
+            publisher_process_generation=(publication.publisher_process_generation),
             publication_generation=publication.publication_generation,
         ),
         request_ready_issuer=_encode_process(plan.request_ready_issuer),
