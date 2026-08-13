@@ -1,0 +1,631 @@
+import dataclasses
+import hashlib
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from functools import lru_cache
+from pathlib import Path
+from types import ModuleType
+from typing import Protocol, cast
+
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NATIVE_DECODE_RESOURCE_MASK,
+    NATIVE_SOURCE_RESOURCE_MASK,
+    NativeTerminalLifecycleRegistration,
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerEvent,
+    NativeTerminalOwnerInventory,
+    NativeTerminalOwnerOutput,
+    NativeTerminalOwnerRole,
+    NativeTerminalProcessIdentity,
+    NativeTerminalProducerRegistration,
+    canonical_native_terminal_deadlines,
+    native_terminal_deadline_table_digest,
+)
+from torch.utils.cpp_extension import load
+
+
+class _NativeTerminalOwnerBridge(Protocol):
+    """Typed boundary implemented by the native terminal-owner extension."""
+
+    def register_producer(
+        self,
+        producer_id: int,
+        name: str,
+        producer_class: int,
+        allowed_role: int,
+        authenticated_issuer: Mapping[str, object] | None,
+    ) -> None:
+        """Register one process-lifetime event producer before startup.
+
+        :param producer_id: Exact producer namespace.
+        :param name: Stable evidence-facing producer name.
+        :param producer_class: Native authority class code.
+        :param allowed_role: Lifecycle role this producer may mutate.
+        :param authenticated_issuer: Route-authenticated issuer, when required.
+        """
+
+    def register_source(self, registration: Mapping[str, object]) -> None:
+        """Register one source lifecycle before startup.
+
+        :param registration: Exact source binding and publication identity.
+        """
+
+    def register_decode(self, registration: Mapping[str, object]) -> None:
+        """Register one decode lifecycle before startup.
+
+        :param registration: Exact decode binding and trusted issuers.
+        """
+
+    def start(self) -> None:
+        """Start the process-lifetime native reactor."""
+
+    def submit_event(self, event: Mapping[str, object]) -> int:
+        """Submit one producer-ordered lifecycle event.
+
+        :param event: Fixed-width event record.
+        :returns: Zero on acceptance, otherwise a positive errno value.
+        """
+
+    def producer_api(self) -> object:
+        """Return the versioned native producer API capsule.
+
+        :returns: PyCapsule carrying the producer ABI table.
+        """
+
+    def producer_capsule(self, producer_id: int) -> object:
+        """Return the exact context capsule for one registered producer.
+
+        :param producer_id: Registered producer identity.
+        :returns: Producer context PyCapsule.
+        """
+
+    def output_fileno(self) -> int:
+        """Return the production-action eventfd.
+
+        :returns: Open pollable descriptor.
+        """
+
+    def drain_outputs(self) -> list[Mapping[str, object]]:
+        """Drain every production action committed before the wake.
+
+        :returns: Immutable output records.
+        """
+
+    def acknowledge_action(self, action_id: int) -> None:
+        """Consume one exact production action identity.
+
+        :param action_id: One-shot native action identity.
+        """
+
+    def inventory(self) -> Mapping[str, object]:
+        """Return the complete process-lifetime owner inventory.
+
+        :returns: Native inventory mapping.
+        """
+
+    def lifecycle_snapshot(self, binding_digest: bytes) -> Mapping[str, object]:
+        """Return one lifecycle from a native test build.
+
+        :param binding_digest: Exact request-generation digest.
+        :returns: Immutable native lifecycle mapping.
+        """
+
+    def enable_test_clock(self, now_ns: int) -> None:
+        """Enable the deterministic clock before reactor startup.
+
+        :param now_ns: Positive initial monotonic time.
+        """
+
+    def set_test_clock(self, now_ns: int) -> None:
+        """Advance the deterministic clock monotonically.
+
+        :param now_ns: New monotonic time.
+        """
+
+    def expire_deadlines_for_test(self) -> None:
+        """Evaluate all armed deadlines at deterministic test time."""
+
+    def start_qualification(
+        self,
+        machine_count: int,
+        minimum_duration_seconds: float,
+        minimum_transition_count: int,
+    ) -> None:
+        """Start the closed-loop real-reducer qualification producer.
+
+        :param machine_count: Concurrent native state machines.
+        :param minimum_duration_seconds: Sustained-duration floor.
+        :param minimum_transition_count: Transition-count floor.
+        """
+
+    def qualification_join(self, timeout_seconds: float) -> bool:
+        """Wait for the native qualification producer to retire.
+
+        :param timeout_seconds: Positive wait bound.
+        :returns: Whether qualification completed within the bound.
+        """
+
+    def qualification_summary(self) -> Mapping[str, object]:
+        """Return native population statistics and bounded audit samples.
+
+        :returns: Exact native summary mapping.
+        """
+
+    def stop_admission(self) -> None:
+        """Close lifecycle and event admission."""
+
+    def join_producers(self) -> None:
+        """Record that every external producer has stopped."""
+
+    def close(self) -> None:
+        """Close a fully drained and retired owner."""
+
+    def abort_and_close(self) -> None:
+        """Fail closed and release the reactor after an incomplete run."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalLifecycleSnapshot:
+    """Test-visible immutable projection of one native lifecycle.
+
+    :ivar binding_digest: Exact request-generation identity.
+    :ivar role: Native owner role.
+    :ivar phase: Stable role-specific phase code.
+    :ivar live_resources: Resources still pinned by the owner.
+    :ivar retired_resources: Resources carrying exact reuse proof.
+    :ivar quarantined_resources: Resources retained fail-closed.
+    :ivar armed_deadline_mask: Deadlines active for this lifecycle.
+    :ivar process_fatal: Whether process continuation became unsafe.
+    """
+
+    binding_digest: bytes
+    role: NativeTerminalOwnerRole
+    phase: int
+    live_resources: int
+    retired_resources: int
+    quarantined_resources: int
+    armed_deadline_mask: int
+    process_fatal: bool
+
+    def __post_init__(self) -> None:
+        """Validate exact identity and resource conservation."""
+
+        if type(self.binding_digest) is not bytes or len(self.binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        if type(self.role) is not NativeTerminalOwnerRole:
+            raise TypeError("role must be NativeTerminalOwnerRole")
+        values = (
+            self.phase,
+            self.live_resources,
+            self.retired_resources,
+            self.quarantined_resources,
+            self.armed_deadline_mask,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("native lifecycle fields must be non-negative integers")
+        if type(self.process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
+        partitions = (
+            self.live_resources,
+            self.retired_resources,
+            self.quarantined_resources,
+        )
+        if (
+            partitions[0] & partitions[1] != 0
+            or partitions[0] & partitions[2] != 0
+            or partitions[1] & partitions[2] != 0
+        ):
+            raise ValueError("native lifecycle resource partitions overlap")
+        expected = (
+            NATIVE_SOURCE_RESOURCE_MASK
+            if self.role is NativeTerminalOwnerRole.SOURCE
+            else NATIVE_DECODE_RESOURCE_MASK
+        )
+        if partitions[0] | partitions[1] | partitions[2] != expected:
+            raise ValueError("native lifecycle resource partitions are incomplete")
+
+    @classmethod
+    def from_native(
+        cls, value: Mapping[str, object]
+    ) -> "NativeTerminalLifecycleSnapshot":
+        """Parse one native inventory lifecycle.
+
+        :param value: Raw immutable lifecycle mapping from the bridge.
+        :returns: Validated lifecycle snapshot.
+        """
+
+        binding_value = value["binding"]
+        if not isinstance(binding_value, Mapping):
+            raise TypeError("native lifecycle binding must be a mapping")
+        return cls(
+            binding_digest=bytes(binding_value["digest"]),
+            role=NativeTerminalOwnerRole(int(value["role"])),
+            phase=int(value["phase"]),
+            live_resources=int(value["live_resources"]),
+            retired_resources=int(value["retired_resources"]),
+            quarantined_resources=int(value["quarantined_resources"]),
+            armed_deadline_mask=int(value["armed_deadline_mask"]),
+            process_fatal=bool(value["process_fatal"]),
+        )
+
+
+def _native_source_path() -> Path:
+    """Return the packaged authoritative native owner source.
+
+    :returns: Absolute C++ source path.
+    """
+
+    return Path(__file__).with_name("native_owner_bridge.cpp")
+
+
+@lru_cache(maxsize=2)
+def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
+    """Compile and load the CPU-only authoritative owner bridge.
+
+    The module name binds the source digest and build variant. A test build may
+    expose deterministic clock controls, while production builds retain native
+    ``CLOCK_MONOTONIC_RAW`` ownership.
+
+    :param testing: Whether native test-only controls are required.
+    :returns: Loaded pybind11 extension module.
+    """
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("native terminal owner requires Linux eventfd and timerfd")
+    source_path = _native_source_path()
+    if not source_path.is_file():
+        raise RuntimeError(f"native terminal owner source is absent: {source_path}")
+    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()[:12]
+    variant = "test" if testing else "runtime"
+    module_name = f"sglang_terminal_owner_bridge_{source_digest}_{variant}"
+    extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
+    if testing:
+        extra_cflags.append("-DSGLANG_TERMINAL_OWNER_TESTING")
+    build_directory_value = os.environ.get("SGLANG_TERMINAL_OWNER_BUILD_DIR")
+    build_directory: str | None = None
+    if build_directory_value is not None:
+        build_path = Path(build_directory_value).resolve() / module_name
+        build_path.mkdir(parents=True, exist_ok=True)
+        build_directory = str(build_path)
+    return load(
+        name=module_name,
+        sources=[str(source_path)],
+        extra_cflags=extra_cflags,
+        extra_ldflags=["-pthread"],
+        build_directory=build_directory,
+        with_cuda=False,
+        verbose=False,
+    )
+
+
+class NativeTerminalOwner:
+    """Typed process-lifetime facade over the authoritative native reducer."""
+
+    _native: _NativeTerminalOwnerBridge
+    _closed: bool
+    _testing: bool
+
+    def __init__(
+        self,
+        input_capacity: int,
+        output_capacity: int,
+        owner_identity: NativeTerminalProcessIdentity,
+        *,
+        testing: bool = False,
+    ) -> None:
+        """Construct one owner before producer and lifecycle registration.
+
+        :param input_capacity: Bounded native event capacity.
+        :param output_capacity: Bounded production-action capacity.
+        :param owner_identity: Exact process and tensor-parallel identity.
+        :param testing: Whether the native test variant is required.
+        """
+
+        capacities = (input_capacity, output_capacity)
+        if any(type(value) is not int or value <= 0 for value in capacities):
+            raise ValueError("native owner capacities must be positive integers")
+        if type(owner_identity) is not NativeTerminalProcessIdentity:
+            raise TypeError("owner_identity must be NativeTerminalProcessIdentity")
+        deadline_table = tuple(
+            deadline.to_native() for deadline in canonical_native_terminal_deadlines()
+        )
+        if any("process_fatal" not in deadline for deadline in deadline_table):
+            raise RuntimeError(
+                "native deadline ABI lacks its process-fatal disposition"
+            )
+        module = load_native_terminal_owner_module(testing=testing)
+        self._native = cast(
+            _NativeTerminalOwnerBridge,
+            module.NativeTerminalOwnerBridge(
+                input_capacity,
+                output_capacity,
+                owner_identity.to_native(),
+                deadline_table,
+                native_terminal_deadline_table_digest(),
+            ),
+        )
+        self._closed = False
+        self._testing = testing
+
+    def register_producer(
+        self, registration: NativeTerminalProducerRegistration
+    ) -> None:
+        """Register one producer before the reactor starts.
+
+        :param registration: Complete producer identity and authority.
+        """
+
+        if type(registration) is not NativeTerminalProducerRegistration:
+            raise TypeError("registration must be NativeTerminalProducerRegistration")
+        value = registration.to_native()
+        issuer = value["authenticated_issuer"]
+        if issuer is not None and not isinstance(issuer, Mapping):
+            raise TypeError("native producer issuer must be a mapping")
+        self._native.register_producer(
+            int(value["producer_id"]),
+            str(value["name"]),
+            int(value["producer_class"]),
+            int(value["allowed_role"]),
+            issuer,
+        )
+
+    def register_lifecycle(
+        self, registration: NativeTerminalLifecycleRegistration
+    ) -> None:
+        """Register one exact source or decode lifecycle before startup.
+
+        :param registration: Complete role-specific lifecycle identity.
+        """
+
+        if type(registration) is not NativeTerminalLifecycleRegistration:
+            raise TypeError("registration must be NativeTerminalLifecycleRegistration")
+        value = registration.to_native()
+        if registration.binding.owner.role is NativeTerminalOwnerRole.SOURCE:
+            self._native.register_source(value)
+            return
+        self._native.register_decode(value)
+
+    def start(self) -> None:
+        """Start the native reactor after all static registration."""
+
+        self._native.start()
+
+    def enable_test_clock(self, now_ns: int) -> None:
+        """Enable deterministic deadline time before test-owner startup.
+
+        :param now_ns: Positive initial monotonic timestamp.
+        :raises RuntimeError: If this owner is not a test build.
+        """
+
+        if not self._testing:
+            raise RuntimeError("deterministic clocks require a native test build")
+        if type(now_ns) is not int or now_ns <= 0:
+            raise ValueError("now_ns must be a positive integer")
+        self._native.enable_test_clock(now_ns)
+
+    def set_test_clock(self, now_ns: int) -> None:
+        """Advance deterministic test-owner time monotonically.
+
+        :param now_ns: New monotonic timestamp.
+        :raises RuntimeError: If this owner is not a test build.
+        """
+
+        if not self._testing:
+            raise RuntimeError("deterministic clocks require a native test build")
+        if type(now_ns) is not int or now_ns <= 0:
+            raise ValueError("now_ns must be a positive integer")
+        self._native.set_test_clock(now_ns)
+
+    def expire_deadlines_for_testing(self) -> None:
+        """Evaluate armed deadlines without sleeping in a native test build.
+
+        :raises RuntimeError: If this owner is not a test build.
+        """
+
+        if not self._testing:
+            raise RuntimeError("deterministic clocks require a native test build")
+        self._native.expire_deadlines_for_test()
+
+    def submit(self, event: NativeTerminalOwnerEvent) -> None:
+        """Submit one exact event or surface the native errno result.
+
+        :param event: Producer-bound lifecycle event.
+        :raises OSError: If native admission rejects the event synchronously.
+        """
+
+        if type(event) is not NativeTerminalOwnerEvent:
+            raise TypeError("event must be NativeTerminalOwnerEvent")
+        status = int(self._native.submit_event(event.to_native()))
+        if status != 0:
+            raise OSError(status, os.strerror(status))
+
+    def submit_unchecked_for_testing(self, event: Mapping[str, object]) -> None:
+        """Submit a structurally adversarial event to a native test build.
+
+        Production callers use :meth:`submit`, whose immutable Python types
+        reject malformed authority before the native boundary. Differential
+        qualification deliberately needs to present forged bindings, receipt
+        kinds, outcomes, and replays to the native reducer itself.
+
+        :param event: Complete raw native event mapping.
+        :raises RuntimeError: If this owner was not built for testing.
+        :raises OSError: If native admission rejects the event synchronously.
+        """
+
+        if not self._testing:
+            raise RuntimeError("unchecked submission requires a native test build")
+        if not isinstance(event, Mapping):
+            raise TypeError("event must be a mapping")
+        status = int(self._native.submit_event(dict(event)))
+        if status != 0:
+            raise OSError(status, os.strerror(status))
+
+    def output_fileno(self) -> int:
+        """Return the production-action eventfd.
+
+        :returns: Open pollable descriptor.
+        """
+
+        return int(self._native.output_fileno())
+
+    def drain_outputs(self) -> tuple[NativeTerminalOwnerOutput, ...]:
+        """Drain and validate every newly earned production action.
+
+        :returns: Immutable typed native commit outputs.
+        """
+
+        values = self._native.drain_outputs()
+        return tuple(NativeTerminalOwnerOutput.from_native(value) for value in values)
+
+    def acknowledge_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Acknowledge one exact one-shot production action.
+
+        :param action: Action previously returned by :meth:`drain_outputs`.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        self._native.acknowledge_action(action.action_id)
+
+    def inventory(self) -> NativeTerminalOwnerInventory:
+        """Return the complete validated native owner inventory.
+
+        :returns: Immutable inventory projection.
+        """
+
+        return NativeTerminalOwnerInventory.from_native(self._native.inventory())
+
+    def lifecycle_snapshot_for_testing(
+        self, binding_digest: bytes
+    ) -> NativeTerminalLifecycleSnapshot:
+        """Return one exact lifecycle projection from a native test build.
+
+        Actionless commits intentionally never enter the production output
+        queue. This read-only projection lets the differential qualification
+        compare those commits without creating a Python-owned transition path.
+
+        :param binding_digest: Exact registered request-generation digest.
+        :returns: Validated immutable native lifecycle snapshot.
+        :raises RuntimeError: If this owner was not built for testing.
+        :raises KeyError: If the exact lifecycle is absent.
+        """
+
+        if not self._testing:
+            raise RuntimeError("lifecycle snapshots require a native test build")
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        return NativeTerminalLifecycleSnapshot.from_native(
+            self._native.lifecycle_snapshot(binding_digest)
+        )
+
+    def producer_api(self) -> object:
+        """Return the versioned producer ABI capsule.
+
+        :returns: Native producer API PyCapsule.
+        """
+
+        return self._native.producer_api()
+
+    def producer_capsule(self, producer_id: int) -> object:
+        """Return the context capsule for one registered producer.
+
+        :param producer_id: Exact registered producer identity.
+        :returns: Native producer context PyCapsule.
+        """
+
+        if type(producer_id) is not int or producer_id < 0:
+            raise ValueError("producer_id must be a non-negative integer")
+        return self._native.producer_capsule(producer_id)
+
+    def start_qualification(
+        self,
+        machine_count: int,
+        minimum_duration_seconds: float,
+        minimum_transition_count: int,
+    ) -> None:
+        """Start native closed-loop qualification on a dedicated owner.
+
+        :param machine_count: Concurrent lifecycle machine count.
+        :param minimum_duration_seconds: Sustained wall-duration floor.
+        :param minimum_transition_count: Measured seven-hop transition floor.
+        """
+
+        if type(machine_count) is not int or machine_count <= 0:
+            raise ValueError("machine_count must be a positive integer")
+        if (
+            type(minimum_duration_seconds) is not float
+            or minimum_duration_seconds <= 0.0
+        ):
+            raise ValueError("minimum_duration_seconds must be a positive float")
+        if type(minimum_transition_count) is not int or minimum_transition_count <= 0:
+            raise ValueError("minimum_transition_count must be a positive integer")
+        self._native.start_qualification(
+            machine_count,
+            minimum_duration_seconds,
+            minimum_transition_count,
+        )
+
+    def qualification_join(self, timeout_seconds: float) -> bool:
+        """Wait without the GIL for native qualification completion.
+
+        :param timeout_seconds: Positive wall-clock wait bound.
+        :returns: Whether the complete population retired within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native.qualification_join(timeout_seconds))
+
+    def qualification_summary(self) -> Mapping[str, object]:
+        """Return exact native statistics and bounded audit samples.
+
+        The bridge computes nearest-rank order statistics over the complete
+        measured population. Only first/last per-machine audit traces cross the
+        Python boundary, so evidence size is independent of run throughput.
+
+        :returns: Immutable native evidence summary mapping.
+        """
+
+        summary = self._native.qualification_summary()
+        if not isinstance(summary, Mapping):
+            raise TypeError("native qualification summary must be a mapping")
+        return summary
+
+    def stop_admission(self) -> None:
+        """Close lifecycle and event admission before drain."""
+
+        self._native.stop_admission()
+
+    def join_producers(self) -> None:
+        """Record that every native and external producer has stopped."""
+
+        self._native.join_producers()
+
+    def close(self) -> None:
+        """Close a fully drained owner exactly once."""
+
+        if self._closed:
+            return
+        self._native.close()
+        self._closed = True
+
+    def abort_and_close(self) -> None:
+        """Fail closed and release an incomplete owner exactly once."""
+
+        if self._closed:
+            return
+        self._native.abort_and_close()
+        self._closed = True
+
+
+def parse_native_owner_outputs(
+    values: Sequence[Mapping[str, object]],
+) -> tuple[NativeTerminalOwnerOutput, ...]:
+    """Parse raw bridge outputs for bounded integration tests.
+
+    :param values: Raw immutable mappings returned by the native drain.
+    :returns: Validated typed commit outputs.
+    """
+
+    return tuple(NativeTerminalOwnerOutput.from_native(value) for value in values)

@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeSourceLifecyclePhase,
     NativeTerminalDeadlineKind,
     NativeTerminalLifecycleRegistration,
+    NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
@@ -122,6 +123,18 @@ def test_native_deadline_table_is_exactly_the_packaged_hash_bound_table() -> Non
     assert tuple(value.kind for value in native) == tuple(NativeTerminalDeadlineKind)
     assert tuple(value.duration_ns for value in native) == tuple(
         spec.duration_ns for spec in PACKED_TERMINAL_DEADLINES
+    )
+    assert tuple(value.process_fatal for value in native) == (
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
     )
     assert tuple(value.starts_at for value in native) == tuple(
         spec.starts_at for spec in PACKED_TERMINAL_DEADLINES
@@ -233,6 +246,13 @@ def test_native_output_requires_complete_exclusive_resource_partition() -> None:
         terminal_timestamp_ns=456,
         nonce=RECEIPT_NONCE,
     )
+    reclaim_action = NativeTerminalOwnerAction(
+        action_id=1,
+        kind=NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        binding=binding,
+        commit_timestamp_ns=456,
+        receipt=reclaim_receipt,
+    )
     output = NativeTerminalOwnerOutput(
         binding=binding,
         owner_sequence=8,
@@ -247,8 +267,7 @@ def test_native_output_requires_complete_exclusive_resource_partition() -> None:
         live_resources=NATIVE_SOURCE_RESOURCE_MASK,
         retired_resources=0,
         quarantined_resources=0,
-        actions=(NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,),
-        receipts=(reclaim_receipt,),
+        actions=(reclaim_action,),
         armed_deadline_mask=0,
         process_fatal=False,
         fatal_code=NativeTerminalOwnerFatalCode.NONE,
@@ -272,8 +291,7 @@ def test_native_output_requires_complete_exclusive_resource_partition() -> None:
             live_resources=NATIVE_SOURCE_RESOURCE_MASK,
             retired_resources=1,
             quarantined_resources=0,
-            actions=(NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,),
-            receipts=(reclaim_receipt,),
+            actions=(reclaim_action,),
             armed_deadline_mask=0,
             process_fatal=False,
             fatal_code=NativeTerminalOwnerFatalCode.NONE,

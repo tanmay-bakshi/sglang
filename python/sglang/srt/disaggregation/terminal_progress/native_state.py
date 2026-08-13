@@ -59,6 +59,15 @@ class NativeTerminalOwnerRole(enum.IntEnum):
     DECODE = 2
 
 
+class NativeTerminalProducerClass(enum.IntEnum):
+    """Stable native producer authority class."""
+
+    LOCAL = 1
+    RECEIPT = 2
+    CONTROL = 3
+    QUALIFICATION = 4
+
+
 class NativeTerminalOwnerEventKind(enum.IntEnum):
     """Closed producer vocabulary reduced by the native owner."""
 
@@ -222,10 +231,7 @@ class NativeTerminalOwnerActionKind(enum.IntEnum):
     LOCAL_DECODE_READY = 3
     REQUEST_RETIRED = 4
     REQUEST_QUARANTINED = 5
-    DEADLINE_ARMED = 6
-    DEADLINE_CANCELLED = 7
-    DEADLINE_EXPIRED = 8
-    PROCESS_FATAL = 9
+    PROCESS_FATAL = 6
 
 
 class NativeTerminalOwnerFatalCode(enum.IntEnum):
@@ -235,16 +241,19 @@ class NativeTerminalOwnerFatalCode(enum.IntEnum):
     INPUT_QUEUE_OVERFLOW = 1
     OUTPUT_QUEUE_OVERFLOW = 2
     EVENTFD_FAILURE = 3
-    PRODUCER_SEQUENCE = 4
-    DUPLICATE_BINDING = 5
-    UNKNOWN_BINDING = 6
-    ILLEGAL_TRANSITION = 7
-    RECEIPT_AUTHORITY = 8
-    RECEIPT_REPLAY = 9
-    DEADLINE_INVARIANT = 10
-    OWNER_DEPENDENCY_DEATH = 11
-    SHUTDOWN_DEADLINE = 12
-    INTERNAL_ERROR = 13
+    TIMERFD_FAILURE = 4
+    PRODUCER_SEQUENCE = 5
+    DUPLICATE_BINDING = 6
+    UNKNOWN_BINDING = 7
+    ILLEGAL_TRANSITION = 8
+    RECEIPT_AUTHORITY = 9
+    RECEIPT_REPLAY = 10
+    UNKNOWN_ACTION = 11
+    ACTION_REPLAY = 12
+    DEADLINE_EXPIRY = 13
+    DEPENDENCY_DEATH = 14
+    CLOSE_WITH_RETAINED_INVENTORY = 15
+    INTERNAL_ERROR = 16
 
 
 _ROLE_TO_NATIVE = {
@@ -376,12 +385,14 @@ class NativeTerminalDeadlineSpec:
 
     :ivar kind: Stable native deadline code.
     :ivar duration_ns: Exact positive integer duration.
+    :ivar process_fatal: Whether expiry makes process continuation unsafe.
     :ivar starts_at: Frozen one-shot start anchor.
     :ivar timeout_outcome: Frozen fail-closed outcome.
     """
 
     kind: NativeTerminalDeadlineKind
     duration_ns: int
+    process_fatal: bool
     starts_at: str
     timeout_outcome: str
 
@@ -393,6 +404,8 @@ class NativeTerminalDeadlineSpec:
         _require_uint(self.duration_ns, _UINT64_MAX, "duration_ns")
         if self.duration_ns == 0:
             raise ValueError("duration_ns must be positive")
+        if type(self.process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
         strings = (self.starts_at, self.timeout_outcome)
         if any(type(value) is not str or len(value) == 0 for value in strings):
             raise ValueError("deadline anchor and outcome must be non-empty strings")
@@ -406,6 +419,7 @@ class NativeTerminalDeadlineSpec:
         return {
             "kind": int(self.kind),
             "duration_ns": self.duration_ns,
+            "process_fatal": self.process_fatal,
             "starts_at": self.starts_at,
             "timeout_outcome": self.timeout_outcome,
         }
@@ -421,6 +435,14 @@ def canonical_native_terminal_deadlines() -> tuple[NativeTerminalDeadlineSpec, .
         NativeTerminalDeadlineSpec(
             kind=_DEADLINE_KIND_TO_NATIVE[spec.kind],
             duration_ns=spec.duration_ns,
+            process_fatal=(
+                spec.kind
+                in (
+                    TerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION,
+                    TerminalDeadlineKind.OWNER_GATEWAY_PUBLICATION,
+                    TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN,
+                )
+            ),
             starts_at=spec.starts_at,
             timeout_outcome=spec.timeout_outcome,
         )
@@ -732,6 +754,73 @@ class NativeTerminalReceipt:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalOwnerAction:
+    """One-shot production action emitted after an authoritative commit.
+
+    :ivar action_id: Gap-free native action identity.
+    :ivar kind: Closed consumer action kind.
+    :ivar binding: Exact request generation earning the action.
+    :ivar commit_timestamp_ns: Native post-commit timestamp.
+    :ivar receipt: Newly minted authority when the action transfers permission.
+    """
+
+    action_id: int
+    kind: NativeTerminalOwnerActionKind
+    binding: NativeTerminalRequestBinding
+    commit_timestamp_ns: int
+    receipt: NativeTerminalReceipt | None
+
+    def __post_init__(self) -> None:
+        """Validate one exact action and optional receipt authority."""
+
+        _require_uint(self.action_id, _UINT64_MAX, "action_id")
+        if type(self.kind) is not NativeTerminalOwnerActionKind:
+            raise TypeError("kind must be NativeTerminalOwnerActionKind")
+        if type(self.binding) is not NativeTerminalRequestBinding:
+            raise TypeError("binding must be NativeTerminalRequestBinding")
+        _require_uint(self.commit_timestamp_ns, _UINT64_MAX, "commit_timestamp_ns")
+        expected_receipt_kind = _ACTION_RECEIPT_REQUIREMENTS.get(self.kind)
+        if expected_receipt_kind is None:
+            if self.receipt is not None:
+                raise ValueError(f"{self.kind.name} does not carry a receipt")
+            return
+        if type(self.receipt) is not NativeTerminalReceipt:
+            raise ValueError(f"{self.kind.name} requires a native receipt")
+        if (
+            self.receipt.binding != self.binding
+            or self.receipt.kind is not expected_receipt_kind
+            or self.receipt.outcome is not NativeTerminalReceiptOutcome.SUCCESS
+            or self.receipt.terminal_timestamp_ns != self.commit_timestamp_ns
+        ):
+            raise ValueError("native action receipt does not match its authority")
+
+    @classmethod
+    def from_native(cls, value: Mapping[str, object]) -> "NativeTerminalOwnerAction":
+        """Parse one immutable native action output.
+
+        :param value: Native action mapping.
+        :returns: Validated immutable action.
+        """
+
+        binding_value = value["binding"]
+        receipt_value = value["receipt"]
+        if not isinstance(binding_value, Mapping):
+            raise TypeError("native action binding must be a mapping")
+        receipt: NativeTerminalReceipt | None = None
+        if receipt_value is not None:
+            if not isinstance(receipt_value, Mapping):
+                raise TypeError("native action receipt must be a mapping")
+            receipt = NativeTerminalReceipt.from_native(receipt_value)
+        return cls(
+            action_id=int(value["action_id"]),
+            kind=NativeTerminalOwnerActionKind(int(value["kind"])),
+            binding=_binding_from_native(binding_value),
+            commit_timestamp_ns=int(value["commit_timestamp_ns"]),
+            receipt=receipt,
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class NativeTerminalLifecycleRegistration:
     """Complete lifecycle registration accepted before producer events.
 
@@ -786,6 +875,60 @@ class NativeTerminalLifecycleRegistration:
             "trusted_issuers": tuple(
                 issuer.to_native() for issuer in self.trusted_issuers
             ),
+        }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalProducerRegistration:
+    """Process-lifetime producer identity and route authentication.
+
+    :ivar producer_id: Exact native producer namespace.
+    :ivar name: Stable evidence-facing producer name.
+    :ivar producer_class: Events this producer is authorized to submit.
+    :ivar allowed_role: Lifecycle role this producer may mutate.
+    :ivar authenticated_issuer: Process identity proved by this route, if any.
+    """
+
+    producer_id: int
+    name: str
+    producer_class: NativeTerminalProducerClass
+    allowed_role: NativeTerminalOwnerRole
+    authenticated_issuer: NativeTerminalProcessIdentity | None
+
+    def __post_init__(self) -> None:
+        """Validate producer authority before native registration."""
+
+        _require_uint(self.producer_id, _UINT64_MAX, "producer_id")
+        if type(self.name) is not str or len(self.name) == 0:
+            raise ValueError("name must be a non-empty string")
+        if type(self.producer_class) is not NativeTerminalProducerClass:
+            raise TypeError("producer_class must be NativeTerminalProducerClass")
+        if type(self.allowed_role) is not NativeTerminalOwnerRole:
+            raise TypeError("allowed_role must be NativeTerminalOwnerRole")
+        if self.authenticated_issuer is not None and (
+            type(self.authenticated_issuer) is not NativeTerminalProcessIdentity
+        ):
+            raise TypeError("authenticated_issuer has an invalid identity")
+        if self.producer_class is NativeTerminalProducerClass.LOCAL:
+            if self.authenticated_issuer is not None:
+                raise ValueError("local native producers cannot assert a wire issuer")
+            return
+        if self.authenticated_issuer is None:
+            raise ValueError("non-local producers require an authenticated issuer")
+
+    def to_native(self) -> dict[str, object]:
+        """Return a pybind-compatible producer registration.
+
+        :returns: Native producer registration fields.
+        """
+
+        issuer = self.authenticated_issuer
+        return {
+            "producer_id": self.producer_id,
+            "name": self.name,
+            "producer_class": int(self.producer_class),
+            "allowed_role": int(self.allowed_role),
+            "authenticated_issuer": None if issuer is None else issuer.to_native(),
         }
 
 
@@ -878,8 +1021,7 @@ class NativeTerminalOwnerOutput:
     :ivar live_resources: Resource bits still pinned.
     :ivar retired_resources: Resource bits carrying exact reuse proof.
     :ivar quarantined_resources: Resource bits retained fail-closed.
-    :ivar actions: Production actions earned by this commit.
-    :ivar receipts: Newly minted one-shot authority receipts.
+    :ivar actions: One-shot production actions earned by this commit.
     :ivar armed_deadline_mask: Deadlines remaining active after this commit.
     :ivar process_fatal: Whether process continuation became unsafe.
     :ivar fatal_code: Sticky first fatal code, or none.
@@ -898,8 +1040,7 @@ class NativeTerminalOwnerOutput:
     live_resources: int
     retired_resources: int
     quarantined_resources: int
-    actions: tuple[NativeTerminalOwnerActionKind, ...]
-    receipts: tuple[NativeTerminalReceipt, ...]
+    actions: tuple[NativeTerminalOwnerAction, ...]
     armed_deadline_mask: int
     process_fatal: bool
     fatal_code: NativeTerminalOwnerFatalCode
@@ -935,28 +1076,18 @@ class NativeTerminalOwnerOutput:
         if type(self.actions) is not tuple or len(self.actions) == 0:
             raise ValueError("actions must be a non-empty tuple")
         if any(
-            type(action) is not NativeTerminalOwnerActionKind for action in self.actions
+            type(action) is not NativeTerminalOwnerAction for action in self.actions
         ):
-            raise TypeError("actions must contain NativeTerminalOwnerActionKind values")
-        if len(set(self.actions)) != len(self.actions):
-            raise ValueError("native output actions must be unique")
-        if type(self.receipts) is not tuple or any(
-            type(receipt) is not NativeTerminalReceipt for receipt in self.receipts
+            raise TypeError("actions must contain NativeTerminalOwnerAction values")
+        if any(action.binding != self.binding for action in self.actions):
+            raise ValueError("native output action belongs to another binding")
+        if any(
+            action.commit_timestamp_ns != self.completed_ns for action in self.actions
         ):
-            raise TypeError("receipts must contain NativeTerminalReceipt values")
-        if any(receipt.binding != self.binding for receipt in self.receipts):
-            raise ValueError("native output receipt belongs to another binding")
-        receipt_nonces = tuple(receipt.nonce for receipt in self.receipts)
-        if len(set(receipt_nonces)) != len(receipt_nonces):
-            raise ValueError("native output receipt nonces must be unique")
-        expected_receipt_kinds = tuple(
-            _ACTION_RECEIPT_REQUIREMENTS[action]
-            for action in self.actions
-            if action in _ACTION_RECEIPT_REQUIREMENTS
-        )
-        observed_receipt_kinds = tuple(receipt.kind for receipt in self.receipts)
-        if sorted(expected_receipt_kinds) != sorted(observed_receipt_kinds):
-            raise ValueError("native output actions and receipts do not agree")
+            raise ValueError("native output action timestamp differs from its commit")
+        action_ids = tuple(action.action_id for action in self.actions)
+        if len(set(action_ids)) != len(action_ids):
+            raise ValueError("native output action identities must be unique")
         if type(self.process_fatal) is not bool:
             raise TypeError("process_fatal must be bool")
         if type(self.fatal_code) is not NativeTerminalOwnerFatalCode:
@@ -966,7 +1097,8 @@ class NativeTerminalOwnerOutput:
         ):
             raise ValueError("process fatal disposition and code must agree")
         if self.process_fatal != (
-            NativeTerminalOwnerActionKind.PROCESS_FATAL in self.actions
+            NativeTerminalOwnerActionKind.PROCESS_FATAL
+            in tuple(action.kind for action in self.actions)
         ):
             raise ValueError("process fatal disposition and action must agree")
         phase_values: tuple[int, ...]
@@ -1020,16 +1152,13 @@ class NativeTerminalOwnerOutput:
         if not isinstance(binding_value, Mapping):
             raise TypeError("native output binding must be a mapping")
         actions_value = value["actions"]
-        receipts_value = value["receipts"]
         if type(actions_value) not in (list, tuple):
             raise TypeError("native output actions must be a sequence")
-        if type(receipts_value) not in (list, tuple):
-            raise TypeError("native output receipts must be a sequence")
-        receipts: list[NativeTerminalReceipt] = []
-        for receipt_value in receipts_value:
-            if not isinstance(receipt_value, Mapping):
-                raise TypeError("native output receipt must be a mapping")
-            receipts.append(NativeTerminalReceipt.from_native(receipt_value))
+        actions: list[NativeTerminalOwnerAction] = []
+        for action_value in actions_value:
+            if not isinstance(action_value, Mapping):
+                raise TypeError("native output action must be a mapping")
+            actions.append(NativeTerminalOwnerAction.from_native(action_value))
         return cls(
             binding=_binding_from_native(binding_value),
             owner_sequence=int(value["owner_sequence"]),
@@ -1044,10 +1173,7 @@ class NativeTerminalOwnerOutput:
             live_resources=int(value["live_resources"]),
             retired_resources=int(value["retired_resources"]),
             quarantined_resources=int(value["quarantined_resources"]),
-            actions=tuple(
-                NativeTerminalOwnerActionKind(int(action)) for action in actions_value
-            ),
-            receipts=tuple(receipts),
+            actions=tuple(actions),
             armed_deadline_mask=int(value["armed_deadline_mask"]),
             process_fatal=bool(value["process_fatal"]),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
