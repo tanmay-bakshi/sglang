@@ -1,0 +1,367 @@
+import dataclasses
+import hashlib
+import os
+import sys
+from functools import lru_cache
+from pathlib import Path
+from types import ModuleType
+from typing import Protocol, cast
+
+from sglang.srt.disaggregation.terminal_progress.native_owner import (
+    NativeTerminalOwner,
+)
+from torch.utils.cpp_extension import CUDA_HOME, load
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CudaTerminalProducerInventory:
+    """Complete CUDA callback-to-owner producer inventory.
+
+    :ivar armed_count: Bindings armed but not yet attached to a stream.
+    :ivar submitted_count: Bindings whose CUDA callbacks have not returned.
+    :ivar active_callback_count: CUDA host callbacks still outstanding.
+    :ivar active_registration_count: Callback registrations still returning.
+    :ivar total_submissions: Successfully registered callbacks.
+    :ivar total_delivered: Events admitted directly into the native owner.
+    :ivar owner_submit_failure_count: Native owner submission failures.
+    :ivar admission_open: Whether new bindings may be armed.
+    :ivar retirement_requested: Whether ordered producer retirement entered.
+    :ivar joined: Whether ordered retirement committed.
+    :ivar closed: Whether exact-zero closure completed.
+    :ivar fatal_code: Sticky first producer failure.
+    :ivar fatal_status: Native errno or CUDA status for the first failure.
+    :ivar fatal_binding: Exact binding associated with the first failure.
+    """
+
+    armed_count: int
+    submitted_count: int
+    active_callback_count: int
+    active_registration_count: int
+    total_submissions: int
+    total_delivered: int
+    owner_submit_failure_count: int
+    admission_open: bool
+    retirement_requested: bool
+    joined: bool
+    closed: bool
+    fatal_code: str
+    fatal_status: int
+    fatal_binding: bytes | None
+
+    @classmethod
+    def from_native(cls, value: dict[str, object]) -> "CudaTerminalProducerInventory":
+        """Parse one native inventory snapshot.
+
+        :param value: Native inventory mapping.
+        :returns: Validated typed inventory.
+        """
+
+        fatal_binding_value = value["fatal_binding"]
+        fatal_binding: bytes | None = None
+        if fatal_binding_value is not None:
+            if type(fatal_binding_value) is not bytes:
+                raise TypeError("fatal_binding must be bytes or None")
+            if len(fatal_binding_value) != 32:
+                raise ValueError("fatal_binding must contain 32 bytes")
+            fatal_binding = fatal_binding_value
+        return cls(
+            armed_count=int(value["armed_count"]),
+            submitted_count=int(value["submitted_count"]),
+            active_callback_count=int(value["active_callback_count"]),
+            active_registration_count=int(value["active_registration_count"]),
+            total_submissions=int(value["total_submissions"]),
+            total_delivered=int(value["total_delivered"]),
+            owner_submit_failure_count=int(value["owner_submit_failure_count"]),
+            admission_open=bool(value["admission_open"]),
+            retirement_requested=bool(value["retirement_requested"]),
+            joined=bool(value["joined"]),
+            closed=bool(value["closed"]),
+            fatal_code=str(value["fatal_code"]),
+            fatal_status=int(value["fatal_status"]),
+            fatal_binding=fatal_binding,
+        )
+
+    @property
+    def retained_count(self) -> int:
+        """Return every binding still owned by the producer.
+
+        :returns: Armed and callback-submitted binding count.
+        """
+
+        return self.armed_count + self.submitted_count
+
+
+class _NativeCudaTerminalProducer(Protocol):
+    """Typed boundary implemented by the CUDA producer extension."""
+
+    def arm(self, binding_digest: bytes) -> None:
+        """Arm one exact owner binding.
+
+        :param binding_digest: Exact request lifecycle digest.
+        """
+
+    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
+        """Attach terminal delivery after prior work on a CUDA stream.
+
+        :param stream_handle: Raw ``cudaStream_t`` value.
+        :param binding_digest: Exact armed request lifecycle digest.
+        """
+
+    def stop_admission(self) -> None:
+        """Permanently stop callback admission."""
+
+    def join(self, timeout_seconds: float) -> bool:
+        """Join callbacks and ordered producer retirement.
+
+        :param timeout_seconds: Positive native wait bound.
+        :returns: Whether ordered producer retirement committed.
+        """
+
+    def close(self) -> None:
+        """Close a joined producer with exact-zero retained inventory."""
+
+    def inventory(self) -> dict[str, object]:
+        """Return complete producer inventory.
+
+        :returns: Native inventory mapping.
+        """
+
+    def _complete_synchronously_for_test(self, binding_digest: bytes) -> None:
+        """Deliver one armed binding without CUDA.
+
+        :param binding_digest: Exact armed lifecycle digest.
+        """
+
+    def _begin_held_callback_for_test(self, binding_digest: bytes) -> None:
+        """Begin one callback retained until an explicit test release.
+
+        :param binding_digest: Exact armed lifecycle digest.
+        """
+
+    def _complete_held_callback_for_test(self, binding_digest: bytes) -> None:
+        """Complete one explicitly held callback.
+
+        :param binding_digest: Exact submitted lifecycle digest.
+        """
+
+    def _complete_concurrently_for_test(self, binding_digests: list[bytes]) -> None:
+        """Deliver multiple bindings from concurrent native threads.
+
+        :param binding_digests: Exact armed lifecycle digests.
+        """
+
+
+def _native_source_path() -> Path:
+    """Return the packaged CUDA producer source.
+
+    :returns: Absolute C++ source path.
+    """
+
+    return Path(__file__).with_name("cuda_owner_producer.cpp")
+
+
+def _native_header_path() -> Path:
+    """Return the shared terminal-owner producer ABI header.
+
+    :returns: Absolute header path.
+    """
+
+    return Path(__file__).with_name("native_producer_api.h")
+
+
+@lru_cache(maxsize=2)
+def _load_native_cuda_terminal_producer(*, testing: bool) -> ModuleType:
+    """Compile and load the direct CUDA-to-owner producer.
+
+    :param testing: Whether deterministic native test controls are required.
+    :returns: Loaded extension module.
+    """
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("CUDA terminal producer requires Linux")
+    if CUDA_HOME is None:
+        raise RuntimeError("CUDA terminal producer requires a CUDA toolkit")
+    cuda_home = Path(CUDA_HOME).resolve()
+    source_path = _native_source_path()
+    header_path = _native_header_path()
+    source_hasher = hashlib.sha256()
+    for required_path in (source_path, header_path):
+        if not required_path.is_file():
+            raise RuntimeError(
+                f"CUDA terminal producer source is absent: {required_path}"
+            )
+        source_hasher.update(required_path.name.encode("utf-8"))
+        source_hasher.update(b"\0")
+        source_hasher.update(required_path.read_bytes())
+    source_digest = source_hasher.hexdigest()[:12]
+    variant = "test" if testing else "runtime"
+    module_name = f"sglang_cuda_terminal_producer_{source_digest}_{variant}"
+    extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
+    if testing:
+        extra_cflags.append("-DSGLANG_CUDA_COMPLETION_BRIDGE_TESTING")
+    build_directory_value = os.environ.get("SGLANG_CUDA_BRIDGE_BUILD_DIR")
+    build_directory: str | None = None
+    if build_directory_value is not None:
+        build_path = Path(build_directory_value).resolve() / module_name
+        build_path.mkdir(parents=True, exist_ok=True)
+        build_directory = str(build_path)
+    return load(
+        name=module_name,
+        sources=[str(source_path)],
+        extra_cflags=[*extra_cflags, f"-I{cuda_home / 'include'}"],
+        extra_include_paths=[str(source_path.parent)],
+        extra_ldflags=[f"-L{cuda_home / 'lib64'}", "-lcudart", "-pthread"],
+        build_directory=build_directory,
+        with_cuda=False,
+        verbose=False,
+    )
+
+
+class CudaTerminalProducer:
+    """Process-lifetime direct CUDA callback producer for one native owner."""
+
+    _native: _NativeCudaTerminalProducer
+    _testing: bool
+
+    def __init__(
+        self,
+        owner: NativeTerminalOwner,
+        producer_id: int,
+        *,
+        testing: bool = False,
+    ) -> None:
+        """Bind one registered producer namespace to CUDA callbacks.
+
+        :param owner: Native owner containing the producer registration.
+        :param producer_id: Registered local decode producer identity.
+        :param testing: Whether native test controls are required.
+        """
+
+        if type(owner) is not NativeTerminalOwner:
+            raise TypeError("owner must be NativeTerminalOwner")
+        if type(producer_id) is not int or producer_id < 0:
+            raise ValueError("producer_id must be a non-negative integer")
+        module = _load_native_cuda_terminal_producer(testing=testing)
+        self._native = cast(
+            _NativeCudaTerminalProducer,
+            module.CudaTerminalProducer(
+                owner.producer_api(),
+                owner.producer_capsule(producer_id),
+            ),
+        )
+        self._testing = testing
+
+    def arm(self, binding_digest: bytes) -> None:
+        """Arm one exact lifecycle before scatter submission.
+
+        :param binding_digest: Exact 32-byte native lifecycle digest.
+        """
+
+        self._require_binding(binding_digest)
+        self._native.arm(binding_digest)
+
+    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
+        """Attach direct owner delivery after scatter on one stream.
+
+        :param stream_handle: Raw ``cudaStream_t`` value.
+        :param binding_digest: Exact armed native lifecycle digest.
+        """
+
+        if type(stream_handle) is not int or stream_handle < 0:
+            raise ValueError("stream_handle must be a non-negative integer")
+        self._require_binding(binding_digest)
+        self._native.submit(stream_handle, binding_digest)
+
+    def stop_admission(self) -> None:
+        """Permanently stop new callback bindings."""
+
+        self._native.stop_admission()
+
+    def join(self, timeout_seconds: float) -> bool:
+        """Join callbacks and commit ordered producer retirement.
+
+        :param timeout_seconds: Positive native wait bound.
+        :returns: Whether retirement committed within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native.join(timeout_seconds))
+
+    def close(self) -> None:
+        """Close after exact-zero joined retirement."""
+
+        self._native.close()
+
+    def inventory(self) -> CudaTerminalProducerInventory:
+        """Return complete callback, binding, and retirement inventory.
+
+        :returns: Typed producer inventory.
+        """
+
+        return CudaTerminalProducerInventory.from_native(self._native.inventory())
+
+    def complete_synchronously_for_testing(self, binding_digest: bytes) -> None:
+        """Deliver one armed binding without CUDA.
+
+        :param binding_digest: Exact armed lifecycle digest.
+        :raises RuntimeError: If this is not a test build.
+        """
+
+        self._require_testing()
+        self._require_binding(binding_digest)
+        self._native._complete_synchronously_for_test(binding_digest)
+
+    def begin_held_callback_for_testing(self, binding_digest: bytes) -> None:
+        """Retain one callback until explicitly completed by its test.
+
+        :param binding_digest: Exact armed lifecycle digest.
+        :raises RuntimeError: If this is not a test build.
+        """
+
+        self._require_testing()
+        self._require_binding(binding_digest)
+        self._native._begin_held_callback_for_test(binding_digest)
+
+    def complete_held_callback_for_testing(self, binding_digest: bytes) -> None:
+        """Release one callback previously held by its test.
+
+        :param binding_digest: Exact submitted lifecycle digest.
+        :raises RuntimeError: If this is not a test build.
+        """
+
+        self._require_testing()
+        self._require_binding(binding_digest)
+        self._native._complete_held_callback_for_test(binding_digest)
+
+    def complete_concurrently_for_testing(
+        self, binding_digests: tuple[bytes, ...]
+    ) -> None:
+        """Deliver exact bindings from concurrent native threads.
+
+        :param binding_digests: Exact armed lifecycle digests.
+        :raises RuntimeError: If this is not a test build.
+        """
+
+        self._require_testing()
+        if type(binding_digests) is not tuple:
+            raise TypeError("binding_digests must be a tuple")
+        for binding_digest in binding_digests:
+            self._require_binding(binding_digest)
+        self._native._complete_concurrently_for_test(list(binding_digests))
+
+    def _require_testing(self) -> None:
+        """Require deterministic native test controls."""
+
+        if not self._testing:
+            raise RuntimeError("CUDA terminal producer test control is unavailable")
+
+    @staticmethod
+    def _require_binding(binding_digest: bytes) -> None:
+        """Validate one exact native lifecycle digest.
+
+        :param binding_digest: Candidate lifecycle digest.
+        """
+
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
