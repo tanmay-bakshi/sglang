@@ -8,11 +8,11 @@ import select
 import threading
 
 import pytest
-from sglang.srt.disaggregation.terminal_progress import (
-    scheduler_inbox as scheduler_inbox_module,
-)
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
+)
+from sglang.srt.disaggregation.terminal_progress import (
+    scheduler_inbox as scheduler_inbox_module,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
