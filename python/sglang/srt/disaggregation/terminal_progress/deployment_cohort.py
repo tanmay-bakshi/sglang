@@ -656,7 +656,7 @@ def load_terminal_deployment_cohort(
     :raises TerminalDeploymentCohortError: If the artifact or digest is invalid.
     """
 
-    if type(path) is not Path:
+    if not isinstance(path, Path):
         raise TypeError("path must be Path")
     if (
         type(expected_digest) is not bytes
