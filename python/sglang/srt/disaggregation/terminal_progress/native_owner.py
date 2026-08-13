@@ -46,14 +46,14 @@ class _NativeTerminalOwnerBridge(Protocol):
         """
 
     def register_source(self, registration: Mapping[str, object]) -> int:
-        """Register one source lifecycle before startup.
+        """Enqueue one source lifecycle in the ordered reactor domain.
 
         :param registration: Exact source binding and publication identity.
         :returns: Zero on ordered admission, otherwise a positive errno value.
         """
 
     def register_decode(self, registration: Mapping[str, object]) -> int:
-        """Register one decode lifecycle before startup.
+        """Enqueue one decode lifecycle in the ordered reactor domain.
 
         :param registration: Exact decode binding and trusted issuers.
         :returns: Zero on ordered admission, otherwise a positive errno value.
@@ -388,7 +388,7 @@ class NativeTerminalOwner:
     def register_lifecycle(
         self, registration: NativeTerminalLifecycleRegistration
     ) -> None:
-        """Register one exact source or decode lifecycle before startup.
+        """Enqueue one dynamic lifecycle before its first ordered event.
 
         :param registration: Complete role-specific lifecycle identity.
         """
@@ -406,7 +406,7 @@ class NativeTerminalOwner:
             raise OSError(status, os.strerror(status))
 
     def start(self) -> None:
-        """Start the native reactor after all static registration."""
+        """Start the process-lifetime native reactor."""
 
         self._native.start()
 

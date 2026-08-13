@@ -1725,8 +1725,7 @@ void enqueue_next_qualification_events_locked(SharedOwner &owner) {
   signal_fd_locked(owner, owner.input_fd);
 }
 
-void register_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle,
-                               const Event *trigger) {
+void register_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle) {
   const auto existing = owner.lifecycles.find(lifecycle.binding.digest);
   if (existing == owner.lifecycles.end()) {
     owner.lifecycles.emplace(lifecycle.binding.digest, std::move(lifecycle));
@@ -1737,7 +1736,10 @@ void register_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle,
       same_binding(existing->second.binding, lifecycle.binding)
           ? "binding was already registered"
           : "binding digest collision changed full payload";
-  quarantine_all_locked(owner, FatalCode::kDuplicateBinding, trigger, reason);
+  Event trigger{};
+  trigger.binding_digest = lifecycle.binding.digest;
+  trigger.enqueued_ns = owner_now_ns_locked(owner);
+  quarantine_all_locked(owner, FatalCode::kDuplicateBinding, &trigger, reason);
 }
 
 void dispatch_event_locked(SharedOwner &owner, const Event &event) {
@@ -1922,8 +1924,7 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
           continue;
         }
         if (command.kind == InputKind::kRegisterLifecycle) {
-          register_lifecycle_locked(*owner, std::move(command.lifecycle),
-                                    nullptr);
+          register_lifecycle_locked(*owner, std::move(command.lifecycle));
         } else {
           dispatch_event_locked(*owner, command.event);
         }
@@ -2382,6 +2383,10 @@ public:
       throw std::invalid_argument(
           "qualification transition floor exceeds its evidence bound");
     }
+    if (machine_count > owner_->input_capacity) {
+      throw std::invalid_argument(
+          "qualification bootstrap exceeds the native input capacity");
+    }
     std::lock_guard<std::mutex> lock(owner_->mutex);
     if (!owner_->started || owner_->qualification.running ||
         owner_->qualification.complete) {
@@ -2435,13 +2440,14 @@ public:
       lifecycle.phase = static_cast<std::uint8_t>(SourcePhase::kFrozen);
       lifecycle.live_resources = kSourceResourceMask;
       lifecycle.trusted_issuers.insert(owner_->owner_identity.digest);
-      if (!owner_->lifecycles.emplace(binding.digest, lifecycle).second) {
-        throw std::runtime_error("qualification binding collision");
-      }
+      InputCommand command{};
+      command.kind = InputKind::kRegisterLifecycle;
+      command.lifecycle = std::move(lifecycle);
+      owner_->input_queue.push_back(std::move(command));
       qualification.bindings[index] = binding.digest;
       qualification.producer_ids[index] = producer_id;
     }
-    enqueue_next_qualification_events_locked(*owner_);
+    signal_fd_locked(*owner_, owner_->input_fd);
   }
 
   bool qualification_join(double timeout_seconds) {
