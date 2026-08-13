@@ -22,11 +22,12 @@ import sys
 import time
 import uuid
 from array import array
+from collections.abc import Callable
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, TypeVar, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -76,6 +77,18 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     PdProcessRuntimeCapabilities,
+)
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
+    TerminalSchedulerServing,
+    TerminalSchedulerServingInventory,
+    TerminalSchedulerServingRole,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -314,6 +327,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+ForwardSubmissionResultT = TypeVar("ForwardSubmissionResultT")
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -377,6 +391,7 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        self.terminal_scheduler_serving: TerminalSchedulerServing | None = None
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -1338,6 +1353,172 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def bind_terminal_scheduler_serving(
+        self,
+        serving: TerminalSchedulerServing,
+    ) -> None:
+        """Bind the process-lifetime owner path to scheduler boundaries.
+
+        Source and decode integration construct their role-specific consumer
+        only after the packed manager exists. This method completes that
+        composition before any terminal request is registered.
+
+        :param serving: Exact qualified scheduler serving adapter.
+        """
+
+        if type(serving) is not TerminalSchedulerServing:
+            raise TypeError("serving must be TerminalSchedulerServing")
+        if self.terminal_scheduler_serving is not None:
+            raise RuntimeError("terminal scheduler serving is already bound")
+        expected_role = TerminalSchedulerServingRole.SOURCE
+        if self.disaggregation_mode is DisaggregationMode.DECODE:
+            expected_role = TerminalSchedulerServingRole.DECODE
+        elif self.disaggregation_mode is not DisaggregationMode.PREFILL:
+            raise RuntimeError("terminal scheduler serving requires PD disaggregation")
+        if serving.role is not expected_role:
+            raise ValueError("terminal scheduler serving role differs from scheduler")
+        self.terminal_scheduler_serving = serving
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.register_file_descriptor(serving.fileno())
+
+    def register_terminal_scheduler_request(
+        self,
+        binding: TerminalRequestBinding | NativeTerminalRequestBinding,
+    ) -> None:
+        """Register one exact request before its owner can publish authority.
+
+        :param binding: Exact role-local terminal request binding.
+        """
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            raise RuntimeError("terminal scheduler serving is not bound")
+        if type(binding) is TerminalRequestBinding:
+            serving.register_request(binding)
+            return
+        if type(binding) is NativeTerminalRequestBinding:
+            serving.register_native_request(binding)
+            return
+        raise TypeError(
+            "binding must be TerminalRequestBinding or NativeTerminalRequestBinding"
+        )
+
+    def cancel_unpublished_terminal_scheduler_request(
+        self,
+        binding: TerminalRequestBinding,
+    ) -> None:
+        """Remove one request which cannot receive a scheduler receipt.
+
+        :param binding: Exact live request binding without published authority.
+        """
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            raise RuntimeError("terminal scheduler serving is not bound")
+        serving.cancel_unpublished_request(binding)
+
+    def publish_terminal_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Publish one owner action through the qualified scheduler inbox.
+
+        :param action: Exact reclaim or adoption action from the native owner.
+        """
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            raise RuntimeError("terminal scheduler serving is not bound")
+        serving.publish_action(action)
+
+    def mark_terminal_owner_dead(self) -> None:
+        """Wake the scheduler into sticky fail-closed owner-death state."""
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            raise RuntimeError("terminal scheduler serving is not bound")
+        serving.mark_owner_dead()
+
+    def drain_terminal_scheduler_receipts(self) -> None:
+        """Consume owner authority before selecting scheduler work."""
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            return
+        serving.drain_at_loop_entry()
+
+    def submit_forward_with_terminal_handoff(
+        self,
+        submit: Callable[[], ForwardSubmissionResultT],
+        bind: Callable[[ForwardSubmissionResultT], ForwardSubmissionResultT]
+        | None = None,
+    ) -> ForwardSubmissionResultT:
+        """Run one narrow model-worker submission inside the launch handoff.
+
+        The callback ends at the model-worker boundary, before scheduler result
+        handling can wait on the submitted forward.
+
+        :param submit: Exact host-submission callback.
+        :param bind: Optional immediate immutable terminal-submission binder.
+        :returns: Model-worker submission or bound result.
+        """
+
+        if not callable(submit):
+            raise TypeError("submit must be callable")
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            result = submit()
+            if bind is None:
+                return result
+            return bind(result)
+        if bind is not None:
+            return serving.launch_and_bind_handoff(submit, bind)
+        return serving.launch_handoff(submit)
+
+    def terminal_scheduler_serving_inventory(
+        self,
+    ) -> TerminalSchedulerServingInventory | None:
+        """Return complete terminal scheduler health and conservation state.
+
+        :returns: Serving inventory when the packed owner path is bound.
+        """
+
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            return None
+        return serving.inventory()
+
+    def close_terminal_scheduler_serving(self, *, process_fatal: bool) -> None:
+        """Close scheduler wake ownership at process teardown.
+
+        :param process_fatal: Whether retained identities must remain
+            quarantined as fail-closed evidence.
+        """
+
+        if type(process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
+        serving = self.terminal_scheduler_serving
+        if serving is None:
+            return
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.unregister_file_descriptor(serving.fileno())
+        inventory = serving.inventory()
+        retained_inventory = (
+            inventory.inbox.live_count > 0
+            or inventory.inbox.pending_count > 0
+            or len(inventory.inbox.consuming_request_keys) > 0
+            or inventory.inbox.outstanding_publications > 0
+            or len(inventory.retained_action_ids) > 0
+            or inventory.inbox.fatal_cause is not None
+        )
+        try:
+            if process_fatal or retained_inventory:
+                serving.close_fail_closed()
+            else:
+                serving.close()
+        finally:
+            self.terminal_scheduler_serving = None
 
     def init_decode_reservation_control(self) -> None:
         """Initialize prepared-grant control for supported decode replicas."""
@@ -3583,8 +3764,11 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
+                        batch_result = self.submit_forward_with_terminal_handoff(
+                            lambda: self.model_worker.forward_batch_generation(
+                                batch,
+                                **fwd_kwargs,
+                            )
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -3644,7 +3828,9 @@ class Scheduler(
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                batch_result = self.submit_forward_with_terminal_handoff(
+                    lambda: self.tp_worker.forward_batch_split_prefill(batch)
+                )
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
@@ -3652,7 +3838,9 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.submit_forward_with_terminal_handoff(
+                        lambda: self.model_worker.forward_batch_generation(batch)
+                    )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3676,8 +3864,11 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
+                batch_result = self.submit_forward_with_terminal_handoff(
+                    lambda: self.model_worker.forward_batch_generation(
+                        batch,
+                        **kwargs,
+                    )
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
@@ -3708,7 +3899,9 @@ class Scheduler(
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
                     pooler_output, can_run_cuda_graph = (
-                        self.tp_worker.forward_batch_embedding(batch)
+                        self.submit_forward_with_terminal_handoff(
+                            lambda: self.tp_worker.forward_batch_embedding(batch)
+                        )
                     )
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
@@ -3719,7 +3912,9 @@ class Scheduler(
             else:
                 resolve_forward_inputs(batch, self.future_map)
                 pooler_output, can_run_cuda_graph = (
-                    self.tp_worker.forward_batch_embedding(batch)
+                    self.submit_forward_with_terminal_handoff(
+                        lambda: self.tp_worker.forward_batch_embedding(batch)
+                    )
                 )
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
@@ -4933,8 +5128,9 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
-            # FPM has a background ZMQ publisher thread that needs explicit
-            # teardown to flush queued metrics and close the socket cleanly.
+            # The terminal runtime owns scheduler-serving closure. Its output
+            # projection and abort drain must finish while this consumer and
+            # its wake descriptor remain alive.
             scheduler.metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
