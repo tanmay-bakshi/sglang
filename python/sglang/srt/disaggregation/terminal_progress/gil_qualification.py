@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+from collections.abc import Callable
 
 GIL_QUALIFICATION_LIVE_MACHINE_COUNT = 16
 GIL_QUALIFICATION_MINIMUM_TRANSITIONS = 100_000
@@ -337,4 +338,59 @@ def evaluate_gil_qualification(
         observed_machine_indices=frozenset(sample.machine_index for sample in samples),
         per_hop_p99_ns=hop_p99_ns,
         seven_hop_p99_ns=seven_hop_p99_ns,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GILStressCollection:
+    """Raw evidence returned by a concrete event-storm producer.
+
+    :ivar samples: Correlated latency samples observed during the storm.
+    :ivar elapsed_seconds: Measured sustained storm duration.
+    """
+
+    samples: tuple[GILHopLatencySample, ...]
+    elapsed_seconds: float
+
+    def __post_init__(self) -> None:
+        """Validate one non-empty stress population."""
+
+        if type(self.samples) is not tuple or len(self.samples) == 0:
+            raise ValueError("samples must be a non-empty tuple")
+        if any(type(sample) is not GILHopLatencySample for sample in self.samples):
+            raise TypeError("samples must contain GILHopLatencySample values")
+        if type(self.elapsed_seconds) is not float or self.elapsed_seconds <= 0.0:
+            raise ValueError("elapsed_seconds must be a positive float")
+
+
+GILStressCollector = Callable[[GILStressPlan], GILStressCollection]
+
+
+def execute_gil_stress_plan(
+    plan: GILStressPlan,
+    collector: GILStressCollector,
+) -> GILQualificationResult:
+    """Execute an injected producer and evaluate its complete population.
+
+    This is deliberately only orchestration. A Python collector remains
+    non-authoritative even if its arithmetic passes. Native or GIL-releasing
+    implementations declare that production mode in the frozen plan and must
+    furnish the actual correlated samples.
+
+    :param plan: Exact frozen stress contract and producer authority.
+    :param collector: Concrete sustained event-storm implementation.
+    :returns: Evaluated population, latency, and authority verdict.
+    """
+
+    if type(plan) is not GILStressPlan:
+        raise TypeError("plan must be GILStressPlan")
+    if not callable(collector):
+        raise TypeError("collector must be callable")
+    collection = collector(plan)
+    if type(collection) is not GILStressCollection:
+        raise TypeError("collector must return GILStressCollection")
+    return evaluate_gil_qualification(
+        plan=plan,
+        samples=collection.samples,
+        elapsed_seconds=collection.elapsed_seconds,
     )
