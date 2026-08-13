@@ -244,7 +244,7 @@ def test_direct_construction_rejects_logical_and_physical_overflow() -> None:
         .enqueue(second_receipt)
     )
 
-    with pytest.raises(ValueError, match="live requests"):
+    with pytest.raises(ValueError, match="live request"):
         dataclasses.replace(complete, live_bindings=(first_binding,))
     with pytest.raises(ValueError, match="physical capacity"):
         dataclasses.replace(complete, physical_capacity=1)

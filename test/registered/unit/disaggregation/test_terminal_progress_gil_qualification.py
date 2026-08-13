@@ -104,7 +104,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
     )
     incomplete = evaluate_gil_qualification(
         plan=plan,
-        samples=(
+        samples=tuple(
             GILHopLatencySample(
                 machine_index=0,
                 hop_latencies_ns=(1_000_000,) * 7,
@@ -139,7 +139,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
 
     path_failure = evaluate_gil_qualification(
         plan=plan,
-        samples=(
+        samples=tuple(
             GILHopLatencySample(
                 machine_index=index % 16,
                 hop_latencies_ns=(2_000_000,) * 7,
