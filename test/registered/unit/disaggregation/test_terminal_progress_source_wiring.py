@@ -13,13 +13,17 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
-    NativeTerminalRequestBinding,
     NativeTerminalReceipt,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
     TerminalGatewayPublicationFailure,
     TerminalGatewayPublicationSuccess,
+)
+from sglang.srt.disaggregation.terminal_progress.receipts import (
+    TerminalReceiptKind,
+    TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
@@ -31,10 +35,6 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
     TerminalWireReceiptIssuer,
-)
-from sglang.srt.disaggregation.terminal_progress.receipts import (
-    TerminalReceiptKind,
-    TerminalReceiptOutcome,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -103,6 +103,7 @@ class _Runtime:
     submissions: list[_RuntimeSubmission]
     completed_actions: list[NativeTerminalOwnerAction]
     controls: dict[bytes, object]
+    receipts: dict[bytes, object]
 
     def __init__(self) -> None:
         """Create independent stable producer fixtures."""
@@ -113,6 +114,7 @@ class _Runtime:
         self.submissions = []
         self.completed_actions = []
         self.controls = {}
+        self.receipts = {}
 
     def control_producer(self, issuer_digest: bytes) -> object:
         """Return one stable authenticated producer per issuer.
@@ -125,6 +127,19 @@ class _Runtime:
         if producer is None:
             producer = object()
             self.controls[issuer_digest] = producer
+        return producer
+
+    def receipt_producer(self, issuer_digest: bytes) -> object:
+        """Return one stable authenticated receipt producer per issuer.
+
+        :param issuer_digest: Exact remote process identity.
+        :returns: Stable producer fixture.
+        """
+
+        producer = self.receipts.get(issuer_digest)
+        if producer is None:
+            producer = object()
+            self.receipts[issuer_digest] = producer
         return producer
 
     def register_source(
@@ -140,9 +155,7 @@ class _Runtime:
         :param trusted_issuers: Canonical issuer set.
         """
 
-        self.registrations.append(
-            (binding, publication_identity, trusted_issuers)
-        )
+        self.registrations.append((binding, publication_identity, trusted_issuers))
 
     def submit(
         self,
@@ -418,9 +431,15 @@ def test_request_ready_submits_native_authority_and_canonical_publication() -> N
         local_receipt=issued.local_receipt,
         authenticated_issuer=identity.request_ready_issuer,
     )
-    assert runtime.submissions[-1].kind is NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY
+    assert (
+        runtime.submissions[-1].kind
+        is NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY
+    )
     assert runtime.submissions[-1].receipt == NativeTerminalReceipt.from_wire_receipt(
         issued.wire_receipt
+    )
+    assert runtime.submissions[-1].producer is runtime.receipt_producer(
+        identity.request_ready_issuer.digest
     )
     assert len(publisher.publications) == 1
     assert publisher.publications[0].request_ready_receipt is issued.local_receipt
@@ -513,14 +532,17 @@ def test_publisher_success_returns_native_publication_authority() -> None:
             source_receipts=receipts,
         )
     )
-    assert runtime.submissions[-1].kind is NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED
+    assert (
+        runtime.submissions[-1].kind
+        is NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED
+    )
     assert runtime.submissions[-1].receipt == NativeTerminalReceipt.from_wire_receipt(
         receipts[0].wire_receipt
     )
 
 
-def test_publisher_failure_is_process_fatal_not_storage_quarantine() -> None:
-    """Project publisher death without fabricating a gateway success receipt."""
+def test_publisher_failure_submits_authenticated_failure_authority() -> None:
+    """Project functional publication failure separately from thread death."""
 
     wiring, identity, runtime, _, publisher = _wiring()
     if publisher is None:
@@ -537,17 +559,150 @@ def test_publisher_failure_is_process_fatal_not_storage_quarantine() -> None:
         local_receipt=ready.local_receipt,
         authenticated_issuer=identity.request_ready_issuer,
     )
+    publisher_issuer = TerminalWireReceiptIssuer(identity.publisher_issuer)
+    failure_receipts = tuple(
+        publisher_issuer.issue(
+            binding=binding,
+            kind=TerminalReceiptKind.FAILURE,
+            outcome=TerminalReceiptOutcome.FAILURE,
+            terminal_timestamp_ns=901,
+        )
+        for binding in identity.source_bindings
+    )
     wiring.publisher_result(
         TerminalGatewayPublicationFailure(
             publication=publisher.publications[0],
             failed_ns=901,
-            reason="synthetic publisher death",
+            source_receipts=failure_receipts,
+            reason="synthetic publication failure",
             formatted_traceback="synthetic traceback",
         )
     )
-    assert runtime.submissions[-1].kind is NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED
+    assert (
+        runtime.submissions[-1].kind
+        is NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED
+    )
+    assert runtime.submissions[-1].receipt == NativeTerminalReceipt.from_wire_receipt(
+        failure_receipts[0].wire_receipt
+    )
+    assert runtime.submissions[-1].reason == "synthetic publication failure"
+
+
+def test_noncanonical_rank_consumes_its_own_publication_receipt() -> None:
+    """Require per-rank authority instead of inferring canonical completion."""
+
+    canonical, canonical_identity, _, _, publisher = _wiring(local_rank=0)
+    noncanonical, noncanonical_identity, runtime, _, _ = _wiring(local_rank=1)
+    if publisher is None:
+        raise AssertionError("canonical fixture omitted its publisher")
+    ready_issuer = TerminalWireReceiptIssuer(canonical_identity.request_ready_issuer)
+    canonical_ready = ready_issuer.issue(
+        binding=canonical_identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=801,
+    )
+    noncanonical_ready = ready_issuer.issue(
+        binding=noncanonical_identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=802,
+    )
+    canonical.request_ready(
+        binding_digest=canonical_identity.local_binding.digest,
+        wire_receipt=canonical_ready.wire_receipt,
+        local_receipt=canonical_ready.local_receipt,
+        authenticated_issuer=canonical_identity.request_ready_issuer,
+    )
+    noncanonical.request_ready(
+        binding_digest=noncanonical_identity.local_binding.digest,
+        wire_receipt=noncanonical_ready.wire_receipt,
+        local_receipt=noncanonical_ready.local_receipt,
+        authenticated_issuer=noncanonical_identity.request_ready_issuer,
+    )
+    publication_issuer = TerminalWireReceiptIssuer(canonical_identity.publisher_issuer)
+    receipts = tuple(
+        publication_issuer.issue(
+            binding=binding,
+            kind=TerminalReceiptKind.GATEWAY_PUBLISHED,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=901,
+        )
+        for binding in canonical_identity.source_bindings
+    )
+    noncanonical.publisher_result(
+        TerminalGatewayPublicationSuccess(
+            publication=publisher.publications[0],
+            completed_ns=901,
+            source_receipts=receipts,
+        )
+    )
+    assert runtime.submissions[-1].binding_digest == (
+        noncanonical_identity.local_binding.digest
+    )
+    assert runtime.submissions[-1].receipt == NativeTerminalReceipt.from_wire_receipt(
+        receipts[1].wire_receipt
+    )
+
+
+def test_publisher_thread_death_uses_process_fatal_event() -> None:
+    """Keep publisher-thread death distinct from a functional send failure."""
+
+    wiring, identity, runtime, _, _ = _wiring()
+    wiring.publisher_died(identity.local_binding.digest, "synthetic publisher death")
+    assert (
+        runtime.submissions[-1].kind
+        is NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED
+    )
     assert runtime.submissions[-1].receipt is None
     assert runtime.submissions[-1].reason == "synthetic publisher death"
+
+
+def test_publisher_failure_rejects_another_publication_identity() -> None:
+    """Reject valid receipts when their publication attempt is not local."""
+
+    wiring, identity, _, _, publisher = _wiring()
+    if publisher is None:
+        raise AssertionError("canonical fixture omitted its publisher")
+    ready = TerminalWireReceiptIssuer(identity.request_ready_issuer).issue(
+        binding=identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=801,
+    )
+    wiring.request_ready(
+        binding_digest=identity.local_binding.digest,
+        wire_receipt=ready.wire_receipt,
+        local_receipt=ready.local_receipt,
+        authenticated_issuer=identity.request_ready_issuer,
+    )
+    publication = dataclasses.replace(
+        publisher.publications[0],
+        identity=dataclasses.replace(
+            identity.publication_identity,
+            publication_generation=bytes.fromhex("a1" * 16),
+        ),
+    )
+    publication_issuer = TerminalWireReceiptIssuer(identity.publisher_issuer)
+    failure_receipts = tuple(
+        publication_issuer.issue(
+            binding=binding,
+            kind=TerminalReceiptKind.FAILURE,
+            outcome=TerminalReceiptOutcome.FAILURE,
+            terminal_timestamp_ns=901,
+        )
+        for binding in identity.source_bindings
+    )
+    with pytest.raises(RuntimeError, match="identity plan"):
+        wiring.publisher_result(
+            TerminalGatewayPublicationFailure(
+                publication=publication,
+                failed_ns=901,
+                source_receipts=failure_receipts,
+                reason="synthetic publication failure",
+                formatted_traceback="synthetic traceback",
+            )
+        )
 
 
 def test_metric_failure_does_not_gate_native_progress() -> None:
