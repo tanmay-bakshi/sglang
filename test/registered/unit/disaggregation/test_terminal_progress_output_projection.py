@@ -1,4 +1,5 @@
 import dataclasses
+from array import array
 
 import pytest
 import zmq
@@ -8,8 +9,11 @@ from sglang.srt.disaggregation.terminal_progress.output_projection import (
     PrefillTerminalGatewayOutputProjection,
     PrefillTerminalGatewayPayloadEncoder,
     TerminalGatewayResultSlot,
+    freeze_prefill_gateway_output_shell,
 )
 from sglang.srt.managers.io_struct import BatchTokenIDOutput, sock_recv
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -95,6 +99,37 @@ def _projection() -> PrefillTerminalGatewayOutputProjection:
     )
 
 
+def _request() -> Req:
+    """Build one scheduler-owned request at its pre-forward boundary.
+
+    :returns: Plain-token request supported by terminal publication.
+    """
+
+    request = Req(
+        rid="request-17",
+        origin_input_text="",
+        origin_input_ids=array("q", (10, 11, 12, 13, 14, 15, 16)),
+        origin_input_ids_unpadded=array("q", (10, 11, 12, 13, 14, 15, 16)),
+        sampling_params=SamplingParams(
+            max_new_tokens=16,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False,
+            no_stop_trim=True,
+        ),
+        http_worker_ipc="ipc:///tmp/http-worker-17",
+    )
+    request.cached_tokens = 4
+    request.reasoning_tokens = 2
+    request.retraction_count = 1
+    request.spec_verify_ct = 3
+    request.spec_num_correct_drafts = 4
+    request.spec_num_block_accept_tokens = 5
+    request.spec_num_cap_tokens = 6
+    request.spec_correct_drafts_histogram = [7, 8]
+    request.spec_cap_lens_histogram = [9, 10]
+    return request
+
+
 def _decode_payload(encoded_payload: bytes) -> BatchTokenIDOutput:
     """Decode active IPC bytes through the production socket receiver.
 
@@ -138,6 +173,49 @@ def test_encoder_reconstructs_exact_prefill_completion_without_req() -> None:
     assert payload.completion_tokens == [1]
     assert payload.cached_tokens_details == [{"device": 128, "host": 0}]
     assert payload.time_stats is None
+
+
+def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> None:
+    """Pre-forward projection must not mutate incremental detokenizer state."""
+
+    request = _request()
+    request.output_ids.extend((31, 32))
+    before_output_ids = tuple(request.output_ids)
+
+    shell = freeze_prefill_gateway_output_shell(
+        request,
+        cached_tokens_details={"host": 0, "device": 4},
+        dp_rank=2,
+    )
+
+    assert shell.rid == "request-17"
+    assert shell.origin_tail_ids == (12, 13, 14, 15, 16, 31, 32)
+    assert shell.read_offset == 5
+    assert shell.prompt_tokens == 7
+    assert shell.cached_tokens_details == (("device", 4), ("host", 0))
+    assert shell.reasoning_tokens == 2
+    assert shell.dp_rank == 2
+    assert shell.spec_verify_ct == 3
+    assert shell.spec_correct_drafts_histogram == (7, 8)
+    assert shell.spaces_between_special_tokens is False
+    assert shell.no_stop_trim is True
+    assert request.surr_offset is None
+    assert request.read_offset is None
+    assert tuple(request.output_ids) == before_output_ids
+
+
+def test_shell_builder_rejects_result_modes_without_stable_slots() -> None:
+    """Unsupported mutable result fields cannot fall back to scheduler reads."""
+
+    request = _request()
+    request.return_logprob = True
+
+    with pytest.raises(ValueError, match="plain token output"):
+        freeze_prefill_gateway_output_shell(
+            request,
+            cached_tokens_details=None,
+            dp_rank=0,
+        )
 
 
 def test_projection_digest_binds_shell_slot_and_producer_generations() -> None:

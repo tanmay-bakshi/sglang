@@ -14,7 +14,15 @@ from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
     TerminalGatewayPayloadEncoder,
 )
-from sglang.srt.managers.io_struct import BatchTokenIDOutput, encode_ipc_payload
+from sglang.srt.managers.io_struct import (
+    BatchTokenIDOutput,
+    CachedTokensDetails,
+    encode_ipc_payload,
+)
+from sglang.srt.managers.schedule_batch import (
+    INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
+    Req,
+)
 
 
 def _require_generation(value: bytes, label: str) -> None:
@@ -261,6 +269,124 @@ class FrozenPrefillGatewayOutputShell:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
         return digest.digest()
+
+
+def freeze_prefill_gateway_output_shell(
+    req: Req,
+    *,
+    cached_tokens_details: CachedTokensDetails | None,
+    dp_rank: int,
+) -> FrozenPrefillGatewayOutputShell:
+    """Freeze scheduler-owned response state without mutating the request.
+
+    The publisher appends the producer-complete boundary token from its stable
+    result slot. Every other response field is captured before model
+    submission, so neither the terminal owner nor the publisher ever reads the
+    mutable request.
+
+    :param req: Scheduler-owned prefill request before model submission.
+    :param cached_tokens_details: Exact cache-tier breakdown reported for the
+        request.
+    :param dp_rank: Data-parallel rank producing the response.
+    :returns: Immutable non-logprob gateway response shell.
+    :raises ValueError: If the request uses an unsupported result mode or has
+        already crossed an output-streaming boundary.
+    """
+
+    if not isinstance(req, Req):
+        raise TypeError("req must be a Req")
+    unsupported_result_mode = (
+        req.return_logprob
+        or req.return_hidden_states
+        or req.return_routed_experts
+        or req.return_indexer_topk
+        or req.return_sampling_mask
+    )
+    if unsupported_result_mode:
+        raise ValueError(
+            "terminal prefill publication requires plain token output"
+        )
+    if req.finished_reason is not None or req.finished_output is not None:
+        raise ValueError("terminal prefill shell must be frozen before completion")
+
+    first_detokenizer_boundary = req.surr_offset is None and req.read_offset is None
+    partially_initialized_boundary = (req.surr_offset is None) != (
+        req.read_offset is None
+    )
+    if partially_initialized_boundary:
+        raise ValueError("incremental detokenizer offsets are partially initialized")
+
+    output_ids = tuple(req.output_ids_through_stop)
+    if first_detokenizer_boundary:
+        absolute_read_offset = len(req.origin_input_ids_unpadded)
+        surrounding_offset = max(
+            absolute_read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
+            0,
+        )
+        decode_ids = (
+            tuple(req.origin_input_ids_unpadded[surrounding_offset:]) + output_ids
+        )
+        read_offset = absolute_read_offset - surrounding_offset
+    else:
+        if req.cur_decode_ids_len > len(output_ids):
+            raise ValueError("incremental detokenizer length exceeds output length")
+        decode_ids = tuple(req.surr_and_decode_ids) + output_ids[
+            req.cur_decode_ids_len :
+        ]
+        read_offset = req.read_offset - req.surr_offset
+
+    if req.send_decode_id_offset < 0 or req.send_decode_id_offset > len(decode_ids):
+        raise ValueError("send_decode_id_offset does not index the decode tail")
+    origin_tail_ids = decode_ids[req.send_decode_id_offset :]
+
+    frozen_cache_details = None
+    if cached_tokens_details is not None:
+        frozen_cache_details = tuple(sorted(cached_tokens_details.items()))
+
+    if (
+        req.mm_image_tokens > 0
+        or req.mm_audio_tokens > 0
+        or req.mm_video_tokens > 0
+    ):
+        image_tokens = req.mm_image_tokens
+        audio_tokens = req.mm_audio_tokens
+        video_tokens = req.mm_video_tokens
+    elif req.multimodal_inputs is not None:
+        image_tokens, audio_tokens, video_tokens = (
+            req.multimodal_inputs.compute_mm_token_counts()
+        )
+    else:
+        image_tokens = 0
+        audio_tokens = 0
+        video_tokens = 0
+
+    return FrozenPrefillGatewayOutputShell(
+        rid=req.rid,
+        http_worker_ipc=req.http_worker_ipc,
+        origin_tail_ids=origin_tail_ids,
+        read_offset=read_offset,
+        decoded_text=req.decoded_text,
+        skip_special_tokens=req.sampling_params.skip_special_tokens,
+        spaces_between_special_tokens=(
+            req.sampling_params.spaces_between_special_tokens
+        ),
+        no_stop_trim=req.sampling_params.no_stop_trim,
+        prompt_tokens=len(req.origin_input_ids),
+        reasoning_tokens=req.reasoning_tokens,
+        cached_tokens=req.cached_tokens,
+        cached_tokens_details=frozen_cache_details,
+        image_tokens=image_tokens,
+        audio_tokens=audio_tokens,
+        video_tokens=video_tokens,
+        retraction_count=req.retraction_count,
+        dp_rank=dp_rank,
+        spec_verify_ct=req.spec_verify_ct,
+        spec_num_correct_drafts=req.spec_num_correct_drafts,
+        spec_num_block_accept_tokens=req.spec_num_block_accept_tokens,
+        spec_num_cap_tokens=req.spec_num_cap_tokens,
+        spec_correct_drafts_histogram=tuple(req.spec_correct_drafts_histogram),
+        spec_cap_lens_histogram=tuple(req.spec_cap_lens_histogram),
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
