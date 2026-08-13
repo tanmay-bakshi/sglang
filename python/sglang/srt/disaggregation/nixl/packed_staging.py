@@ -3480,6 +3480,19 @@ class PackedCopyExecutor:
         self._source_stream = torch.cuda.Stream(device=self._device)
         self._scatter_stream = torch.cuda.Stream(device=self._device)
 
+    @property
+    def scatter_stream_handle(self) -> int:
+        """Return the raw stream carrying every destination scatter.
+
+        The caller may attach a native host callback only after ``scatter``
+        returns. All scatter kernels and their timing event then precede that
+        callback in this stream's total order.
+
+        :returns: Raw ``cudaStream_t`` value for native callback registration.
+        """
+
+        return int(self._scatter_stream.cuda_stream)
+
     def gather(
         self,
         *,
