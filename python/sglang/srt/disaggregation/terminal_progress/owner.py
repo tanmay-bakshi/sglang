@@ -303,16 +303,21 @@ class PackedTerminalProgressOwner:
             type(maximum_items) is not int or maximum_items <= 0
         ):
             raise ValueError("maximum_items must be a positive integer")
-        try:
-            self._output_pulse_source.drain()
-        except TerminalOwnerClosedError:
-            pass
         should_wake = False
         with self._condition:
+            try:
+                self._output_pulse_source.drain()
+            except TerminalOwnerClosedError:
+                pass
             count = len(self._outputs)
             if maximum_items is not None:
                 count = min(count, maximum_items)
             outputs = tuple(self._outputs.popleft() for _ in range(count))
+            if len(self._outputs) > 0:
+                try:
+                    self._output_pulse_source.signal()
+                except TerminalOwnerClosedError:
+                    pass
             should_wake = self._disposition is TerminalOwnerDisposition.DRAINING
             self._condition.notify_all()
         if should_wake:
