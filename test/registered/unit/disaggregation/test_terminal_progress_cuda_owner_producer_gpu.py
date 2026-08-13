@@ -36,6 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 _LOCAL_PRODUCER_ID = 1
 _CUDA_PRODUCER_ID = 2
+_CONTROL_PRODUCER_ID = 3
 _WAIT_SECONDS = 2.0
 
 
@@ -56,25 +57,44 @@ def _build_scatter_owner() -> tuple[
         tp_size=1,
     )
     identity = NativeTerminalProcessIdentity.from_identity(process)
+    source_identity = NativeTerminalProcessIdentity.from_identity(
+        TerminalProcessIdentity(
+            process_generation=bytes.fromhex("102132435465768798a9bacbdcedfe0f"),
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=0,
+            tp_size=1,
+        )
+    )
     owner = NativeTerminalOwner(
         input_capacity=64,
         output_capacity=64,
         owner_identity=identity,
         testing=True,
     )
-    for producer_id, name in (
-        (_LOCAL_PRODUCER_ID, "decode-local"),
-        (_CUDA_PRODUCER_ID, "decode-cuda-scatter"),
+    for registration in (
+        NativeTerminalProducerRegistration(
+            producer_id=_LOCAL_PRODUCER_ID,
+            name="decode-local",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CUDA_PRODUCER_ID,
+            name="decode-cuda-scatter",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CONTROL_PRODUCER_ID,
+            name="source-control",
+            producer_class=NativeTerminalProducerClass.CONTROL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=source_identity,
+        ),
     ):
-        owner.register_producer(
-            NativeTerminalProducerRegistration(
-                producer_id=producer_id,
-                name=name,
-                producer_class=NativeTerminalProducerClass.LOCAL,
-                allowed_role=NativeTerminalOwnerRole.DECODE,
-                authenticated_issuer=None,
-            )
-        )
+        owner.register_producer(registration)
     request_key = PackedRequestKey(
         room_id=701,
         request_generation=bytes.fromhex("00112233445566778899aabbccddeeff"),
@@ -91,7 +111,7 @@ def _build_scatter_owner() -> tuple[
         NativeTerminalLifecycleRegistration(
             binding=binding,
             publication_identity=None,
-            trusted_issuers=(identity,),
+            trusted_issuers=(identity, source_identity),
         )
     )
     for kind in (
@@ -100,9 +120,15 @@ def _build_scatter_owner() -> tuple[
         NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
         NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
     ):
+        producer_id = _LOCAL_PRODUCER_ID
+        if kind in (
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+        ):
+            producer_id = _CONTROL_PRODUCER_ID
         owner.submit(
             NativeTerminalOwnerEvent(
-                producer_id=_LOCAL_PRODUCER_ID,
+                producer_id=producer_id,
                 binding_digest=binding.digest,
                 kind=kind,
                 enqueued_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
@@ -140,6 +166,7 @@ def test_real_cuda_callback_delivers_directly_into_native_owner() -> None:
     assert inventory.total_delivered == 1
     assert inventory.retained_count == 0
     owner.retire_python_producer(_LOCAL_PRODUCER_ID)
+    owner.retire_python_producer(_CONTROL_PRODUCER_ID)
     assert producer.join(_WAIT_SECONDS)
     producer.close()
     assert owner.wait_for_producer_retirement(_LOCAL_PRODUCER_ID, _WAIT_SECONDS)

@@ -34,6 +34,7 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _LOCAL_PRODUCER_ID = 1
 _CUDA_PRODUCER_ID = 2
+_CONTROL_PRODUCER_ID = 3
 _WAIT_SECONDS = 2.0
 
 
@@ -61,10 +62,14 @@ def test_independent_owner_and_cuda_dsos_compile_the_exact_same_abi() -> None:
     }
 
 
-def _make_owner() -> tuple[NativeTerminalOwner, NativeTerminalProcessIdentity]:
+def _make_owner() -> tuple[
+    NativeTerminalOwner,
+    NativeTerminalProcessIdentity,
+    NativeTerminalProcessIdentity,
+]:
     """Create one decode owner with local and CUDA producer namespaces.
 
-    :returns: Started native owner and its exact process identity.
+    :returns: Native owner plus its local and authenticated source identities.
     """
 
     process = TerminalProcessIdentity(
@@ -74,37 +79,58 @@ def _make_owner() -> tuple[NativeTerminalOwner, NativeTerminalProcessIdentity]:
         tp_size=1,
     )
     identity = NativeTerminalProcessIdentity.from_identity(process)
+    source_identity = NativeTerminalProcessIdentity.from_identity(
+        TerminalProcessIdentity(
+            process_generation=bytes.fromhex("ffeeddccbbaa99887766554433221100"),
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=0,
+            tp_size=1,
+        )
+    )
     owner = NativeTerminalOwner(
         input_capacity=128,
         output_capacity=128,
         owner_identity=identity,
         testing=True,
     )
-    for producer_id, name in (
-        (_LOCAL_PRODUCER_ID, "decode-local"),
-        (_CUDA_PRODUCER_ID, "decode-cuda-scatter"),
+    for registration in (
+        NativeTerminalProducerRegistration(
+            producer_id=_LOCAL_PRODUCER_ID,
+            name="decode-local",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CUDA_PRODUCER_ID,
+            name="decode-cuda-scatter",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CONTROL_PRODUCER_ID,
+            name="source-control",
+            producer_class=NativeTerminalProducerClass.CONTROL,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=source_identity,
+        ),
     ):
-        owner.register_producer(
-            NativeTerminalProducerRegistration(
-                producer_id=producer_id,
-                name=name,
-                producer_class=NativeTerminalProducerClass.LOCAL,
-                allowed_role=NativeTerminalOwnerRole.DECODE,
-                authenticated_issuer=None,
-            )
-        )
-    return owner, identity
+        owner.register_producer(registration)
+    return owner, identity, source_identity
 
 
 def _register_scatter_inflight(
     owner: NativeTerminalOwner,
     identity: NativeTerminalProcessIdentity,
+    source_identity: NativeTerminalProcessIdentity,
     room_id: int,
 ) -> NativeTerminalRequestBinding:
     """Register and advance one decode lifecycle to scatter in flight.
 
     :param owner: Process-lifetime native owner.
     :param identity: Exact decode owner identity.
+    :param source_identity: Authenticated source control identity.
     :param room_id: Stable test request room.
     :returns: Exact native request binding.
     """
@@ -131,7 +157,7 @@ def _register_scatter_inflight(
         NativeTerminalLifecycleRegistration(
             binding=binding,
             publication_identity=None,
-            trusted_issuers=(identity,),
+            trusted_issuers=(identity, source_identity),
         )
     )
     for kind in (
@@ -140,9 +166,15 @@ def _register_scatter_inflight(
         NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
         NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
     ):
+        producer_id = _LOCAL_PRODUCER_ID
+        if kind in (
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+        ):
+            producer_id = _CONTROL_PRODUCER_ID
         owner.submit(
             NativeTerminalOwnerEvent(
-                producer_id=_LOCAL_PRODUCER_ID,
+                producer_id=producer_id,
                 binding_digest=binding.digest,
                 kind=kind,
                 enqueued_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
@@ -185,13 +217,14 @@ def _retire_and_abort(
     owner: NativeTerminalOwner,
     producer: CudaTerminalProducer,
 ) -> None:
-    """Retire both producer namespaces and release the test lifecycle.
+    """Retire every producer namespace and release the test lifecycle.
 
     :param owner: Process-lifetime native owner.
     :param producer: Direct CUDA producer bound to the owner.
     """
 
     owner.retire_python_producer(_LOCAL_PRODUCER_ID)
+    owner.retire_python_producer(_CONTROL_PRODUCER_ID)
     assert producer.join(_WAIT_SECONDS)
     producer.close()
     assert owner.wait_for_producer_retirement(_LOCAL_PRODUCER_ID, _WAIT_SECONDS)
@@ -202,8 +235,13 @@ def _retire_and_abort(
 def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
     """A CUDA terminal callback mutates native state without an intermediate queue."""
 
-    owner, identity = _make_owner()
-    binding = _register_scatter_inflight(owner, identity, room_id=401)
+    owner, identity, source_identity = _make_owner()
+    binding = _register_scatter_inflight(
+        owner,
+        identity,
+        source_identity,
+        room_id=401,
+    )
     producer = CudaTerminalProducer(
         owner,
         _CUDA_PRODUCER_ID,
@@ -226,9 +264,14 @@ def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
 def test_concurrent_callbacks_preserve_owner_assigned_queue_order() -> None:
     """Concurrent native callbacks cannot forge or reorder producer sequences."""
 
-    owner, identity = _make_owner()
+    owner, identity, source_identity = _make_owner()
     bindings = tuple(
-        _register_scatter_inflight(owner, identity, room_id=500 + index)
+        _register_scatter_inflight(
+            owner,
+            identity,
+            source_identity,
+            room_id=500 + index,
+        )
         for index in range(16)
     )
     producer = CudaTerminalProducer(
@@ -260,8 +303,13 @@ def test_concurrent_callbacks_preserve_owner_assigned_queue_order() -> None:
 def test_close_with_live_callback_fails_closed_and_keeps_capsule_lifetime() -> None:
     """A live callback prevents producer and owner context destruction."""
 
-    owner, identity = _make_owner()
-    binding = _register_scatter_inflight(owner, identity, room_id=601)
+    owner, identity, source_identity = _make_owner()
+    binding = _register_scatter_inflight(
+        owner,
+        identity,
+        source_identity,
+        room_id=601,
+    )
     producer = CudaTerminalProducer(
         owner,
         _CUDA_PRODUCER_ID,
