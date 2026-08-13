@@ -12,10 +12,10 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentBootstrapEndpoint,
     TerminalDeploymentCohort,
     TerminalDeploymentCohortError,
-    TerminalDeploymentLocalService,
+    TerminalDeploymentDecoder,
+    TerminalDeploymentPrefill,
     TerminalDeploymentRequestPlan,
     TerminalDeploymentRole,
-    TerminalDeploymentService,
     decode_terminal_deployment_cohort,
     encode_terminal_deployment_cohort,
     load_terminal_deployment_cohort,
@@ -35,33 +35,6 @@ def _uuid(marker: int) -> uuid.UUID:
     return uuid.UUID(int=marker)
 
 
-def _service(
-    service_id: str,
-    role: TerminalDeploymentRole,
-    marker: int,
-    tp_size: int,
-    port: int,
-) -> TerminalDeploymentService:
-    """Build one exact launcher service fixture.
-
-    :param service_id: Stable service name.
-    :param role: Prefill or decode role.
-    :param marker: Launch UUID marker.
-    :param tp_size: Complete service TP width.
-    :param port: Exact loopback HTTP port.
-    :returns: Valid service identity.
-    """
-
-    return TerminalDeploymentService(
-        service_id=service_id,
-        role=role,
-        launch_instance_id=_uuid(marker),
-        tensor_parallel_size=tp_size,
-        origin=f"http://127.0.0.1:{port}",
-        port=port,
-    )
-
-
 def _cohort() -> TerminalDeploymentCohort:
     """Build one immutable per-group deployment fixture.
 
@@ -72,14 +45,29 @@ def _cohort() -> TerminalDeploymentCohort:
         group_id="group-a",
         model_fingerprint="11" * 32,
         logical_kv_layout_fingerprint="22" * 32,
-        bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
-            host="gemma-dev-1",
-            port=32150,
+        prefill=TerminalDeploymentPrefill(
+            service_id="prefill-a",
+            launch_instance_id=_uuid(2),
+            origin="http://127.0.0.1:32001",
+            bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
+                host="gemma-dev-1",
+                port=32150,
+            ),
+            tensor_parallel_size=2,
         ),
-        services=(
-            _service("prefill-a", TerminalDeploymentRole.PREFILL, 2, 2, 32001),
-            _service("decode-a", TerminalDeploymentRole.DECODE, 3, 1, 32002),
-            _service("decode-b", TerminalDeploymentRole.DECODE, 4, 1, 32003),
+        decoders=(
+            TerminalDeploymentDecoder(
+                service_id="decode-a",
+                launch_instance_id=_uuid(3),
+                origin="http://127.0.0.1:32002",
+                tensor_parallel_size=1,
+            ),
+            TerminalDeploymentDecoder(
+                service_id="decode-b",
+                launch_instance_id=_uuid(4),
+                origin="http://127.0.0.1:32003",
+                tensor_parallel_size=1,
+            ),
         ),
     )
 
@@ -104,99 +92,87 @@ def _request_plan(
     )
 
 
-def _require_local(
-    cohort: TerminalDeploymentCohort,
-    service: TerminalDeploymentService,
-) -> TerminalDeploymentLocalService:
-    """Select one exact service from its fixture cohort.
-
-    :param cohort: Owning deployment cohort.
-    :param service: Exact cohort member.
-    :returns: Validated local membership.
-    """
-
-    bootstrap = (
-        cohort.bootstrap_endpoint
-        if service.role is TerminalDeploymentRole.PREFILL
-        else None
-    )
-    return cohort.require_local_service(
-        service_id=service.service_id,
-        role=service.role,
-        launch_instance_id=service.launch_instance_id,
-        tensor_parallel_size=service.tensor_parallel_size,
-        origin=service.origin,
-        port=service.port,
-        bootstrap_endpoint=bootstrap,
-    )
-
-
-def test_cohort_matches_launcher_schema_bytes() -> None:
+def test_cohort_matches_canonical_launcher_schema_bytes() -> None:
     """Preserve the exact launcher-owned schema and field ordering."""
 
     cohort = _cohort()
     payload = encode_terminal_deployment_cohort(cohort)
     expected = {
-        "schema": "pd-terminal-deployment-cohort-v1",
+        "schema": "packed-terminal-deployment-cohort-v1",
         "group_id": "group-a",
         "model_fingerprint": "11" * 32,
         "logical_kv_layout_fingerprint": "22" * 32,
-        "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32150},
-        "services": [
-            {
-                "id": "prefill-a",
-                "role": "prefill",
-                "launch_instance_id": str(_uuid(2)),
-                "tensor_parallel_size": 2,
-                "origin": "http://127.0.0.1:32001",
-                "port": 32001,
-            },
+        "prefill": {
+            "id": "prefill-a",
+            "launch_instance_id": str(_uuid(2)),
+            "origin": "http://127.0.0.1:32001",
+            "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32150},
+            "tensor_parallel_size": 2,
+        },
+        "decoders": [
             {
                 "id": "decode-a",
-                "role": "decode",
                 "launch_instance_id": str(_uuid(3)),
-                "tensor_parallel_size": 1,
                 "origin": "http://127.0.0.1:32002",
-                "port": 32002,
+                "tensor_parallel_size": 1,
             },
             {
                 "id": "decode-b",
-                "role": "decode",
                 "launch_instance_id": str(_uuid(4)),
-                "tensor_parallel_size": 1,
                 "origin": "http://127.0.0.1:32003",
-                "port": 32003,
+                "tensor_parallel_size": 1,
             },
         ],
     }
 
-    assert json.loads(payload) == expected
-    assert payload == json.dumps(expected, separators=(",", ":")).encode()
+    assert (
+        payload
+        == json.dumps(
+            expected,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode()
+    )
     assert decode_terminal_deployment_cohort(payload) == cohort
     assert cohort.digest == hashlib.sha256(payload).digest()
     assert payload.startswith(
         b'{"schema":"' + TERMINAL_DEPLOYMENT_COHORT_SCHEMA.encode() + b'"'
     )
+    assert not payload.endswith(b"\n")
 
 
 def test_local_service_requires_exact_static_membership() -> None:
     """Bind service name, generation, role, width, origin, and bootstrap."""
 
     cohort = _cohort()
-    prefill = _require_local(cohort, cohort.prefill)
-    decoder = _require_local(cohort, cohort.decoders[1])
+    prefill = cohort.require_local_service(
+        service_id=cohort.prefill.service_id,
+        role=TerminalDeploymentRole.PREFILL,
+        launch_instance_id=cohort.prefill.launch_instance_id,
+        tensor_parallel_size=cohort.prefill.tensor_parallel_size,
+        origin=cohort.prefill.origin,
+        bootstrap_endpoint=cohort.prefill.bootstrap_endpoint,
+    )
+    decoder_record = cohort.decoders[1]
+    decoder = cohort.require_local_service(
+        service_id=decoder_record.service_id,
+        role=TerminalDeploymentRole.DECODE,
+        launch_instance_id=decoder_record.launch_instance_id,
+        tensor_parallel_size=decoder_record.tensor_parallel_size,
+        origin=decoder_record.origin,
+        bootstrap_endpoint=None,
+    )
 
-    assert prefill.service == cohort.prefill
-    assert decoder.service == cohort.decoders[1]
+    assert prefill.cohort_digest == cohort.digest
+    assert decoder.service_id == decoder_record.service_id
     with pytest.raises(TerminalDeploymentCohortError, match="differs"):
         cohort.require_local_service(
             service_id=cohort.prefill.service_id,
-            role=cohort.prefill.role,
+            role=TerminalDeploymentRole.PREFILL,
             launch_instance_id=cohort.prefill.launch_instance_id,
             tensor_parallel_size=4,
             origin=cohort.prefill.origin,
-            port=cohort.prefill.port,
-            bootstrap_endpoint=cohort.bootstrap_endpoint,
+            bootstrap_endpoint=cohort.prefill.bootstrap_endpoint,
         )
     with pytest.raises(TerminalDeploymentCohortError, match="absent"):
         cohort.require_local_service(
@@ -205,7 +181,6 @@ def test_local_service_requires_exact_static_membership() -> None:
             launch_instance_id=_uuid(99),
             tensor_parallel_size=1,
             origin="http://127.0.0.1:32099",
-            port=32099,
             bootstrap_endpoint=None,
         )
 
@@ -244,9 +219,30 @@ def test_request_plan_contains_only_its_exact_local_members() -> None:
 
     cohort = _cohort()
     plan = _request_plan(cohort)
-    prefill = _require_local(cohort, cohort.prefill)
-    selected_decoder = _require_local(cohort, cohort.decoders[0])
-    other_decoder = _require_local(cohort, cohort.decoders[1])
+    prefill = cohort.require_local_service(
+        service_id=cohort.prefill.service_id,
+        role=TerminalDeploymentRole.PREFILL,
+        launch_instance_id=cohort.prefill.launch_instance_id,
+        tensor_parallel_size=cohort.prefill.tensor_parallel_size,
+        origin=cohort.prefill.origin,
+        bootstrap_endpoint=cohort.prefill.bootstrap_endpoint,
+    )
+    selected_decoder = cohort.require_local_service(
+        service_id=cohort.decoders[0].service_id,
+        role=TerminalDeploymentRole.DECODE,
+        launch_instance_id=cohort.decoders[0].launch_instance_id,
+        tensor_parallel_size=cohort.decoders[0].tensor_parallel_size,
+        origin=cohort.decoders[0].origin,
+        bootstrap_endpoint=None,
+    )
+    other_decoder = cohort.require_local_service(
+        service_id=cohort.decoders[1].service_id,
+        role=TerminalDeploymentRole.DECODE,
+        launch_instance_id=cohort.decoders[1].launch_instance_id,
+        tensor_parallel_size=cohort.decoders[1].tensor_parallel_size,
+        origin=cohort.decoders[1].origin,
+        bootstrap_endpoint=None,
+    )
 
     assert plan.contains(prefill)
     assert plan.contains(selected_decoder)
@@ -254,11 +250,11 @@ def test_request_plan_contains_only_its_exact_local_members() -> None:
 
 
 def test_cohort_rejects_order_and_identity_collisions() -> None:
-    """Keep prefill first and every launcher identity collision-free."""
+    """Keep decoder order and every launcher identity collision-free."""
 
     cohort = _cohort()
-    with pytest.raises(ValueError, match="prefill before"):
-        dataclasses.replace(cohort, services=tuple(reversed(cohort.services)))
+    with pytest.raises(ValueError, match="canonical service_id order"):
+        dataclasses.replace(cohort, decoders=tuple(reversed(cohort.decoders)))
     duplicate_launch = dataclasses.replace(
         cohort.decoders[0],
         launch_instance_id=cohort.prefill.launch_instance_id,
@@ -266,17 +262,16 @@ def test_cohort_rejects_order_and_identity_collisions() -> None:
     with pytest.raises(ValueError, match="launch_instance_id"):
         dataclasses.replace(
             cohort,
-            services=(cohort.prefill, duplicate_launch, cohort.decoders[1]),
+            decoders=(duplicate_launch, cohort.decoders[1]),
         )
     duplicate_origin = dataclasses.replace(
         cohort.decoders[0],
         origin=cohort.prefill.origin,
-        port=cohort.prefill.port,
     )
     with pytest.raises(ValueError, match="origin"):
         dataclasses.replace(
             cohort,
-            services=(cohort.prefill, duplicate_origin, cohort.decoders[1]),
+            decoders=(duplicate_origin, cohort.decoders[1]),
         )
 
 
@@ -292,7 +287,7 @@ def test_decoder_rejects_unknown_duplicate_and_noncanonical_json() -> None:
 
     duplicate = payload.replace(
         b'{"schema":',
-        b'{"schema":"pd-terminal-deployment-cohort-v1","schema":',
+        b'{"schema":"packed-terminal-deployment-cohort-v1","schema":',
         1,
     )
     with pytest.raises(TerminalDeploymentCohortError, match="duplicate JSON field"):
@@ -331,20 +326,19 @@ def test_decoder_rejects_bootstrap_and_boolean_integer_drift() -> None:
 
     cohort = _cohort()
     decoder = cohort.decoders[0]
-    with pytest.raises(TerminalDeploymentCohortError, match="cannot claim"):
+    with pytest.raises(TerminalDeploymentCohortError, match="differs"):
         cohort.require_local_service(
             service_id=decoder.service_id,
-            role=decoder.role,
+            role=TerminalDeploymentRole.DECODE,
             launch_instance_id=decoder.launch_instance_id,
             tensor_parallel_size=decoder.tensor_parallel_size,
             origin=decoder.origin,
-            port=decoder.port,
-            bootstrap_endpoint=cohort.bootstrap_endpoint,
+            bootstrap_endpoint=cohort.prefill.bootstrap_endpoint,
         )
 
     payload = encode_terminal_deployment_cohort(cohort)
     decoded = json.loads(payload)
-    decoded["services"][0]["tensor_parallel_size"] = True
+    decoded["prefill"]["tensor_parallel_size"] = True
     invalid = json.dumps(decoded, separators=(",", ":")).encode()
     with pytest.raises(TerminalDeploymentCohortError, match="integer"):
         decode_terminal_deployment_cohort(invalid)
