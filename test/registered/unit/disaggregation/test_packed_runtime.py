@@ -1720,8 +1720,9 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
         source_plan,
     )
     assert registration.binding == binding
-    assert registration.trusted_issuers == tuple(
-        writer_identity.process_identity for writer_identity in source_plan.writers
+    assert registration.trusted_issuers == (
+        *(writer_identity.process_identity for writer_identity in source_plan.writers),
+        source_plan.request_ready_issuer,
     )
     assert runtime.terminal_owner_transaction(binding.digest) is transaction
     transaction.state = PackedRequestTransactionState.PUBLISHED
