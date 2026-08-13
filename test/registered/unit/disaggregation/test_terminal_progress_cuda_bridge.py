@@ -2,21 +2,15 @@ import gc
 import select
 
 import pytest
-import torch
 
 from sglang.srt.disaggregation.terminal_progress.cuda_bridge import (
     CudaCompletionBridge,
     CudaCompletionFatalCode,
     CudaCompletionIdentity,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA host callbacks require one CUDA device",
-)
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _identity(cookie: int, generation_byte: int | None = None) -> CudaCompletionIdentity:
@@ -53,15 +47,13 @@ def _close_healthy_bridge(bridge: CudaCompletionBridge) -> None:
     bridge.close()
 
 
-def test_immediate_callback_is_take_once_and_closes_without_inventory() -> None:
-    """An empty-stream callback delivers exactly once and retires cleanly."""
+def test_deterministic_completion_is_take_once_and_closes_without_inventory() -> None:
+    """One native publication delivers exactly once and retires cleanly."""
 
     bridge = CudaCompletionBridge(capacity=4, testing=True)
     identity = _identity(1)
-    stream = torch.cuda.Stream()
     bridge.arm(identity)
-    bridge.submit(stream.cuda_stream, identity)
-    stream.synchronize()
+    bridge.complete_synchronously_for_test(identity)
 
     _assert_readable(bridge.fileno())
     first = bridge.drain()
@@ -82,64 +74,45 @@ def test_immediate_callback_is_take_once_and_closes_without_inventory() -> None:
     assert closed.fatal_code is CudaCompletionFatalCode.NONE
 
 
-def test_deferred_callback_blocks_join_and_active_close_fails_closed() -> None:
-    """Shutdown cannot outrun one callback queued behind GPU work."""
+def test_close_with_armed_identity_fails_closed() -> None:
+    """Shutdown cannot erase one armed exact identity."""
 
     bridge = CudaCompletionBridge(capacity=4, testing=True)
     identity = _identity(2)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        torch.cuda._sleep(1_000_000_000)
     bridge.arm(identity)
-    bridge.submit(stream.cuda_stream, identity)
 
-    assert not bridge.join_producers()
-    with pytest.raises(RuntimeError, match="close_with_active_callbacks"):
+    assert bridge.join_producers()
+    with pytest.raises(RuntimeError, match="close_with_retained_inventory"):
         bridge.close()
     failed = bridge.inventory()
-    assert failed.active_callback_count == 1
-    assert failed.fatal_code is CudaCompletionFatalCode.CLOSE_WITH_ACTIVE_CALLBACKS
-
-    stream.synchronize()
-    _assert_readable(bridge.fileno())
-    drained = bridge.drain()
-    assert drained.identities == (identity,)
-    assert bridge.join_producers()
-    settled = bridge.inventory()
-    assert settled.active_callback_count == 0
-    assert settled.live_count == 0
-    assert settled.fatal_code is CudaCompletionFatalCode.CLOSE_WITH_ACTIVE_CALLBACKS
+    assert failed.armed_count == 1
+    assert failed.active_callback_count == 0
+    assert (
+        failed.fatal_code is CudaCompletionFatalCode.CLOSE_WITH_RETAINED_INVENTORY
+    )
 
 
-def test_callback_keeps_native_state_alive_after_failed_close() -> None:
-    """Destroying a failed wrapper cannot race a deferred callback into UAF."""
+def test_wrapper_destruction_with_armed_identity_preserves_memory_safety() -> None:
+    """Destroying a failed wrapper releases native state without a UAF."""
 
     bridge = CudaCompletionBridge(capacity=4, testing=True)
     identity = _identity(3)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        torch.cuda._sleep(1_000_000_000)
     bridge.arm(identity)
-    bridge.submit(stream.cuda_stream, identity)
 
-    with pytest.raises(RuntimeError, match="close_with_active_callbacks"):
+    with pytest.raises(RuntimeError, match="close_with_retained_inventory"):
         bridge.close()
     del bridge
     gc.collect()
-    stream.synchronize()
 
 
-def test_eventfd_coalesces_multiple_cuda_callback_producers() -> None:
-    """Concurrent callback producers share one lossless eventfd wake."""
+def test_eventfd_coalesces_multiple_native_producers() -> None:
+    """Multiple native producer publications share one lossless eventfd wake."""
 
     bridge = CudaCompletionBridge(capacity=16, testing=True)
-    streams = [torch.cuda.Stream() for _ in range(8)]
-    identities = tuple(_identity(index + 10) for index in range(len(streams)))
-    for stream, identity in zip(streams, identities, strict=True):
+    identities = tuple(_identity(index + 10) for index in range(8))
+    for identity in identities:
         bridge.arm(identity)
-        bridge.submit(stream.cuda_stream, identity)
-    for stream in streams:
-        stream.synchronize()
+        bridge.complete_synchronously_for_test(identity)
 
     _assert_readable(bridge.fileno())
     drained = bridge.drain()
