@@ -1314,13 +1314,21 @@ void publisher_death_locked(SharedOwner &owner, const Event &event) {
     const std::uint8_t previous_phase = lifecycle.phase;
     const SourcePhase source_phase =
         static_cast<SourcePhase>(lifecycle.phase);
+    const bool publication_already_terminal =
+        lifecycle.role == OwnerRole::kSource &&
+        lifecycle.publication_authorized &&
+        (lifecycle.gateway_published || lifecycle.publication_quarantined);
     const bool decode_adoption_proven =
         lifecycle.role == OwnerRole::kSource &&
         (source_phase == SourcePhase::kRequestReadyReceived ||
          source_phase == SourcePhase::kPublicationQuarantined) &&
         lifecycle.publication_authorized &&
         !lifecycle.gateway_published;
-    if (decode_adoption_proven) {
+    if (publication_already_terminal) {
+      // Decode has adopted its pages, and the publication identity already has
+      // an exact terminal disposition. Publisher death changes only process
+      // liveness; it cannot make proven source storage ambiguous again.
+    } else if (decode_adoption_proven) {
       if (!lifecycle.gateway_published &&
           !lifecycle.publication_quarantined) {
         lifecycle.live_resources &= ~(1ULL << 8);
