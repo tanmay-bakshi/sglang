@@ -217,6 +217,29 @@ def _load_native_cuda_terminal_producer(*, testing: bool) -> ModuleType:
     )
 
 
+def cuda_terminal_producer_abi(*, testing: bool = False) -> dict[str, object]:
+    """Return the CUDA DSO's independently compiled owner ABI layout.
+
+    :param testing: Whether to inspect the native test variant.
+    :returns: Version, flags, structure sizes, and event-field offsets.
+    """
+
+    module = _load_native_cuda_terminal_producer(testing=testing)
+    value = module.compiled_abi()
+    if type(value) is not dict:
+        raise TypeError("CUDA terminal producer ABI must be a dictionary")
+    offsets = value["event_offsets"]
+    if type(offsets) is not dict:
+        raise TypeError("CUDA terminal producer ABI offsets must be a dictionary")
+    return {
+        "abi_version": int(value["abi_version"]),
+        "api_struct_size": int(value["api_struct_size"]),
+        "event_struct_size": int(value["event_struct_size"]),
+        "required_flags": int(value["required_flags"]),
+        "event_offsets": {str(key): int(item) for key, item in offsets.items()},
+    }
+
+
 class CudaTerminalProducer:
     """Process-lifetime direct CUDA callback producer for one native owner."""
 

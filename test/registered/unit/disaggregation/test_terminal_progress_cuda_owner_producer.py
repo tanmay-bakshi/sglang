@@ -5,6 +5,7 @@ import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
     CudaTerminalProducer,
+    cuda_terminal_producer_abi,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -13,6 +14,7 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 )
 from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
+    native_terminal_owner_producer_abi,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeDecodeLifecyclePhase,
@@ -33,6 +35,30 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 _LOCAL_PRODUCER_ID = 1
 _CUDA_PRODUCER_ID = 2
 _WAIT_SECONDS = 2.0
+
+
+def test_independent_owner_and_cuda_dsos_compile_the_exact_same_abi() -> None:
+    """Structure sizes and offsets match across independent native builds."""
+
+    owner_abi = native_terminal_owner_producer_abi(testing=True)
+    cuda_abi = cuda_terminal_producer_abi(testing=True)
+
+    assert owner_abi == cuda_abi
+    assert owner_abi == {
+        "abi_version": 1,
+        "api_struct_size": 40,
+        "event_struct_size": 168,
+        "required_flags": 3,
+        "event_offsets": {
+            "abi_version": 0,
+            "struct_size": 4,
+            "binding_digest": 8,
+            "event_kind": 40,
+            "enqueued_ns": 48,
+            "receipt_binding_digest": 80,
+            "receipt_nonce": 152,
+        },
+    }
 
 
 def _make_owner() -> tuple[NativeTerminalOwner, NativeTerminalProcessIdentity]:

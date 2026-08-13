@@ -2967,6 +2967,21 @@ private:
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  py::dict producer_event_offsets;
+  producer_event_offsets["abi_version"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, abi_version);
+  producer_event_offsets["struct_size"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, struct_size);
+  producer_event_offsets["binding_digest"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, binding_digest);
+  producer_event_offsets["event_kind"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, event_kind);
+  producer_event_offsets["enqueued_ns"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, enqueued_ns);
+  producer_event_offsets["receipt_binding_digest"] = offsetof(
+      sglang_terminal_owner_producer_event_v1, receipt_binding_digest);
+  producer_event_offsets["receipt_nonce"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, receipt_nonce);
   module.attr("PRODUCER_ABI_VERSION") =
       SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION;
   module.attr("PRODUCER_EVENT_POD_SIZE") =
@@ -2975,6 +2990,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       sizeof(sglang_terminal_owner_producer_api_v1);
   module.attr("PRODUCER_API_FLAGS") =
       SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS;
+  module.attr("PRODUCER_EVENT_OFFSETS") = std::move(producer_event_offsets);
   module.attr("PRODUCER_API_CAPSULE_NAME") =
       SGLANG_TERMINAL_OWNER_PRODUCER_API_CAPSULE_NAME;
   module.attr("PRODUCER_CONTEXT_CAPSULE_NAME") =
