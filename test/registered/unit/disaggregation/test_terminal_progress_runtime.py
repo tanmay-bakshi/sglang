@@ -755,6 +755,84 @@ def test_runtime_queue_overflow_enters_one_process_fatal_path() -> None:
         _finish_fail_closed(runtime)
 
 
+def test_scheduler_failure_releases_action_accounting_and_retains_quarantine() -> None:
+    """A failed reclaim cannot leak pending authority or imply safe cleanup."""
+
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registration = _registration(owner, remote, 89)
+    binding_digest = registration.binding.digest
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        runtime.submit(
+            _LOCAL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        )
+        runtime.submit(
+            _LOCAL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+        )
+        gather = _drain_actions(runtime.source_work_actions)[0]
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            gather,
+            NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+        )
+        runtime.submit(
+            _LOCAL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+        )
+        outcome = _drain_actions(runtime.source_work_actions)[0]
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            outcome,
+            NativeTerminalOwnerEventKind.SOURCE_OUTCOMES_SENT,
+        )
+        runtime.submit(
+            _REMOTE_CONTROL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_TEARDOWN_RECEIVED,
+        )
+        acknowledgement = _drain_actions(runtime.source_work_actions)[0]
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            acknowledgement,
+            NativeTerminalOwnerEventKind.SOURCE_ACK_SENT,
+        )
+        runtime.submit_imported_receipt(
+            _REMOTE_RECEIPT_PRODUCER_ID,
+            _receipt(
+                registration,
+                remote,
+                NativeTerminalReceiptKind.REQUEST_READY,
+                890,
+            ),
+            NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
+        )
+        reclaim = _drain_actions(runtime.scheduler_actions)[0]
+        assert reclaim.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
+        runtime.fail_scheduler_action(reclaim, "synthetic scheduler cleanup failure")
+
+        snapshot = runtime.snapshot()
+        assert snapshot.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
+        assert snapshot.scheduler_pending_count == 0
+        assert snapshot.consumer_pending_count >= 1
+        lifecycle = _drain_actions(runtime.lifecycle_actions)
+        quarantine = tuple(
+            action
+            for action in lifecycle
+            if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED
+        )
+        assert len(quarantine) == 1
+        runtime.acknowledge_consumed_action(quarantine[0])
+        assert runtime.snapshot().quarantined_binding_digests == (binding_digest,)
+    finally:
+        _finish_fail_closed(runtime)
+
+
 def test_abort_preserves_every_registration_and_quarantine_identity() -> None:
     runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
     registrations = (
