@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestPublication,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
     TerminalProcessIdentity,
     TerminalRequestBinding,
 )
@@ -30,6 +31,10 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProducerClass,
     NativeTerminalReceipt,
     NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.receipts import (
+    TerminalReceiptKind,
+    TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourcePlan,
@@ -149,6 +154,17 @@ class NativeTerminalDecodeRuntime(Protocol):
         :param action: Exact native action whose side effect completed.
         """
 
+    def fail_scheduler_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> None:
+        """Fail one scheduler action whose ownership became ambiguous.
+
+        :param action: Exact adoption action which could not complete.
+        :param reason: Stable process-fatal failure evidence.
+        """
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PackedDecodeScatterHandoff:
@@ -187,6 +203,7 @@ class PackedTerminalDecodeWiring:
     _runtime: NativeTerminalDecodeRuntime
     _cuda_completion: PackedDecodeScatterCompletionProducer
     _local_producer_id: int
+    _local_receipt_producer_id: int
 
     def __init__(
         self,
@@ -194,12 +211,14 @@ class PackedTerminalDecodeWiring:
         actor: PackedDecodeRuntime,
         runtime: NativeTerminalDecodeRuntime,
         cuda_completion: PackedDecodeScatterCompletionProducer,
+        local_identity: TerminalProcessIdentity,
     ) -> None:
         """Construct decode orchestration around process-lifetime owners.
 
         :param actor: Existing packed decode transaction actor.
         :param runtime: Sole authoritative native lifecycle runtime.
         :param cuda_completion: Direct CUDA callback-to-owner producer.
+        :param local_identity: Exact decode process owned by this wiring.
         """
 
         if type(actor) is not PackedDecodeRuntime:
@@ -213,11 +232,19 @@ class PackedTerminalDecodeWiring:
             raise TypeError(
                 "cuda_completion must satisfy PackedDecodeScatterCompletionProducer"
             )
+        if type(local_identity) is not TerminalProcessIdentity:
+            raise TypeError("local_identity must be TerminalProcessIdentity")
+        if local_identity.role is not TerminalOwnerRole.DECODE:
+            raise ValueError("local_identity must belong to decode")
         self._actor = actor
         self._runtime = runtime
         self._cuda_completion = cuda_completion
         self._local_producer_id = runtime.python_producer_id(
             NativeTerminalProducerClass.LOCAL
+        )
+        self._local_receipt_producer_id = runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            NativeTerminalProcessIdentity.from_identity(local_identity),
         )
 
     def bind_transaction(
@@ -398,13 +425,15 @@ class PackedTerminalDecodeWiring:
         if not callable(finalize_request):
             raise TypeError("finalize_request must be callable")
         transaction = self._actor.terminal_owner_transaction(action.binding.digest)
+        scheduler_action_completed = False
         try:
             owner = self._actor.consume_terminal_owner_adoption(transaction)
             self._runtime.complete_scheduler_action(
-                self._local_producer_id,
+                self._local_receipt_producer_id,
                 action,
                 NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
             )
+            scheduler_action_completed = True
             adopt_request(owner)
             self._actor.complete_terminal_owner_metadata_consumption(transaction)
             self._runtime.submit(
@@ -430,7 +459,10 @@ class PackedTerminalDecodeWiring:
                     traceback.format_exc(),
                 )
             try:
-                self._submit_local_failure(action.binding.digest, reason)
+                if scheduler_action_completed:
+                    self._submit_local_failure(action.binding.digest, reason)
+                else:
+                    self._runtime.fail_scheduler_action(action, reason)
             except Exception:  # noqa: BLE001
                 logger.error(
                     "Decode native failure publication failed after adoption "
@@ -483,9 +515,77 @@ class PackedTerminalDecodeWiring:
             raise TypeError("wire_receipt must be TerminalWireReceipt")
         if type(authenticated_issuer) is not TerminalProcessIdentity:
             raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
+        if (
+            wire_receipt.kind is not TerminalReceiptKind.REQUEST_READY
+            or wire_receipt.outcome is not TerminalReceiptOutcome.SUCCESS
+        ):
+            raise RuntimeError("request-ready ingress requires successful readiness")
+        self._submit_request_terminal_receipt(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            authenticated_issuer=authenticated_issuer,
+            event_kind=NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
+            reason=None,
+        )
+
+    def request_failed(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        reason: str,
+    ) -> None:
+        """Submit request-global failure from the authenticated coordinator.
+
+        :param binding_digest: Exact local decode lifecycle identity.
+        :param wire_receipt: Imported one-shot request-failure authority.
+        :param authenticated_issuer: Coordinator proved by the control route.
+        :param reason: Stable request-global failure evidence.
+        """
+
+        if type(wire_receipt) is not TerminalWireReceipt:
+            raise TypeError("wire_receipt must be TerminalWireReceipt")
+        if type(authenticated_issuer) is not TerminalProcessIdentity:
+            raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        if (
+            wire_receipt.kind is not TerminalReceiptKind.FAILURE
+            or wire_receipt.outcome is not TerminalReceiptOutcome.FAILURE
+        ):
+            raise RuntimeError("request-failure ingress requires failure authority")
+        self._submit_request_terminal_receipt(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            authenticated_issuer=authenticated_issuer,
+            event_kind=NativeTerminalOwnerEventKind.DECODE_REQUEST_FAILED,
+            reason=reason,
+        )
+
+    def _submit_request_terminal_receipt(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        event_kind: NativeTerminalOwnerEventKind,
+        reason: str | None,
+    ) -> None:
+        """Join route authentication with one request-global wire authority.
+
+        :param binding_digest: Exact local decode lifecycle identity.
+        :param wire_receipt: Validated request-global receipt.
+        :param authenticated_issuer: Identity proved by the receive route.
+        :param event_kind: Native ready or failed transition.
+        :param reason: Failure evidence, otherwise ``None``.
+        """
+
         expected = self._actor.terminal_owner_request_ready_issuer(binding_digest)
         if authenticated_issuer != expected:
             raise RuntimeError("request-ready route authenticated another coordinator")
+        if wire_receipt.issuer != authenticated_issuer:
+            raise RuntimeError("request-ready receipt asserts another coordinator")
         if wire_receipt.binding.digest != binding_digest:
             raise RuntimeError("request-ready receipt targets another binding")
         native_issuer = NativeTerminalProcessIdentity.from_identity(
@@ -498,7 +598,8 @@ class PackedTerminalDecodeWiring:
         self._runtime.submit_imported_receipt(
             producer_id,
             NativeTerminalReceipt.from_wire_receipt(wire_receipt),
-            NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
+            event_kind,
+            reason=reason,
         )
 
     def retire(self, action: NativeTerminalOwnerAction) -> None:

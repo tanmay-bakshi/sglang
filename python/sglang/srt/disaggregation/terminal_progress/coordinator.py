@@ -317,6 +317,22 @@ class TerminalRequestCoordinator:
         with self._lock:
             return self._terminal_emissions
 
+    @property
+    def deadline_expires_ns(self) -> int | None:
+        """Return the armed request-global deadline, when one exists.
+
+        The process reactor uses this value to arm its timer source after the
+        first local-ready receipt. Reading the value never advances coordinator
+        state and therefore cannot become a progress mechanism.
+
+        :returns: Exact monotonic expiration timestamp, otherwise ``None``.
+        """
+
+        with self._lock:
+            if self._deadline is None:
+                return None
+            return self._deadline.expires_ns
+
     def accept(
         self,
         wire_receipt: TerminalWireReceipt,
@@ -447,6 +463,31 @@ class TerminalRequestCoordinator:
             if self._disposition is TerminalRequestCoordinatorDisposition.COLLECTING:
                 raise TerminalRequestCoordinatorError(
                     "cannot close an incomplete request coordinator"
+                )
+            for binding in self._manifest.destination_bindings:
+                self._importers[binding.owner].retire_binding(binding)
+            self._closed = True
+
+    def cancel_unpublished(self) -> None:
+        """Release replay state for a request never made externally visible.
+
+        This is the sole nonterminal coordinator rollback. Once any destination
+        receipt has arrived, request-global identity is externally observable
+        and only terminal fan-out or fail-closed retention may release it.
+
+        :raises TerminalRequestCoordinatorError: If coordination already began.
+        """
+
+        with self._lock:
+            self._require_open()
+            if (
+                self._disposition
+                is not TerminalRequestCoordinatorDisposition.COLLECTING
+                or len(self._accepted) != 0
+                or self._deadline is not None
+            ):
+                raise TerminalRequestCoordinatorError(
+                    "cannot cancel a published request coordinator"
                 )
             for binding in self._manifest.destination_bindings:
                 self._importers[binding.owner].retire_binding(binding)
