@@ -511,7 +511,6 @@ class _NativeOracleRuntime:
                 self._owner.submit(
                     NativeTerminalOwnerEvent(
                         producer_id=producer_id,
-                        producer_sequence=producer_sequence,
                         binding_digest=binding.digest,
                         kind=event_kind,
                         enqueued_ns=int(event_mapping["enqueued_ns"]),

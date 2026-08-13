@@ -945,7 +945,6 @@ class NativeTerminalOwnerEvent:
     """Producer-bound event submitted to the authoritative native reducer.
 
     :ivar producer_id: Registered native producer identity.
-    :ivar producer_sequence: Gap-free producer-local sequence.
     :ivar binding_digest: Exact 32-byte lifecycle lookup key.
     :ivar kind: Closed lifecycle event, never a producer-selected phase.
     :ivar enqueued_ns: Producer-side ``CLOCK_MONOTONIC_RAW`` timestamp.
@@ -954,7 +953,6 @@ class NativeTerminalOwnerEvent:
     """
 
     producer_id: int
-    producer_sequence: int
     binding_digest: bytes
     kind: NativeTerminalOwnerEventKind
     enqueued_ns: int
@@ -965,7 +963,6 @@ class NativeTerminalOwnerEvent:
         """Validate one structurally complete native owner event."""
 
         _require_uint(self.producer_id, _UINT64_MAX, "producer_id")
-        _require_uint(self.producer_sequence, _UINT64_MAX, "producer_sequence")
         _require_exact_bytes(self.binding_digest, _DIGEST_BYTES, "binding_digest")
         if type(self.kind) is not NativeTerminalOwnerEventKind:
             raise TypeError("kind must be NativeTerminalOwnerEventKind")
@@ -1003,7 +1000,6 @@ class NativeTerminalOwnerEvent:
         receipt = self.receipt
         return {
             "producer_id": self.producer_id,
-            "producer_sequence": self.producer_sequence,
             "binding_digest": self.binding_digest,
             "kind": int(self.kind),
             "enqueued_ns": self.enqueued_ns,
