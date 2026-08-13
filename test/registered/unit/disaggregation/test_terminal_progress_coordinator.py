@@ -180,11 +180,13 @@ def test_failure_wins_over_incomplete_success() -> None:
 
 def test_coordinator_deadline_is_anchored_once_at_first_receipt() -> None:
     coordinator, destinations, _, issuers = _coordinator()
+    assert coordinator.deadline_expires_ns is None
     first = _local_ready(issuers[0], destinations[0], 100)
     coordinator.accept(first, destinations[0].owner, 1_000)
     timeout_ns = terminal_deadline_spec(
         TerminalDeadlineKind.OWNER_REQUEST_GLOBAL_READY
     ).duration_ns
+    assert coordinator.deadline_expires_ns == 1_000 + timeout_ns
 
     before = coordinator.expire(1_000 + timeout_ns - 1)
     expired = coordinator.expire(1_000 + timeout_ns)
@@ -194,6 +196,35 @@ def test_coordinator_deadline_is_anchored_once_at_first_receipt() -> None:
     assert expired.newly_terminal
     assert expired.timing is not None
     assert expired.timing.duration_ns == timeout_ns
+
+
+def test_unpublished_coordinator_cancellation_releases_replay_state() -> None:
+    """A coordinator with no input has one explicit safe rollback boundary."""
+
+    coordinator, destinations, _, issuers = _coordinator()
+
+    coordinator.cancel_unpublished()
+
+    with pytest.raises(TerminalRequestCoordinatorError, match="closed"):
+        coordinator.accept(
+            _local_ready(issuers[0], destinations[0], 100),
+            destinations[0].owner,
+            1_000,
+        )
+
+
+def test_published_coordinator_cannot_use_unpublished_rollback() -> None:
+    """Receipt admission permanently closes the nonterminal rollback path."""
+
+    coordinator, destinations, _, issuers = _coordinator()
+    coordinator.accept(
+        _local_ready(issuers[0], destinations[0], 100),
+        destinations[0].owner,
+        1_000,
+    )
+
+    with pytest.raises(TerminalRequestCoordinatorError, match="published"):
+        coordinator.cancel_unpublished()
 
 
 def test_conflicting_rank_receipt_fails_closed() -> None:
