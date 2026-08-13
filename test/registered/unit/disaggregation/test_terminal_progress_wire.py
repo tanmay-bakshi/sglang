@@ -1,7 +1,6 @@
 import dataclasses
 
 import pytest
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
 )
