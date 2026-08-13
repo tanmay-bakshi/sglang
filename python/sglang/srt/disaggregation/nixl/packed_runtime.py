@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 import os
 import re
@@ -14,7 +15,6 @@ from typing import Any, Protocol
 import numpy as np
 import numpy.typing as npt
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -96,6 +96,13 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
+    TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourcePlan,
 )
 
 logger = logging.getLogger(__name__)
@@ -1446,6 +1453,60 @@ class _DecodeRequestRecord:
     destination_scatter_copy_duration_ms: float = 0.0
     finalize_started_at: float | None = None
     stats_emitted: bool = False
+    terminal_owner_bound: bool = False
+    writer_manifest_reported: bool = False
+    scatter_started_by_owner: bool = False
+    scatter_terminal_reported: bool = False
+    ack_manifest_reported: bool = False
+    adoption_consumed_by_owner: bool = False
+    metadata_consumed_by_owner: bool = False
+    terminal_source_plan: PackedTerminalSourcePlan | None = None
+    terminal_binding: TerminalRequestBinding | None = None
+
+
+class PackedDecodeOwnerSignal(enum.StrEnum):
+    """Off-thread transaction boundary earned by authenticated control."""
+
+    WRITER_MANIFEST_COMPLETED = "writer_manifest_completed"
+    ACK_MANIFEST_COMPLETED = "ack_manifest_completed"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedDecodeScatterBatch:
+    """One request-level scatter batch submitted to the dedicated stream.
+
+    :ivar chunk_keys: Exact chunk generations covered by the tail callback.
+    :ivar stream_handle: Raw CUDA stream carrying every submitted scatter.
+    """
+
+    chunk_keys: tuple[PackedChunkKey, ...]
+    stream_handle: int
+
+    def __post_init__(self) -> None:
+        """Validate one exact callback attachment boundary."""
+
+        if type(self.chunk_keys) is not tuple or len(self.chunk_keys) == 0:
+            raise ValueError("chunk_keys must be a non-empty tuple")
+        if any(type(key) is not PackedChunkKey for key in self.chunk_keys):
+            raise TypeError("chunk_keys must contain PackedChunkKey values")
+        if type(self.stream_handle) is not int or self.stream_handle < 0:
+            raise ValueError("stream_handle must be a non-negative integer")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedDecodeOwnerInventory:
+    """Exact actor state retained by terminal-owner request generations.
+
+    :ivar active_bindings: All actor-owned terminal binding digests.
+    :ivar quarantined_bindings: Bindings retaining ambiguous resources.
+    :ivar in_flight_scatter_count: Submitted scatters awaiting one tail callback.
+    :ivar pending_adoption_count: Commit receipts not consumed by the scheduler.
+    """
+
+    active_bindings: tuple[bytes, ...]
+    quarantined_bindings: tuple[bytes, ...]
+    in_flight_scatter_count: int
+    pending_adoption_count: int
 
 
 class PackedDecodeRuntime:
@@ -1483,6 +1544,7 @@ class PackedDecodeRuntime:
         self._consumer_authority: object | None = None
         self._records: dict[PackedRequestKey, _DecodeRequestRecord] = {}
         self._records_by_room: dict[int, PackedRequestKey] = {}
+        self._records_by_terminal_binding: dict[bytes, PackedRequestKey] = {}
         self._lock = threading.RLock()
 
     @property
@@ -1711,6 +1773,84 @@ class PackedDecodeRuntime:
         self._retire_record(record)
         return owner
 
+    def bind_terminal_owner(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+        binding: TerminalRequestBinding,
+        source_plan: PackedTerminalSourcePlan,
+    ) -> None:
+        """Give terminal progress exclusive authority over actor continuations.
+
+        This binding must precede allocation publication. Once bound, scatter,
+        teardown, adoption, and metadata release may advance only through the
+        explicit owner methods below; scheduler polling is rejected.
+
+        :param transaction: Exact prepared request transaction.
+        :param binding: Exact local decode request-generation identity.
+        :param source_plan: Decoder-authored cross-rank terminal identity plan.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        if type(source_plan) is not PackedTerminalSourcePlan:
+            raise TypeError("source_plan must be PackedTerminalSourcePlan")
+        record = self._record_for_transaction(transaction)
+        with self._lock:
+            if record.terminal_owner_bound:
+                raise RuntimeError("packed terminal owner was already bound")
+            if transaction.state is not PackedRequestTransactionState.PREPARED:
+                raise RuntimeError(
+                    "packed terminal owner must bind before allocation publication"
+                )
+            if source_plan.request_key != transaction.snapshot().key:
+                raise RuntimeError(
+                    "terminal source plan belongs to another request generation"
+                )
+            if (
+                binding.request_key != source_plan.request_key
+                or binding.owner.role is not TerminalOwnerRole.DECODE
+                or binding.rank_manifest_digest != source_plan.rank_manifest_digest
+                or binding.allocation_digest != source_plan.allocation_digest
+            ):
+                raise RuntimeError(
+                    "decode terminal binding differs from the source identity plan"
+                )
+            if binding.digest in self._records_by_terminal_binding:
+                raise RuntimeError("decode terminal binding is already registered")
+            record.terminal_owner_bound = True
+            record.terminal_source_plan = source_plan
+            record.terminal_binding = binding
+            self._records_by_terminal_binding[binding.digest] = (
+                transaction.snapshot().key
+            )
+
+    def terminal_owner_transaction(
+        self,
+        binding_digest: bytes,
+    ) -> PackedDecodeRequestTransaction:
+        """Resolve one native action without a second request registry.
+
+        :param binding_digest: Exact local decode binding digest.
+        :returns: Actor-owned mutable request transaction.
+        """
+
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        with self._lock:
+            key = self._records_by_terminal_binding.get(binding_digest)
+            if key is None:
+                raise RuntimeError(
+                    "decode terminal action references an unknown binding"
+                )
+            record = self._records.get(key)
+            if (
+                record is None
+                or record.terminal_binding is None
+                or record.terminal_binding.digest != binding_digest
+            ):
+                raise RuntimeError("decode terminal binding index is inconsistent")
+            return record.transaction
+
     def bind_publication(
         self,
         transaction: PackedDecodeRequestTransaction,
@@ -1734,17 +1874,34 @@ class PackedDecodeRuntime:
         with self._lock:
             if len(record.routes) > 0:
                 raise RuntimeError("packed control routes were already bound")
+            source_plan = record.terminal_source_plan
+            if record.terminal_owner_bound:
+                if source_plan is None:
+                    raise RuntimeError(
+                        "terminal-owner publication lacks a source identity plan"
+                    )
+                if (
+                    source_plan.rank_manifest_digest
+                    != publication.writer_manifest_digest
+                    or source_plan.allocation_digest != publication.allocation_digest
+                    or tuple(writer.writer_id for writer in source_plan.writers)
+                    != expected_writers
+                ):
+                    raise RuntimeError(
+                        "terminal source plan differs from decode publication"
+                    )
             record.routes = route_map
 
     def handle_control(
         self,
         authenticated_writer_id: StagingWriterId,
         message: PackedWireMessage,
-    ) -> None:
+    ) -> PackedDecodeOwnerSignal | None:
         """Dispatch one peer-authenticated source control message.
 
         :param authenticated_writer_id: Writer derived from native peer state.
         :param message: Validated packed payload.
+        :returns: Newly earned terminal-owner boundary, when bound.
         """
 
         request_key = _request_key_for_message(message)
@@ -1765,19 +1922,19 @@ class PackedDecodeRuntime:
                     if route is None:
                         raise RuntimeError("READY writer has no authenticated route")
                     route.send_message(ready)
-                return
+                return None
             if type(message) is PackedWriterOutcome:
                 record.transaction.handle_writer_outcome(
                     message,
                     authenticated_writer_id,
                 )
-                return
+                return self._take_writer_manifest_signal(record)
             if type(message) is PackedAuxiliaryOutcome:
                 record.transaction.handle_auxiliary_outcome(
                     message,
                     authenticated_writer_id,
                 )
-                return
+                return self._take_writer_manifest_signal(record)
             if type(message) is PackedRequestTeardownAck:
                 receipt = record.transaction.handle_teardown_ack(
                     message,
@@ -1788,7 +1945,7 @@ class PackedDecodeRuntime:
                         if record.commit_receipt is not None:
                             raise RuntimeError("packed commit receipt was duplicated")
                         record.commit_receipt = receipt
-                return
+                return self._take_ack_manifest_signal(record)
             raise RuntimeError(
                 f"decode received unsupported packed message {type(message).__name__}"
             )
@@ -1798,6 +1955,249 @@ class PackedDecodeRuntime:
             self._fail_record(record, reason)
             raise
 
+    def begin_terminal_owner_scatter(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> PackedDecodeScatterBatch:
+        """Launch the complete request scatter after owner authorization.
+
+        Every chunk is submitted to one dedicated stream. The caller attaches
+        one native tail callback to ``stream_handle``; that callback therefore
+        proves terminality for the complete immutable ``chunk_keys`` manifest.
+
+        :param transaction: Exact terminal-owner-bound transaction.
+        :returns: Tail-callback identity for the submitted scatter batch.
+        """
+
+        record = self._record_for_transaction(transaction)
+        try:
+            with self._lock:
+                self._require_terminal_owner_record_locked(record)
+                if not record.writer_manifest_reported:
+                    raise RuntimeError("decode scatter lacks writer-manifest authority")
+                if record.scatter_started_by_owner or len(record.scatters) > 0:
+                    raise RuntimeError("decode scatter was already submitted")
+                if (
+                    transaction.state
+                    is not PackedRequestTransactionState.WRITERS_COMPLETED
+                ):
+                    raise RuntimeError(
+                        "decode scatter requires complete writer aggregation"
+                    )
+                if record.upstream_wait_duration_ms is None:
+                    record.upstream_wait_duration_ms = (
+                        time.perf_counter() - record.pipeline_started_at
+                    ) * 1000.0
+                for key in record.chunk_keys:
+                    scatter = transaction.begin_scatter(key)
+                    submission = self._arena.copy_executor.scatter(
+                        scatter.work,
+                        scatter.proofs,
+                    )
+                    record.scatters[key] = (scatter, submission)
+                record.scatter_started_by_owner = True
+                return PackedDecodeScatterBatch(
+                    chunk_keys=record.chunk_keys,
+                    stream_handle=self._arena.copy_executor.scatter_stream_handle,
+                )
+        except (RuntimeError, TypeError, ValueError):
+            self._fail_record(record, "terminal-owner scatter submission failed")
+            raise
+
+    def complete_terminal_owner_scatter(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+        chunk_keys: tuple[PackedChunkKey, ...],
+    ) -> None:
+        """Consume one native tail callback without querying CUDA for progress.
+
+        :param transaction: Exact terminal-owner-bound transaction.
+        :param chunk_keys: Exact manifest attached to the native callback.
+        """
+
+        record = self._record_for_transaction(transaction)
+        try:
+            with self._lock:
+                self._require_terminal_owner_record_locked(record)
+                if not record.scatter_started_by_owner:
+                    raise RuntimeError("decode scatter callback arrived before launch")
+                if record.scatter_terminal_reported:
+                    raise RuntimeError("decode scatter callback was replayed")
+                if chunk_keys != record.chunk_keys:
+                    raise RuntimeError(
+                        "decode scatter callback differs from its chunk manifest"
+                    )
+                if tuple(record.scatters) != record.chunk_keys:
+                    raise RuntimeError(
+                        "decode scatter callback lacks complete live ownership"
+                    )
+                completed_at = time.perf_counter()
+                for key in record.chunk_keys:
+                    scatter, submission = record.scatters[key]
+                    record.destination_scatter_copy_duration_ms += (
+                        submission.elapsed_milliseconds()
+                    )
+                    transaction.complete_scatter(scatter)
+                record.scatters.clear()
+                if (
+                    transaction.state
+                    is not PackedRequestTransactionState.SCATTER_COMPLETED
+                ):
+                    raise RuntimeError(
+                        "tail callback did not complete the request scatter"
+                    )
+                record.finalize_started_at = completed_at
+                record.scatter_terminal_reported = True
+        except (RuntimeError, TypeError, ValueError):
+            self._fail_record(record, "terminal-owner scatter completion failed")
+            raise
+
+    def begin_terminal_owner_teardown(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Send writer-specific teardown after owner scatter terminality.
+
+        :param transaction: Exact terminal-owner-bound transaction.
+        """
+
+        record = self._record_for_transaction(transaction)
+        try:
+            with self._lock:
+                self._require_terminal_owner_record_locked(record)
+                if not record.scatter_terminal_reported:
+                    raise RuntimeError(
+                        "decode teardown lacks scatter-terminal authority"
+                    )
+                self._begin_teardown_locked(record)
+        except (RuntimeError, TypeError, ValueError):
+            self._fail_record(record, "terminal-owner teardown dispatch failed")
+            raise
+
+    def consume_terminal_owner_adoption(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> object:
+        """Adopt the exact allocation on the scheduler thread.
+
+        :param transaction: Exact terminal-owner-bound transaction.
+        :returns: Retained request owner associated with the allocation.
+        """
+
+        record = self._record_for_transaction(transaction)
+        try:
+            with self._lock:
+                self._require_terminal_owner_record_locked(record)
+                if not record.ack_manifest_reported:
+                    raise RuntimeError("decode adoption lacks ACK-manifest authority")
+                if record.adoption_consumed_by_owner:
+                    raise RuntimeError("decode adoption authority was replayed")
+                receipt = record.commit_receipt
+                if receipt is None:
+                    raise RuntimeError("decode adoption lacks a commit receipt")
+                owner = transaction.commit_on_scheduler_thread(receipt)
+                if owner is not transaction.request_owner:
+                    raise RuntimeError(
+                        "packed scheduler commit returned another request"
+                    )
+                record.commit_receipt = None
+                record.adoption_consumed_by_owner = True
+                self._emit_transfer_stats(record, time.perf_counter())
+                return owner
+        except (RuntimeError, TypeError, ValueError):
+            self._fail_record(record, "terminal-owner allocation adoption failed")
+            raise
+
+    def complete_terminal_owner_metadata_consumption(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Release copied metadata while retaining lifecycle actor identity.
+
+        The actor record remains live until native request retirement. This is
+        what makes teardown inventory authoritative after scheduler adoption.
+
+        :param transaction: Exact adopted terminal-owner transaction.
+        """
+
+        record = self._record_for_transaction(transaction)
+        consumer = self._consumer_authority
+        if consumer is None:
+            raise RuntimeError("packed metadata consumer authority is unavailable")
+        try:
+            with self._lock:
+                self._require_terminal_owner_record_locked(record)
+                if not record.adoption_consumed_by_owner:
+                    raise RuntimeError("metadata consumption lacks allocation adoption")
+                if record.metadata_consumed_by_owner:
+                    raise RuntimeError("metadata consumption authority was replayed")
+                transaction.complete_auxiliary_consumption_on_scheduler_thread(consumer)
+                if not record.auxiliary_allocation.released:
+                    raise RuntimeError(
+                        "packed metadata adapter did not release its row"
+                    )
+                record.metadata_consumed_by_owner = True
+        except (RuntimeError, TypeError, ValueError):
+            self._fail_record(record, "terminal-owner metadata consumption failed")
+            raise
+
+    def retire_terminal_owner_request(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Retire actor identity after native request-global completion.
+
+        :param transaction: Exact committed terminal-owner transaction.
+        """
+
+        record = self._record_for_transaction(transaction)
+        with self._lock:
+            self._require_terminal_owner_record_locked(record)
+            if not record.metadata_consumed_by_owner:
+                raise RuntimeError(
+                    "decode actor retirement precedes metadata consumption"
+                )
+            if transaction.state is not PackedRequestTransactionState.COMMITTED:
+                raise RuntimeError("decode actor retirement requires committed state")
+            self._retire_record_locked(record)
+
+    def terminal_owner_inventory(self) -> PackedDecodeOwnerInventory:
+        """Return exact actor inventory for health and fail-closed teardown.
+
+        :returns: Active, quarantined, scatter, and adoption populations.
+        """
+
+        with self._lock:
+            records = tuple(
+                record
+                for record in self._records.values()
+                if record.terminal_owner_bound
+            )
+            active = tuple(
+                sorted(
+                    (
+                        record.terminal_binding.digest
+                        for record in records
+                        if record.terminal_binding is not None
+                    ),
+                )
+            )
+            quarantined = tuple(
+                record.terminal_binding.digest
+                for record in records
+                if record.terminal_binding is not None
+                and record.transaction.state
+                is PackedRequestTransactionState.QUARANTINED
+            )
+            return PackedDecodeOwnerInventory(
+                active_bindings=active,
+                quarantined_bindings=tuple(sorted(quarantined)),
+                in_flight_scatter_count=sum(len(record.scatters) for record in records),
+                pending_adoption_count=sum(
+                    record.commit_receipt is not None for record in records
+                ),
+            )
+
     def poll(self, transaction: PackedDecodeRequestTransaction) -> KVPoll:
         """Advance scheduler-owned scatter, teardown, and commit work.
 
@@ -1806,6 +2206,10 @@ class PackedDecodeRuntime:
         """
 
         record = self._record_for_transaction(transaction)
+        if record.terminal_owner_bound:
+            raise RuntimeError(
+                "terminal-owner transaction cannot advance through polling"
+            )
         try:
             if (
                 transaction.state
@@ -1841,6 +2245,10 @@ class PackedDecodeRuntime:
         """
 
         record = self._record_for_transaction(transaction)
+        if record.terminal_owner_bound:
+            raise RuntimeError(
+                "terminal-owner metadata requires explicit owner consumption"
+            )
         consumer = self._consumer_authority
         if consumer is None:
             raise RuntimeError("packed metadata consumer authority is unavailable")
@@ -1943,13 +2351,29 @@ class PackedDecodeRuntime:
         record.stats_emitted = True
 
     def _begin_teardown_if_ready(self, record: _DecodeRequestRecord) -> None:
+        with self._lock:
+            if record.teardown_sent:
+                return
+            if (
+                record.transaction.state
+                is not PackedRequestTransactionState.SCATTER_COMPLETED
+            ):
+                return
+            self._begin_teardown_locked(record)
+
+    def _begin_teardown_locked(self, record: _DecodeRequestRecord) -> None:
+        """Send one exact teardown manifest while holding the actor lock.
+
+        :param record: Exact actor-owned request generation.
+        """
+
         if record.teardown_sent:
-            return
+            raise RuntimeError("packed decode teardown was already sent")
         if (
             record.transaction.state
             is not PackedRequestTransactionState.SCATTER_COMPLETED
         ):
-            return
+            raise RuntimeError("packed decode teardown precedes scatter completion")
         requests = record.transaction.begin_teardown()
         for request in requests:
             route = record.routes.get(request.writer_id)
@@ -1957,6 +2381,63 @@ class PackedDecodeRuntime:
                 raise RuntimeError("teardown writer has no authenticated route")
             route.send_message(request)
         record.teardown_sent = True
+
+    def _take_writer_manifest_signal(
+        self,
+        record: _DecodeRequestRecord,
+    ) -> PackedDecodeOwnerSignal | None:
+        """Take the one-shot writer-manifest boundary for a bound request.
+
+        :param record: Exact actor-owned request generation.
+        :returns: Newly earned boundary, or ``None`` for legacy/incomplete work.
+        """
+
+        with self._lock:
+            if not record.terminal_owner_bound:
+                return None
+            if (
+                record.transaction.state
+                is not PackedRequestTransactionState.WRITERS_COMPLETED
+                or record.writer_manifest_reported
+            ):
+                return None
+            record.writer_manifest_reported = True
+            return PackedDecodeOwnerSignal.WRITER_MANIFEST_COMPLETED
+
+    def _take_ack_manifest_signal(
+        self,
+        record: _DecodeRequestRecord,
+    ) -> PackedDecodeOwnerSignal | None:
+        """Take the one-shot teardown-ACK boundary for a bound request.
+
+        :param record: Exact actor-owned request generation.
+        :returns: Newly earned boundary, or ``None`` for legacy/incomplete work.
+        """
+
+        with self._lock:
+            if not record.terminal_owner_bound:
+                return None
+            if record.commit_receipt is None or record.ack_manifest_reported:
+                return None
+            if (
+                record.transaction.state
+                is not PackedRequestTransactionState.COMMIT_READY
+            ):
+                raise RuntimeError(
+                    "decode commit receipt exists before ACK-manifest completion"
+                )
+            record.ack_manifest_reported = True
+            return PackedDecodeOwnerSignal.ACK_MANIFEST_COMPLETED
+
+    @staticmethod
+    def _require_terminal_owner_record_locked(record: _DecodeRequestRecord) -> None:
+        """Require one record under exclusive terminal-owner progression.
+
+        :param record: Exact actor-owned request generation.
+        """
+
+        if not record.terminal_owner_bound:
+            raise RuntimeError("packed request has no terminal owner binding")
 
     def _record_for_transaction(
         self,
@@ -1970,13 +2451,27 @@ class PackedDecodeRuntime:
         return record
 
     def _retire_record(self, record: _DecodeRequestRecord) -> None:
-        key = record.transaction.snapshot().key
         with self._lock:
-            current = self._records.get(key)
-            if current is not record:
-                raise RuntimeError("packed request registry ownership changed")
-            del self._records[key]
-            self._records_by_room.pop(key.room_id, None)
+            self._retire_record_locked(record)
+
+    def _retire_record_locked(self, record: _DecodeRequestRecord) -> None:
+        """Remove exact actor identity while holding its registry lock.
+
+        :param record: Terminal request whose mutable ownership is exhausted.
+        """
+
+        key = record.transaction.snapshot().key
+        current = self._records.get(key)
+        if current is not record:
+            raise RuntimeError("packed request registry ownership changed")
+        binding = record.terminal_binding
+        if binding is not None:
+            indexed_key = self._records_by_terminal_binding.get(binding.digest)
+            if indexed_key != key:
+                raise RuntimeError("packed terminal binding ownership changed")
+            del self._records_by_terminal_binding[binding.digest]
+        del self._records[key]
+        self._records_by_room.pop(key.room_id, None)
 
     def _fail_record(self, record: _DecodeRequestRecord, reason: str) -> None:
         try:

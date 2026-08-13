@@ -6,7 +6,6 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -44,6 +43,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
     PackedControlSender,
     PackedDecodeControlSender,
+    PackedDecodeOwnerSignal,
     PackedDecodeRuntime,
     PackedPrefillRuntime,
     PackedPrefillSubmission,
@@ -63,6 +63,16 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestTransactionState,
+)
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
+    TerminalProcessIdentity,
+    TerminalPublicationIdentity,
+    TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourcePlan,
+    PackedTerminalSourceWriter,
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -358,6 +368,15 @@ class _CopyExecutor:
         self.event = event
         self.submissions = []
 
+    @property
+    def scatter_stream_handle(self) -> int:
+        """Return one deterministic fake CUDA stream handle.
+
+        :returns: Stable non-negative stream identity.
+        """
+
+        return 0xC0FFEE
+
     def scatter(
         self,
         work: object,
@@ -396,6 +415,7 @@ class _DecodeLifecycleTransaction:
     acknowledgements: list[tuple[PackedRequestTeardownAck, StagingWriterId]]
     defer_scatter_completion_until_auxiliary: bool
     scatter_complete: bool
+    auxiliary_allocation: "_AuxiliaryAllocation | None"
 
     def __init__(
         self,
@@ -404,6 +424,7 @@ class _DecodeLifecycleTransaction:
         ready: PackedReady,
         teardown: PackedRequestTeardown,
         defer_scatter_completion_until_auxiliary: bool = False,
+        auxiliary_allocation: "_AuxiliaryAllocation | None" = None,
     ) -> None:
         """Initialize a published fake transaction.
 
@@ -413,6 +434,7 @@ class _DecodeLifecycleTransaction:
         :param teardown: Teardown emitted after scatter.
         :param defer_scatter_completion_until_auxiliary: Keep request state before
             scatter completion until the delayed auxiliary outcome arrives.
+        :param auxiliary_allocation: Metadata row released after scheduler copy.
         """
 
         self.key = key
@@ -429,6 +451,7 @@ class _DecodeLifecycleTransaction:
             defer_scatter_completion_until_auxiliary
         )
         self.scatter_complete = False
+        self.auxiliary_allocation = auxiliary_allocation
 
     def snapshot(self) -> _DecodeLifecycleSnapshot:
         """Return current actor-facing transaction state.
@@ -542,6 +565,32 @@ class _DecodeLifecycleTransaction:
         del receipt
         self.state = PackedRequestTransactionState.DESTINATION_CONSUMPTION_WAITING
         return self.request_owner
+
+    def complete_auxiliary_consumption_on_scheduler_thread(
+        self,
+        consumer: object,
+    ) -> None:
+        """Release the configured metadata row after scheduler adoption.
+
+        :param consumer: Exact fake scheduler consumer.
+        """
+
+        del consumer
+        allocation = self.auxiliary_allocation
+        if allocation is None:
+            raise RuntimeError("fake transaction has no auxiliary allocation")
+        allocation.released = True
+        self.state = PackedRequestTransactionState.COMMITTED
+
+    def quarantine(self, reason: str) -> None:
+        """Retain one failed fake transaction.
+
+        :param reason: Stable actor failure evidence.
+        """
+
+        if len(reason) == 0:
+            raise ValueError("reason must be non-empty")
+        self.state = PackedRequestTransactionState.QUARANTINED
 
 
 @dataclasses.dataclass
@@ -844,6 +893,65 @@ def _plan(peer: PackedPeerIdentity) -> PackedAuxiliaryPlan:
         destination_process_generation=peer.agent_generation,
         native_route_digest=b"n" * 32,
         runtime_cohort_digest=b"c" * 32,
+    )
+
+
+def _terminal_source_plan(
+    key: PackedRequestKey,
+    writer: StagingWriterId,
+) -> PackedTerminalSourcePlan:
+    """Build one decoder-authored terminal identity plan.
+
+    :param key: Exact packed request generation.
+    :param writer: Sole source writer in this actor fixture.
+    :returns: Complete source and coordinator identity graph.
+    """
+
+    source = TerminalProcessIdentity(
+        process_generation=b"s" * 16,
+        role=TerminalOwnerRole.SOURCE,
+        tp_rank=0,
+        tp_size=1,
+    )
+    decode = TerminalProcessIdentity(
+        process_generation=b"d" * 16,
+        role=TerminalOwnerRole.DECODE,
+        tp_rank=0,
+        tp_size=1,
+    )
+    return PackedTerminalSourcePlan(
+        request_key=key,
+        writers=(
+            PackedTerminalSourceWriter(
+                writer_id=writer,
+                process_identity=source,
+            ),
+        ),
+        rank_manifest_digest=b"w" * 32,
+        allocation_digest=b"l" * 32,
+        publication_identity=TerminalPublicationIdentity(
+            request_key=key,
+            publisher_process_generation=source.process_generation,
+            publication_generation=b"g" * 16,
+        ),
+        request_ready_issuer=decode,
+    )
+
+
+def _terminal_decode_binding(
+    source_plan: PackedTerminalSourcePlan,
+) -> TerminalRequestBinding:
+    """Build the local decode binding matching one terminal source plan.
+
+    :param source_plan: Complete decoder-authored source identity graph.
+    :returns: Exact local decode request binding.
+    """
+
+    return TerminalRequestBinding(
+        request_key=source_plan.request_key,
+        owner=source_plan.request_ready_issuer,
+        rank_manifest_digest=source_plan.rank_manifest_digest,
+        allocation_digest=source_plan.allocation_digest,
     )
 
 
@@ -1537,3 +1645,241 @@ def test_decode_prepare_scatter_teardown_and_commit_dispatch(
         "destination_scatter_copy_duration=7.000ms, "
         "finalize_duration=5.000ms, packed_pipeline_duration=43.000ms)"
     ) in caplog.messages
+
+
+def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive one owner-bound actor through callback, adoption, and retirement."""
+
+    manager = _FakeManager()
+    artifacts = _runtime_artifacts()
+    policy = build_same_host_visibility_policy(artifacts)
+    writer = _writer()
+    peer = PackedPeerIdentity("decoder-agent", b"p" * 16)
+    plan = _plan(peer)
+    chunk_key = PackedChunkKey(
+        room_id=plan.key.room_id,
+        chunk_id=0,
+        request_generation=plan.key.request_generation,
+    )
+    ready = PackedReady(
+        key=chunk_key,
+        writer_id=writer,
+        digest=b"d" * 32,
+        visibility_policy_digest=policy.digest,
+        lease_id=9,
+        lease_base_address=0x400000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+    teardown = PackedRequestTeardown(
+        key=plan.key,
+        writer_id=writer,
+        request_slot_generation=7,
+        writer_manifest_digest=b"w" * 32,
+        allocation_digest=b"l" * 32,
+        teardown_generation=b"t" * 16,
+    )
+    auxiliary = _AuxiliaryAllocation()
+    request_owner = object()
+    transaction = _DecodeLifecycleTransaction(
+        plan.key,
+        request_owner,
+        ready,
+        teardown,
+        auxiliary_allocation=auxiliary,
+    )
+    transaction.state = PackedRequestTransactionState.PREPARED
+    sent_messages: list[object] = []
+    record = runtime_module._DecodeRequestRecord(
+        transaction=transaction,
+        auxiliary_allocation=auxiliary,
+        chunk_keys=(chunk_key,),
+        routes={writer: PackedControlSender(writer, sent_messages.append)},
+        pipeline_started_at=1.0,
+    )
+    event = _Event()
+    executor = _CopyExecutor(event)
+    runtime = object.__new__(PackedDecodeRuntime)
+    runtime._manager = manager
+    runtime._arena = _Arena(executor)
+    runtime._records = {plan.key: record}
+    runtime._records_by_room = {plan.key.room_id: plan.key}
+    runtime._records_by_terminal_binding = {}
+    runtime._lock = runtime_module.threading.RLock()
+    runtime._consumer_authority = object()
+    source_plan = _terminal_source_plan(plan.key, writer)
+    binding = _terminal_decode_binding(source_plan)
+    runtime.bind_terminal_owner(
+        transaction,
+        binding,
+        source_plan,
+    )
+    assert runtime.terminal_owner_transaction(binding.digest) is transaction
+    transaction.state = PackedRequestTransactionState.PUBLISHED
+    timestamps = iter((1.031, 1.038, 1.043))
+    monkeypatch.setattr(runtime_module.time, "perf_counter", lambda: next(timestamps))
+    caplog.set_level(logging.INFO, logger=runtime_module.__name__)
+
+    assert (
+        runtime.handle_control(
+            writer,
+            _unvalidated_prepare(chunk_key, writer),
+        )
+        is None
+    )
+    visibility = PackedWriterVisibilityEvidence(
+        policy_digest=policy.digest,
+        transport_path=policy.transport_path,
+        lane_identifier=policy.lane_identifier,
+        completion_mechanism=policy.completion_mechanism,
+        writer_action=policy.expected_writer_action,
+        native_handle_generation=11,
+        native_descriptor_digest=b"d" * 32,
+        native_evidence_digest=b"e" * 32,
+    )
+    outcome = PackedWriterOutcome(
+        key=chunk_key,
+        writer_id=writer,
+        digest=ready.digest,
+        lease_id=ready.lease_id,
+        status=PackedWriterOutcomeStatus.DONE,
+        visibility=visibility,
+    )
+    assert (
+        runtime.handle_control(writer, outcome)
+        is PackedDecodeOwnerSignal.WRITER_MANIFEST_COMPLETED
+    )
+    assert runtime.handle_control(writer, outcome) is None
+    with pytest.raises(RuntimeError, match="cannot advance through polling"):
+        runtime.poll(transaction)
+
+    batch = runtime.begin_terminal_owner_scatter(transaction)
+
+    assert batch.chunk_keys == (chunk_key,)
+    assert batch.stream_handle == executor.scatter_stream_handle
+    assert len(executor.submissions) == 1
+    event.complete = True
+    runtime.complete_terminal_owner_scatter(transaction, batch.chunk_keys)
+    runtime.begin_terminal_owner_teardown(transaction)
+
+    assert sent_messages == [ready, teardown]
+    acknowledgement = PackedRequestTeardownAck(
+        key=teardown.key,
+        writer_id=teardown.writer_id,
+        request_slot_generation=teardown.request_slot_generation,
+        writer_manifest_digest=teardown.writer_manifest_digest,
+        allocation_digest=teardown.allocation_digest,
+        teardown_generation=teardown.teardown_generation,
+        auxiliary_handle_generation=teardown.auxiliary_handle_generation,
+    )
+    assert (
+        runtime.handle_control(writer, acknowledgement)
+        is PackedDecodeOwnerSignal.ACK_MANIFEST_COMPLETED
+    )
+    assert runtime.consume_terminal_owner_adoption(transaction) is request_owner
+    runtime.complete_terminal_owner_metadata_consumption(transaction)
+
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.active_bindings == (binding.digest,)
+    assert inventory.quarantined_bindings == ()
+    assert inventory.in_flight_scatter_count == 0
+    assert inventory.pending_adoption_count == 0
+    assert auxiliary.released
+    assert transaction.state is PackedRequestTransactionState.COMMITTED
+    assert (
+        "PackedTransferStats(room=41, role=decode, destination_rank=0, "
+        "upstream_wait_duration=31.000ms, "
+        "destination_scatter_copy_duration=7.000ms, "
+        "finalize_duration=5.000ms, packed_pipeline_duration=43.000ms)"
+    ) in caplog.messages
+
+    runtime.retire_terminal_owner_request(transaction)
+
+    assert runtime.terminal_owner_inventory().active_bindings == ()
+    with pytest.raises(RuntimeError, match="unknown binding"):
+        runtime.terminal_owner_transaction(binding.digest)
+
+
+def test_terminal_owner_rejects_a_conflicting_scatter_callback() -> None:
+    """A stale callback generation quarantines the sole mutable actor record."""
+
+    manager = _FakeManager()
+    writer = _writer()
+    peer = PackedPeerIdentity("decoder-agent", b"p" * 16)
+    plan = _plan(peer)
+    chunk_key = PackedChunkKey(
+        room_id=plan.key.room_id,
+        chunk_id=0,
+        request_generation=plan.key.request_generation,
+    )
+    ready = PackedReady(
+        key=chunk_key,
+        writer_id=writer,
+        digest=b"d" * 32,
+        visibility_policy_digest=b"v" * 32,
+        lease_id=9,
+        lease_base_address=0x400000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+    teardown = PackedRequestTeardown(
+        key=plan.key,
+        writer_id=writer,
+        request_slot_generation=7,
+        writer_manifest_digest=b"w" * 32,
+        allocation_digest=b"l" * 32,
+        teardown_generation=b"t" * 16,
+    )
+    auxiliary = _AuxiliaryAllocation()
+    transaction = _DecodeLifecycleTransaction(
+        plan.key,
+        object(),
+        ready,
+        teardown,
+        auxiliary_allocation=auxiliary,
+    )
+    transaction.state = PackedRequestTransactionState.PREPARED
+    record = runtime_module._DecodeRequestRecord(
+        transaction=transaction,
+        auxiliary_allocation=auxiliary,
+        chunk_keys=(chunk_key,),
+        routes={writer: PackedControlSender(writer, lambda message: None)},
+    )
+    executor = _CopyExecutor(_Event())
+    runtime = object.__new__(PackedDecodeRuntime)
+    runtime._manager = manager
+    runtime._arena = _Arena(executor)
+    runtime._records = {plan.key: record}
+    runtime._records_by_room = {plan.key.room_id: plan.key}
+    runtime._records_by_terminal_binding = {}
+    runtime._lock = runtime_module.threading.RLock()
+    runtime._consumer_authority = object()
+    source_plan = _terminal_source_plan(plan.key, writer)
+    binding = _terminal_decode_binding(source_plan)
+    runtime.bind_terminal_owner(
+        transaction,
+        binding,
+        source_plan,
+    )
+    transaction.state = PackedRequestTransactionState.WRITERS_COMPLETED
+    record.writer_manifest_reported = True
+    batch = runtime.begin_terminal_owner_scatter(transaction)
+    stale_key = PackedChunkKey(
+        room_id=chunk_key.room_id,
+        chunk_id=chunk_key.chunk_id,
+        request_generation=b"x" * 16,
+    )
+
+    with pytest.raises(RuntimeError, match="differs from its chunk manifest"):
+        runtime.complete_terminal_owner_scatter(transaction, (stale_key,))
+
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.active_bindings == (binding.digest,)
+    assert inventory.quarantined_bindings == (binding.digest,)
+    assert inventory.in_flight_scatter_count == len(batch.chunk_keys)
+    assert manager.failures == [
+        (plan.key.room_id, "terminal-owner scatter completion failed")
+    ]
