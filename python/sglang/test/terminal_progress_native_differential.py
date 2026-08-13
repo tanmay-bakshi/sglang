@@ -61,15 +61,9 @@ from sglang.test.terminal_progress_native_oracle import (
     source_oracle_paths,
 )
 
-_SOURCE_PROCESS_GENERATION = bytes.fromhex(
-    "102132435465768798a9bacbdcedfe0f"
-)
-_DECODE_PROCESS_GENERATION = bytes.fromhex(
-    "ffeeddccbbaa99887766554433221100"
-)
-_UNTRUSTED_PROCESS_GENERATION = bytes.fromhex(
-    "aabbccddeeff00112233445566778899"
-)
+_SOURCE_PROCESS_GENERATION = bytes.fromhex("102132435465768798a9bacbdcedfe0f")
+_DECODE_PROCESS_GENERATION = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+_UNTRUSTED_PROCESS_GENERATION = bytes.fromhex("aabbccddeeff00112233445566778899")
 _REQUEST_GENERATION = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PUBLICATION_GENERATION = bytes.fromhex("0123456789abcdeffedcba9876543210")
 _RANK_MANIFEST_DIGEST = b"r" * 32
@@ -77,6 +71,7 @@ _ALLOCATION_DIGEST = b"a" * 32
 _LOCAL_PRODUCER_ID = 1
 _TRUSTED_PRODUCER_ID = 2
 _UNTRUSTED_PRODUCER_ID = 3
+_CONTROL_PRODUCER_ID = 4
 _WAIT_SECONDS = 2.0
 
 _SOURCE_EVENT_KINDS = {
@@ -181,6 +176,15 @@ _PROCESS_FATAL_EVENT_KINDS = frozenset(
         SourceLifecycleEventKind.SCHEDULER_INBOX_OVERFLOW,
         DecodeLifecycleEventKind.OWNER_DIED,
         DecodeLifecycleEventKind.SCHEDULER_INBOX_OVERFLOW,
+    )
+)
+_CONTROL_EVENT_KINDS = frozenset(
+    (
+        SourceLifecycleEventKind.TEARDOWN_RECEIVED,
+        DecodeLifecycleEventKind.WRITER_AGGREGATION_STARTED,
+        DecodeLifecycleEventKind.WRITER_MANIFEST_COMPLETED,
+        DecodeLifecycleEventKind.ACK_AGGREGATION_STARTED,
+        DecodeLifecycleEventKind.ACK_MANIFEST_COMPLETED,
     )
 )
 
@@ -301,9 +305,7 @@ class _NativeOracleRuntime:
     _untrusted_identity: NativeTerminalProcessIdentity
     _deterministic_clock_ns: int | None
     _producer_sequences: dict[int, int]
-    _receipts: dict[
-        tuple[bytes, str], tuple[OracleReceiptSpec, NativeTerminalReceipt]
-    ]
+    _receipts: dict[tuple[bytes, str], tuple[OracleReceiptSpec, NativeTerminalReceipt]]
 
     def __init__(
         self,
@@ -320,10 +322,7 @@ class _NativeOracleRuntime:
         :param deterministic_clock_ns: Optional positive test-clock origin.
         """
 
-        if (
-            role is not TerminalOwnerRole.SOURCE
-            and len(additional_source_room_ids) > 0
-        ):
+        if role is not TerminalOwnerRole.SOURCE and len(additional_source_room_ids) > 0:
             raise ValueError("additional lifecycles require a source owner")
         if len(set(additional_source_room_ids)) != len(additional_source_room_ids):
             raise ValueError("additional source room identities must be unique")
@@ -355,6 +354,7 @@ class _NativeOracleRuntime:
             _LOCAL_PRODUCER_ID: 0,
             _TRUSTED_PRODUCER_ID: 0,
             _UNTRUSTED_PRODUCER_ID: 0,
+            _CONTROL_PRODUCER_ID: 0,
         }
         self._receipts = {}
         self._owner = NativeTerminalOwner(
@@ -391,6 +391,15 @@ class _NativeOracleRuntime:
                 producer_class=NativeTerminalProducerClass.RECEIPT,
                 allowed_role=native_role,
                 authenticated_issuer=untrusted_identity,
+            )
+        )
+        self._owner.register_producer(
+            NativeTerminalProducerRegistration(
+                producer_id=_CONTROL_PRODUCER_ID,
+                name="oracle-trusted-control",
+                producer_class=NativeTerminalProducerClass.CONTROL,
+                allowed_role=native_role,
+                authenticated_issuer=owner_identity,
             )
         )
         publication = None
@@ -489,8 +498,7 @@ class _NativeOracleRuntime:
                     receipt is not None
                     and (
                         receipt.kind is not _expected_native_receipt_kind(spec)
-                        or receipt.outcome
-                        is not _expected_native_receipt_outcome(spec)
+                        or receipt.outcome is not _expected_native_receipt_outcome(spec)
                     )
                 )
             )
@@ -624,6 +632,8 @@ class _NativeOracleRuntime:
         :returns: Registered native producer identity.
         """
 
+        if spec.kind in _CONTROL_EVENT_KINDS:
+            return _CONTROL_PRODUCER_ID
         if owner_minted_local_failure or spec.receipt is None:
             return _LOCAL_PRODUCER_ID
         if spec.receipt.issuer is OracleReceiptIssuer.TRUSTED:
@@ -722,9 +732,7 @@ def evaluate_native_differential_case(
             )
             prefix_expected = evaluate_oracle_transition(prefix_case)
             if not prefix_expected.accepted:
-                raise RuntimeError(
-                    f"declared oracle path rejected {event.kind.value}"
-                )
+                raise RuntimeError(f"declared oracle path rejected {event.kind.value}")
             prefix_observed = runtime.apply(event)
             last_path_step = prefix_observed
             prefix_mismatches = _compare_step(prefix_expected, prefix_observed)
@@ -930,8 +938,9 @@ def evaluate_native_publisher_death_blast_radius() -> NativePublisherDeathBlastR
         runtime.abort_and_close()
 
 
-def evaluate_native_post_publication_quarantine_request_failure(
-) -> NativeDifferentialResult:
+def evaluate_native_post_publication_quarantine_request_failure() -> (
+    NativeDifferentialResult
+):
     """Exercise request failure after publication identity quarantine.
 
     The publication identity is already quarantined and remains so. A later
@@ -976,8 +985,7 @@ def _compare_step(
             f"native={native_before!r}"
         )
     event_is_process_fatal = (
-        expected.accepted
-        and expected.case.event.kind in _PROCESS_FATAL_EVENT_KINDS
+        expected.accepted and expected.case.event.kind in _PROCESS_FATAL_EVENT_KINDS
     )
     native_accepted = observed.submitted and (
         observed.fatal_code is NativeTerminalOwnerFatalCode.NONE
@@ -1111,9 +1119,7 @@ def _project_native_snapshot(
         phase=phase,
         live_resources=_resources_from_mask(snapshot.live_resources),
         retired_resources=_resources_from_mask(snapshot.retired_resources),
-        quarantined_resources=_resources_from_mask(
-            snapshot.quarantined_resources
-        ),
+        quarantined_resources=_resources_from_mask(snapshot.quarantined_resources),
         process_fatal=snapshot.process_fatal,
     )
 
@@ -1171,9 +1177,6 @@ def _expected_native_receipt_kind(
         SourceLifecycleEventKind.REQUEST_FAILED: NativeTerminalReceiptKind.FAILURE,
         DecodeLifecycleEventKind.ADOPTION_CONSUMED: (
             NativeTerminalReceiptKind.ADOPTION_READY
-        ),
-        DecodeLifecycleEventKind.METADATA_CONSUMED: (
-            NativeTerminalReceiptKind.METADATA_CONSUMED
         ),
         DecodeLifecycleEventKind.REQUEST_READY_RECEIVED: (
             NativeTerminalReceiptKind.REQUEST_READY
