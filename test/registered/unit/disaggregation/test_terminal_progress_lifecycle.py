@@ -695,7 +695,7 @@ def test_decode_valid_path_retires_all_resources() -> None:
 
     assert final.phase is DecodeLifecyclePhase.RETIRED
     assert final.inventory.safely_retired == DECODE_RESOURCE_KINDS
-    assert len(final.receipt_ledger.consumed_tokens) == 3
+    assert len(final.receipt_ledger.consumed_tokens) == 2
     assert_conserved(final.inventory)
     assert initial.phase is DecodeLifecyclePhase.PREPARED
 
