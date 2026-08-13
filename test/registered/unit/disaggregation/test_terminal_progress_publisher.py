@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import threading
 
 import pytest
@@ -10,8 +11,11 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
+    EncodedTerminalGatewayPayload,
+    FrozenTerminalGatewayOutputProjection,
     FrozenTerminalGatewayPublication,
     PackedTerminalOutputPublisher,
+    TerminalGatewayPayloadEncoder,
     TerminalGatewayPublicationFailure,
     TerminalGatewayPublicationResult,
     TerminalGatewayPublicationSuccess,
@@ -31,6 +35,94 @@ from sglang.srt.disaggregation.terminal_progress.wire import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TestOutputProjection(FrozenTerminalGatewayOutputProjection):
+    """Immutable test shell and generation-bound result-slot projection.
+
+    :ivar shell: Static output fields frozen before forward submission.
+    :ivar producer_event_generation: Exact result-producing event generation.
+    :ivar result_slot_generation: Exact stable pinned-result-slot generation.
+    :ivar result_fields: Synthetic fields populated before request readiness.
+    """
+
+    shell: bytes
+    producer_event_generation: bytes
+    result_slot_generation: bytes
+    result_fields: bytes
+
+    @property
+    def digest(self) -> bytes:
+        """Return the complete immutable projection binding.
+
+        :returns: SHA-256 over shell, producer, slot, and result identities.
+        """
+
+        digest = hashlib.sha256()
+        digest.update(b"sglang.test.gateway-output-projection.v1")
+        for field in (
+            self.shell,
+            self.producer_event_generation,
+            self.result_slot_generation,
+            self.result_fields,
+        ):
+            digest.update(len(field).to_bytes(8, "big"))
+            digest.update(field)
+        return digest.digest()
+
+
+class _RecordingPayloadEncoder(TerminalGatewayPayloadEncoder):
+    """Test encoder proving projection work stays on the publisher thread."""
+
+    encoded_thread: int | None
+    projections: list[_TestOutputProjection]
+
+    def __init__(self) -> None:
+        """Create an empty encoder observation ledger."""
+
+        self.encoded_thread = None
+        self.projections = []
+
+    def encode(
+        self,
+        projection: FrozenTerminalGatewayOutputProjection,
+    ) -> EncodedTerminalGatewayPayload:
+        """Encode one synthetic shell and stable result slot.
+
+        :param projection: Exact immutable test projection.
+        :returns: Publisher-thread encoding bound to the projection digest.
+        """
+
+        if type(projection) is not _TestOutputProjection:
+            raise TypeError("test encoder requires _TestOutputProjection")
+        self.encoded_thread = threading.get_ident()
+        self.projections.append(projection)
+        return EncodedTerminalGatewayPayload(
+            projection_digest=projection.digest,
+            encoded_payload=projection.result_fields,
+        )
+
+
+class _MismatchedPayloadEncoder(TerminalGatewayPayloadEncoder):
+    """Test encoder returning bytes for another projection generation."""
+
+    def encode(
+        self,
+        projection: FrozenTerminalGatewayOutputProjection,
+    ) -> EncodedTerminalGatewayPayload:
+        """Return a deliberately conflicting projection binding.
+
+        :param projection: Exact projection which must not match the result.
+        :returns: Non-empty bytes bound to another digest.
+        """
+
+        if not isinstance(projection, FrozenTerminalGatewayOutputProjection):
+            raise TypeError("projection must be FrozenTerminalGatewayOutputProjection")
+        return EncodedTerminalGatewayPayload(
+            projection_digest=bytes.fromhex("f6" * 32),
+            encoded_payload=b"wrong-generation-output",
+        )
 
 
 class _Clock:
@@ -229,12 +321,18 @@ def _publication(
 
     :param bindings: Complete source TP manifest.
     :param request_ready_issuer: Trusted imported coordinator authority.
-    :param payload: Frozen downstream IPC bytes.
+    :param payload: Synthetic result fields encoded by the publisher thread.
     :param publication_generation_byte: Byte repeated across publication generation.
     :returns: Complete publisher input.
     """
 
     canonical = bindings[0]
+    output_projection = _TestOutputProjection(
+        shell=b"frozen-output-shell",
+        producer_event_generation=bytes.fromhex("d4" * 16),
+        result_slot_generation=bytes.fromhex("e5" * 16),
+        result_fields=payload,
+    )
     return FrozenTerminalGatewayPublication(
         identity=TerminalPublicationIdentity(
             request_key=canonical.request_key,
@@ -249,7 +347,7 @@ def _publication(
             outcome=TerminalReceiptOutcome.SUCCESS,
             terminal_timestamp_ns=999,
         ),
-        encoded_payload=payload,
+        output_projection=output_projection,
         enqueued_ns=1_000,
     )
 
@@ -263,6 +361,7 @@ def _publisher(
     clock: _Clock,
     *,
     capacity: int = 4,
+    payload_encoder: TerminalGatewayPayloadEncoder | None = None,
     result_event: threading.Event | None = None,
     fail_result_listener: bool = False,
 ) -> PackedTerminalOutputPublisher:
@@ -275,6 +374,7 @@ def _publisher(
     :param fatals: Mutable test-only fatal capture.
     :param clock: Synthetic publisher clock.
     :param capacity: Maximum pending publication count.
+    :param payload_encoder: Optional observable publisher-thread encoder.
     :param result_event: Optional result-delivery notification.
     :param fail_result_listener: Whether result delivery raises after notification.
     :returns: Unstarted publisher.
@@ -295,6 +395,9 @@ def _publisher(
     return PackedTerminalOutputPublisher(
         capacity=capacity,
         sink_factory=factory,
+        payload_encoder=(
+            _RecordingPayloadEncoder() if payload_encoder is None else payload_encoder
+        ),
         wire_issuer=TerminalWireReceiptIssuer(bindings[0].owner),
         request_ready_authorities=frozenset((request_ready_issuer.authority,)),
         result_listener=record_result,
@@ -310,6 +413,7 @@ def test_exact_duplicate_coalesces_and_socket_lifecycle_stays_on_thread() -> Non
     request_ready_issuer = TerminalReceiptIssuer()
     publication = _publication(bindings, request_ready_issuer)
     factory = _RecordingSinkFactory()
+    payload_encoder = _RecordingPayloadEncoder()
     results: list[TerminalGatewayPublicationResult] = []
     fatals: list[tuple[str, str | None]] = []
     publisher = _publisher(
@@ -319,6 +423,7 @@ def test_exact_duplicate_coalesces_and_socket_lifecycle_stays_on_thread() -> Non
         results,
         fatals,
         _Clock(),
+        payload_encoder=payload_encoder,
     )
 
     publisher.start()
@@ -329,6 +434,8 @@ def test_exact_duplicate_coalesces_and_socket_lifecycle_stays_on_thread() -> Non
     sink = factory.sink
     assert sink is not None
     assert sink.payloads == [b"frozen-output"]
+    assert payload_encoder.encoded_thread == sink.created_thread
+    assert payload_encoder.projections == [publication.output_projection]
     assert len(sink.timeout_seconds) == 1
     assert 59.0 < sink.timeout_seconds[0] <= 60.0
     assert sink.created_thread == sink.closed_thread
@@ -343,6 +450,43 @@ def test_exact_duplicate_coalesces_and_socket_lifecycle_stays_on_thread() -> Non
     assert snapshot.disposition is TerminalGatewayPublisherDisposition.STOPPED
     assert snapshot.pending_identities == ()
     assert snapshot.completed_identities == (publication.identity,)
+
+
+def test_projection_generation_mismatch_fails_before_socket_send() -> None:
+    """Publisher encoding cannot substitute another result-slot generation."""
+
+    bindings = _source_bindings()
+    request_ready_issuer = TerminalReceiptIssuer()
+    publication = _publication(bindings, request_ready_issuer)
+    factory = _RecordingSinkFactory()
+    results: list[TerminalGatewayPublicationResult] = []
+    fatals: list[tuple[str, str | None]] = []
+    publisher = _publisher(
+        factory,
+        bindings,
+        request_ready_issuer,
+        results,
+        fatals,
+        _Clock(),
+        payload_encoder=_MismatchedPayloadEncoder(),
+    )
+
+    publisher.start()
+    assert publisher.submit(publication)
+    assert publisher.stop_admission_and_join()
+
+    sink = factory.sink
+    assert sink is not None
+    assert sink.payloads == []
+    snapshot = publisher.snapshot()
+    assert snapshot.disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL
+    assert snapshot.pending_identities == ()
+    assert snapshot.completed_identities == ()
+    assert snapshot.failed_identities == (publication.identity,)
+    assert len(results) == 1
+    assert type(results[0]) is TerminalGatewayPublicationFailure
+    assert "another output projection" in results[0].formatted_traceback
+    assert len(fatals) == 1
 
 
 def test_conflicting_generation_is_process_fatal_without_second_send() -> None:
@@ -363,7 +507,15 @@ def test_conflicting_generation_is_process_fatal_without_second_send() -> None:
         _Clock(),
     )
     first = _publication(bindings, request_ready_issuer)
-    conflicting = dataclasses.replace(first, encoded_payload=b"conflicting-output")
+    first_projection = first.output_projection
+    assert type(first_projection) is _TestOutputProjection
+    conflicting = dataclasses.replace(
+        first,
+        output_projection=dataclasses.replace(
+            first_projection,
+            result_fields=b"conflicting-output",
+        ),
+    )
 
     publisher.start()
     assert publisher.submit(first)
@@ -649,9 +801,14 @@ def test_completed_identity_is_not_rolled_back_by_a_late_conflict() -> None:
         result_event=result_event,
     )
     publication = _publication(bindings, request_ready_issuer)
+    output_projection = publication.output_projection
+    assert type(output_projection) is _TestOutputProjection
     conflicting = dataclasses.replace(
         publication,
-        encoded_payload=b"late-conflicting-output",
+        output_projection=dataclasses.replace(
+            output_projection,
+            result_fields=b"late-conflicting-output",
+        ),
     )
 
     publisher.start()

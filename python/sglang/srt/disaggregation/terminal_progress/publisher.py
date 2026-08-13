@@ -49,15 +49,64 @@ class TerminalGatewayPublisherDisposition(enum.StrEnum):
     PROCESS_FATAL = "process_fatal"
 
 
+class FrozenTerminalGatewayOutputProjection(abc.ABC):
+    """Immutable pre-forward shell and generation-bound result-slot projection."""
+
+    @property
+    @abc.abstractmethod
+    def digest(self) -> bytes:
+        """Return the shell, slot, and producer-generation binding.
+
+        :returns: SHA-256 over the complete immutable projection identity.
+        """
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class EncodedTerminalGatewayPayload:
+    """Publisher-thread encoding of one frozen output projection.
+
+    :ivar projection_digest: Exact projection identity which was encoded.
+    :ivar encoded_payload: Complete bytes accepted by the downstream IPC receiver.
+    """
+
+    projection_digest: bytes
+    encoded_payload: bytes
+
+    def __post_init__(self) -> None:
+        """Validate one publisher-owned encoding result."""
+
+        if type(self.projection_digest) is not bytes:
+            raise TypeError("projection_digest must be bytes")
+        if len(self.projection_digest) != hashlib.sha256().digest_size:
+            raise ValueError("projection_digest must be a SHA-256 digest")
+        if type(self.encoded_payload) is not bytes or len(self.encoded_payload) == 0:
+            raise ValueError("encoded_payload must be non-empty bytes")
+
+
+class TerminalGatewayPayloadEncoder(abc.ABC):
+    """Publisher-thread encoder for frozen output shells and stable result slots."""
+
+    @abc.abstractmethod
+    def encode(
+        self,
+        projection: FrozenTerminalGatewayOutputProjection,
+    ) -> EncodedTerminalGatewayPayload:
+        """Fill and encode one projection after request-global readiness.
+
+        :param projection: Immutable shell and generation-bound result slots.
+        :returns: Complete bytes bound back to the exact projection digest.
+        """
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class FrozenTerminalGatewayPublication:
-    """Immutable request-global output ready for publisher-owned I/O.
+    """Immutable request-global output ready for publisher-owned projection.
 
     :ivar identity: Exactly-once publication generation.
     :ivar canonical_binding: Source-rank binding owning the gateway endpoint.
     :ivar source_bindings: Complete source-rank receipt fan-out manifest.
     :ivar request_ready_receipt: Imported request-global readiness authority.
-    :ivar encoded_payload: Complete IPC bytes frozen before submission.
+    :ivar output_projection: Pre-forward shell and stable result-slot binding.
     :ivar enqueued_ns: Publisher-process monotonic enqueue timestamp.
     """
 
@@ -65,8 +114,9 @@ class FrozenTerminalGatewayPublication:
     canonical_binding: TerminalRequestBinding
     source_bindings: tuple[TerminalRequestBinding, ...]
     request_ready_receipt: TerminalReceipt
-    encoded_payload: bytes
+    output_projection: FrozenTerminalGatewayOutputProjection
     enqueued_ns: int
+    _output_projection_digest: bytes = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate one complete publication handoff."""
@@ -84,8 +134,19 @@ class FrozenTerminalGatewayPublication:
             raise TypeError("source_bindings must contain TerminalRequestBinding")
         if type(self.request_ready_receipt) is not TerminalReceipt:
             raise TypeError("request_ready_receipt must be TerminalReceipt")
-        if type(self.encoded_payload) is not bytes or len(self.encoded_payload) == 0:
-            raise ValueError("encoded_payload must be non-empty bytes")
+        if not isinstance(
+            self.output_projection,
+            FrozenTerminalGatewayOutputProjection,
+        ):
+            raise TypeError(
+                "output_projection must inherit FrozenTerminalGatewayOutputProjection"
+            )
+        projection_digest = self.output_projection.digest
+        if type(projection_digest) is not bytes:
+            raise TypeError("output projection digest must be bytes")
+        if len(projection_digest) != hashlib.sha256().digest_size:
+            raise ValueError("output projection digest must be SHA-256")
+        object.__setattr__(self, "_output_projection_digest", projection_digest)
         if type(self.enqueued_ns) is not int or self.enqueued_ns < 0:
             raise ValueError("enqueued_ns must be a non-negative integer")
 
@@ -125,18 +186,18 @@ class FrozenTerminalGatewayPublication:
 
     @property
     def digest(self) -> bytes:
-        """Return the exact identity and payload digest used for deduplication.
+        """Return the identity and output-projection deduplication digest.
 
         :returns: SHA-256 over immutable publication inputs.
         """
 
         digest = hashlib.sha256()
-        digest.update(b"sglang.packed-terminal.gateway-publication.v1")
+        digest.update(b"sglang.packed-terminal.gateway-publication.v2")
         digest.update(self.identity.digest)
         digest.update(len(self.source_bindings).to_bytes(4, "big"))
         for binding in self.source_bindings:
             digest.update(binding.digest)
-        digest.update(hashlib.sha256(self.encoded_payload).digest())
+        digest.update(self._output_projection_digest)
         return digest.digest()
 
 
@@ -300,7 +361,7 @@ class TerminalGatewayPublisherSnapshot:
 
 
 class TerminalGatewaySink(abc.ABC):
-    """Thread-owned byte sink for frozen scheduler IPC payloads."""
+    """Thread-owned byte sink for publisher-encoded IPC payloads."""
 
     @abc.abstractmethod
     def send(self, encoded_payload: bytes, timeout_seconds: float) -> None:
@@ -400,15 +461,18 @@ _PUBLISHER_STOP = object()
 class PackedTerminalOutputPublisher:
     """Process-lifetime exactly-once publisher with no scheduler-owned socket.
 
-    The scheduler freezes complete IPC bytes before enqueue. The publisher
-    creates, uses, and closes its sink on its own thread. Any unexpected thread
-    exit, queue overflow, conflicting generation, send failure, or listener
-    failure is process-fatal and leaves the affected publication identities in
-    explicit inventory.
+    The scheduler freezes an output shell and generation-bound result slots
+    before forward submission. The publisher fills and encodes that projection
+    only after consuming request-global readiness, then creates, uses, and
+    closes its sink on its own thread. Any unexpected thread exit, queue
+    overflow, conflicting generation, projection mismatch, send failure, or
+    listener failure is process-fatal and leaves affected publication
+    identities in explicit inventory.
     """
 
     _capacity: int
     _sink_factory: TerminalGatewaySinkFactory
+    _payload_encoder: TerminalGatewayPayloadEncoder
     _wire_issuer: TerminalWireReceiptIssuer
     _request_ready_ledger: TerminalReceiptLedger
     _result_listener: Callable[[TerminalGatewayPublicationResult], None]
@@ -438,6 +502,7 @@ class PackedTerminalOutputPublisher:
         *,
         capacity: int,
         sink_factory: TerminalGatewaySinkFactory,
+        payload_encoder: TerminalGatewayPayloadEncoder,
         wire_issuer: TerminalWireReceiptIssuer,
         request_ready_authorities: frozenset[TerminalReceiptAuthority],
         result_listener: Callable[[TerminalGatewayPublicationResult], None],
@@ -449,6 +514,7 @@ class PackedTerminalOutputPublisher:
 
         :param capacity: Maximum pending publication population.
         :param sink_factory: Factory executed inside the publisher thread.
+        :param payload_encoder: Publisher-owned output projection encoder.
         :param wire_issuer: Canonical source-rank terminal receipt issuer.
         :param request_ready_authorities: Imported coordinator authorities trusted
             by this publisher.
@@ -462,6 +528,10 @@ class PackedTerminalOutputPublisher:
             raise ValueError("capacity must be a positive integer")
         if not isinstance(sink_factory, TerminalGatewaySinkFactory):
             raise TypeError("sink_factory must inherit TerminalGatewaySinkFactory")
+        if not isinstance(payload_encoder, TerminalGatewayPayloadEncoder):
+            raise TypeError(
+                "payload_encoder must inherit TerminalGatewayPayloadEncoder"
+            )
         if type(wire_issuer) is not TerminalWireReceiptIssuer:
             raise TypeError("wire_issuer must be TerminalWireReceiptIssuer")
         if wire_issuer.identity.role is not TerminalOwnerRole.SOURCE:
@@ -489,6 +559,7 @@ class PackedTerminalOutputPublisher:
 
         self._capacity = capacity
         self._sink_factory = sink_factory
+        self._payload_encoder = payload_encoder
         self._wire_issuer = wire_issuer
         self._request_ready_ledger = TerminalReceiptLedger(
             authorities=request_ready_authorities
@@ -823,7 +894,16 @@ class PackedTerminalOutputPublisher:
         timeout_seconds = self._remaining_deadline_seconds(deadline)
         if timeout_seconds <= 0.0:
             raise TerminalGatewayPublisherError(deadline.spec.timeout_outcome)
-        sink.send(publication.encoded_payload, timeout_seconds)
+        encoded = self._payload_encoder.encode(publication.output_projection)
+        if type(encoded) is not EncodedTerminalGatewayPayload:
+            raise TerminalGatewayPublisherError(
+                "gateway payload encoder returned an invalid result"
+            )
+        if encoded.projection_digest != publication._output_projection_digest:
+            raise TerminalGatewayPublisherError(
+                "gateway payload encoding belongs to another output projection"
+            )
+        sink.send(encoded.encoded_payload, timeout_seconds)
         completed_ns = self._clock_ns()
         if completed_ns >= deadline.expires_ns:
             raise TerminalGatewayPublisherError(deadline.spec.timeout_outcome)
