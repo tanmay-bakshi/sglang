@@ -274,8 +274,9 @@ def _load_native_cuda_completion_bridge(testing: bool = False) -> ModuleType:
         name=module_name,
         sources=[str(source_path)],
         extra_cflags=extra_cflags,
+        extra_ldflags=["-L/usr/local/cuda/lib64", "-lcudart"],
         build_directory=build_directory,
-        with_cuda=True,
+        with_cuda=False,
         verbose=False,
     )
 
