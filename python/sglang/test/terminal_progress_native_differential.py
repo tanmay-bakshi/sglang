@@ -485,10 +485,13 @@ class _NativeOracleRuntime:
             spec.receipt is not None
             and (
                 spec.receipt.binding is OracleReceiptBinding.OTHER_REQUEST
-                or receipt is not None
-                and (
-                    receipt.kind is not _expected_native_receipt_kind(spec)
-                    or receipt.outcome is not _expected_native_receipt_outcome(spec)
+                or (
+                    receipt is not None
+                    and (
+                        receipt.kind is not _expected_native_receipt_kind(spec)
+                        or receipt.outcome
+                        is not _expected_native_receipt_outcome(spec)
+                    )
                 )
             )
         )
@@ -1035,7 +1038,10 @@ def _compare_step(
             if not observed.after.process_fatal:
                 mismatches.append("native rejection retained a healthy process")
             if expected.case.event.kind in _PROCESS_FATAL_EVENT_KINDS:
-                if observed.fatal_code is not NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH:
+                if (
+                    observed.fatal_code
+                    is not NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
+                ):
                     mismatches.append(
                         "rejected process-fatal event did not preserve its fatal cause"
                     )
