@@ -12,12 +12,10 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentBootstrapEndpoint,
     TerminalDeploymentCohort,
     TerminalDeploymentCohortError,
-    TerminalDeploymentDecoder,
-    TerminalDeploymentGroup,
     TerminalDeploymentLocalService,
-    TerminalDeploymentPrefill,
     TerminalDeploymentRequestPlan,
     TerminalDeploymentRole,
+    TerminalDeploymentService,
     decode_terminal_deployment_cohort,
     encode_terminal_deployment_cohort,
     load_terminal_deployment_cohort,
@@ -37,232 +35,249 @@ def _uuid(marker: int) -> uuid.UUID:
     return uuid.UUID(int=marker)
 
 
+def _service(
+    service_id: str,
+    role: TerminalDeploymentRole,
+    marker: int,
+    tp_size: int,
+    port: int,
+) -> TerminalDeploymentService:
+    """Build one exact launcher service fixture.
+
+    :param service_id: Stable service name.
+    :param role: Prefill or decode role.
+    :param marker: Launch UUID marker.
+    :param tp_size: Complete service TP width.
+    :param port: Exact loopback HTTP port.
+    :returns: Valid service identity.
+    """
+
+    return TerminalDeploymentService(
+        service_id=service_id,
+        role=role,
+        launch_instance_id=_uuid(marker),
+        tensor_parallel_size=tp_size,
+        origin=f"http://127.0.0.1:{port}",
+        port=port,
+    )
+
+
 def _cohort() -> TerminalDeploymentCohort:
-    """Build a two-group immutable deployment fixture.
+    """Build one immutable per-group deployment fixture.
 
     :returns: Valid deployment cohort.
     """
 
     return TerminalDeploymentCohort(
-        groups=(
-            TerminalDeploymentGroup(
-                group_id="group-a",
-                launch_epoch=_uuid(1),
-                prefill=TerminalDeploymentPrefill(
-                    launch_instance_id=_uuid(2),
-                    bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
-                        host="gemma-dev-1",
-                        port=32150,
-                    ),
-                    tensor_parallel_size=2,
-                ),
-                decoders=(
-                    TerminalDeploymentDecoder(
-                        launch_instance_id=_uuid(3),
-                        tensor_parallel_size=1,
-                    ),
-                    TerminalDeploymentDecoder(
-                        launch_instance_id=_uuid(4),
-                        tensor_parallel_size=1,
-                    ),
-                ),
-            ),
-            TerminalDeploymentGroup(
-                group_id="group-b",
-                launch_epoch=_uuid(5),
-                prefill=TerminalDeploymentPrefill(
-                    launch_instance_id=_uuid(6),
-                    bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
-                        host="gemma-dev-2",
-                        port=32250,
-                    ),
-                    tensor_parallel_size=4,
-                ),
-                decoders=(
-                    TerminalDeploymentDecoder(
-                        launch_instance_id=_uuid(7),
-                        tensor_parallel_size=2,
-                    ),
-                ),
-            ),
-        )
+        group_id="group-a",
+        bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
+            host="gemma-dev-1",
+            port=32150,
+        ),
+        services=(
+            _service("prefill-a", TerminalDeploymentRole.PREFILL, 2, 2, 32001),
+            _service("decode-a", TerminalDeploymentRole.DECODE, 3, 1, 32002),
+            _service("decode-b", TerminalDeploymentRole.DECODE, 4, 1, 32003),
+        ),
     )
 
 
 def _request_plan(
     cohort: TerminalDeploymentCohort | None = None,
 ) -> TerminalDeploymentRequestPlan:
-    """Select the first decoder in the first fixture group.
+    """Select the first decoder in the fixture group.
 
     :param cohort: Optional cohort whose exact objects should be selected.
     :returns: Valid request-selected subset.
     """
 
     selected = _cohort() if cohort is None else cohort
-    group = selected.groups[0]
-    decoder = group.decoders[0]
     return TerminalDeploymentRequestPlan(
-        group_id=group.group_id,
-        group_launch_epoch=group.launch_epoch,
-        prefill_launch_instance_id=group.prefill.launch_instance_id,
-        prefill_bootstrap_endpoint=group.prefill.bootstrap_endpoint,
-        prefill_tensor_parallel_size=group.prefill.tensor_parallel_size,
-        decoder_launch_instance_id=decoder.launch_instance_id,
-        decoder_tensor_parallel_size=decoder.tensor_parallel_size,
+        cohort_digest=selected.digest,
+        group_id=selected.group_id,
+        prefill_service_id=selected.prefill.service_id,
+        prefill_launch_instance_id=selected.prefill.launch_instance_id,
+        decoder_service_id=selected.decoders[0].service_id,
+        decoder_launch_instance_id=selected.decoders[0].launch_instance_id,
     )
 
 
-def test_cohort_round_trip_is_canonical_and_hash_bound() -> None:
-    """Preserve every deployment fact under one deterministic digest."""
+def _require_local(
+    cohort: TerminalDeploymentCohort,
+    service: TerminalDeploymentService,
+) -> TerminalDeploymentLocalService:
+    """Select one exact service from its fixture cohort.
+
+    :param cohort: Owning deployment cohort.
+    :param service: Exact cohort member.
+    :returns: Validated local membership.
+    """
+
+    bootstrap = (
+        cohort.bootstrap_endpoint
+        if service.role is TerminalDeploymentRole.PREFILL
+        else None
+    )
+    return cohort.require_local_service(
+        service_id=service.service_id,
+        role=service.role,
+        launch_instance_id=service.launch_instance_id,
+        tensor_parallel_size=service.tensor_parallel_size,
+        origin=service.origin,
+        port=service.port,
+        bootstrap_endpoint=bootstrap,
+    )
+
+
+def test_cohort_matches_launcher_schema_bytes() -> None:
+    """Preserve the exact launcher-owned schema and field ordering."""
 
     cohort = _cohort()
     payload = encode_terminal_deployment_cohort(cohort)
+    expected = {
+        "schema": "pd-terminal-deployment-cohort-v1",
+        "group_id": "group-a",
+        "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32150},
+        "services": [
+            {
+                "id": "prefill-a",
+                "role": "prefill",
+                "launch_instance_id": str(_uuid(2)),
+                "tensor_parallel_size": 2,
+                "origin": "http://127.0.0.1:32001",
+                "port": 32001,
+            },
+            {
+                "id": "decode-a",
+                "role": "decode",
+                "launch_instance_id": str(_uuid(3)),
+                "tensor_parallel_size": 1,
+                "origin": "http://127.0.0.1:32002",
+                "port": 32002,
+            },
+            {
+                "id": "decode-b",
+                "role": "decode",
+                "launch_instance_id": str(_uuid(4)),
+                "tensor_parallel_size": 1,
+                "origin": "http://127.0.0.1:32003",
+                "port": 32003,
+            },
+        ],
+    }
 
+    assert json.loads(payload) == expected
+    assert payload == json.dumps(expected, separators=(",", ":")).encode()
     assert decode_terminal_deployment_cohort(payload) == cohort
     assert cohort.digest == hashlib.sha256(payload).digest()
     assert payload.startswith(
         b'{"schema":"' + TERMINAL_DEPLOYMENT_COHORT_SCHEMA.encode() + b'"'
     )
-    assert not payload.endswith(b"\n")
 
 
-def test_local_service_requires_exact_group_membership() -> None:
-    """Bind local role, launch generation, TP width, and bootstrap exactly."""
+def test_local_service_requires_exact_static_membership() -> None:
+    """Bind service name, generation, role, width, origin, and bootstrap."""
 
     cohort = _cohort()
-    group = cohort.groups[0]
-    prefill = cohort.require_local_service(
-        group_id=group.group_id,
-        role=TerminalDeploymentRole.PREFILL,
-        launch_instance_id=group.prefill.launch_instance_id,
-        tensor_parallel_size=group.prefill.tensor_parallel_size,
-        bootstrap_endpoint=group.prefill.bootstrap_endpoint,
-    )
-    decoder_record = group.decoders[1]
-    decoder = cohort.require_local_service(
-        group_id=group.group_id,
-        role=TerminalDeploymentRole.DECODE,
-        launch_instance_id=decoder_record.launch_instance_id,
-        tensor_parallel_size=decoder_record.tensor_parallel_size,
-        bootstrap_endpoint=None,
-    )
+    prefill = _require_local(cohort, cohort.prefill)
+    decoder = _require_local(cohort, cohort.decoders[1])
 
-    assert prefill.group_launch_epoch == group.launch_epoch
-    assert decoder.launch_instance_id == decoder_record.launch_instance_id
+    assert prefill.service == cohort.prefill
+    assert decoder.service == cohort.decoders[1]
     with pytest.raises(TerminalDeploymentCohortError, match="differs"):
         cohort.require_local_service(
-            group_id=group.group_id,
-            role=TerminalDeploymentRole.PREFILL,
-            launch_instance_id=group.prefill.launch_instance_id,
+            service_id=cohort.prefill.service_id,
+            role=cohort.prefill.role,
+            launch_instance_id=cohort.prefill.launch_instance_id,
             tensor_parallel_size=4,
-            bootstrap_endpoint=group.prefill.bootstrap_endpoint,
+            origin=cohort.prefill.origin,
+            port=cohort.prefill.port,
+            bootstrap_endpoint=cohort.bootstrap_endpoint,
         )
     with pytest.raises(TerminalDeploymentCohortError, match="absent"):
         cohort.require_local_service(
-            group_id=group.group_id,
+            service_id="decode-z",
             role=TerminalDeploymentRole.DECODE,
             launch_instance_id=_uuid(99),
             tensor_parallel_size=1,
+            origin="http://127.0.0.1:32099",
+            port=32099,
             bootstrap_endpoint=None,
         )
 
 
-def test_request_plan_must_be_an_exact_same_group_subset() -> None:
-    """Reject stale epochs, cross-group decoders, and route drift."""
+def test_request_plan_must_be_an_exact_same_cohort_subset() -> None:
+    """Reject stale epoch digests, cross-group plans, and service drift."""
 
     cohort = _cohort()
     plan = _request_plan(cohort)
-    group, prefill, decoder = cohort.require_request_plan(plan)
+    prefill, decoder = cohort.require_request_plan(plan)
 
-    assert group == cohort.groups[0]
-    assert prefill == group.prefill
-    assert decoder == group.decoders[0]
+    assert prefill == cohort.prefill
+    assert decoder == cohort.decoders[0]
     with pytest.raises(TerminalDeploymentCohortError, match="stale"):
         cohort.require_request_plan(
-            dataclasses.replace(plan, group_launch_epoch=_uuid(90))
+            dataclasses.replace(plan, cohort_digest=bytes.fromhex("90" * 32))
         )
+    with pytest.raises(TerminalDeploymentCohortError, match="another"):
+        cohort.require_request_plan(dataclasses.replace(plan, group_id="group-b"))
     with pytest.raises(TerminalDeploymentCohortError, match="prefill differs"):
         cohort.require_request_plan(
-            dataclasses.replace(
-                plan,
-                prefill_bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
-                    host="gemma-dev-1",
-                    port=32151,
-                ),
-            )
+            dataclasses.replace(plan, prefill_launch_instance_id=_uuid(90))
         )
-    with pytest.raises(TerminalDeploymentCohortError, match="decoder is absent"):
+    with pytest.raises(TerminalDeploymentCohortError, match="absent"):
         cohort.require_request_plan(
             dataclasses.replace(
                 plan,
-                decoder_launch_instance_id=cohort.groups[1]
-                .decoders[0]
-                .launch_instance_id,
-                decoder_tensor_parallel_size=2,
+                decoder_service_id="decode-z",
+                decoder_launch_instance_id=_uuid(99),
             )
         )
 
 
 def test_request_plan_contains_only_its_exact_local_members() -> None:
-    """Expose an explicit membership check for local request composition."""
+    """Expose explicit request subset validation for local composition."""
 
     cohort = _cohort()
-    group = cohort.groups[0]
     plan = _request_plan(cohort)
-    prefill = cohort.require_local_service(
-        group_id=group.group_id,
-        role=TerminalDeploymentRole.PREFILL,
-        launch_instance_id=group.prefill.launch_instance_id,
-        tensor_parallel_size=group.prefill.tensor_parallel_size,
-        bootstrap_endpoint=group.prefill.bootstrap_endpoint,
-    )
-    selected_decoder = cohort.require_local_service(
-        group_id=group.group_id,
-        role=TerminalDeploymentRole.DECODE,
-        launch_instance_id=group.decoders[0].launch_instance_id,
-        tensor_parallel_size=group.decoders[0].tensor_parallel_size,
-        bootstrap_endpoint=None,
-    )
-    other_decoder = cohort.require_local_service(
-        group_id=group.group_id,
-        role=TerminalDeploymentRole.DECODE,
-        launch_instance_id=group.decoders[1].launch_instance_id,
-        tensor_parallel_size=group.decoders[1].tensor_parallel_size,
-        bootstrap_endpoint=None,
-    )
+    prefill = _require_local(cohort, cohort.prefill)
+    selected_decoder = _require_local(cohort, cohort.decoders[0])
+    other_decoder = _require_local(cohort, cohort.decoders[1])
 
     assert plan.contains(prefill)
     assert plan.contains(selected_decoder)
     assert not plan.contains(other_decoder)
 
 
-def test_cohort_rejects_identity_collisions_and_noncanonical_group_order() -> None:
-    """Keep launch epochs and service generations deployment-global."""
+def test_cohort_rejects_order_and_identity_collisions() -> None:
+    """Keep prefill first and every launcher identity collision-free."""
 
     cohort = _cohort()
-    with pytest.raises(ValueError, match="canonical group_id order"):
-        dataclasses.replace(cohort, groups=tuple(reversed(cohort.groups)))
-    duplicate_epoch = dataclasses.replace(
-        cohort.groups[1],
-        launch_epoch=cohort.groups[0].launch_epoch,
+    with pytest.raises(ValueError, match="prefill before"):
+        dataclasses.replace(cohort, services=tuple(reversed(cohort.services)))
+    duplicate_launch = dataclasses.replace(
+        cohort.decoders[0],
+        launch_instance_id=cohort.prefill.launch_instance_id,
     )
-    with pytest.raises(ValueError, match="launch_epoch"):
-        dataclasses.replace(cohort, groups=(cohort.groups[0], duplicate_epoch))
-    duplicate_service = dataclasses.replace(
-        cohort.groups[1],
-        decoders=(
-            dataclasses.replace(
-                cohort.groups[1].decoders[0],
-                launch_instance_id=cohort.groups[0].decoders[0].launch_instance_id,
-            ),
-        ),
+    with pytest.raises(ValueError, match="launch_instance_id"):
+        dataclasses.replace(
+            cohort,
+            services=(cohort.prefill, duplicate_launch, cohort.decoders[1]),
+        )
+    duplicate_origin = dataclasses.replace(
+        cohort.decoders[0],
+        origin=cohort.prefill.origin,
+        port=cohort.prefill.port,
     )
-    with pytest.raises(ValueError, match="deployment-global"):
-        dataclasses.replace(cohort, groups=(cohort.groups[0], duplicate_service))
+    with pytest.raises(ValueError, match="origin"):
+        dataclasses.replace(
+            cohort,
+            services=(cohort.prefill, duplicate_origin, cohort.decoders[1]),
+        )
 
 
 def test_decoder_rejects_unknown_duplicate_and_noncanonical_json() -> None:
-    """Give one byte representation to every accepted deployment fact set."""
+    """Give every accepted static cohort exactly one byte representation."""
 
     payload = encode_terminal_deployment_cohort(_cohort())
     decoded = json.loads(payload)
@@ -273,7 +288,7 @@ def test_decoder_rejects_unknown_duplicate_and_noncanonical_json() -> None:
 
     duplicate = payload.replace(
         b'{"schema":',
-        b'{"schema":"packed-terminal-deployment-cohort-v1","schema":',
+        b'{"schema":"pd-terminal-deployment-cohort-v1","schema":',
         1,
     )
     with pytest.raises(TerminalDeploymentCohortError, match="duplicate JSON field"):
@@ -290,7 +305,7 @@ def test_decoder_rejects_unknown_duplicate_and_noncanonical_json() -> None:
 def test_loader_requires_regular_canonical_artifact_and_exact_digest(
     tmp_path: Path,
 ) -> None:
-    """Bind filesystem loading to the launcher-attested canonical bytes."""
+    """Bind filesystem loading to launcher-attested canonical bytes."""
 
     payload = encode_terminal_deployment_cohort(_cohort())
     path = tmp_path / "cohort.json"
@@ -307,30 +322,25 @@ def test_loader_requires_regular_canonical_artifact_and_exact_digest(
         load_terminal_deployment_cohort(link, digest)
 
 
-def test_local_membership_shape_rejects_decode_bootstrap() -> None:
-    """Prevent a decoder claim from borrowing a prefill route."""
+def test_decoder_rejects_bootstrap_and_boolean_integer_drift() -> None:
+    """Keep decoder roles and JSON booleans out of trusted static facts."""
 
-    with pytest.raises(ValueError, match="decode membership"):
-        TerminalDeploymentLocalService(
-            group_id="group-a",
-            group_launch_epoch=_uuid(1),
-            role=TerminalDeploymentRole.DECODE,
-            launch_instance_id=_uuid(3),
-            tensor_parallel_size=1,
-            bootstrap_endpoint=TerminalDeploymentBootstrapEndpoint(
-                host="gemma-dev-1",
-                port=32150,
-            ),
+    cohort = _cohort()
+    decoder = cohort.decoders[0]
+    with pytest.raises(TerminalDeploymentCohortError, match="cannot claim"):
+        cohort.require_local_service(
+            service_id=decoder.service_id,
+            role=decoder.role,
+            launch_instance_id=decoder.launch_instance_id,
+            tensor_parallel_size=decoder.tensor_parallel_size,
+            origin=decoder.origin,
+            port=decoder.port,
+            bootstrap_endpoint=cohort.bootstrap_endpoint,
         )
 
-
-def test_service_widths_reject_boolean_json_scalars() -> None:
-    """Keep JSON booleans out of integer tensor-parallel fields."""
-
-    payload = encode_terminal_deployment_cohort(_cohort())
+    payload = encode_terminal_deployment_cohort(cohort)
     decoded = json.loads(payload)
-    decoded["groups"][0]["prefill"]["tensor_parallel_size"] = True
+    decoded["services"][0]["tensor_parallel_size"] = True
     invalid = json.dumps(decoded, separators=(",", ":")).encode()
-
     with pytest.raises(TerminalDeploymentCohortError, match="integer"):
         decode_terminal_deployment_cohort(invalid)
