@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import selectors
 import threading
 import time
@@ -55,13 +56,13 @@ from sglang.srt.disaggregation.terminal_progress.owner_events import (
     TerminalOwnerEventSourceRegistration,
     TerminalOwnerFatalCause,
     TerminalOwnerOutput,
+    TerminalOwnerOverflowError,
     TerminalOwnerPulse,
     TerminalOwnerQuarantineEntry,
     TerminalOwnerReceiptEmission,
     TerminalOwnerSnapshot,
     TerminalOwnerTimingAnchor,
     TerminalOwnerTimingSample,
-    TerminalOwnerOverflowError,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceipt,
@@ -305,26 +306,20 @@ class PackedTerminalProgressOwner:
             raise ValueError("maximum_items must be a positive integer")
         should_wake = False
         with self._condition:
-            try:
+            with contextlib.suppress(TerminalOwnerClosedError):
                 self._output_pulse_source.drain()
-            except TerminalOwnerClosedError:
-                pass
             count = len(self._outputs)
             if maximum_items is not None:
                 count = min(count, maximum_items)
             outputs = tuple(self._outputs.popleft() for _ in range(count))
             if len(self._outputs) > 0:
-                try:
+                with contextlib.suppress(TerminalOwnerClosedError):
                     self._output_pulse_source.signal()
-                except TerminalOwnerClosedError:
-                    pass
             should_wake = self._disposition is TerminalOwnerDisposition.DRAINING
             self._condition.notify_all()
         if should_wake:
-            try:
+            with contextlib.suppress(TerminalOwnerClosedError):
                 self._submission_source.publish(TerminalOwnerPulse())
-            except TerminalOwnerClosedError:
-                pass
         return outputs
 
     def output_fileno(self) -> int:
