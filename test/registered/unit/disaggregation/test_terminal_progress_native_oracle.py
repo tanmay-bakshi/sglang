@@ -48,8 +48,8 @@ def test_source_oracle_matrix_covers_every_reachable_state_event_pair() -> None:
     )
 
     evaluations = tuple(evaluate_oracle_transition(case) for case in cases)
-    assert sum(evaluation.accepted for evaluation in evaluations) == 68
-    assert sum(not evaluation.accepted for evaluation in evaluations) == 202
+    assert sum(evaluation.accepted for evaluation in evaluations) == 71
+    assert sum(not evaluation.accepted for evaluation in evaluations) == 199
     assert (
         sum(
             evaluation.error is OracleReductionError.STATE_INVARIANT
@@ -62,6 +62,43 @@ def test_source_oracle_matrix_covers_every_reachable_state_event_pair() -> None:
         and evaluation.after.role is TerminalOwnerRole.SOURCE
         for evaluation in evaluations
     )
+
+
+def test_process_fatal_events_preserve_exhausted_source_dispositions() -> None:
+    fatal_kinds = frozenset(
+        (
+            SourceLifecycleEventKind.OWNER_DIED,
+            SourceLifecycleEventKind.PUBLISHER_DIED,
+            SourceLifecycleEventKind.SCHEDULER_INBOX_OVERFLOW,
+        )
+    )
+    evaluations = tuple(
+        evaluate_oracle_transition(case)
+        for case in exhaustive_source_transition_cases()
+        if case.path.name == "source-publication-quarantined-after-reclaim"
+        and case.event.kind in fatal_kinds
+    )
+
+    assert len(evaluations) == len(fatal_kinds)
+    assert {evaluation.case.event.kind for evaluation in evaluations} == fatal_kinds
+    for evaluation in evaluations:
+        assert evaluation.accepted
+        assert not evaluation.before.process_fatal
+        assert evaluation.after.process_fatal
+        assert evaluation.after.phase == evaluation.before.phase
+        assert evaluation.after.live_resources == evaluation.before.live_resources
+        assert evaluation.after.retired_resources == evaluation.before.retired_resources
+        assert (
+            evaluation.after.quarantined_resources
+            == evaluation.before.quarantined_resources
+        )
+        assert evaluation.actions == (
+            OracleOwnerAction.STATE_COMMITTED,
+            OracleOwnerAction.PROCESS_FATAL,
+        )
+        assert evaluation.emitted_receipts == ()
+        assert evaluation.error is None
+        assert evaluation.error_message is None
 
 
 def test_decode_oracle_matrix_covers_every_reachable_state_event_pair() -> None:
