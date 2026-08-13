@@ -709,17 +709,17 @@ class PackedTerminalSourceWiring:
             raise RuntimeError("canonical source rank has no gateway publisher")
         submission = record.submission
         identity = submission.identity
-        publication = FrozenTerminalGatewayPublication(
-            identity=identity.publication_identity,
-            canonical_binding=identity.local_binding,
-            source_bindings=identity.source_bindings,
-            request_ready_receipt=ready_receipt,
-            output_projection=submission.output_projection,
-            enqueued_ns=self._clock_ns(),
-        )
-        with self._lock:
-            record.publication_submitted = True
         try:
+            publication = FrozenTerminalGatewayPublication(
+                identity=identity.publication_identity,
+                canonical_binding=identity.local_binding,
+                source_bindings=identity.source_bindings,
+                request_ready_receipt=ready_receipt,
+                output_projection=submission.output_projection,
+                enqueued_ns=self._clock_ns(),
+            )
+            with self._lock:
+                record.publication_submitted = True
             accepted = publisher.submit(publication)
             if not accepted:
                 raise RuntimeError("gateway publisher rejected a new publication")
