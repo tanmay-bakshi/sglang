@@ -1,26 +1,40 @@
+import dataclasses
 import sys
 import time
 
 import pytest
+from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
+    TerminalPublicationIdentity,
+    TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.lifecycle import (
     DecodeLifecycleEventKind,
     SourceLifecycleEventKind,
     SourceLifecyclePhase,
 )
+from sglang.srt.disaggregation.terminal_progress.native_owner import (
+    NativeTerminalLifecycleSnapshot,
+    NativeTerminalOwner,
+    NativeTerminalOwnerInventory,
+)
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NATIVE_SOURCE_RECLAIMABLE_MASK,
     NativeSourceLifecyclePhase,
-    NativeTerminalProcessIdentity,
+    NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerActionKind,
+    NativeTerminalOwnerEvent,
+    NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerRole,
+    NativeTerminalProcessIdentity,
+    NativeTerminalProducerClass,
+    NativeTerminalProducerRegistration,
+    NativeTerminalPublicationIdentity,
+    NativeTerminalRequestBinding,
     NativeTerminalResource,
-)
-from sglang.srt.disaggregation.terminal_progress.native_owner import (
-    NativeTerminalOwner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.terminal_progress_native_differential import (
@@ -31,7 +45,6 @@ from sglang.test.terminal_progress_native_differential import (
     evaluate_native_publisher_death_blast_radius,
 )
 from sglang.test.terminal_progress_native_oracle import (
-    OracleLifecyclePath,
     OracleTransitionCase,
     decode_oracle_paths,
     exhaustive_decode_transition_cases,
@@ -47,6 +60,10 @@ pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="native terminal owner requires Linux eventfd and timerfd",
 )
+
+_DYNAMIC_PRODUCER_ID = 97
+_DYNAMIC_WAIT_SECONDS = 2.0
+_DYNAMIC_PROCESS_GENERATION = bytes.fromhex("11223344556677889900aabbccddeeff")
 
 
 def test_real_native_owner_matches_all_526_reachable_state_event_pairs() -> None:
@@ -157,9 +174,7 @@ def test_publisher_death_is_process_fatal_with_phase_exact_blast_radius() -> Non
     frozen = next(
         path for path in source_oracle_paths() if path.name == "source-frozen"
     )
-    ready = next(
-        path for path in source_oracle_paths() if path.name == "source-ready"
-    )
+    ready = next(path for path in source_oracle_paths() if path.name == "source-ready")
     cases = tuple(
         OracleTransitionCase(
             name=f"{path.name}-publisher-death-blast-radius",
@@ -188,12 +203,8 @@ def test_publisher_death_is_process_fatal_with_phase_exact_blast_radius() -> Non
         assert result.observed.fatal_code is (
             NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
         )
-        assert result.observed.actions == (
-            NativeTerminalOwnerActionKind.PROCESS_FATAL,
-        )
-        assert result.observed.output_previous_phases == (
-            result.observed.before.phase,
-        )
+        assert result.observed.actions == (NativeTerminalOwnerActionKind.PROCESS_FATAL,)
+        assert result.observed.output_previous_phases == (result.observed.before.phase,)
         assert result.expected.after.process_fatal
     assert before_ready.expected.after.phase == SourceLifecyclePhase.QUARANTINED.value
     assert (
@@ -212,21 +223,18 @@ def test_publisher_death_quarantines_only_publication_for_ready_siblings() -> No
         blast.reclaimed_sibling,
         blast.live_sibling,
     ):
-        assert snapshot.phase == int(
-            NativeSourceLifecyclePhase.PUBLICATION_QUARANTINED
-        )
+        assert snapshot.phase == int(NativeSourceLifecyclePhase.PUBLICATION_QUARANTINED)
         assert snapshot.quarantined_resources == publication
         assert snapshot.process_fatal
     assert blast.target.live_resources == NATIVE_SOURCE_RECLAIMABLE_MASK
     assert blast.live_sibling.live_resources == NATIVE_SOURCE_RECLAIMABLE_MASK
     assert blast.reclaimed_sibling.live_resources == 0
-    assert blast.reclaimed_sibling.retired_resources == (
-        NATIVE_SOURCE_RECLAIMABLE_MASK
-    )
+    assert blast.reclaimed_sibling.retired_resources == (NATIVE_SOURCE_RECLAIMABLE_MASK)
 
 
-def test_request_failure_after_publication_quarantine_is_notification_idempotent(
-) -> None:
+def test_request_failure_after_publication_quarantine_is_notification_idempotent() -> (
+    None
+):
     result = evaluate_native_post_publication_quarantine_request_failure()
 
     assert len(result.mismatches) == 0
@@ -273,6 +281,269 @@ def test_active_qualification_abort_is_bounded_and_closes_the_reactor() -> None:
     inventory = owner.inventory()
     assert inventory.closed
     assert inventory.queued_input_count == 0
+
+
+def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
+    owner, identity = _make_dynamic_source_owner(start=True)
+    try:
+        first = _make_dynamic_source_registration(identity, room_id=801)
+        owner.register_lifecycle(first)
+        _submit_dynamic_source_start(owner, first.binding, producer_sequence=0)
+        first_snapshot = _wait_for_source_phase(
+            owner,
+            first.binding.digest,
+            NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER,
+        )
+
+        second = _make_dynamic_source_registration(identity, room_id=802)
+        owner.register_lifecycle(second)
+        _submit_dynamic_source_start(owner, second.binding, producer_sequence=1)
+        second_snapshot = _wait_for_source_phase(
+            owner,
+            second.binding.digest,
+            NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER,
+        )
+
+        assert first_snapshot.binding_digest == first.binding.digest
+        assert second_snapshot.binding_digest == second.binding.digest
+        inventory = owner.inventory()
+        assert inventory.active_source_count == 2
+        assert inventory.transition_count == 2
+        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
+    finally:
+        owner.abort_and_close()
+
+
+def test_event_ordered_before_registration_fails_closed_as_unknown_binding() -> None:
+    owner, identity = _make_dynamic_source_owner(start=False)
+    registration = _make_dynamic_source_registration(identity, room_id=803)
+    try:
+        _submit_dynamic_source_start(owner, registration.binding, producer_sequence=0)
+        owner.register_lifecycle(registration)
+        owner.start()
+
+        inventory = _wait_for_fatal_and_empty(
+            owner,
+            NativeTerminalOwnerFatalCode.UNKNOWN_BINDING,
+        )
+        assert inventory.fatal_binding_digest == registration.binding.digest
+        assert not inventory.admission_open
+        assert not owner.wait_for_lifecycle_registration(
+            registration.binding.digest,
+            _DYNAMIC_WAIT_SECONDS,
+        )
+    finally:
+        owner.abort_and_close()
+
+
+def test_exact_dynamic_registration_duplicate_is_process_fatal() -> None:
+    owner, identity = _make_dynamic_source_owner(start=True)
+    registration = _make_dynamic_source_registration(identity, room_id=804)
+    try:
+        owner.register_lifecycle(registration)
+        assert owner.wait_for_lifecycle_registration(
+            registration.binding.digest,
+            _DYNAMIC_WAIT_SECONDS,
+        )
+
+        owner.register_lifecycle(registration)
+        inventory = _wait_for_fatal_and_empty(
+            owner,
+            NativeTerminalOwnerFatalCode.DUPLICATE_BINDING,
+        )
+        snapshot = owner.lifecycle_snapshot_for_testing(registration.binding.digest)
+
+        assert inventory.fatal_binding_digest == registration.binding.digest
+        assert snapshot.process_fatal
+        assert snapshot.live_resources == 0
+        assert snapshot.quarantined_resources == (
+            NATIVE_SOURCE_RECLAIMABLE_MASK
+            | int(NativeTerminalResource.PUBLICATION_IDENTITY)
+        )
+    finally:
+        owner.abort_and_close()
+
+
+def test_dynamic_registration_digest_collision_is_process_fatal() -> None:
+    owner, identity = _make_dynamic_source_owner(start=True)
+    registered = _make_dynamic_source_registration(identity, room_id=805)
+    candidate = _make_dynamic_source_registration(identity, room_id=806)
+    collision = dataclasses.replace(
+        candidate,
+        binding=dataclasses.replace(
+            candidate.binding,
+            digest=registered.binding.digest,
+        ),
+    )
+    try:
+        owner.register_lifecycle(registered)
+        assert owner.wait_for_lifecycle_registration(
+            registered.binding.digest,
+            _DYNAMIC_WAIT_SECONDS,
+        )
+
+        owner.register_lifecycle(collision)
+        inventory = _wait_for_fatal_and_empty(
+            owner,
+            NativeTerminalOwnerFatalCode.DUPLICATE_BINDING,
+        )
+        snapshot = owner.lifecycle_snapshot_for_testing(registered.binding.digest)
+
+        assert inventory.fatal_binding_digest == registered.binding.digest
+        assert inventory.quarantined_count == 1
+        assert snapshot.process_fatal
+        assert snapshot.binding_digest == registered.binding.digest
+        assert snapshot.live_resources == 0
+    finally:
+        owner.abort_and_close()
+
+
+def _make_dynamic_source_owner(
+    *, start: bool
+) -> tuple[NativeTerminalOwner, NativeTerminalProcessIdentity]:
+    """Create one process-lifetime source owner with a local producer.
+
+    :param start: Whether to start the reactor before returning.
+    :returns: Native owner and its exact process identity.
+    """
+
+    process_identity = TerminalProcessIdentity(
+        process_generation=_DYNAMIC_PROCESS_GENERATION,
+        role=TerminalOwnerRole.SOURCE,
+        tp_rank=0,
+        tp_size=1,
+    )
+    identity = NativeTerminalProcessIdentity.from_identity(process_identity)
+    owner = NativeTerminalOwner(
+        input_capacity=64,
+        output_capacity=64,
+        owner_identity=identity,
+        testing=True,
+    )
+    owner.register_producer(
+        NativeTerminalProducerRegistration(
+            producer_id=_DYNAMIC_PRODUCER_ID,
+            name="dynamic-registration-local",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.SOURCE,
+            authenticated_issuer=None,
+        )
+    )
+    if start:
+        owner.start()
+    return owner, identity
+
+
+def _make_dynamic_source_registration(
+    identity: NativeTerminalProcessIdentity,
+    *,
+    room_id: int,
+) -> NativeTerminalLifecycleRegistration:
+    """Create one source lifecycle bound to a process-lifetime owner.
+
+    :param identity: Exact owner process identity.
+    :param room_id: Stable request room identity.
+    :returns: Complete dynamic source registration.
+    """
+
+    request_generation = room_id.to_bytes(16, "big")
+    request_key = PackedRequestKey(
+        room_id=room_id,
+        request_generation=request_generation,
+    )
+    binding = TerminalRequestBinding(
+        request_key=request_key,
+        owner=TerminalProcessIdentity(
+            process_generation=identity.process_generation,
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=identity.tp_rank,
+            tp_size=identity.tp_size,
+        ),
+        rank_manifest_digest=b"r" * 32,
+        allocation_digest=room_id.to_bytes(32, "big"),
+    )
+    publication = TerminalPublicationIdentity(
+        request_key=request_key,
+        publisher_process_generation=identity.process_generation,
+        publication_generation=(room_id + 1_000).to_bytes(16, "big"),
+    )
+    return NativeTerminalLifecycleRegistration(
+        binding=NativeTerminalRequestBinding.from_binding(binding),
+        publication_identity=NativeTerminalPublicationIdentity.from_identity(
+            publication
+        ),
+        trusted_issuers=(identity,),
+    )
+
+
+def _submit_dynamic_source_start(
+    owner: NativeTerminalOwner,
+    binding: NativeTerminalRequestBinding,
+    *,
+    producer_sequence: int,
+) -> None:
+    """Submit the first event for one dynamically admitted source lifecycle.
+
+    :param owner: Process-lifetime native owner.
+    :param binding: Exact target lifecycle binding.
+    :param producer_sequence: Gap-free local producer sequence.
+    """
+
+    owner.submit(
+        NativeTerminalOwnerEvent(
+            producer_id=_DYNAMIC_PRODUCER_ID,
+            producer_sequence=producer_sequence,
+            binding_digest=binding.digest,
+            kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
+        )
+    )
+
+
+def _wait_for_source_phase(
+    owner: NativeTerminalOwner,
+    binding_digest: bytes,
+    phase: NativeSourceLifecyclePhase,
+) -> NativeTerminalLifecycleSnapshot:
+    """Wait for one actionless native source commit.
+
+    :param owner: Process-lifetime native owner.
+    :param binding_digest: Exact request-generation digest.
+    :param phase: Expected committed source phase.
+    :returns: Exact native lifecycle snapshot.
+    """
+
+    deadline = time.monotonic() + _DYNAMIC_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            snapshot = owner.lifecycle_snapshot_for_testing(binding_digest)
+        except KeyError:
+            time.sleep(0.001)
+            continue
+        if snapshot.phase == int(phase):
+            return snapshot
+        time.sleep(0.001)
+    raise TimeoutError(f"native lifecycle did not reach {phase.name}")
+
+
+def _wait_for_fatal_and_empty(
+    owner: NativeTerminalOwner,
+    fatal_code: NativeTerminalOwnerFatalCode,
+) -> NativeTerminalOwnerInventory:
+    """Wait for a sticky native fatal disposition and drained input queue.
+
+    :param owner: Process-lifetime native owner.
+    :param fatal_code: Expected sticky fatal code.
+    :returns: Complete fatal native inventory.
+    """
+
+    deadline = time.monotonic() + _DYNAMIC_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        inventory = owner.inventory()
+        if inventory.fatal_code is fatal_code and inventory.queued_input_count == 0:
+            return inventory
+        time.sleep(0.001)
+    raise TimeoutError(f"native owner did not reach {fatal_code.name}")
 
 
 def _assert_no_mismatches(results: tuple[NativeDifferentialResult, ...]) -> None:
