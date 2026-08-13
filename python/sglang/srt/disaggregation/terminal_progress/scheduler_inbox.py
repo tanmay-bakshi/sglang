@@ -317,12 +317,38 @@ class TerminalReceiptInbox:
             exact binding.
         """
 
+        return self.publish_after_retention(receipt, lambda: None)
+
+    def publish_after_retention(
+        self,
+        receipt: TerminalWireReceipt,
+        retain: Callable[[], None],
+    ) -> SchedulerReceiptPublishResult:
+        """Publish after retaining scheduler-affine authority.
+
+        The publication intent is announced before ``retain`` runs, and the
+        receipt cannot become visible until ``retain`` returns successfully.
+        This lets adapters retain an opaque native action without opening a
+        race between host submission and scheduler consumption.
+
+        :param receipt: Canonical fixed-width scheduler receipt.
+        :param retain: Nonblocking callback which retains matching authority.
+        :returns: Whether the receipt was queued or coalesced.
+        :raises SchedulerReceiptInboxFatalError: If a bound or duplicate
+            invariant enters process-fatal disposition.
+        :raises SchedulerInboxError: If the receipt does not target a live
+            exact binding.
+        """
+
         if type(receipt) is not TerminalWireReceipt:
             raise TypeError("receipt must be TerminalWireReceipt")
+        if not callable(retain):
+            raise TypeError("retain must be callable")
         intent = self._begin_publication_intent()
         fatal_error: SchedulerReceiptInboxFatalError | None = None
         result: SchedulerReceiptPublishResult | None = None
         try:
+            retain()
             encoded = receipt.encode()
             request_key = receipt.binding.request_key
             with self._state_lock:
@@ -470,6 +496,40 @@ class TerminalReceiptInbox:
                 write_fd = self._write_fd
             os.close(read_fd)
             os.close(write_fd)
+
+    def close_fail_closed(self) -> SchedulerReceiptInboxInventory:
+        """Close wake descriptors while retaining process-fatal evidence.
+
+        This operation is reserved for process teardown. It never retires a
+        live binding or active receipt because ambiguous resources must remain
+        quarantined in the final inventory.
+
+        :returns: Complete retained inventory after descriptor closure.
+        :raises SchedulerInboxError: If no process-fatal cause is present or a
+            publication is still inside its linearization boundary.
+        """
+
+        with self._consumer_lock:
+            with self._state_lock:
+                if self._closed:
+                    return self._inventory_locked()
+                if self._fatal_cause is None:
+                    raise SchedulerInboxError(
+                        "fail-closed scheduler inbox teardown requires a fatal cause"
+                    )
+                with self._intent_condition:
+                    if len(self._active_intents) > 0:
+                        raise SchedulerInboxError(
+                            "cannot close scheduler inbox during receipt publication"
+                        )
+                self._clear_wake_locked()
+                self._closed = True
+                read_fd = self._read_fd
+                write_fd = self._write_fd
+                inventory = self._inventory_locked()
+            os.close(read_fd)
+            os.close(write_fd)
+            return inventory
 
     def _begin_publication_intent(self) -> int:
         """Announce a publication before it can block on the launch gate.
