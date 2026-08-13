@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
+    IssuedTerminalWireReceipt,
     TerminalWireReceiptIssuer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -559,14 +560,96 @@ def test_send_failure_quarantines_identity_and_kills_publisher() -> None:
     assert publisher.stop_admission_and_join()
 
     assert len(results) == 1
-    assert type(results[0]) is TerminalGatewayPublicationFailure
-    assert "synthetic gateway send failure" in results[0].formatted_traceback
+    failure = results[0]
+    assert type(failure) is TerminalGatewayPublicationFailure
+    assert "synthetic gateway send failure" in failure.formatted_traceback
+    assert len(failure.source_receipts) == len(bindings)
+    for binding, issued_receipt in zip(
+        bindings,
+        failure.source_receipts,
+        strict=True,
+    ):
+        wire_receipt = issued_receipt.wire_receipt
+        local_receipt = issued_receipt.local_receipt
+        assert wire_receipt.binding == binding
+        assert wire_receipt.issuer == bindings[0].owner
+        assert wire_receipt.kind is TerminalReceiptKind.FAILURE
+        assert wire_receipt.outcome is TerminalReceiptOutcome.FAILURE
+        assert wire_receipt.terminal_timestamp_ns == failure.failed_ns
+        assert local_receipt.binding == binding
+        assert local_receipt.kind is TerminalReceiptKind.FAILURE
+        assert local_receipt.outcome is TerminalReceiptOutcome.FAILURE
+        assert local_receipt.terminal_timestamp_ns == failure.failed_ns
     snapshot = publisher.snapshot()
     assert snapshot.disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL
     assert snapshot.failed_identities == (publication.identity,)
     assert len(fatals) == 1
     with pytest.raises(TerminalGatewayPublisherError):
         publisher.start()
+
+
+def test_publication_failure_requires_exact_canonical_source_fanout() -> None:
+    """Failure evidence rejects missing, reordered, or forged rank authority."""
+
+    bindings = _source_bindings()
+    request_ready_issuer = TerminalReceiptIssuer()
+    publication = _publication(bindings, request_ready_issuer)
+    failed_ns = publication.enqueued_ns + 7
+    canonical_issuer = TerminalWireReceiptIssuer(bindings[0].owner)
+
+    def issue(
+        binding: TerminalRequestBinding,
+        *,
+        issuer: TerminalWireReceiptIssuer = canonical_issuer,
+        kind: TerminalReceiptKind = TerminalReceiptKind.FAILURE,
+        outcome: TerminalReceiptOutcome = TerminalReceiptOutcome.FAILURE,
+        timestamp_ns: int = failed_ns,
+    ) -> IssuedTerminalWireReceipt:
+        """Issue one test receipt with an independently varied authority field.
+
+        :param binding: Exact source binding targeted by the receipt.
+        :param issuer: Process-bound receipt issuer.
+        :param kind: Authority kind placed on the receipt.
+        :param outcome: Terminal outcome placed on the receipt.
+        :param timestamp_ns: Issuer-local terminal timestamp.
+        :returns: Joined local and wire receipt forms.
+        """
+
+        return issuer.issue(
+            binding=binding,
+            kind=kind,
+            outcome=outcome,
+            terminal_timestamp_ns=timestamp_ns,
+        )
+
+    valid_receipts = tuple(issue(binding) for binding in bindings)
+    failure = TerminalGatewayPublicationFailure(
+        publication=publication,
+        failed_ns=failed_ns,
+        source_receipts=valid_receipts,
+        reason="synthetic functional publication failure",
+        formatted_traceback="synthetic traceback",
+    )
+    assert failure.source_receipts == valid_receipts
+
+    noncanonical_issuer = TerminalWireReceiptIssuer(bindings[1].owner)
+    invalid_fanouts = (
+        valid_receipts[:-1],
+        tuple(reversed(valid_receipts)),
+        (issue(bindings[0], issuer=noncanonical_issuer), valid_receipts[1]),
+        (
+            issue(bindings[0], kind=TerminalReceiptKind.GATEWAY_PUBLISHED),
+            valid_receipts[1],
+        ),
+        (
+            issue(bindings[0], outcome=TerminalReceiptOutcome.SUCCESS),
+            valid_receipts[1],
+        ),
+        (issue(bindings[0], timestamp_ns=failed_ns + 1), valid_receipts[1]),
+    )
+    for invalid_fanout in invalid_fanouts:
+        with pytest.raises(ValueError):
+            dataclasses.replace(failure, source_receipts=invalid_fanout)
 
 
 def test_publication_identity_must_name_the_canonical_publisher() -> None:
