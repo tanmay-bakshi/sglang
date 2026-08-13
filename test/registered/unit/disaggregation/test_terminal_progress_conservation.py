@@ -229,12 +229,7 @@ def _decode_path(
         TerminalReceiptKind.ADOPTION_READY,
         DecodeLifecycleEventKind.ADOPTION_CONSUMED,
     )
-    metadata = _receipt_event(
-        issuer,
-        binding,
-        TerminalReceiptKind.METADATA_CONSUMED,
-        DecodeLifecycleEventKind.METADATA_CONSUMED,
-    )
+    metadata = DecodeLifecycleEvent(kind=DecodeLifecycleEventKind.METADATA_CONSUMED)
     request_ready = _receipt_event(
         issuer,
         binding,

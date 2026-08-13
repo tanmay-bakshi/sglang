@@ -100,6 +100,13 @@ class _NativeTerminalOwnerBridge(Protocol):
         :param action_id: One-shot native action identity.
         """
 
+    def fail_action_delivery(self, action_id: int, reason: str) -> None:
+        """Reject one action and atomically enter fail-closed authority.
+
+        :param action_id: Exact action which no consumer could accept.
+        :param reason: Stable consumer-boundary failure evidence.
+        """
+
     def inventory(self) -> Mapping[str, object]:
         """Return the complete process-lifetime owner inventory.
 
@@ -170,28 +177,30 @@ class _NativeTerminalOwnerBridge(Protocol):
     def stop_admission(self) -> None:
         """Close lifecycle and event admission."""
 
-    def retire_python_producer(self, producer_id: int) -> int:
-        """Order one Python producer's retirement behind accepted events.
+    def retire_python_producer(self, producer_id: int) -> None:
+        """Retire one Python-owned producer namespace.
 
         :param producer_id: Exact registered producer identity.
-        :returns: Zero on ordered admission, otherwise a positive errno value.
-        """
-
-    def wait_for_producer_retirement(
-        self, producer_id: int, timeout_seconds: float
-    ) -> bool:
-        """Wait for an ordered producer retirement to commit.
-
-        :param producer_id: Exact registered producer identity.
-        :param timeout_seconds: Positive wall-clock bound.
-        :returns: Whether retirement committed within the bound.
         """
 
     def join_producers(self) -> bool:
         """Verify that every registered producer retired.
 
-        :returns: Whether event admission closed after exact retirement.
+        :returns: Whether the complete producer registry is retired.
         """
+
+    def wait_for_output_quiescence(self, timeout_seconds: float) -> bool:
+        """Wait for all swapped native actions to finish routing.
+
+        :param timeout_seconds: Positive hash-bound shutdown timeout.
+        :returns: Whether no queued, swapped, or unacknowledged output remains.
+        """
+
+    def begin_abort(self) -> None:
+        """Quarantine unresolved lifecycles and stop the native reactor."""
+
+    def close_aborted(self) -> None:
+        """Close descriptors after final quarantine actions were routed."""
 
     def close(self) -> None:
         """Close a fully drained and retired owner."""
@@ -366,6 +375,7 @@ class NativeTerminalOwner:
         output_capacity: int,
         owner_identity: NativeTerminalProcessIdentity,
         *,
+        maximum_live_lifecycles: int | None = None,
         testing: bool = False,
     ) -> None:
         """Construct one owner before producer and lifecycle registration.
@@ -373,10 +383,13 @@ class NativeTerminalOwner:
         :param input_capacity: Bounded native event capacity.
         :param output_capacity: Bounded production-action capacity.
         :param owner_identity: Exact process and tensor-parallel identity.
+        :param maximum_live_lifecycles: Bound for complete fail-closed output.
         :param testing: Whether the native test variant is required.
         """
 
-        capacities = (input_capacity, output_capacity)
+        if maximum_live_lifecycles is None:
+            maximum_live_lifecycles = input_capacity
+        capacities = (input_capacity, output_capacity, maximum_live_lifecycles)
         if any(type(value) is not int or value <= 0 for value in capacities):
             raise ValueError("native owner capacities must be positive integers")
         if type(owner_identity) is not NativeTerminalProcessIdentity:
@@ -394,6 +407,7 @@ class NativeTerminalOwner:
             module.NativeTerminalOwnerBridge(
                 input_capacity,
                 output_capacity,
+                maximum_live_lifecycles,
                 owner_identity.to_native(),
                 deadline_table,
                 native_terminal_deadline_table_digest(),
@@ -560,6 +574,21 @@ class NativeTerminalOwner:
             raise TypeError("action must be NativeTerminalOwnerAction")
         self._native.acknowledge_action(action.action_id)
 
+    def fail_action_delivery(
+        self, action: NativeTerminalOwnerAction, reason: str
+    ) -> None:
+        """Reject one action and enter the native process-fatal path.
+
+        :param action: Action which failed bounded consumer admission.
+        :param reason: Complete consumer-boundary failure evidence.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        self._native.fail_action_delivery(action.action_id, reason)
+
     def inventory(self) -> NativeTerminalOwnerInventory:
         """Return the complete validated native owner inventory.
 
@@ -692,55 +721,51 @@ class NativeTerminalOwner:
         return summary
 
     def stop_admission(self) -> None:
-        """Stop new lifecycle registration while existing events drain."""
+        """Close lifecycle and event admission before drain."""
 
         self._native.stop_admission()
 
     def retire_python_producer(self, producer_id: int) -> None:
-        """Order one Python producer's retirement after its accepted events.
+        """Retire one Python producer after its execution context joins.
 
-        The caller must first join the producer's execution context. Native
-        CUDA and NIXL bindings use the equivalent capsule operation so their
-        callback lifetime and producer lifetime remain one ownership unit.
-
-        :param producer_id: Exact registered producer identity.
-        :raises OSError: If retirement cannot enter the ordered input domain.
+        :param producer_id: Exact registered Python producer namespace.
         """
 
         if type(producer_id) is not int or producer_id < 0:
             raise ValueError("producer_id must be a non-negative integer")
-        status = int(self._native.retire_python_producer(producer_id))
-        if status != 0:
-            raise OSError(status, os.strerror(status))
-
-    def wait_for_producer_retirement(
-        self, producer_id: int, timeout_seconds: float
-    ) -> bool:
-        """Wait for one ordered retirement fence to commit.
-
-        :param producer_id: Exact registered producer identity.
-        :param timeout_seconds: Positive wall-clock bound.
-        :returns: Whether retirement committed within the bound.
-        """
-
-        if type(producer_id) is not int or producer_id < 0:
-            raise ValueError("producer_id must be a non-negative integer")
-        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
-            raise ValueError("timeout_seconds must be a positive float")
-        return bool(
-            self._native.wait_for_producer_retirement(
-                producer_id,
-                timeout_seconds,
-            )
-        )
+        self._native.retire_python_producer(producer_id)
 
     def join_producers(self) -> bool:
-        """Close event admission only after every producer retired.
+        """Verify that every native and Python producer retired.
 
-        :returns: Whether the complete registered producer population retired.
+        :returns: Whether event admission closed after exact retirement.
         """
 
         return bool(self._native.join_producers())
+
+    def wait_for_output_quiescence(self, timeout_seconds: float) -> bool:
+        """Wait for the sole output consumer to finish native routing.
+
+        :param timeout_seconds: Positive hash-bound shutdown timeout.
+        :returns: Whether no queued, swapped, or unacknowledged output remains.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native.wait_for_output_quiescence(timeout_seconds))
+
+    def begin_abort(self) -> None:
+        """Quarantine unresolved lifecycles while output routing stays alive."""
+
+        self._native.begin_abort()
+
+    def close_aborted(self) -> None:
+        """Close a fatal owner after final native authority was routed."""
+
+        if self._closed:
+            return
+        self._native.close_aborted()
+        self._closed = True
 
     def close(self) -> None:
         """Close a fully drained owner exactly once."""

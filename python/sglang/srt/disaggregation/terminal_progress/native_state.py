@@ -232,6 +232,12 @@ class NativeTerminalOwnerActionKind(enum.IntEnum):
     REQUEST_RETIRED = 4
     REQUEST_QUARANTINED = 5
     PROCESS_FATAL = 6
+    SOURCE_GATHER_READY = 7
+    SOURCE_OUTCOME_READY = 8
+    SOURCE_ACK_READY = 9
+    DECODE_SCATTER_READY = 10
+    DECODE_TEARDOWN_READY = 11
+    GATEWAY_PUBLICATION_READY = 12
 
 
 class NativeTerminalOwnerFatalCode(enum.IntEnum):
@@ -340,10 +346,6 @@ _EVENT_RECEIPT_REQUIREMENTS = {
         NativeTerminalReceiptKind.ADOPTION_READY,
         NativeTerminalReceiptOutcome.SUCCESS,
     ),
-    NativeTerminalOwnerEventKind.DECODE_METADATA_CONSUMED: (
-        NativeTerminalReceiptKind.METADATA_CONSUMED,
-        NativeTerminalReceiptOutcome.SUCCESS,
-    ),
     NativeTerminalOwnerEventKind.DECODE_REQUEST_READY: (
         NativeTerminalReceiptKind.REQUEST_READY,
         NativeTerminalReceiptOutcome.SUCCESS,
@@ -353,6 +355,12 @@ _EVENT_RECEIPT_REQUIREMENTS = {
         NativeTerminalReceiptOutcome.FAILURE,
     ),
 }
+_EVENT_OPTIONAL_LOCAL_FAILURE_RECEIPTS = frozenset(
+    (
+        NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+        NativeTerminalOwnerEventKind.DECODE_REQUEST_FAILED,
+    )
+)
 _EVENT_REASON_KINDS = frozenset(
     (
         NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED,
@@ -937,6 +945,7 @@ class NativeTerminalOwnerEvent:
     """Producer-bound event submitted to the authoritative native reducer.
 
     :ivar producer_id: Registered native producer identity.
+    :ivar producer_sequence: Gap-free producer-local sequence.
     :ivar binding_digest: Exact 32-byte lifecycle lookup key.
     :ivar kind: Closed lifecycle event, never a producer-selected phase.
     :ivar enqueued_ns: Producer-side ``CLOCK_MONOTONIC_RAW`` timestamp.
@@ -945,6 +954,7 @@ class NativeTerminalOwnerEvent:
     """
 
     producer_id: int
+    producer_sequence: int
     binding_digest: bytes
     kind: NativeTerminalOwnerEventKind
     enqueued_ns: int
@@ -955,6 +965,7 @@ class NativeTerminalOwnerEvent:
         """Validate one structurally complete native owner event."""
 
         _require_uint(self.producer_id, _UINT64_MAX, "producer_id")
+        _require_uint(self.producer_sequence, _UINT64_MAX, "producer_sequence")
         _require_exact_bytes(self.binding_digest, _DIGEST_BYTES, "binding_digest")
         if type(self.kind) is not NativeTerminalOwnerEventKind:
             raise TypeError("kind must be NativeTerminalOwnerEventKind")
@@ -966,9 +977,12 @@ class NativeTerminalOwnerEvent:
             if self.receipt is not None:
                 raise ValueError(f"{self.kind.name} does not accept a receipt")
         else:
-            if self.receipt is None:
-                raise ValueError(f"{self.kind.name} requires a receipt")
             if (
+                self.receipt is None
+                and self.kind not in _EVENT_OPTIONAL_LOCAL_FAILURE_RECEIPTS
+            ):
+                raise ValueError(f"{self.kind.name} requires a receipt")
+            if self.receipt is not None and (
                 self.receipt.binding.digest != self.binding_digest
                 or self.receipt.kind is not receipt_requirement[0]
                 or self.receipt.outcome is not receipt_requirement[1]
@@ -989,6 +1003,7 @@ class NativeTerminalOwnerEvent:
         receipt = self.receipt
         return {
             "producer_id": self.producer_id,
+            "producer_sequence": self.producer_sequence,
             "binding_digest": self.binding_digest,
             "kind": int(self.kind),
             "enqueued_ns": self.enqueued_ns,
@@ -1262,25 +1277,31 @@ class NativeTerminalOwnerInventory:
 
     :ivar input_capacity: Bounded native input capacity.
     :ivar output_capacity: Bounded production-action capacity.
+    :ivar fatal_output_capacity: Reserved fail-closed action capacity.
     :ivar queued_input_count: Inputs not yet committed.
     :ivar queued_output_count: Earned actions not yet consumed.
+    :ivar queued_fatal_output_count: Reserved fail-closed actions not consumed.
+    :ivar pending_action_count: Native actions not yet acknowledged.
     :ivar registered_producer_count: Exact producer registry size.
-    :ivar joined_producer_count: Producers with committed retirement fences.
+    :ivar joined_producer_count: Producers explicitly joined at drain.
     :ivar active_source_count: Source generations with live resources.
     :ivar active_decode_count: Decode generations with live resources.
     :ivar safely_retired_count: Fully retired request generations.
     :ivar quarantined_count: Generations retaining quarantined resources.
+    :ivar quarantined_binding_digests: Exact retained quarantine identities.
     :ivar armed_deadline_count: Exact active deadline count.
     :ivar transition_count: Authoritative native reducer commit count.
     :ivar action_count: Production actions earned since construction.
     :ivar qualification_trace_count: Test-only retained correlated traces.
     :ivar started: Whether the native reactor started.
     :ivar admission_open: Whether new lifecycle registrations remain accepted.
-    :ivar event_admission_open: Whether unretired producers may submit events.
+    :ivar event_admission_open: Whether registered producers may still drain
+        existing lifecycles.
     :ivar draining: Whether fail-closed drain began.
     :ivar closed: Whether exact clean closure completed.
     :ivar input_eventfd_open: Whether the native input descriptor remains open.
     :ivar output_eventfd_open: Whether the action descriptor remains open.
+    :ivar output_drain_active: Whether the sole consumer owns a swapped batch.
     :ivar fatal_code: Sticky first process-fatal code.
     :ivar fatal_binding_digest: Exact triggering binding when request-local.
     :ivar deadline_table_digest: Hash-bound table retained by the reactor.
@@ -1288,14 +1309,18 @@ class NativeTerminalOwnerInventory:
 
     input_capacity: int
     output_capacity: int
+    fatal_output_capacity: int
     queued_input_count: int
     queued_output_count: int
+    queued_fatal_output_count: int
+    pending_action_count: int
     registered_producer_count: int
     joined_producer_count: int
     active_source_count: int
     active_decode_count: int
     safely_retired_count: int
     quarantined_count: int
+    quarantined_binding_digests: tuple[bytes, ...]
     armed_deadline_count: int
     transition_count: int
     action_count: int
@@ -1307,6 +1332,7 @@ class NativeTerminalOwnerInventory:
     closed: bool
     input_eventfd_open: bool
     output_eventfd_open: bool
+    output_drain_active: bool
     fatal_code: NativeTerminalOwnerFatalCode
     fatal_binding_digest: bytes | None
     deadline_table_digest: bytes
@@ -1317,8 +1343,11 @@ class NativeTerminalOwnerInventory:
         counts = (
             self.input_capacity,
             self.output_capacity,
+            self.fatal_output_capacity,
             self.queued_input_count,
             self.queued_output_count,
+            self.queued_fatal_output_count,
+            self.pending_action_count,
             self.registered_producer_count,
             self.joined_producer_count,
             self.active_source_count,
@@ -1332,14 +1361,32 @@ class NativeTerminalOwnerInventory:
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("native inventory counts must be non-negative")
-        if self.input_capacity == 0 or self.output_capacity == 0:
+        if (
+            self.input_capacity == 0
+            or self.output_capacity == 0
+            or self.fatal_output_capacity == 0
+        ):
             raise ValueError("native inventory capacities must be positive")
         if self.queued_input_count > self.input_capacity:
             raise ValueError("native input queue exceeds its physical capacity")
-        if self.queued_output_count > self.output_capacity:
+        normal_output_count = self.queued_output_count - self.queued_fatal_output_count
+        if normal_output_count < 0 or normal_output_count > self.output_capacity:
             raise ValueError("native output queue exceeds its physical capacity")
+        if self.queued_fatal_output_count > self.fatal_output_capacity:
+            raise ValueError("native fatal output queue exceeds its reserve")
         if self.joined_producer_count > self.registered_producer_count:
             raise ValueError("joined producer count exceeds registered producers")
+        if type(self.quarantined_binding_digests) is not tuple or any(
+            type(digest) is not bytes or len(digest) != _DIGEST_BYTES
+            for digest in self.quarantined_binding_digests
+        ):
+            raise ValueError("quarantined binding digests must contain 32 bytes")
+        if len(set(self.quarantined_binding_digests)) != len(
+            self.quarantined_binding_digests
+        ):
+            raise ValueError("quarantined binding digests must be unique")
+        if len(self.quarantined_binding_digests) != self.quarantined_count:
+            raise ValueError("quarantine count and identities disagree")
         flags = (
             self.started,
             self.admission_open,
@@ -1348,6 +1395,7 @@ class NativeTerminalOwnerInventory:
             self.closed,
             self.input_eventfd_open,
             self.output_eventfd_open,
+            self.output_drain_active,
         )
         if any(type(value) is not bool for value in flags):
             raise TypeError("native inventory lifecycle flags must be bool values")
@@ -1362,15 +1410,20 @@ class NativeTerminalOwnerInventory:
         )
         if self.closed:
             if self.admission_open or self.event_admission_open:
-                raise ValueError("closed native inventory cannot accept admission")
-            if self.joined_producer_count != self.registered_producer_count:
+                raise ValueError("closed native inventory cannot accept work")
+            if (
+                self.fatal_code is NativeTerminalOwnerFatalCode.NONE
+                and self.joined_producer_count != self.registered_producer_count
+            ):
                 raise ValueError("closed native inventory has unjoined producers")
             if (
                 self.queued_input_count != 0
                 or self.queued_output_count != 0
+                or self.pending_action_count != 0
                 or self.active_source_count != 0
                 or self.active_decode_count != 0
                 or self.armed_deadline_count != 0
+                or self.output_drain_active
             ):
                 raise ValueError("closed native inventory retains active work")
             if self.input_eventfd_open or self.output_eventfd_open:
@@ -1391,14 +1444,20 @@ class NativeTerminalOwnerInventory:
         return cls(
             input_capacity=int(value["input_capacity"]),
             output_capacity=int(value["output_capacity"]),
+            fatal_output_capacity=int(value["fatal_output_capacity"]),
             queued_input_count=int(value["queued_input_count"]),
             queued_output_count=int(value["queued_output_count"]),
+            queued_fatal_output_count=int(value["queued_fatal_output_count"]),
+            pending_action_count=int(value["pending_action_count"]),
             registered_producer_count=int(value["registered_producer_count"]),
             joined_producer_count=int(value["joined_producer_count"]),
             active_source_count=int(value["active_source_count"]),
             active_decode_count=int(value["active_decode_count"]),
             safely_retired_count=int(value["safely_retired_count"]),
             quarantined_count=int(value["quarantined_count"]),
+            quarantined_binding_digests=tuple(
+                bytes(digest) for digest in value["quarantined_binding_digests"]
+            ),
             armed_deadline_count=int(value["armed_deadline_count"]),
             transition_count=int(value["transition_count"]),
             action_count=int(value["action_count"]),
@@ -1410,6 +1469,7 @@ class NativeTerminalOwnerInventory:
             closed=bool(value["closed"]),
             input_eventfd_open=bool(value["input_eventfd_open"]),
             output_eventfd_open=bool(value["output_eventfd_open"]),
+            output_drain_active=bool(value["output_drain_active"]),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
             fatal_binding_digest=fatal_binding_digest,
             deadline_table_digest=bytes(value["deadline_table_digest"]),

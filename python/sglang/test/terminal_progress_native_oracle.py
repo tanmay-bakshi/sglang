@@ -83,6 +83,12 @@ class OracleOwnerAction(enum.StrEnum):
     REQUEST_RETIRED = "request_retired"
     REQUEST_QUARANTINED = "request_quarantined"
     PROCESS_FATAL = "process_fatal"
+    SOURCE_GATHER_READY = "source_gather_ready"
+    SOURCE_OUTCOME_READY = "source_outcome_ready"
+    SOURCE_ACK_READY = "source_ack_ready"
+    DECODE_SCATTER_READY = "decode_scatter_ready"
+    DECODE_TEARDOWN_READY = "decode_teardown_ready"
+    GATEWAY_PUBLICATION_READY = "gateway_publication_ready"
 
 
 class OracleDeadlineOutcome(enum.StrEnum):
@@ -414,10 +420,6 @@ _DECODE_RECEIPT_REQUIREMENTS = {
         TerminalReceiptKind.ADOPTION_READY,
         TerminalReceiptOutcome.SUCCESS,
     ),
-    DecodeLifecycleEventKind.METADATA_CONSUMED: (
-        TerminalReceiptKind.METADATA_CONSUMED,
-        TerminalReceiptOutcome.SUCCESS,
-    ),
     DecodeLifecycleEventKind.REQUEST_READY_RECEIVED: (
         TerminalReceiptKind.REQUEST_READY,
         TerminalReceiptOutcome.SUCCESS,
@@ -712,7 +714,6 @@ def decode_oracle_paths() -> tuple[OracleLifecyclePath, ...]:
     )
     metadata = make_oracle_event(
         DecodeLifecycleEventKind.METADATA_CONSUMED,
-        receipt_key="decode-path-metadata",
     )
     local_ready = make_oracle_event(DecodeLifecycleEventKind.LOCAL_DECODE_READY_ISSUED)
     request_ready = make_oracle_event(
@@ -1222,12 +1223,23 @@ def _oracle_actions(
 
     actions = [OracleOwnerAction.STATE_COMMITTED]
     if type(previous) is SourceLifecycle and type(current) is SourceLifecycle:
+        if current.phase is SourceLifecyclePhase.GATHERING:
+            actions.append(OracleOwnerAction.SOURCE_GATHER_READY)
+        if current.phase is SourceLifecyclePhase.LOCAL_TRANSFER_TERMINAL:
+            actions.append(OracleOwnerAction.SOURCE_OUTCOME_READY)
+        if current.phase is SourceLifecyclePhase.TEARDOWN_RECEIVED:
+            actions.append(OracleOwnerAction.SOURCE_ACK_READY)
         if (
             previous.phase is not SourceLifecyclePhase.REQUEST_READY_RECEIVED
             and current.phase is SourceLifecyclePhase.REQUEST_READY_RECEIVED
         ):
             actions.append(OracleOwnerAction.RECLAIM_AUTHORIZED)
+            actions.append(OracleOwnerAction.GATEWAY_PUBLICATION_READY)
     elif type(previous) is DecodeLifecycle and type(current) is DecodeLifecycle:
+        if current.phase is DecodeLifecyclePhase.SCATTER_READY:
+            actions.append(OracleOwnerAction.DECODE_SCATTER_READY)
+        if current.phase is DecodeLifecyclePhase.SCATTER_TERMINAL:
+            actions.append(OracleOwnerAction.DECODE_TEARDOWN_READY)
         if current.phase is DecodeLifecyclePhase.ADOPTION_READY:
             actions.append(OracleOwnerAction.ADOPTION_READY)
         if current.phase is DecodeLifecyclePhase.LOCAL_DECODE_READY:

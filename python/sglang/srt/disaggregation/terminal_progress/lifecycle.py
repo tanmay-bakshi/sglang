@@ -758,10 +758,6 @@ _DECODE_RECEIPT_EVENTS = {
         TerminalReceiptKind.ADOPTION_READY,
         TerminalReceiptOutcome.SUCCESS,
     ),
-    DecodeLifecycleEventKind.METADATA_CONSUMED: (
-        TerminalReceiptKind.METADATA_CONSUMED,
-        TerminalReceiptOutcome.SUCCESS,
-    ),
     DecodeLifecycleEventKind.REQUEST_READY_RECEIVED: (
         TerminalReceiptKind.REQUEST_READY,
         TerminalReceiptOutcome.SUCCESS,

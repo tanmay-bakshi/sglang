@@ -71,6 +71,7 @@ _ALLOCATION_DIGEST = b"a" * 32
 _LOCAL_PRODUCER_ID = 1
 _TRUSTED_PRODUCER_ID = 2
 _UNTRUSTED_PRODUCER_ID = 3
+_CONTROL_PRODUCER_ID = 4
 _WAIT_SECONDS = 2.0
 
 _SOURCE_EVENT_KINDS = {
@@ -175,6 +176,15 @@ _PROCESS_FATAL_EVENT_KINDS = frozenset(
         SourceLifecycleEventKind.SCHEDULER_INBOX_OVERFLOW,
         DecodeLifecycleEventKind.OWNER_DIED,
         DecodeLifecycleEventKind.SCHEDULER_INBOX_OVERFLOW,
+    )
+)
+_CONTROL_EVENT_KINDS = frozenset(
+    (
+        SourceLifecycleEventKind.TEARDOWN_RECEIVED,
+        DecodeLifecycleEventKind.WRITER_AGGREGATION_STARTED,
+        DecodeLifecycleEventKind.WRITER_MANIFEST_COMPLETED,
+        DecodeLifecycleEventKind.ACK_AGGREGATION_STARTED,
+        DecodeLifecycleEventKind.ACK_MANIFEST_COMPLETED,
     )
 )
 
@@ -344,6 +354,7 @@ class _NativeOracleRuntime:
             _LOCAL_PRODUCER_ID: 0,
             _TRUSTED_PRODUCER_ID: 0,
             _UNTRUSTED_PRODUCER_ID: 0,
+            _CONTROL_PRODUCER_ID: 0,
         }
         self._receipts = {}
         self._owner = NativeTerminalOwner(
@@ -380,6 +391,15 @@ class _NativeOracleRuntime:
                 producer_class=NativeTerminalProducerClass.RECEIPT,
                 allowed_role=native_role,
                 authenticated_issuer=untrusted_identity,
+            )
+        )
+        self._owner.register_producer(
+            NativeTerminalProducerRegistration(
+                producer_id=_CONTROL_PRODUCER_ID,
+                name="oracle-trusted-control",
+                producer_class=NativeTerminalProducerClass.CONTROL,
+                allowed_role=native_role,
+                authenticated_issuer=owner_identity,
             )
         )
         publication = None
@@ -454,6 +474,7 @@ class _NativeOracleRuntime:
         before_inventory = self._owner.inventory()
         event_kind = _native_event_kind(spec)
         producer_id = self._producer_id(spec, owner_minted_local_failure)
+        producer_sequence = self._producer_sequences[producer_id]
         receipt = None
         if not owner_minted_local_failure:
             receipt = self._materialize_receipt(spec.receipt, binding)
@@ -462,6 +483,7 @@ class _NativeOracleRuntime:
             enqueued_ns = self._deterministic_clock_ns
         event_mapping: dict[str, object] = {
             "producer_id": producer_id,
+            "producer_sequence": producer_sequence,
             "binding_digest": binding.digest,
             "kind": int(event_kind),
             "enqueued_ns": enqueued_ns,
@@ -489,6 +511,7 @@ class _NativeOracleRuntime:
                 self._owner.submit(
                     NativeTerminalOwnerEvent(
                         producer_id=producer_id,
+                        producer_sequence=producer_sequence,
                         binding_digest=binding.digest,
                         kind=event_kind,
                         enqueued_ns=int(event_mapping["enqueued_ns"]),
@@ -609,6 +632,8 @@ class _NativeOracleRuntime:
         :returns: Registered native producer identity.
         """
 
+        if spec.kind in _CONTROL_EVENT_KINDS:
+            return _CONTROL_PRODUCER_ID
         if owner_minted_local_failure or spec.receipt is None:
             return _LOCAL_PRODUCER_ID
         if spec.receipt.issuer is OracleReceiptIssuer.TRUSTED:
@@ -1152,9 +1177,6 @@ def _expected_native_receipt_kind(
         SourceLifecycleEventKind.REQUEST_FAILED: NativeTerminalReceiptKind.FAILURE,
         DecodeLifecycleEventKind.ADOPTION_CONSUMED: (
             NativeTerminalReceiptKind.ADOPTION_READY
-        ),
-        DecodeLifecycleEventKind.METADATA_CONSUMED: (
-            NativeTerminalReceiptKind.METADATA_CONSUMED
         ),
         DecodeLifecycleEventKind.REQUEST_READY_RECEIVED: (
             NativeTerminalReceiptKind.REQUEST_READY

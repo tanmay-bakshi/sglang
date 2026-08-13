@@ -12,6 +12,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -42,8 +43,7 @@ constexpr std::size_t kDigestBytes = 32;
 constexpr std::size_t kReceiptNonceBytes = 16;
 constexpr std::uint64_t kSourceReclaimableMask = (1ULL << 8) - 1;
 constexpr std::uint64_t kSourceResourceMask = (1ULL << 9) - 1;
-constexpr std::uint64_t kDecodeResourceMask =
-    ((1ULL << 16) - 1) ^ kSourceResourceMask;
+constexpr std::uint64_t kDecodeResourceMask = ((1ULL << 16) - 1) ^ kSourceResourceMask;
 constexpr std::size_t kQualificationMeasuredHopCount = 7;
 constexpr std::size_t kQualificationLifecycleHopCount = 10;
 constexpr std::size_t kQualificationMaximumMachineCount = 64;
@@ -148,6 +148,12 @@ enum class ActionKind : std::uint8_t {
   kRequestRetired = 4,
   kRequestQuarantined = 5,
   kProcessFatal = 6,
+  kSourceGatherReady = 7,
+  kSourceOutcomeReady = 8,
+  kSourceAckReady = 9,
+  kDecodeScatterReady = 10,
+  kDecodeTeardownReady = 11,
+  kGatewayPublicationReady = 12,
 };
 
 enum class DeadlineKind : std::uint8_t {
@@ -509,6 +515,8 @@ Receipt receipt_from_python(const py::dict &value) {
 Event event_from_python(const py::dict &value) {
   Event result{};
   result.producer_id = py::cast<std::uint64_t>(value["producer_id"]);
+  result.producer_sequence =
+      py::cast<std::uint64_t>(value["producer_sequence"]);
   result.binding_digest =
       exact_bytes<kDigestBytes>(value["binding_digest"], "binding digest");
   result.kind = static_cast<EventKind>(py::cast<int>(value["kind"]));
@@ -658,6 +666,7 @@ struct SharedOwner {
   std::condition_variable qualification_condition{};
   std::size_t input_capacity{0};
   std::size_t output_capacity{0};
+  std::size_t maximum_live_lifecycles{0};
   ProcessIdentity owner_identity{};
   Digest deadline_table_digest{};
   std::array<DeadlineSpec, 11> deadline_specs{};
@@ -665,8 +674,10 @@ struct SharedOwner {
   std::unordered_map<Digest, Lifecycle, DigestHash, DigestEqual> lifecycles{};
   std::deque<InputCommand> input_queue{};
   std::deque<Output> output_queue{};
+  std::deque<Output> fatal_output_queue{};
   std::unordered_map<std::uint64_t, Action> pending_actions{};
   std::unordered_set<std::uint64_t> consumed_actions{};
+  std::unordered_set<std::uint64_t> output_drain_action_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -681,7 +692,11 @@ struct SharedOwner {
   bool admission_open{true};
   bool event_admission_open{true};
   bool stop_requested{false};
+  bool producer_join_requested{false};
+  bool producer_join_barrier_complete{false};
   bool producers_joined{false};
+  bool abort_started{false};
+  bool reactor_stopped{false};
   bool closed{false};
   bool output_drain_active{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
@@ -886,13 +901,47 @@ bool event_requires_receipt(EventKind kind) noexcept {
   case EventKind::kSourcePublicationFailed:
   case EventKind::kSourceRequestFailed:
   case EventKind::kDecodeAdoptionConsumed:
-  case EventKind::kDecodeMetadataConsumed:
   case EventKind::kDecodeRequestReady:
   case EventKind::kDecodeRequestFailed:
     return true;
   default:
     return false;
   }
+}
+
+bool event_is_control_ingress(EventKind kind) noexcept {
+  switch (kind) {
+  case EventKind::kSourceTeardownReceived:
+  case EventKind::kDecodeWriterAggregationStarted:
+  case EventKind::kDecodeWriterManifestCompleted:
+  case EventKind::kDecodeAckAggregationStarted:
+  case EventKind::kDecodeAckManifestCompleted:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool producer_authorizes_event(const ProducerRegistration &producer,
+                               const Event &event) noexcept {
+  if (producer.producer_class == ProducerClass::kQualification) {
+    return true;
+  }
+  const bool local_failure =
+      producer.producer_class == ProducerClass::kLocal &&
+      (event.kind == EventKind::kSourceRequestFailed ||
+       event.kind == EventKind::kDecodeRequestFailed) &&
+      !event.has_receipt;
+  if (local_failure) {
+    return true;
+  }
+  if (event_requires_receipt(event.kind)) {
+    return producer.producer_class == ProducerClass::kReceipt;
+  }
+  if (event_is_control_ingress(event.kind)) {
+    return producer.producer_class == ProducerClass::kControl;
+  }
+  return producer.producer_class == ProducerClass::kLocal;
 }
 
 std::pair<ReceiptKind, ReceiptOutcome> expected_receipt(EventKind kind) {
@@ -906,8 +955,6 @@ std::pair<ReceiptKind, ReceiptOutcome> expected_receipt(EventKind kind) {
     return {ReceiptKind::kGatewayPublished, ReceiptOutcome::kSuccess};
   case EventKind::kDecodeAdoptionConsumed:
     return {ReceiptKind::kAdoptionReady, ReceiptOutcome::kSuccess};
-  case EventKind::kDecodeMetadataConsumed:
-    return {ReceiptKind::kMetadataConsumed, ReceiptOutcome::kSuccess};
   case EventKind::kSourcePublicationFailed:
   case EventKind::kSourceRequestFailed:
   case EventKind::kDecodeRequestFailed:
@@ -927,6 +974,17 @@ void validate_receipt_locked(Lifecycle &lifecycle,
   if (local_failure) {
     if (event.has_receipt) {
       throw std::runtime_error("local failure producer cannot forge a receipt");
+    }
+    return;
+  }
+  if (event_is_control_ingress(event.kind)) {
+    if (event.has_receipt) {
+      throw std::runtime_error("control ingress supplied an unexpected receipt");
+    }
+    if (!producer.has_issuer ||
+        lifecycle.trusted_issuers.count(producer.issuer.digest) != 1) {
+      throw std::runtime_error(
+          "control route issuer is not trusted by the lifecycle");
     }
     return;
   }
@@ -976,6 +1034,13 @@ void add_action_locked(SharedOwner &owner, Lifecycle &lifecycle, Output &output,
   output.actions.push_back(std::move(action));
 }
 
+void discard_unpublished_actions_locked(SharedOwner &owner,
+                                        const Output &output) noexcept {
+  for (const Action &action : output.actions) {
+    owner.pending_actions.erase(action.action_id);
+  }
+}
+
 bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
                           const Event &event, Output &output,
                           std::uint64_t completed_ns) {
@@ -997,6 +1062,8 @@ bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
     break;
   case EventKind::kSourceProducerCompleted:
     transition(SourcePhase::kWaitingForProducer, SourcePhase::kGathering);
+    add_action_locked(owner, lifecycle, output, ActionKind::kSourceGatherReady,
+                      completed_ns);
     break;
   case EventKind::kSourceGatherPosted:
     transition(SourcePhase::kGathering, SourcePhase::kNativeInFlight);
@@ -1008,6 +1075,8 @@ bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
     transition(SourcePhase::kNativeInFlight,
                SourcePhase::kLocalTransferTerminal);
     cancel_deadline_locked(lifecycle, DeadlineKind::kOwnerNativeTransfer);
+    add_action_locked(owner, lifecycle, output, ActionKind::kSourceOutcomeReady,
+                      completed_ns);
     break;
   case EventKind::kSourceOutcomesSent:
     transition(SourcePhase::kLocalTransferTerminal, SourcePhase::kOutcomesSent);
@@ -1016,6 +1085,8 @@ bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
     break;
   case EventKind::kSourceTeardownReceived:
     transition(SourcePhase::kOutcomesSent, SourcePhase::kTeardownReceived);
+    add_action_locked(owner, lifecycle, output, ActionKind::kSourceAckReady,
+                      completed_ns);
     break;
   case EventKind::kSourceAckSent:
     transition(SourcePhase::kTeardownReceived, SourcePhase::kAckSent);
@@ -1035,6 +1106,8 @@ bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
                         DeadlineKind::kOwnerGatewayPublication, completed_ns);
     add_action_locked(owner, lifecycle, output, ActionKind::kReclaimAuthorized,
                       completed_ns, ReceiptKind::kReclaimAuthorized);
+    add_action_locked(owner, lifecycle, output,
+                      ActionKind::kGatewayPublicationReady, completed_ns);
     break;
   case EventKind::kSourceReclaimConsumed:
     if ((phase != SourcePhase::kRequestReadyReceived &&
@@ -1128,6 +1201,8 @@ bool reduce_decode_locked(SharedOwner &owner, Lifecycle &lifecycle,
     break;
   case EventKind::kDecodeWriterManifestCompleted:
     transition(DecodePhase::kWriterAggregating, DecodePhase::kScatterReady);
+    add_action_locked(owner, lifecycle, output, ActionKind::kDecodeScatterReady,
+                      completed_ns);
     break;
   case EventKind::kDecodeScatterStarted:
     transition(DecodePhase::kScatterReady, DecodePhase::kScatterInFlight);
@@ -1137,6 +1212,8 @@ bool reduce_decode_locked(SharedOwner &owner, Lifecycle &lifecycle,
   case EventKind::kDecodeScatterTerminal:
     transition(DecodePhase::kScatterInFlight, DecodePhase::kScatterTerminal);
     cancel_deadline_locked(lifecycle, DeadlineKind::kOwnerDecodeScatter);
+    add_action_locked(owner, lifecycle,
+                      output, ActionKind::kDecodeTeardownReady, completed_ns);
     break;
   case EventKind::kDecodeTeardownSent:
     transition(DecodePhase::kScatterTerminal, DecodePhase::kTeardownSent);
@@ -1213,23 +1290,19 @@ bool reduce_decode_locked(SharedOwner &owner, Lifecycle &lifecycle,
   return !output.actions.empty();
 }
 
-void quarantine_all_locked(SharedOwner &owner, FatalCode code,
-                           const Event *trigger, const std::string &reason) {
-  if (owner.fatal_code != FatalCode::kNone) {
+void publish_quarantine_for_live_locked(SharedOwner &owner, FatalCode code,
+                                        const Event *trigger) {
+  const std::uint64_t completed_ns = owner_now_ns_locked(owner);
+  const std::size_t live_count = std::count_if(
+      owner.lifecycles.begin(), owner.lifecycles.end(),
+      [](const auto &entry) { return entry.second.live_resources != 0; });
+  if (owner.fatal_output_queue.size() + live_count >
+      owner.maximum_live_lifecycles) {
+    owner.fatal_code = FatalCode::kInternalError;
+    owner.fatal_reason = "fatal output reserve violated lifecycle bound";
+    owner.condition.notify_all();
     return;
   }
-  owner.fatal_code = code;
-  owner.fatal_reason = reason;
-  owner.admission_open = false;
-  owner.event_admission_open = false;
-  if (trigger != nullptr) {
-    owner.fatal_binding = trigger->binding_digest;
-    owner.fatal_producer_id = trigger->producer_id;
-    owner.fatal_producer_sequence = trigger->producer_sequence;
-    owner.fatal_reason_code = trigger->reason_code;
-    owner.fatal_backend_status = trigger->backend_status;
-  }
-  const std::uint64_t completed_ns = owner_now_ns_locked(owner);
   for (auto &entry : owner.lifecycles) {
     Lifecycle &lifecycle = entry.second;
     if (lifecycle.live_resources == 0) {
@@ -1267,13 +1340,30 @@ void quarantine_all_locked(SharedOwner &owner, FatalCode code,
     output.fatal_code = code;
     add_action_locked(owner, lifecycle, output, ActionKind::kProcessFatal,
                       completed_ns);
-    if (owner.output_queue.size() < owner.output_capacity) {
-      owner.output_queue.push_back(std::move(output));
-    }
+    owner.fatal_output_queue.push_back(std::move(output));
   }
   signal_fd_locked(owner, owner.output_fd);
   owner.condition.notify_all();
   owner.qualification_condition.notify_all();
+}
+
+void quarantine_all_locked(SharedOwner &owner, FatalCode code,
+                           const Event *trigger, const std::string &reason) {
+  if (owner.fatal_code != FatalCode::kNone) {
+    return;
+  }
+  owner.fatal_code = code;
+  owner.fatal_reason = reason;
+  owner.admission_open = false;
+  owner.event_admission_open = false;
+  if (trigger != nullptr) {
+    owner.fatal_binding = trigger->binding_digest;
+    owner.fatal_producer_id = trigger->producer_id;
+    owner.fatal_producer_sequence = trigger->producer_sequence;
+    owner.fatal_reason_code = trigger->reason_code;
+    owner.fatal_backend_status = trigger->backend_status;
+  }
+  publish_quarantine_for_live_locked(owner, code, trigger);
 }
 
 void apply_publication_owner_loss_locked(Lifecycle &lifecycle) {
@@ -1323,6 +1413,16 @@ void publication_owner_failure_locked(SharedOwner &owner, FatalCode code,
   owner.fatal_reason_code = trigger.reason_code;
   owner.fatal_backend_status = trigger.backend_status;
   const std::uint64_t completed_ns = owner_now_ns_locked(owner);
+  const std::size_t live_count = std::count_if(
+      owner.lifecycles.begin(), owner.lifecycles.end(),
+      [](const auto &entry) { return entry.second.live_resources != 0; });
+  if (owner.fatal_output_queue.size() + live_count >
+      owner.maximum_live_lifecycles) {
+    owner.fatal_code = FatalCode::kInternalError;
+    owner.fatal_reason = "fatal output reserve violated lifecycle bound";
+    owner.condition.notify_all();
+    return;
+  }
   for (auto &entry : owner.lifecycles) {
     Lifecycle &lifecycle = entry.second;
     if (lifecycle.live_resources == 0) {
@@ -1350,9 +1450,7 @@ void publication_owner_failure_locked(SharedOwner &owner, FatalCode code,
     output.fatal_code = owner.fatal_code;
     add_action_locked(owner, lifecycle, output, ActionKind::kProcessFatal,
                       completed_ns);
-    if (owner.output_queue.size() < owner.output_capacity) {
-      owner.output_queue.push_back(std::move(output));
-    }
+    owner.fatal_output_queue.push_back(std::move(output));
   }
   signal_fd_locked(owner, owner.output_fd);
   owner.condition.notify_all();
@@ -1444,6 +1542,14 @@ void expire_deadlines_locked(SharedOwner &owner) {
       add_action_locked(owner, lifecycle, output,
                         ActionKind::kRequestQuarantined, now_ns);
       if (owner.output_queue.size() >= owner.output_capacity) {
+        if (owner.fatal_output_queue.size() >=
+            owner.maximum_live_lifecycles) {
+          discard_unpublished_actions_locked(owner, output);
+          quarantine_all_locked(owner, FatalCode::kInternalError, nullptr,
+                                "deadline fatal-output reserve overflowed");
+          return;
+        }
+        owner.fatal_output_queue.push_back(std::move(output));
         quarantine_all_locked(owner, FatalCode::kOutputQueueOverflow, nullptr,
                               "deadline output overflowed");
         return;
@@ -1655,12 +1761,10 @@ void finish_qualification_transition_locked(SharedOwner &owner,
       qualification.complete = true;
       qualification.running = false;
       for (const std::uint64_t producer_id : qualification.producer_ids) {
-        ProducerRegistration &producer = owner.producers.at(producer_id);
-        producer.retirement_requested = true;
-        producer.retired = true;
+        owner.producers.at(producer_id).retirement_requested = true;
+        owner.producers.at(producer_id).retired = true;
       }
       owner.qualification_condition.notify_all();
-      owner.condition.notify_all();
     }
     return;
   }
@@ -1774,6 +1878,11 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
     return;
   }
   ++producer.next_dispatch_sequence;
+  if (!producer_authorizes_event(producer, event)) {
+    quarantine_all_locked(owner, FatalCode::kReceiptAuthority, &event,
+                          "producer class does not authorize event kind");
+    return;
+  }
   const auto lifecycle_iterator = owner.lifecycles.find(event.binding_digest);
   if (lifecycle_iterator == owner.lifecycles.end()) {
     quarantine_all_locked(owner, FatalCode::kUnknownBinding, &event,
@@ -1856,6 +1965,7 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
                                             output);
     if (!output.actions.empty()) {
       if (owner.output_queue.size() >= owner.output_capacity) {
+        discard_unpublished_actions_locked(owner, output);
         quarantine_all_locked(owner, FatalCode::kOutputQueueOverflow, &event,
                               "production action queue overflowed");
         return;
@@ -1898,6 +2008,18 @@ void retire_producer_locked(SharedOwner &owner, const InputCommand &command) {
   owner.condition.notify_all();
 }
 
+void finish_producer_join_barrier_locked(SharedOwner &owner) {
+  if (!owner.producer_join_requested ||
+      owner.producer_join_barrier_complete || !owner.input_queue.empty()) {
+    return;
+  }
+  owner.producers_joined = std::all_of(
+      owner.producers.begin(), owner.producers.end(),
+      [](const auto &entry) { return entry.second.retired; });
+  owner.producer_join_barrier_complete = true;
+  owner.condition.notify_all();
+}
+
 void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
   pollfd descriptors[3]{{owner->input_fd, POLLIN, 0},
                         {owner->timer_fd, POLLIN, 0},
@@ -1923,6 +2045,7 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
         return;
       }
       if (owner->stop_requested && owner->input_queue.empty()) {
+        finish_producer_join_barrier_locked(*owner);
         owner->condition.notify_all();
         return;
       }
@@ -1955,12 +2078,14 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
         if (owner->input_queue.empty()) {
           enqueue_next_qualification_events_locked(*owner);
           if (owner->input_queue.empty()) {
+            finish_producer_join_barrier_locked(*owner);
             break;
           }
         }
         InputCommand command = std::move(owner->input_queue.front());
         owner->input_queue.pop_front();
-        if (owner->fatal_code != FatalCode::kNone) {
+        if (owner->fatal_code != FatalCode::kNone &&
+            command.kind != InputKind::kRetireProducer) {
           continue;
         }
         if (command.kind == InputKind::kRegisterLifecycle) {
@@ -1970,12 +2095,14 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
         } else {
           retire_producer_locked(*owner, command);
         }
+        owner->condition.notify_all();
       }
     }
   }
 }
 
-int enqueue_event_locked(SharedOwner &owner, Event event) noexcept {
+int submit_event_locked(SharedOwner &owner, Event event) noexcept {
+  std::lock_guard<std::mutex> lock(owner.mutex);
   if (owner.closed || !owner.event_admission_open ||
       owner.fatal_code != FatalCode::kNone) {
     return ESHUTDOWN;
@@ -2003,42 +2130,44 @@ int enqueue_event_locked(SharedOwner &owner, Event event) noexcept {
   return owner.fatal_code == FatalCode::kNone ? 0 : EIO;
 }
 
-int submit_event_locked(SharedOwner &owner, Event event) noexcept {
+int submit_producer_retirement_locked(SharedOwner &owner,
+                                      std::uint64_t producer_id) noexcept {
   std::lock_guard<std::mutex> lock(owner.mutex);
-  return enqueue_event_locked(owner, std::move(event));
-}
-
-int enqueue_producer_retirement_locked(SharedOwner &owner,
-                                       std::uint64_t producer_id) noexcept {
-  if (owner.closed || owner.fatal_code != FatalCode::kNone) {
+  if (owner.closed) {
     return ESHUTDOWN;
   }
-  const auto producer_iterator = owner.producers.find(producer_id);
-  if (producer_iterator == owner.producers.end()) {
+  const auto producer = owner.producers.find(producer_id);
+  if (producer == owner.producers.end()) {
     return ENOENT;
   }
-  ProducerRegistration &producer = producer_iterator->second;
-  if (producer.retirement_requested || producer.retired) {
+  if (producer->second.retired) {
     return EALREADY;
+  }
+  if (owner.abort_started) {
+    producer->second.retirement_requested = true;
+    producer->second.retired = true;
+    owner.condition.notify_all();
+    return 0;
+  }
+  if (producer->second.retirement_requested) {
+    return EALREADY;
+  }
+  if (!owner.event_admission_open || owner.fatal_code != FatalCode::kNone) {
+    return ESHUTDOWN;
   }
   if (owner.input_queue.size() >= owner.input_capacity) {
     quarantine_all_locked(owner, FatalCode::kInputQueueOverflow, nullptr,
                           "producer retirement queue overflowed");
     return ENOBUFS;
   }
+  producer->second.retirement_requested = true;
   InputCommand command{};
   command.kind = InputKind::kRetireProducer;
   command.producer_id = producer_id;
-  command.retire_after_sequence = producer.next_submission_sequence;
+  command.retire_after_sequence = producer->second.next_submission_sequence;
   owner.input_queue.push_back(std::move(command));
-  producer.retirement_requested = true;
   signal_fd_locked(owner, owner.input_fd);
   return owner.fatal_code == FatalCode::kNone ? 0 : EIO;
-}
-
-bool all_producers_retired_locked(const SharedOwner &owner) noexcept {
-  return std::all_of(owner.producers.begin(), owner.producers.end(),
-                     [](const auto &entry) { return entry.second.retired; });
 }
 
 int submit_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle) noexcept {
@@ -2053,6 +2182,19 @@ int submit_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle) noexcept {
     quarantine_all_locked(owner, FatalCode::kInputQueueOverflow, &trigger,
                           "native lifecycle registration queue overflowed");
     return ENOBUFS;
+  }
+  std::size_t pending_registrations = 0;
+  for (const InputCommand &command : owner.input_queue) {
+    if (command.kind == InputKind::kRegisterLifecycle) {
+      ++pending_registrations;
+    }
+  }
+  const std::size_t active_lifecycles = std::count_if(
+      owner.lifecycles.begin(), owner.lifecycles.end(),
+      [](const auto &entry) { return entry.second.live_resources != 0; });
+  if (active_lifecycles + pending_registrations >=
+      owner.maximum_live_lifecycles) {
+    return ENOSPC;
   }
   InputCommand command{};
   command.kind = InputKind::kRegisterLifecycle;
@@ -2105,9 +2247,7 @@ int producer_capsule_submit(
         value->receipt_terminal_timestamp_ns;
     std::memcpy(event.receipt.nonce.data(), value->receipt_nonce,
                 kReceiptNonceBytes);
-  }
-  std::lock_guard<std::mutex> lock(owner->mutex);
-  if (event.has_receipt) {
+    std::lock_guard<std::mutex> lock(owner->mutex);
     const auto lifecycle = owner->lifecycles.find(event.binding_digest);
     if (lifecycle == owner->lifecycles.end()) {
       return ENOENT;
@@ -2119,7 +2259,7 @@ int producer_capsule_submit(
     }
     event.receipt.issuer = producer->second.issuer;
   }
-  return enqueue_event_locked(*owner, std::move(event));
+  return submit_event_locked(*owner, std::move(event));
 }
 
 int producer_capsule_retire(void *context) noexcept {
@@ -2131,8 +2271,7 @@ int producer_capsule_retire(void *context) noexcept {
   if (owner == nullptr) {
     return ESHUTDOWN;
   }
-  std::lock_guard<std::mutex> lock(owner->mutex);
-  return enqueue_producer_retirement_locked(*owner, capsule->producer_id);
+  return submit_producer_retirement_locked(*owner, capsule->producer_id);
 }
 
 int producer_capsule_join(void *context, std::uint64_t timeout_ns) noexcept {
@@ -2159,10 +2298,7 @@ int producer_capsule_join(void *context, std::uint64_t timeout_ns) noexcept {
     if (producer == owner->producers.end()) {
       return ENOENT;
     }
-    if (producer->second.retired) {
-      return 0;
-    }
-    return ESHUTDOWN;
+    return producer->second.retired ? 0 : ESHUTDOWN;
   } catch (...) {
     return EIO;
   }
@@ -2181,15 +2317,18 @@ class NativeTerminalOwnerBridge {
 public:
   NativeTerminalOwnerBridge(std::size_t input_capacity,
                             std::size_t output_capacity,
+                            std::size_t maximum_live_lifecycles,
                             const py::dict &owner_identity,
                             const py::sequence &deadline_table,
                             const py::bytes &deadline_table_digest)
       : owner_(std::make_shared<SharedOwner>()) {
-    if (input_capacity == 0 || output_capacity == 0) {
+    if (input_capacity == 0 || output_capacity == 0 ||
+        maximum_live_lifecycles == 0) {
       throw std::invalid_argument("owner queue capacities must be positive");
     }
     owner_->input_capacity = input_capacity;
     owner_->output_capacity = output_capacity;
+    owner_->maximum_live_lifecycles = maximum_live_lifecycles;
     owner_->owner_identity = process_identity_from_python(owner_identity);
     owner_->deadline_table_digest =
         exact_bytes<kDigestBytes>(deadline_table_digest,
@@ -2389,7 +2528,23 @@ public:
                                 "output eventfd read failed");
       }
       outputs.swap(owner_->output_queue);
-      owner_->output_drain_active = false;
+      outputs.insert(outputs.end(),
+                     std::make_move_iterator(owner_->fatal_output_queue.begin()),
+                     std::make_move_iterator(owner_->fatal_output_queue.end()));
+      owner_->fatal_output_queue.clear();
+      for (const Output &output : outputs) {
+        for (const Action &action : output.actions) {
+          if (!owner_->output_drain_action_ids.insert(action.action_id).second) {
+            owner_->output_drain_active = false;
+            quarantine_all_locked(*owner_, FatalCode::kInternalError, nullptr,
+                                  "output drain duplicated an action identity");
+            throw std::runtime_error(
+                "output drain duplicated an action identity");
+          }
+        }
+      }
+      owner_->output_drain_active =
+          !owner_->output_drain_action_ids.empty();
       owner_->condition.notify_all();
     }
     py::list result;
@@ -2412,6 +2567,44 @@ public:
     }
     owner_->pending_actions.erase(action);
     owner_->consumed_actions.insert(action_id);
+    if (owner_->output_drain_active) {
+      if (owner_->output_drain_action_ids.erase(action_id) != 1) {
+        quarantine_all_locked(*owner_, FatalCode::kUnknownAction, nullptr,
+                              "action acknowledgement bypassed output drain");
+        throw std::runtime_error(
+            "action acknowledgement bypassed output drain");
+      }
+      if (owner_->output_drain_action_ids.empty()) {
+        owner_->output_drain_active = false;
+      }
+    }
+    owner_->condition.notify_all();
+  }
+
+  void fail_action_delivery(std::uint64_t action_id,
+                            const std::string &reason) {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    const auto action = owner_->pending_actions.find(action_id);
+    if (action == owner_->pending_actions.end()) {
+      throw std::runtime_error(
+          "failed action delivery was absent or already resolved");
+    }
+    Event trigger{};
+    trigger.binding_digest = action->second.binding.digest;
+    trigger.enqueued_ns = owner_now_ns_locked(*owner_);
+    trigger.kind = action->second.binding.owner.role == OwnerRole::kSource
+                       ? EventKind::kSourceInboxOverflow
+                       : EventKind::kDecodeInboxOverflow;
+    owner_->pending_actions.erase(action);
+    owner_->output_drain_action_ids.erase(action_id);
+    if (owner_->output_drain_action_ids.empty()) {
+      owner_->output_drain_active = false;
+    }
+    if (owner_->fatal_code == FatalCode::kNone) {
+      quarantine_all_locked(*owner_, FatalCode::kOutputQueueOverflow,
+                            &trigger, reason);
+    }
+    owner_->condition.notify_all();
   }
 
   py::dict inventory() const {
@@ -2503,10 +2696,6 @@ public:
       owner_->event_admission_open = false;
       owner_->qualification.running = false;
       owner_->stop_requested = true;
-      for (auto &entry : owner_->producers) {
-        entry.second.retirement_requested = true;
-        entry.second.retired = true;
-      }
       owner_->producers_joined = true;
       owner_->input_queue.clear();
       for (auto &entry : owner_->lifecycles) {
@@ -2700,37 +2889,63 @@ public:
     owner_->admission_open = false;
   }
 
-  int retire_python_producer(std::uint64_t producer_id) {
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    return enqueue_producer_retirement_locked(*owner_, producer_id);
+  bool join_producers() {
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    if (owner_->closed) {
+      return false;
+    }
+    if (owner_->abort_started) {
+      owner_->producers_joined = std::all_of(
+          owner_->producers.begin(), owner_->producers.end(),
+          [](const auto &entry) { return entry.second.retired; });
+      return owner_->producers_joined;
+    }
+    const bool every_retirement_requested = std::all_of(
+        owner_->producers.begin(), owner_->producers.end(),
+        [](const auto &entry) {
+          return entry.second.retirement_requested || entry.second.retired;
+        });
+    if (!every_retirement_requested) {
+      return false;
+    }
+    if (!owner_->producer_join_requested) {
+      owner_->producer_join_requested = true;
+      owner_->event_admission_open = false;
+      signal_fd_locked(*owner_, owner_->input_fd);
+    }
+    owner_->condition.wait(lock, [&]() {
+      return owner_->producer_join_barrier_complete ||
+             owner_->closed;
+    });
+    return owner_->producers_joined;
   }
 
-  bool wait_for_producer_retirement(std::uint64_t producer_id,
-                                    double timeout_seconds) {
+  void retire_python_producer(std::uint64_t producer_id) {
+    const int status = submit_producer_retirement_locked(*owner_, producer_id);
+    if (status != 0) {
+      throw std::system_error(status, std::generic_category(),
+                              "producer retirement failed");
+    }
+  }
+
+  bool wait_for_output_quiescence(double timeout_seconds) {
     if (timeout_seconds <= 0.0) {
-      throw std::invalid_argument("producer retirement wait must be positive");
+      throw std::invalid_argument(
+          "output quiescence wait must be positive");
     }
     std::unique_lock<std::mutex> lock(owner_->mutex);
-    if (owner_->producers.count(producer_id) != 1) {
-      throw std::invalid_argument("producer retirement requires registration");
+    if (!owner_->producers_joined) {
+      return false;
     }
     return owner_->condition.wait_for(
-               lock, std::chrono::duration<double>(timeout_seconds),
-               [&]() {
-                 return owner_->producers.at(producer_id).retired ||
-                        owner_->fatal_code != FatalCode::kNone ||
-                        owner_->closed;
-               }) &&
-           owner_->producers.at(producer_id).retired;
-  }
-
-  bool join_producers() {
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    owner_->producers_joined = all_producers_retired_locked(*owner_);
-    if (owner_->producers_joined) {
-      owner_->event_admission_open = false;
-    }
-    return owner_->producers_joined;
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return owner_->input_queue.empty() &&
+                 owner_->output_queue.empty() &&
+                 owner_->fatal_output_queue.empty() &&
+                 owner_->pending_actions.empty() &&
+                 !owner_->output_drain_active &&
+                 !owner_->qualification.running;
+        });
   }
 
   void close() {
@@ -2741,13 +2956,13 @@ public:
         return;
       }
       owner_->admission_open = false;
-      owner_->producers_joined = all_producers_retired_locked(*owner_);
-      if (owner_->producers_joined) {
-        owner_->event_admission_open = false;
-      }
+      owner_->event_admission_open = false;
       bool retained = !owner_->input_queue.empty() ||
                       !owner_->output_queue.empty() ||
+                      !owner_->fatal_output_queue.empty() ||
                       !owner_->pending_actions.empty() ||
+                      owner_->output_drain_active ||
+                      !owner_->output_drain_action_ids.empty() ||
                       !owner_->producers_joined;
       for (const auto &entry : owner_->lifecycles) {
         retained = retained || entry.second.live_resources != 0;
@@ -2771,28 +2986,43 @@ public:
     owner_->closed = true;
   }
 
-  void abort_and_close() noexcept {
-    if (owner_ == nullptr) {
-      return;
-    }
+  void begin_abort() {
     std::thread reactor;
     {
       std::lock_guard<std::mutex> lock(owner_->mutex);
       if (owner_->closed) {
         return;
       }
+      if (owner_->abort_started) {
+        return;
+      }
+      owner_->abort_started = true;
       owner_->admission_open = false;
       owner_->event_admission_open = false;
+      owner_->stop_requested = true;
+      owner_->qualification.running = false;
+      for (InputCommand &command : owner_->input_queue) {
+        if (command.kind != InputKind::kRegisterLifecycle) {
+          continue;
+        }
+        register_lifecycle_locked(*owner_, std::move(command.lifecycle));
+      }
+      for (const InputCommand &command : owner_->input_queue) {
+        if (command.kind != InputKind::kRetireProducer) {
+          continue;
+        }
+        auto producer = owner_->producers.find(command.producer_id);
+        if (producer != owner_->producers.end()) {
+          producer->second.retired = true;
+        }
+      }
+      owner_->input_queue.clear();
       if (owner_->fatal_code == FatalCode::kNone) {
         quarantine_all_locked(*owner_, FatalCode::kDependencyDeath, nullptr,
                               "owner aborted before clean close");
-      }
-      owner_->stop_requested = true;
-      owner_->qualification.running = false;
-      owner_->producers_joined = true;
-      owner_->input_queue.clear();
-      for (auto &entry : owner_->lifecycles) {
-        quarantine_live(entry.second);
+      } else {
+        publish_quarantine_for_live_locked(*owner_, owner_->fatal_code,
+                                           nullptr);
       }
       signal_fd_locked(*owner_, owner_->shutdown_fd);
       reactor = std::move(owner_->reactor);
@@ -2800,7 +3030,51 @@ public:
     if (reactor.joinable()) {
       reactor.join();
     }
+    {
+      std::lock_guard<std::mutex> lock(owner_->mutex);
+      owner_->reactor_stopped = true;
+      owner_->condition.notify_all();
+    }
+  }
+
+  void close_aborted() {
     std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (owner_->closed) {
+      return;
+    }
+    if (!owner_->abort_started || !owner_->reactor_stopped ||
+        owner_->fatal_code == FatalCode::kNone || !owner_->producers_joined) {
+      throw std::runtime_error(
+          "aborted close requires terminal authority and producer join");
+    }
+    if (!owner_->output_queue.empty() || !owner_->pending_actions.empty() ||
+        !owner_->fatal_output_queue.empty() ||
+        owner_->output_drain_active ||
+        !owner_->output_drain_action_ids.empty()) {
+      throw std::runtime_error(
+          "aborted close retained unrouted terminal authority");
+    }
+    close_fds_locked();
+    owner_->closed = true;
+  }
+
+  void abort_and_close() noexcept {
+    if (owner_ == nullptr) {
+      return;
+    }
+    try {
+      begin_abort();
+    } catch (...) {
+    }
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (owner_->closed) {
+      return;
+    }
+    owner_->output_queue.clear();
+    owner_->fatal_output_queue.clear();
+    owner_->pending_actions.clear();
+    owner_->output_drain_action_ids.clear();
+    owner_->output_drain_active = false;
     close_fds_locked();
     owner_->closed = true;
   }
@@ -2826,6 +3100,7 @@ private:
     std::size_t quarantined_count = 0;
     std::size_t armed_deadline_count = 0;
     py::list bindings;
+    py::list quarantined_binding_digests;
     for (const auto &entry : owner_->lifecycles) {
       const Lifecycle &lifecycle = entry.second;
       if (lifecycle.live_resources != 0) {
@@ -2841,6 +3116,7 @@ private:
       }
       if (lifecycle.quarantined_resources != 0) {
         ++quarantined_count;
+        quarantined_binding_digests.append(to_bytes(lifecycle.binding.digest));
       }
       armed_deadline_count += static_cast<std::size_t>(
           __builtin_popcount(static_cast<unsigned>(
@@ -2872,16 +3148,21 @@ private:
     result["deadline_table"] = std::move(deadline_table);
     result["input_capacity"] = owner_->input_capacity;
     result["output_capacity"] = owner_->output_capacity;
+    result["fatal_output_capacity"] = owner_->maximum_live_lifecycles;
     result["queued_input_count"] = owner_->input_queue.size();
-    result["queued_output_count"] = owner_->output_queue.size();
+    result["queued_output_count"] =
+        owner_->output_queue.size() + owner_->fatal_output_queue.size();
+    result["queued_fatal_output_count"] = owner_->fatal_output_queue.size();
     result["registered_producer_count"] = owner_->producers.size();
-    result["joined_producer_count"] =
-        std::count_if(owner_->producers.begin(), owner_->producers.end(),
-                      [](const auto &entry) { return entry.second.retired; });
+    result["joined_producer_count"] = std::count_if(
+        owner_->producers.begin(), owner_->producers.end(),
+        [](const auto &entry) { return entry.second.retired; });
     result["active_source_count"] = active_source_count;
     result["active_decode_count"] = active_decode_count;
     result["safely_retired_count"] = retired_count;
     result["quarantined_count"] = quarantined_count;
+    result["quarantined_binding_digests"] =
+        std::move(quarantined_binding_digests);
     result["armed_deadline_count"] = armed_deadline_count;
     result["transition_count"] = owner_->next_owner_sequence;
     result["action_count"] = owner_->total_action_count;
@@ -2897,7 +3178,9 @@ private:
     result["lifecycles"] = std::move(bindings);
     result["input_queue_count"] = owner_->input_queue.size();
     result["output_queue_count"] = owner_->output_queue.size();
+    result["fatal_output_queue_count"] = owner_->fatal_output_queue.size();
     result["pending_action_count"] = owner_->pending_actions.size();
+    result["output_drain_active"] = owner_->output_drain_active;
     result["producer_count"] = owner_->producers.size();
     py::list producers;
     for (const auto &entry : owner_->producers) {
@@ -2980,14 +3263,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("PRODUCER_CONTEXT_CAPSULE_NAME") =
       SGLANG_TERMINAL_OWNER_PRODUCER_CONTEXT_CAPSULE_NAME;
   py::class_<NativeTerminalOwnerBridge>(module, "NativeTerminalOwnerBridge")
-      .def(py::init<std::size_t, std::size_t, const py::dict &,
+      .def(py::init<std::size_t, std::size_t, std::size_t, const py::dict &,
                     const py::sequence &, const py::bytes &>(),
            py::arg("input_capacity"), py::arg("output_capacity"),
+           py::arg("maximum_live_lifecycles"),
            py::arg("owner_identity"), py::arg("deadline_table"),
            py::arg("deadline_table_digest"))
-      .def("register_producer", &NativeTerminalOwnerBridge::register_producer,
-           py::arg("producer_id"), py::arg("name"), py::arg("producer_class"),
-           py::arg("allowed_role"),
+      .def("register_producer",
+           &NativeTerminalOwnerBridge::register_producer,
+           py::arg("producer_id"), py::arg("name"),
+           py::arg("producer_class"), py::arg("allowed_role"),
            py::arg("authenticated_issuer") = py::none())
       .def("register_source", &NativeTerminalOwnerBridge::register_source,
            py::arg("registration"))
@@ -3002,14 +3287,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("producer_id"))
       .def("output_fileno", &NativeTerminalOwnerBridge::output_fileno)
       .def("drain_outputs", &NativeTerminalOwnerBridge::drain_outputs)
-      .def("acknowledge_action", &NativeTerminalOwnerBridge::acknowledge_action,
+      .def("acknowledge_action",
+           &NativeTerminalOwnerBridge::acknowledge_action,
            py::arg("action_id"), py::call_guard<py::gil_scoped_release>())
+      .def("fail_action_delivery",
+           &NativeTerminalOwnerBridge::fail_action_delivery,
+           py::arg("action_id"), py::arg("reason"),
+           py::call_guard<py::gil_scoped_release>())
       .def("inventory", &NativeTerminalOwnerBridge::inventory)
       .def("wait_for_lifecycle_registration",
            &NativeTerminalOwnerBridge::wait_for_lifecycle_registration,
            py::arg("binding_digest"), py::arg("timeout_seconds"))
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
-      .def("lifecycle_snapshot", &NativeTerminalOwnerBridge::lifecycle_snapshot,
+      .def("lifecycle_snapshot",
+           &NativeTerminalOwnerBridge::lifecycle_snapshot,
            py::arg("binding_digest"))
       .def("enable_test_clock", &NativeTerminalOwnerBridge::enable_test_clock,
            py::arg("now_ns"))
@@ -3026,20 +3317,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("machine_count"), py::arg("minimum_duration_seconds"),
            py::arg("minimum_transition_count"),
            py::call_guard<py::gil_scoped_release>())
-      .def("qualification_join", &NativeTerminalOwnerBridge::qualification_join,
-           py::arg("timeout_seconds"), py::call_guard<py::gil_scoped_release>())
+      .def("qualification_join",
+           &NativeTerminalOwnerBridge::qualification_join,
+           py::arg("timeout_seconds"),
+           py::call_guard<py::gil_scoped_release>())
       .def("qualification_summary",
            &NativeTerminalOwnerBridge::qualification_summary)
       .def("stop_admission", &NativeTerminalOwnerBridge::stop_admission,
            py::call_guard<py::gil_scoped_release>())
+      .def("join_producers", &NativeTerminalOwnerBridge::join_producers,
+           py::call_guard<py::gil_scoped_release>())
       .def("retire_python_producer",
            &NativeTerminalOwnerBridge::retire_python_producer,
            py::arg("producer_id"), py::call_guard<py::gil_scoped_release>())
-      .def("wait_for_producer_retirement",
-           &NativeTerminalOwnerBridge::wait_for_producer_retirement,
-           py::arg("producer_id"), py::arg("timeout_seconds"),
+      .def("wait_for_output_quiescence",
+           &NativeTerminalOwnerBridge::wait_for_output_quiescence,
+           py::arg("timeout_seconds"),
            py::call_guard<py::gil_scoped_release>())
-      .def("join_producers", &NativeTerminalOwnerBridge::join_producers,
+      .def("begin_abort", &NativeTerminalOwnerBridge::begin_abort,
+           py::call_guard<py::gil_scoped_release>())
+      .def("close_aborted", &NativeTerminalOwnerBridge::close_aborted,
            py::call_guard<py::gil_scoped_release>())
       .def("close", &NativeTerminalOwnerBridge::close,
            py::call_guard<py::gil_scoped_release>())

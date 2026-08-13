@@ -674,12 +674,6 @@ def test_decode_valid_path_retires_all_resources() -> None:
         current,
         DecodeLifecycleEvent(
             kind=DecodeLifecycleEventKind.METADATA_CONSUMED,
-            receipt=issue_receipt(
-                issuer,
-                current.binding,
-                TerminalReceiptKind.METADATA_CONSUMED,
-                timestamp_ns=21,
-            ),
         ),
     ).current
     current = reduce_decode_lifecycle(

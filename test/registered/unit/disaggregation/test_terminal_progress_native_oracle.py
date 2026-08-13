@@ -154,7 +154,7 @@ def test_source_join_orders_reach_the_same_fully_retired_state() -> None:
     assert publication_intermediate.live_resources == SOURCE_RECLAIMABLE_RESOURCES
 
 
-def test_decode_path_exposes_all_three_receipt_governed_joins() -> None:
+def test_decode_path_separates_receipt_authority_from_local_metadata_ack() -> None:
     path_by_name = {path.name: path for path in decode_oracle_paths()}
     adoption_case = next(
         case
@@ -215,6 +215,7 @@ def test_owner_action_and_receipt_oracle_marks_exact_authority_boundaries() -> N
     assert source_ready.actions == (
         OracleOwnerAction.STATE_COMMITTED,
         OracleOwnerAction.RECLAIM_AUTHORIZED,
+        OracleOwnerAction.GATEWAY_PUBLICATION_READY,
     )
     assert source_ready.emitted_receipts == (TerminalReceiptKind.RECLAIM_AUTHORIZED,)
     assert decode_adoption.actions == (
