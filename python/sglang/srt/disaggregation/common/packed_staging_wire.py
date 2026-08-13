@@ -1,4 +1,5 @@
 import msgspec
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryDestinationSegment,
