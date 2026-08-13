@@ -2,6 +2,10 @@ import dataclasses
 import time
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
+from sglang.srt.disaggregation.terminal_progress.deadlines import (
+    TerminalDeadlineKind,
+    terminal_deadline_spec,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -20,6 +24,7 @@ from sglang.srt.disaggregation.terminal_progress.native_owner import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeDecodeLifecyclePhase,
     NativeSourceLifecyclePhase,
+    NativeTerminalDeadlineKind,
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
@@ -50,6 +55,7 @@ from sglang.test.terminal_progress_native_oracle import (
     OracleReductionError,
     OracleTransitionCase,
     OracleTransitionEvaluation,
+    decode_oracle_paths,
     evaluate_oracle_transition,
     make_oracle_event,
     source_oracle_paths,
@@ -237,6 +243,52 @@ class NativePublisherDeathBlastRadius:
     fatal_code: NativeTerminalOwnerFatalCode
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class NativeDeadlineArmContext:
+    """One role-specific lifecycle context which arms a native deadline.
+
+    :ivar name: Stable reader-facing context identity.
+    :ivar kind: Exact native deadline kind armed by the context.
+    :ivar role: Lifecycle role which owns the deadline.
+    :ivar path_name: Canonical accepted path reaching the armed context.
+    """
+
+    name: str
+    kind: NativeTerminalDeadlineKind
+    role: TerminalOwnerRole
+    path_name: str
+
+    def __post_init__(self) -> None:
+        """Validate one complete role-specific deadline context."""
+
+        if type(self.name) is not str or len(self.name) == 0:
+            raise ValueError("deadline context name must be non-empty")
+        if type(self.kind) is not NativeTerminalDeadlineKind:
+            raise TypeError("deadline context kind must be native")
+        if type(self.role) is not TerminalOwnerRole:
+            raise TypeError("deadline context role must be TerminalOwnerRole")
+        if type(self.path_name) is not str or len(self.path_name) == 0:
+            raise ValueError("deadline context path name must be non-empty")
+
+    @property
+    def duration_ns(self) -> int:
+        """Return the frozen duration for this native deadline.
+
+        :returns: Hash-bound deadline duration in nanoseconds.
+        """
+
+        return terminal_deadline_spec(TerminalDeadlineKind[self.kind.name]).duration_ns
+
+    @property
+    def armed_mask(self) -> int:
+        """Return the single deadline bit expected in this context.
+
+        :returns: Native deadline bit mask.
+        """
+
+        return 1 << (int(self.kind) - 1)
+
+
 class _NativeOracleRuntime:
     """Fresh real native owner and deterministic receipt namespace."""
 
@@ -247,6 +299,7 @@ class _NativeOracleRuntime:
     _bindings_by_room: dict[int, NativeTerminalRequestBinding]
     _owner_identity: NativeTerminalProcessIdentity
     _untrusted_identity: NativeTerminalProcessIdentity
+    _deterministic_clock_ns: int | None
     _producer_sequences: dict[int, int]
     _receipts: dict[
         tuple[bytes, str], tuple[OracleReceiptSpec, NativeTerminalReceipt]
@@ -297,6 +350,7 @@ class _NativeOracleRuntime:
         self._bindings_by_room = {71: self._binding}
         self._owner_identity = owner_identity
         self._untrusted_identity = untrusted_identity
+        self._deterministic_clock_ns = deterministic_clock_ns
         self._producer_sequences = {
             _LOCAL_PRODUCER_ID: 0,
             _TRUSTED_PRODUCER_ID: 0,
@@ -415,12 +469,15 @@ class _NativeOracleRuntime:
         receipt = None
         if not owner_minted_local_failure:
             receipt = self._materialize_receipt(spec.receipt, binding)
+        enqueued_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        if self._deterministic_clock_ns is not None:
+            enqueued_ns = self._deterministic_clock_ns
         event_mapping: dict[str, object] = {
             "producer_id": producer_id,
             "producer_sequence": producer_sequence,
             "binding_digest": binding.digest,
             "kind": int(event_kind),
-            "enqueued_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
+            "enqueued_ns": enqueued_ns,
             "receipt": None if receipt is None else receipt.to_native(),
             "reason": spec.reason,
         }
@@ -528,6 +585,7 @@ class _NativeOracleRuntime:
         """
 
         self._owner.set_test_clock(now_ns)
+        self._deterministic_clock_ns = now_ns
         self._owner.expire_deadlines_for_testing()
 
     def _snapshot(
@@ -699,6 +757,126 @@ def evaluate_native_differential_case(
             observed=observed,
             mismatches=_compare_step(expected, observed),
         )
+    finally:
+        runtime.abort_and_close()
+
+
+def native_deadline_arm_contexts() -> tuple[NativeDeadlineArmContext, ...]:
+    """Return every role-specific context which arms native deadline kinds 3-9.
+
+    Deadline kinds shared by source and decode have one context per role. The
+    source scheduler-consumption and publication contexts complete the other
+    join first so exactly one same-anchor deadline remains armed.
+
+    :returns: Ten contexts ordered by native deadline kind and lifecycle role.
+    """
+
+    return (
+        NativeDeadlineArmContext(
+            name="source-producer-and-gather",
+            kind=NativeTerminalDeadlineKind.OWNER_PRODUCER_AND_GATHER,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-waiting_for_producer",
+        ),
+        NativeDeadlineArmContext(
+            name="source-native-transfer",
+            kind=NativeTerminalDeadlineKind.OWNER_NATIVE_TRANSFER,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-native_in_flight",
+        ),
+        NativeDeadlineArmContext(
+            name="decode-scatter",
+            kind=NativeTerminalDeadlineKind.OWNER_DECODE_SCATTER,
+            role=TerminalOwnerRole.DECODE,
+            path_name="decode-scatter_in_flight",
+        ),
+        NativeDeadlineArmContext(
+            name="source-teardown-ack",
+            kind=NativeTerminalDeadlineKind.OWNER_TEARDOWN_ACK,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-outcomes_sent",
+        ),
+        NativeDeadlineArmContext(
+            name="decode-teardown-ack",
+            kind=NativeTerminalDeadlineKind.OWNER_TEARDOWN_ACK,
+            role=TerminalOwnerRole.DECODE,
+            path_name="decode-teardown_sent",
+        ),
+        NativeDeadlineArmContext(
+            name="source-request-global-ready",
+            kind=NativeTerminalDeadlineKind.OWNER_REQUEST_GLOBAL_READY,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-ack_sent",
+        ),
+        NativeDeadlineArmContext(
+            name="decode-request-global-ready",
+            kind=NativeTerminalDeadlineKind.OWNER_REQUEST_GLOBAL_READY,
+            role=TerminalOwnerRole.DECODE,
+            path_name="decode-local-ready",
+        ),
+        NativeDeadlineArmContext(
+            name="source-scheduler-receipt-consumption",
+            kind=NativeTerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-ready-gateway-published",
+        ),
+        NativeDeadlineArmContext(
+            name="decode-scheduler-receipt-consumption",
+            kind=NativeTerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION,
+            role=TerminalOwnerRole.DECODE,
+            path_name="decode-adoption_ready",
+        ),
+        NativeDeadlineArmContext(
+            name="source-gateway-publication",
+            kind=NativeTerminalDeadlineKind.OWNER_GATEWAY_PUBLICATION,
+            role=TerminalOwnerRole.SOURCE,
+            path_name="source-ready-reclaim-consumed",
+        ),
+    )
+
+
+def evaluate_native_deadline_boundary(
+    context: NativeDeadlineArmContext,
+    *,
+    started_ns: int,
+    now_ns: int,
+) -> NativeDifferentialStep:
+    """Evaluate one armed native deadline at a deterministic timestamp.
+
+    :param context: Exact role-specific deadline context.
+    :param started_ns: Deterministic timestamp used by the arming transition.
+    :param now_ns: Deterministic timestamp at which expiry is evaluated.
+    :returns: Native lifecycle disposition and emitted actions.
+    """
+
+    if type(context) is not NativeDeadlineArmContext:
+        raise TypeError("context must be NativeDeadlineArmContext")
+    if type(started_ns) is not int or started_ns <= 0:
+        raise ValueError("started_ns must be a positive integer")
+    if type(now_ns) is not int or now_ns < started_ns:
+        raise ValueError("now_ns must not precede started_ns")
+    paths = source_oracle_paths()
+    if context.role is TerminalOwnerRole.DECODE:
+        paths = decode_oracle_paths()
+    matches = tuple(path for path in paths if path.name == context.path_name)
+    if len(matches) != 1:
+        raise RuntimeError("deadline context path must resolve exactly once")
+    path = matches[0]
+    runtime = _NativeOracleRuntime(
+        context.role,
+        deterministic_clock_ns=started_ns,
+    )
+    try:
+        for event in path.events:
+            step = runtime.apply(event)
+            if step.fatal_code is not NativeTerminalOwnerFatalCode.NONE:
+                raise RuntimeError("deadline setup became process-fatal")
+        armed = runtime.snapshot()
+        if armed.armed_deadline_mask != context.armed_mask:
+            raise RuntimeError(
+                "deadline context did not isolate its exact native deadline"
+            )
+        return runtime.expire_deadline_at(now_ns)
     finally:
         runtime.abort_and_close()
 

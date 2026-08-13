@@ -22,7 +22,9 @@ from sglang.srt.disaggregation.terminal_progress.native_owner import (
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NATIVE_SOURCE_RECLAIMABLE_MASK,
+    NativeDecodeLifecyclePhase,
     NativeSourceLifecyclePhase,
+    NativeTerminalDeadlineKind,
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
@@ -38,11 +40,14 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.terminal_progress_native_differential import (
+    NativeDeadlineArmContext,
     NativeDifferentialPathError,
     NativeDifferentialResult,
+    evaluate_native_deadline_boundary,
     evaluate_native_differential_case,
     evaluate_native_post_publication_quarantine_request_failure,
     evaluate_native_publisher_death_blast_radius,
+    native_deadline_arm_contexts,
 )
 from sglang.test.terminal_progress_native_oracle import (
     OracleTransitionCase,
@@ -64,6 +69,7 @@ pytestmark = pytest.mark.skipif(
 _DYNAMIC_PRODUCER_ID = 97
 _DYNAMIC_WAIT_SECONDS = 2.0
 _DYNAMIC_PROCESS_GENERATION = bytes.fromhex("11223344556677889900aabbccddeeff")
+_DEADLINE_STARTED_NS = 5_000_000_003
 
 
 def test_real_native_owner_matches_all_526_reachable_state_event_pairs() -> None:
@@ -281,6 +287,95 @@ def test_active_qualification_abort_is_bounded_and_closes_the_reactor() -> None:
     inventory = owner.inventory()
     assert inventory.closed
     assert inventory.queued_input_count == 0
+
+
+def test_native_deadline_contexts_cover_every_current_role_specific_arm() -> None:
+    contexts = native_deadline_arm_contexts()
+
+    assert len(contexts) == 10
+    assert tuple(context.kind for context in contexts) == (
+        NativeTerminalDeadlineKind.OWNER_PRODUCER_AND_GATHER,
+        NativeTerminalDeadlineKind.OWNER_NATIVE_TRANSFER,
+        NativeTerminalDeadlineKind.OWNER_DECODE_SCATTER,
+        NativeTerminalDeadlineKind.OWNER_TEARDOWN_ACK,
+        NativeTerminalDeadlineKind.OWNER_TEARDOWN_ACK,
+        NativeTerminalDeadlineKind.OWNER_REQUEST_GLOBAL_READY,
+        NativeTerminalDeadlineKind.OWNER_REQUEST_GLOBAL_READY,
+        NativeTerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION,
+        NativeTerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION,
+        NativeTerminalDeadlineKind.OWNER_GATEWAY_PUBLICATION,
+    )
+    assert NativeTerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN not in {
+        context.kind for context in contexts
+    }
+
+
+@pytest.mark.parametrize(
+    "context",
+    native_deadline_arm_contexts(),
+    ids=lambda context: context.name,
+)
+@pytest.mark.parametrize(
+    "boundary_delta_ns",
+    (-1, 0, 1),
+    ids=("before", "at", "after"),
+)
+def test_native_deadline_expiry_is_exact_and_preserves_lifetime_proof(
+    context: NativeDeadlineArmContext,
+    boundary_delta_ns: int,
+) -> None:
+    expires_ns = _DEADLINE_STARTED_NS + context.duration_ns
+    step = evaluate_native_deadline_boundary(
+        context,
+        started_ns=_DEADLINE_STARTED_NS,
+        now_ns=expires_ns + boundary_delta_ns,
+    )
+
+    assert step.before.armed_deadline_mask == context.armed_mask
+    if boundary_delta_ns < 0:
+        assert step.after == step.before
+        assert step.actions == ()
+        assert step.receipts == ()
+        assert step.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert step.output_previous_phases == ()
+        return
+
+    assert step.after.armed_deadline_mask == 0
+    assert step.after.live_resources == 0
+    assert step.after.retired_resources == step.before.retired_resources
+    assert step.after.quarantined_resources == (
+        step.before.quarantined_resources | step.before.live_resources
+    )
+    assert step.receipts == ()
+    assert step.output_previous_phases == (step.before.phase,)
+    if context.kind < NativeTerminalDeadlineKind.OWNER_SCHEDULER_RECEIPT_CONSUMPTION:
+        expected_phase = int(NativeSourceLifecyclePhase.QUARANTINED)
+        if context.role is TerminalOwnerRole.DECODE:
+            expected_phase = int(NativeDecodeLifecyclePhase.QUARANTINED)
+        assert step.after.phase == expected_phase
+        assert step.actions == (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        )
+        assert step.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert not step.after.process_fatal
+        return
+
+    assert step.actions == (NativeTerminalOwnerActionKind.PROCESS_FATAL,)
+    assert step.fatal_code is NativeTerminalOwnerFatalCode.DEADLINE_EXPIRY
+    assert step.after.process_fatal
+    if context.kind is NativeTerminalDeadlineKind.OWNER_GATEWAY_PUBLICATION:
+        assert step.before.retired_resources == NATIVE_SOURCE_RECLAIMABLE_MASK
+        assert step.before.live_resources == int(
+            NativeTerminalResource.PUBLICATION_IDENTITY
+        )
+        assert step.after.phase == int(
+            NativeSourceLifecyclePhase.PUBLICATION_QUARANTINED
+        )
+        return
+    expected_phase = int(NativeSourceLifecyclePhase.QUARANTINED)
+    if context.role is TerminalOwnerRole.DECODE:
+        expected_phase = int(NativeDecodeLifecyclePhase.QUARANTINED)
+    assert step.after.phase == expected_phase
 
 
 def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
