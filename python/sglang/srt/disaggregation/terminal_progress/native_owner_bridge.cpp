@@ -2532,6 +2532,32 @@ public:
     owner_->condition.notify_all();
   }
 
+  void fail_action_delivery(std::uint64_t action_id,
+                            const std::string &reason) {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    const auto action = owner_->pending_actions.find(action_id);
+    if (action == owner_->pending_actions.end()) {
+      throw std::runtime_error(
+          "failed action delivery was absent or already resolved");
+    }
+    Event trigger{};
+    trigger.binding_digest = action->second.binding.digest;
+    trigger.enqueued_ns = owner_now_ns_locked(*owner_);
+    trigger.kind = action->second.binding.owner.role == OwnerRole::kSource
+                       ? EventKind::kSourceInboxOverflow
+                       : EventKind::kDecodeInboxOverflow;
+    owner_->pending_actions.erase(action);
+    owner_->output_drain_action_ids.erase(action_id);
+    if (owner_->output_drain_action_ids.empty()) {
+      owner_->output_drain_active = false;
+    }
+    if (owner_->fatal_code == FatalCode::kNone) {
+      quarantine_all_locked(*owner_, FatalCode::kOutputQueueOverflow,
+                            &trigger, reason);
+    }
+    owner_->condition.notify_all();
+  }
+
   py::dict inventory() const {
     std::lock_guard<std::mutex> lock(owner_->mutex);
     return inventory_locked();
@@ -3205,6 +3231,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("acknowledge_action",
            &NativeTerminalOwnerBridge::acknowledge_action,
            py::arg("action_id"), py::call_guard<py::gil_scoped_release>())
+      .def("fail_action_delivery",
+           &NativeTerminalOwnerBridge::fail_action_delivery,
+           py::arg("action_id"), py::arg("reason"),
+           py::call_guard<py::gil_scoped_release>())
       .def("inventory", &NativeTerminalOwnerBridge::inventory)
       .def("wait_for_lifecycle_registration",
            &NativeTerminalOwnerBridge::wait_for_lifecycle_registration,

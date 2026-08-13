@@ -324,6 +324,7 @@ class _RuntimeProducer:
     registration: NativeTerminalProducerRegistration
     delivery: NativeTerminalProducerDelivery
     _next_sequence: int
+    _retirement_requested: bool
     _lock: threading.Lock
 
     def __init__(self, spec: NativeTerminalRuntimeProducerSpec) -> None:
@@ -335,6 +336,7 @@ class _RuntimeProducer:
         self.registration = spec.registration
         self.delivery = spec.delivery
         self._next_sequence = 0
+        self._retirement_requested = False
         self._lock = threading.Lock()
 
 
@@ -1156,7 +1158,11 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "producer retirement requires closed lifecycle admission"
                 )
-        self._owner.retire_python_producer(producer_id)
+        with producer._lock:
+            if producer._retirement_requested:
+                raise NativeTerminalRuntimeError("producer was already retired")
+            self._owner.retire_python_producer(producer_id)
+            producer._retirement_requested = True
 
     def join_producers(self) -> None:
         """Verify every registered producer retired and close event admission."""
@@ -1415,6 +1421,10 @@ class NativeTerminalRuntime:
         if timestamp_ns is None:
             timestamp_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         with producer._lock:
+            if producer._retirement_requested:
+                raise NativeTerminalRuntimeClosedError(
+                    "retired producer cannot submit another event"
+                )
             event = NativeTerminalOwnerEvent(
                 producer_id=registration.producer_id,
                 producer_sequence=producer._next_sequence,
@@ -1481,7 +1491,17 @@ class NativeTerminalRuntime:
         if type(output) is not NativeTerminalOwnerOutput:
             raise TypeError("output must be NativeTerminalOwnerOutput")
         for action in output.actions:
-            self._route_action(action)
+            try:
+                self._route_action(action)
+            except Exception:  # noqa: BLE001
+                formatted_traceback = traceback.format_exc()
+                self._owner.fail_action_delivery(
+                    action,
+                    "runtime consumer rejected a native terminal action",
+                )
+                with self._condition:
+                    self._enter_runtime_fatal_locked(formatted_traceback)
+                continue
             self._owner.acknowledge_action(action)
         try:
             self._observations._enqueue(output)

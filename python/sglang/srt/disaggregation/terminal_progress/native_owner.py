@@ -100,6 +100,13 @@ class _NativeTerminalOwnerBridge(Protocol):
         :param action_id: One-shot native action identity.
         """
 
+    def fail_action_delivery(self, action_id: int, reason: str) -> None:
+        """Reject one action and atomically enter fail-closed authority.
+
+        :param action_id: Exact action which no consumer could accept.
+        :param reason: Stable consumer-boundary failure evidence.
+        """
+
     def inventory(self) -> Mapping[str, object]:
         """Return the complete process-lifetime owner inventory.
 
@@ -547,6 +554,21 @@ class NativeTerminalOwner:
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
         self._native.acknowledge_action(action.action_id)
+
+    def fail_action_delivery(
+        self, action: NativeTerminalOwnerAction, reason: str
+    ) -> None:
+        """Reject one action and enter the native process-fatal path.
+
+        :param action: Action which failed bounded consumer admission.
+        :param reason: Complete consumer-boundary failure evidence.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        self._native.fail_action_delivery(action.action_id, reason)
 
     def inventory(self) -> NativeTerminalOwnerInventory:
         """Return the complete validated native owner inventory.

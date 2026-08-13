@@ -1,4 +1,5 @@
 import selectors
+import time
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -266,6 +267,78 @@ def _drain_observations(runtime: NativeTerminalRuntime) -> None:
         runtime.observations.drain()
 
 
+def _retire_all_producers(runtime: NativeTerminalRuntime) -> None:
+    """Retire every test producer through its owning delivery boundary.
+
+    :param runtime: Draining runtime with no further producer work.
+    """
+
+    for producer_id in (
+        _LOCAL_PRODUCER_ID,
+        _OWNER_RECEIPT_PRODUCER_ID,
+        _REMOTE_RECEIPT_PRODUCER_ID,
+        _REMOTE_CONTROL_PRODUCER_ID,
+    ):
+        runtime.retire_python_producer(producer_id)
+    runtime._owner.retire_python_producer(_NATIVE_PRODUCER_ID)
+
+
+def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
+    """Drive the explicit abort drain used by exceptional test cleanup.
+
+    :param runtime: Runtime whose producer and consumer authority must drain.
+    """
+
+    if runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.STOPPED:
+        return
+    runtime.begin_abort()
+    _retire_all_producers(runtime)
+    runtime.join_producers()
+    action_inboxes = (
+        runtime.scheduler_actions,
+        runtime.coordinator_actions,
+        runtime.lifecycle_actions,
+        runtime.source_work_actions,
+        runtime.decode_work_actions,
+        runtime.publisher_actions,
+    )
+    expires_at = time.monotonic() + _WAIT_SECONDS
+    with selectors.DefaultSelector() as selector:
+        for inbox in action_inboxes:
+            selector.register(inbox.fileno(), selectors.EVENT_READ, inbox)
+        selector.register(
+            runtime.observations.fileno(),
+            selectors.EVENT_READ,
+            runtime.observations,
+        )
+        while True:
+            snapshot = runtime.snapshot()
+            queued_count = sum(
+                inbox.snapshot().queued_count for inbox in action_inboxes
+            )
+            queued_count += runtime.observations.snapshot().queued_count
+            if (
+                snapshot.owner.pending_action_count == 0
+                and snapshot.consumer_pending_count == 0
+                and queued_count == 0
+            ):
+                break
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError("fail-closed runtime drain expired")
+            ready = selector.select(remaining)
+            if len(ready) == 0:
+                raise TimeoutError("fail-closed runtime drain did not wake")
+            for key, _ in ready:
+                inbox = key.data
+                if inbox is runtime.observations:
+                    inbox.drain()
+                    continue
+                for action in inbox.drain():
+                    runtime.acknowledge_aborted_action(action)
+    runtime.finish_abort_close()
+
+
 def _complete_source(
     runtime: NativeTerminalRuntime,
     registration: NativeTerminalLifecycleRegistration,
@@ -392,6 +465,7 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
         assert snapshot.consumer_pending_count == 0
         assert snapshot.dropped_observation_count > 0
         _drain_observations(runtime)
+        _retire_all_producers(runtime)
         runtime.join_producers()
         with pytest.raises(NativeTerminalRuntimeClosedError):
             runtime.submit(
@@ -402,7 +476,7 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
             )
         runtime.close_clean()
     finally:
-        runtime.abort_and_close()
+        _finish_fail_closed(runtime)
 
 
 def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
@@ -497,11 +571,12 @@ def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
         assert snapshot.scheduler_pending_count == 0
         assert snapshot.consumer_pending_count == 0
         runtime.stop_admission()
+        _retire_all_producers(runtime)
         runtime.join_producers()
         _drain_observations(runtime)
         runtime.close_clean()
     finally:
-        runtime.abort_and_close()
+        _finish_fail_closed(runtime)
 
 
 def test_runtime_producer_directory_prevents_dynamic_or_cross_domain_authority() -> (
@@ -547,10 +622,11 @@ def test_runtime_producer_directory_prevents_dynamic_or_cross_domain_authority()
                 NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
             )
         runtime.stop_admission()
+        _retire_all_producers(runtime)
         runtime.join_producers()
         runtime.close_clean()
     finally:
-        runtime.abort_and_close()
+        _finish_fail_closed(runtime)
 
 
 def test_runtime_queue_overflow_enters_one_process_fatal_path() -> None:
@@ -614,6 +690,6 @@ def test_runtime_queue_overflow_enters_one_process_fatal_path() -> None:
         assert snapshot.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
         assert snapshot.fatal_reason is not None
         assert "scheduler" in snapshot.fatal_reason
-        assert snapshot.output_reactor_alive is False
+        assert snapshot.output_reactor_alive
     finally:
-        runtime.abort_and_close()
+        _finish_fail_closed(runtime)
