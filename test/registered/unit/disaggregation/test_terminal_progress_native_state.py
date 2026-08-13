@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
@@ -215,6 +217,21 @@ def test_native_receipt_preserves_authenticated_wire_authority() -> None:
     assert native.nonce == RECEIPT_NONCE
     roundtrip = NativeTerminalReceipt.from_native(native.to_native())
     assert roundtrip == native
+    assert native.binding.to_binding() == binding
+    assert native.issuer.to_identity() == issuer
+    assert native.to_wire_receipt() == wire
+
+
+def test_native_to_python_conversion_rejects_digest_drift() -> None:
+    binding = make_binding(TerminalOwnerRole.SOURCE)
+    native = NativeTerminalRequestBinding.from_binding(binding)
+    corrupt_binding = dataclasses.replace(native, digest=b"x" * 32)
+    corrupt_owner = dataclasses.replace(native.owner, digest=b"y" * 32)
+
+    with pytest.raises(ValueError, match="binding digest"):
+        corrupt_binding.to_binding()
+    with pytest.raises(ValueError, match="process identity digest"):
+        corrupt_owner.to_identity()
 
 
 def test_native_event_has_no_producer_selected_phase() -> None:

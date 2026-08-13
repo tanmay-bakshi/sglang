@@ -2,6 +2,9 @@ import dataclasses
 import enum
 from collections.abc import Mapping
 
+from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedRequestKey,
+)
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     PACKED_TERMINAL_DEADLINES,
     TerminalDeadlineKind,
@@ -266,6 +269,7 @@ _ROLE_TO_NATIVE = {
     TerminalOwnerRole.SOURCE: NativeTerminalOwnerRole.SOURCE,
     TerminalOwnerRole.DECODE: NativeTerminalOwnerRole.DECODE,
 }
+_NATIVE_TO_ROLE = {value: key for key, value in _ROLE_TO_NATIVE.items()}
 _RECEIPT_KIND_TO_NATIVE = {
     TerminalReceiptKind.ADOPTION_READY: NativeTerminalReceiptKind.ADOPTION_READY,
     TerminalReceiptKind.METADATA_CONSUMED: (
@@ -288,6 +292,12 @@ _RECEIPT_OUTCOME_TO_NATIVE = {
     TerminalReceiptOutcome.SUCCESS: NativeTerminalReceiptOutcome.SUCCESS,
     TerminalReceiptOutcome.FAILURE: NativeTerminalReceiptOutcome.FAILURE,
     TerminalReceiptOutcome.CANCELLED: NativeTerminalReceiptOutcome.CANCELLED,
+}
+_NATIVE_TO_RECEIPT_KIND = {
+    value: key for key, value in _RECEIPT_KIND_TO_NATIVE.items()
+}
+_NATIVE_TO_RECEIPT_OUTCOME = {
+    value: key for key, value in _RECEIPT_OUTCOME_TO_NATIVE.items()
 }
 _DEADLINE_KIND_TO_NATIVE = {
     TerminalDeadlineKind.EXISTING_NIXL_CAPABILITY_READY: (
@@ -533,6 +543,22 @@ class NativeTerminalProcessIdentity:
             "digest": self.digest,
         }
 
+    def to_identity(self) -> TerminalProcessIdentity:
+        """Recover the canonical Python identity with digest verification.
+
+        :returns: Exact process identity represented by this native value.
+        """
+
+        identity = TerminalProcessIdentity(
+            process_generation=self.process_generation,
+            role=_NATIVE_TO_ROLE[self.role],
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+        if identity.digest != self.digest:
+            raise ValueError("native process identity digest is inconsistent")
+        return identity
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class NativeTerminalRequestBinding:
@@ -603,6 +629,25 @@ class NativeTerminalRequestBinding:
             "allocation_digest": self.allocation_digest,
             "digest": self.digest,
         }
+
+    def to_binding(self) -> TerminalRequestBinding:
+        """Recover the canonical Python binding with digest verification.
+
+        :returns: Exact request binding represented by this native value.
+        """
+
+        binding = TerminalRequestBinding(
+            request_key=PackedRequestKey(
+                room_id=self.room_id,
+                request_generation=self.request_generation,
+            ),
+            owner=self.owner.to_identity(),
+            rank_manifest_digest=self.rank_manifest_digest,
+            allocation_digest=self.allocation_digest,
+        )
+        if binding.digest != self.digest:
+            raise ValueError("native request binding digest is inconsistent")
+        return binding
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -736,6 +781,21 @@ class NativeTerminalReceipt:
             "terminal_timestamp_ns": self.terminal_timestamp_ns,
             "nonce": self.nonce,
         }
+
+    def to_wire_receipt(self) -> TerminalWireReceipt:
+        """Recover the canonical authenticated-route receipt value.
+
+        :returns: Exact wire receipt represented by this native value.
+        """
+
+        return TerminalWireReceipt(
+            binding=self.binding.to_binding(),
+            issuer=self.issuer.to_identity(),
+            kind=_NATIVE_TO_RECEIPT_KIND[self.kind],
+            outcome=_NATIVE_TO_RECEIPT_OUTCOME[self.outcome],
+            terminal_timestamp_ns=self.terminal_timestamp_ns,
+            receipt_nonce=self.nonce,
+        )
 
     @classmethod
     def from_native(cls, value: Mapping[str, object]) -> "NativeTerminalReceipt":

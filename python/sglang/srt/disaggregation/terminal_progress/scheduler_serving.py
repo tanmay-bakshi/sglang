@@ -6,28 +6,17 @@ import traceback
 from collections.abc import Callable
 from typing import Protocol, TypeVar, runtime_checkable
 
-from sglang.srt.disaggregation.common.packed_staging_protocol import (
-    PackedRequestKey,
-)
+from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
-    TerminalProcessIdentity,
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.inbox import SchedulerInboxError
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
-    NativeTerminalOwnerRole,
-    NativeTerminalProcessIdentity,
     NativeTerminalReceipt,
-    NativeTerminalReceiptKind,
-    NativeTerminalReceiptOutcome,
     NativeTerminalRequestBinding,
-)
-from sglang.srt.disaggregation.terminal_progress.receipts import (
-    TerminalReceiptKind,
-    TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxFatalError,
@@ -161,82 +150,6 @@ class TerminalSchedulerServingInventory:
             raise TypeError("fatal_delivered must be bool")
 
 
-_NATIVE_ROLE_TO_TERMINAL = {
-    NativeTerminalOwnerRole.SOURCE: TerminalOwnerRole.SOURCE,
-    NativeTerminalOwnerRole.DECODE: TerminalOwnerRole.DECODE,
-}
-_NATIVE_KIND_TO_TERMINAL = {
-    NativeTerminalReceiptKind.ADOPTION_READY: TerminalReceiptKind.ADOPTION_READY,
-    NativeTerminalReceiptKind.METADATA_CONSUMED: (
-        TerminalReceiptKind.METADATA_CONSUMED
-    ),
-    NativeTerminalReceiptKind.LOCAL_DECODE_READY: (
-        TerminalReceiptKind.LOCAL_DECODE_READY
-    ),
-    NativeTerminalReceiptKind.REQUEST_READY: TerminalReceiptKind.REQUEST_READY,
-    NativeTerminalReceiptKind.RECLAIM_AUTHORIZED: (
-        TerminalReceiptKind.RECLAIM_AUTHORIZED
-    ),
-    NativeTerminalReceiptKind.RECLAIM_CONSUMED: (TerminalReceiptKind.RECLAIM_CONSUMED),
-    NativeTerminalReceiptKind.GATEWAY_PUBLISHED: (
-        TerminalReceiptKind.GATEWAY_PUBLISHED
-    ),
-    NativeTerminalReceiptKind.FAILURE: TerminalReceiptKind.FAILURE,
-}
-_NATIVE_OUTCOME_TO_TERMINAL = {
-    NativeTerminalReceiptOutcome.SUCCESS: TerminalReceiptOutcome.SUCCESS,
-    NativeTerminalReceiptOutcome.FAILURE: TerminalReceiptOutcome.FAILURE,
-    NativeTerminalReceiptOutcome.CANCELLED: TerminalReceiptOutcome.CANCELLED,
-}
-
-
-def _terminal_process_identity(
-    identity: NativeTerminalProcessIdentity,
-) -> TerminalProcessIdentity:
-    """Convert one collision-checked native process identity.
-
-    :param identity: Exact native owner or issuer identity.
-    :returns: Canonical Python process identity.
-    """
-
-    if type(identity) is not NativeTerminalProcessIdentity:
-        raise TypeError("identity must be NativeTerminalProcessIdentity")
-    result = TerminalProcessIdentity(
-        process_generation=identity.process_generation,
-        role=_NATIVE_ROLE_TO_TERMINAL[identity.role],
-        tp_rank=identity.tp_rank,
-        tp_size=identity.tp_size,
-    )
-    if result.digest != identity.digest:
-        raise ValueError("native process identity digest is inconsistent")
-    return result
-
-
-def _terminal_request_binding(
-    binding: NativeTerminalRequestBinding,
-) -> TerminalRequestBinding:
-    """Convert one collision-checked native request binding.
-
-    :param binding: Exact native request binding.
-    :returns: Canonical Python request binding.
-    """
-
-    if type(binding) is not NativeTerminalRequestBinding:
-        raise TypeError("binding must be NativeTerminalRequestBinding")
-    result = TerminalRequestBinding(
-        request_key=PackedRequestKey(
-            room_id=binding.room_id,
-            request_generation=binding.request_generation,
-        ),
-        owner=_terminal_process_identity(binding.owner),
-        rank_manifest_digest=binding.rank_manifest_digest,
-        allocation_digest=binding.allocation_digest,
-    )
-    if result.digest != binding.digest:
-        raise ValueError("native request binding digest is inconsistent")
-    return result
-
-
 def _terminal_wire_receipt(receipt: NativeTerminalReceipt) -> TerminalWireReceipt:
     """Project one owner-minted receipt into the qualified inbox wire value.
 
@@ -246,14 +159,7 @@ def _terminal_wire_receipt(receipt: NativeTerminalReceipt) -> TerminalWireReceip
 
     if type(receipt) is not NativeTerminalReceipt:
         raise TypeError("receipt must be NativeTerminalReceipt")
-    return TerminalWireReceipt(
-        binding=_terminal_request_binding(receipt.binding),
-        issuer=_terminal_process_identity(receipt.issuer),
-        kind=_NATIVE_KIND_TO_TERMINAL[receipt.kind],
-        outcome=_NATIVE_OUTCOME_TO_TERMINAL[receipt.outcome],
-        terminal_timestamp_ns=receipt.terminal_timestamp_ns,
-        receipt_nonce=receipt.nonce,
-    )
+    return receipt.to_wire_receipt()
 
 
 class TerminalSchedulerServing:
@@ -370,7 +276,7 @@ class TerminalSchedulerServing:
         :param binding: Native representation owned by the terminal runtime.
         """
 
-        self.register_request(_terminal_request_binding(binding))
+        self.register_request(binding.to_binding())
 
     def cancel_unpublished_request(self, binding: TerminalRequestBinding) -> None:
         """Remove one request which can no longer receive an owner action.
