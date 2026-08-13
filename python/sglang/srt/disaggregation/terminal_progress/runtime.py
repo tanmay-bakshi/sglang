@@ -1281,10 +1281,14 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeClosedError("runtime is stopped")
             if self._disposition is NativeTerminalRuntimeDisposition.ABORT_DRAINING:
                 return
-            self._enter_runtime_fatal_locked(
-                self._fatal_reason or "runtime aborted before clean close"
-            )
-            self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
+            if self._disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL:
+                self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
+                self._condition.notify_all()
+            else:
+                self._enter_runtime_fatal_locked(
+                    self._fatal_reason or "runtime aborted before clean close"
+                )
+                self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
         self._owner.begin_abort()
 
     def finish_abort_close(self) -> None:
