@@ -478,6 +478,61 @@ def test_handoff_advances_while_unrelated_forward_barrier_stays_held() -> None:
     _fail_and_join(owner)
 
 
+def test_output_fd_rearms_after_partial_drain_without_losing_outputs() -> None:
+    """A bounded drain preserves both remaining outputs and their fd wake."""
+
+    clock = ManualTerminalOwnerClock(initial_ns=100)
+    owner = _running_owner(clock=clock)
+    binding = _binding(TerminalOwnerRole.SOURCE)
+    owner.submit(
+        RegisterSourceLifecycle(
+            binding=binding,
+            publication_identity=_publication(binding),
+            trusted_authorities=frozenset(),
+        )
+    )
+    owner.wait_for_snapshot(
+        lambda snapshot: snapshot.owner_transition_count >= 1,
+        timeout_seconds=2.0,
+    )
+    event_kinds = (
+        SourceLifecycleEventKind.SUBMISSION_ACCEPTED,
+        SourceLifecycleEventKind.PRODUCER_COMPLETED,
+    )
+    for index, event_kind in enumerate(event_kinds):
+        owner.submit(
+            ApplySourceLifecycleEvent(
+                binding=binding,
+                event=SourceLifecycleEvent(kind=event_kind),
+                timing_anchor=TerminalOwnerTimingAnchor(
+                    field=TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF,
+                    sample_key=f"source-transition-{index}",
+                    started_ns=100,
+                ),
+            ),
+            enqueued_ns=100,
+        )
+
+    assert owner.wait_for_output_count(minimum_count=2, timeout_seconds=2.0) == 2
+    readable, _, _ = select.select((owner.output_fileno(),), (), (), 0.0)
+    assert readable == [owner.output_fileno()]
+
+    first = owner.drain_outputs(maximum_items=1)
+    assert len(first) == 1
+    assert type(first[0]) is TerminalOwnerTimingSample
+    assert first[0].sample_key == "source-transition-0"
+    readable, _, _ = select.select((owner.output_fileno(),), (), (), 0.0)
+    assert readable == [owner.output_fileno()]
+
+    second = owner.drain_outputs()
+    assert len(second) == 1
+    assert type(second[0]) is TerminalOwnerTimingSample
+    assert second[0].sample_key == "source-transition-1"
+    readable, _, _ = select.select((owner.output_fileno(),), (), (), 0.0)
+    assert readable == []
+    _fail_and_join(owner)
+
+
 def test_owner_mints_immutable_adoption_authority_and_tracks_ack() -> None:
     """Decode adoption authority remains pending until exact consumer ACK."""
 
