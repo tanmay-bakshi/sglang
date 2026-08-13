@@ -223,6 +223,32 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
         evaluate_gil_qualification(plan=plan, samples=(), elapsed_seconds=1.0)
 
 
+def test_closed_loop_generations_must_be_unique_and_gap_free() -> None:
+    """Duplicate or skipped replacements cannot inflate the event population."""
+
+    plan = GILStressPlan(
+        config=GILQualificationConfig(),
+        producer=GILQualificationProducer.PYTHON_THREAD,
+    )
+    base = GILHopLatencySample(
+        machine_index=0,
+        generation_index=0,
+        hop_latencies_ns=(1,) * GIL_QUALIFICATION_OWNER_HOP_COUNT,
+    )
+    with pytest.raises(ValueError, match="unique and gap-free"):
+        evaluate_gil_qualification(
+            plan=plan,
+            samples=(base, base),
+            elapsed_seconds=1.0,
+        )
+    with pytest.raises(ValueError, match="unique and gap-free"):
+        evaluate_gil_qualification(
+            plan=plan,
+            samples=(dataclasses.replace(base, generation_index=1),),
+            elapsed_seconds=1.0,
+        )
+
+
 def test_executable_scaffold_preserves_collector_authority() -> None:
     """A concrete collector cannot upgrade a Python feeder to authority."""
 

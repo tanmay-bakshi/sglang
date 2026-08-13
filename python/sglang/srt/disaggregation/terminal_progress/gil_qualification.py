@@ -153,7 +153,7 @@ class GILHopLatencySample:
     """One correlated seven-hop owner completion path.
 
     :ivar machine_index: Closed-loop machine producing the sample.
-    :ivar generation_index: Gap-free request generation within the machine.
+    :ivar generation_index: Gap-free replacement generation within the machine.
     :ivar hop_latencies_ns: Ordered latency for every owner transition.
     """
 
@@ -332,12 +332,12 @@ def evaluate_gil_qualification(
     samples_by_machine: dict[int, list[GILHopLatencySample]] = {}
     for sample in samples:
         samples_by_machine.setdefault(sample.machine_index, []).append(sample)
-    for machine_samples in samples_by_machine.values():
-        observed_generations = sorted(
-            sample.generation_index for sample in machine_samples
-        )
-        if observed_generations != list(range(len(observed_generations))):
-            raise ValueError("sample generations must be unique and gap-free")
+    for machine_index, machine_samples in samples_by_machine.items():
+        generations = sorted(sample.generation_index for sample in machine_samples)
+        if generations != list(range(len(generations))):
+            raise ValueError(
+                f"machine {machine_index} generations must be unique and gap-free"
+            )
 
     hop_p99_ns = tuple(
         _p99_nearest_rank(

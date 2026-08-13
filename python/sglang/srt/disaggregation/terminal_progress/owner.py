@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import selectors
 import threading
 import time
@@ -53,6 +54,7 @@ from sglang.srt.disaggregation.terminal_progress.owner_events import (
     TerminalOwnerError,
     TerminalOwnerEventEnvelope,
     TerminalOwnerEventSource,
+    TerminalOwnerEventSourceFatalError,
     TerminalOwnerEventSourceRegistration,
     TerminalOwnerFatalCause,
     TerminalOwnerOutput,
@@ -310,23 +312,22 @@ class PackedTerminalProgressOwner:
             type(maximum_items) is not int or maximum_items <= 0
         ):
             raise ValueError("maximum_items must be a positive integer")
-        try:
-            self._output_pulse_source.drain()
-        except TerminalOwnerClosedError:
-            pass
         should_wake = False
         with self._condition:
+            with contextlib.suppress(TerminalOwnerClosedError):
+                self._output_pulse_source.drain()
             count = len(self._outputs)
             if maximum_items is not None:
                 count = min(count, maximum_items)
             outputs = tuple(self._outputs.popleft() for _ in range(count))
+            if len(self._outputs) > 0:
+                with contextlib.suppress(TerminalOwnerClosedError):
+                    self._output_pulse_source.signal()
             should_wake = self._disposition is TerminalOwnerDisposition.DRAINING
             self._condition.notify_all()
         if should_wake:
-            try:
+            with contextlib.suppress(TerminalOwnerClosedError):
                 self._submission_source.publish(TerminalOwnerPulse())
-            except TerminalOwnerClosedError:
-                pass
         return outputs
 
     def output_fileno(self) -> int:
@@ -471,8 +472,21 @@ class PackedTerminalProgressOwner:
         finally:
             selector.close()
             for registration in self._registrations:
-                if registration.close_on_shutdown:
+                if not registration.close_on_shutdown:
+                    continue
+                try:
                     registration.source.close()
+                except Exception:
+                    formatted_traceback = traceback.format_exc()
+                    with self._condition:
+                        self._enter_fatal_locked(
+                            cause=TerminalOwnerFatalCause.EVENT_SOURCE_FAILURE,
+                            reason=(
+                                f"event source {registration.source.name} failed "
+                                "during owner closure"
+                            ),
+                            formatted_traceback=formatted_traceback,
+                        )
             self._output_pulse_source.close()
             with self._condition:
                 self._reactor_alive = False
@@ -502,6 +516,15 @@ class PackedTerminalProgressOwner:
                 self._enter_fatal_locked(
                     cause=TerminalOwnerFatalCause.SUBMISSION_QUEUE_OVERFLOW,
                     reason=f"event source {source.name} overflowed",
+                    formatted_traceback=formatted_traceback,
+                )
+            return
+        except TerminalOwnerEventSourceFatalError as error:
+            formatted_traceback = traceback.format_exc()
+            with self._condition:
+                self._enter_fatal_locked(
+                    cause=TerminalOwnerFatalCause.EVENT_SOURCE_FAILURE,
+                    reason=str(error),
                     formatted_traceback=formatted_traceback,
                 )
             return

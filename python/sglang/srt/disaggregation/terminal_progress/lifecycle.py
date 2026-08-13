@@ -43,13 +43,13 @@ class TerminalResourceKind(enum.StrEnum):
     SOURCE_NIXL_HANDLES = "source_nixl_handles"
     SOURCE_RESULT_SLOT = "source_result_slot"
     SOURCE_REQUEST_IDENTITY = "source_request_identity"
-    SOURCE_METADATA = "source_metadata"
+    SOURCE_DFLASH_AUX_VRAM_ROWS = "source_dflash_aux_vram_rows"
     PUBLICATION_IDENTITY = "publication_identity"
     DECODE_FULL_PAGES = "decode_full_pages"
     DECODE_SWA_PAGES = "decode_swa_pages"
     DECODE_REQUEST_SLOT = "decode_request_slot"
     DECODE_STAGING_LEASE = "decode_staging_lease"
-    DECODE_METADATA_ROW = "decode_metadata_row"
+    DECODE_DFLASH_AUX_VRAM_ROWS = "decode_dflash_aux_vram_rows"
     DECODE_WRITER_STATE = "decode_writer_state"
     DECODE_NATIVE_IDENTITY = "decode_native_identity"
 
@@ -63,7 +63,7 @@ SOURCE_RECLAIMABLE_RESOURCES = frozenset(
         TerminalResourceKind.SOURCE_NIXL_HANDLES,
         TerminalResourceKind.SOURCE_RESULT_SLOT,
         TerminalResourceKind.SOURCE_REQUEST_IDENTITY,
-        TerminalResourceKind.SOURCE_METADATA,
+        TerminalResourceKind.SOURCE_DFLASH_AUX_VRAM_ROWS,
     )
 )
 SOURCE_RESOURCE_KINDS = SOURCE_RECLAIMABLE_RESOURCES | frozenset(
@@ -75,7 +75,7 @@ DECODE_RESOURCE_KINDS = frozenset(
         TerminalResourceKind.DECODE_SWA_PAGES,
         TerminalResourceKind.DECODE_REQUEST_SLOT,
         TerminalResourceKind.DECODE_STAGING_LEASE,
-        TerminalResourceKind.DECODE_METADATA_ROW,
+        TerminalResourceKind.DECODE_DFLASH_AUX_VRAM_ROWS,
         TerminalResourceKind.DECODE_WRITER_STATE,
         TerminalResourceKind.DECODE_NATIVE_IDENTITY,
     )
@@ -618,13 +618,19 @@ def _source_quarantine_all(
     :returns: Pure terminal transition result.
     """
 
-    if len(lifecycle.inventory.live) == 0:
-        raise TerminalLifecycleError(
-            "source failure has no live resource to quarantine"
-        )
     disposition = lifecycle.process_disposition
     if process_fatal:
         disposition = TerminalProcessDisposition.PROCESS_FATAL
+    if len(lifecycle.inventory.live) == 0:
+        if not process_fatal:
+            raise TerminalLifecycleError(
+                "source failure has no live resource to quarantine"
+            )
+        current = dataclasses.replace(
+            lifecycle,
+            process_disposition=disposition,
+        )
+        return SourceTransitionResult(previous=lifecycle, current=current)
     current = dataclasses.replace(
         lifecycle,
         phase=SourceLifecyclePhase.QUARANTINED,
@@ -647,46 +653,48 @@ def _source_publisher_failure(
     :returns: Pure failure transition result.
     """
 
+    if lifecycle.gateway_published:
+        if not process_fatal:
+            raise TerminalLifecycleError("a published identity cannot fail publication")
+        current = dataclasses.replace(
+            lifecycle,
+            process_disposition=TerminalProcessDisposition.PROCESS_FATAL,
+        )
+        return SourceTransitionResult(previous=lifecycle, current=current)
+    if lifecycle.publication_identity_quarantined:
+        if not process_fatal:
+            raise TerminalLifecycleError("publication identity is already quarantined")
+        current = dataclasses.replace(
+            lifecycle,
+            process_disposition=TerminalProcessDisposition.PROCESS_FATAL,
+        )
+        return SourceTransitionResult(previous=lifecycle, current=current)
+    if (
+        lifecycle.phase is not SourceLifecyclePhase.REQUEST_READY_RECEIVED
+        or not lifecycle.publication_authorized
+    ):
+        if process_fatal:
+            return _source_quarantine_all(lifecycle, process_fatal=True)
+        raise TerminalLifecycleError(
+            "publication failure requires request-global publication authority"
+        )
+    inventory = lifecycle.inventory.quarantine(
+        frozenset((TerminalResourceKind.PUBLICATION_IDENTITY,))
+    )
     disposition = lifecycle.process_disposition
     if process_fatal:
         disposition = TerminalProcessDisposition.PROCESS_FATAL
-
-    if lifecycle.publication_authorized:
-        publication_resolved = (
-            lifecycle.gateway_published or lifecycle.publication_identity_quarantined
-        )
-        if process_fatal and publication_resolved:
-            current = dataclasses.replace(
-                lifecycle,
-                process_disposition=disposition,
-            )
-            return SourceTransitionResult(previous=lifecycle, current=current)
-        if publication_resolved:
-            raise TerminalLifecycleError(
-                "publication failure requires an unresolved publication identity"
-            )
-        inventory = lifecycle.inventory.quarantine(
-            frozenset((TerminalResourceKind.PUBLICATION_IDENTITY,))
-        )
-        current = dataclasses.replace(
-            lifecycle,
-            phase=SourceLifecyclePhase.PUBLICATION_QUARANTINED,
-            inventory=inventory,
-            receipt_ledger=(
-                receipt_ledger
-                if receipt_ledger is not None
-                else lifecycle.receipt_ledger
-            ),
-            publication_identity_quarantined=True,
-            process_disposition=disposition,
-        )
-        return SourceTransitionResult(previous=lifecycle, current=current)
-
-    if process_fatal:
-        return _source_quarantine_all(lifecycle, process_fatal=True)
-    raise TerminalLifecycleError(
-        "publication failure requires request-global publication authority"
+    current = dataclasses.replace(
+        lifecycle,
+        phase=SourceLifecyclePhase.PUBLICATION_QUARANTINED,
+        inventory=inventory,
+        receipt_ledger=(
+            receipt_ledger if receipt_ledger is not None else lifecycle.receipt_ledger
+        ),
+        publication_identity_quarantined=True,
+        process_disposition=disposition,
     )
+    return SourceTransitionResult(previous=lifecycle, current=current)
 
 
 def _illegal_source_transition(

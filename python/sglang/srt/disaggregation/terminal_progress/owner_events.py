@@ -63,6 +63,48 @@ class TerminalOwnerOverflowError(TerminalOwnerError):
         self.rejected_envelope = rejected_envelope
 
 
+class TerminalOwnerEventSourceFatalError(TerminalOwnerError):
+    """Process-fatal event-source outcome retaining exact native identities."""
+
+    source_name: str
+    reason: str
+    retained_identity_labels: tuple[str, ...]
+
+    def __init__(
+        self,
+        source_name: str,
+        reason: str,
+        retained_identity_labels: tuple[str, ...],
+    ) -> None:
+        """Create immutable reader-facing evidence for one source fatal.
+
+        :param source_name: Stable registered event-source identity.
+        :param reason: Precise native or routing failure.
+        :param retained_identity_labels: Sorted exact identities which remain
+            owned or were observed while entering the fatal state.
+        """
+
+        if type(source_name) is not str or len(source_name) == 0:
+            raise ValueError("source_name must be a non-empty string")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        if type(retained_identity_labels) is not tuple or any(
+            type(label) is not str or len(label) == 0
+            for label in retained_identity_labels
+        ):
+            raise TypeError(
+                "retained_identity_labels must be a tuple of non-empty strings"
+            )
+        self.source_name = source_name
+        self.reason = reason
+        self.retained_identity_labels = retained_identity_labels
+        inventory = ",".join(retained_identity_labels)
+        super().__init__(
+            f"event source {source_name} is process-fatal: {reason}; "
+            f"retained_identities=[{inventory}]"
+        )
+
+
 class TerminalOwnerDisposition(enum.StrEnum):
     """Process-lifetime reactor disposition."""
 

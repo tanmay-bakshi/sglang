@@ -2398,12 +2398,21 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
-def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
-    if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
-        return
+def encode_ipc_payload(obj: Any) -> bytes:
+    """Serialize one IPC object without transferring socket ownership.
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    :param obj: Scheduler IPC value to freeze before another execution context
+        owns publication.
+    :returns: Bytes accepted by :func:`sock_recv` under the active IPC mode.
+    """
+
+    if _USE_PICKLE_IPC:
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return msgpack_encode(obj)
+
+
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    socket.send(encode_ipc_payload(obj), flags=flags)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
