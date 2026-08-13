@@ -379,6 +379,11 @@ class _NativeOracleRuntime:
                 )
             )
         self._owner.start()
+        for registered_binding in self._bindings_by_room.values():
+            if not self._owner.wait_for_lifecycle_registration(
+                registered_binding.digest, _WAIT_SECONDS
+            ):
+                raise TimeoutError("native lifecycle registration did not commit")
 
     def abort_and_close(self) -> None:
         """Release the bounded test owner without requiring retirement."""

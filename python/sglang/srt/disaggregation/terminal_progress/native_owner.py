@@ -45,16 +45,18 @@ class _NativeTerminalOwnerBridge(Protocol):
         :param authenticated_issuer: Route-authenticated issuer, when required.
         """
 
-    def register_source(self, registration: Mapping[str, object]) -> None:
+    def register_source(self, registration: Mapping[str, object]) -> int:
         """Register one source lifecycle before startup.
 
         :param registration: Exact source binding and publication identity.
+        :returns: Zero on ordered admission, otherwise a positive errno value.
         """
 
-    def register_decode(self, registration: Mapping[str, object]) -> None:
+    def register_decode(self, registration: Mapping[str, object]) -> int:
         """Register one decode lifecycle before startup.
 
         :param registration: Exact decode binding and trusted issuers.
+        :returns: Zero on ordered admission, otherwise a positive errno value.
         """
 
     def start(self) -> None:
@@ -109,6 +111,16 @@ class _NativeTerminalOwnerBridge(Protocol):
 
         :param binding_digest: Exact request-generation digest.
         :returns: Immutable native lifecycle mapping.
+        """
+
+    def wait_for_lifecycle_registration(
+        self, binding_digest: bytes, timeout_seconds: float
+    ) -> bool:
+        """Wait for ordered reactor registration of one binding.
+
+        :param binding_digest: Exact request-generation digest.
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether the binding became reactor-visible.
         """
 
     def enable_test_clock(self, now_ns: int) -> None:
@@ -385,9 +397,13 @@ class NativeTerminalOwner:
             raise TypeError("registration must be NativeTerminalLifecycleRegistration")
         value = registration.to_native()
         if registration.binding.owner.role is NativeTerminalOwnerRole.SOURCE:
-            self._native.register_source(value)
+            status = int(self._native.register_source(value))
+            if status != 0:
+                raise OSError(status, os.strerror(status))
             return
-        self._native.register_decode(value)
+        status = int(self._native.register_decode(value))
+        if status != 0:
+            raise OSError(status, os.strerror(status))
 
     def start(self) -> None:
         """Start the native reactor after all static registration."""
@@ -534,6 +550,31 @@ class NativeTerminalOwner:
             raise ValueError("binding_digest must contain 32 bytes")
         return NativeTerminalLifecycleSnapshot.from_native(
             self._native.lifecycle_snapshot(binding_digest)
+        )
+
+    def wait_for_lifecycle_registration(
+        self, binding_digest: bytes, timeout_seconds: float
+    ) -> bool:
+        """Wait for one ordered lifecycle registration to commit.
+
+        This is a synchronization receipt for callers which need to know that
+        the reactor has consumed registration. First events do not need this
+        wait when submitted through the same ordered input domain.
+
+        :param binding_digest: Exact request-generation digest.
+        :param timeout_seconds: Positive wall-clock wait bound.
+        :returns: Whether the lifecycle became reactor-visible.
+        """
+
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(
+            self._native.wait_for_lifecycle_registration(
+                binding_digest,
+                timeout_seconds,
+            )
         )
 
     def producer_api(self) -> object:

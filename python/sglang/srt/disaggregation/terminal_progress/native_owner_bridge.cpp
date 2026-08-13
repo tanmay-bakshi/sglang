@@ -347,6 +347,17 @@ struct Lifecycle {
   bool publication_quarantined{false};
 };
 
+enum class InputKind : std::uint8_t {
+  kRegisterLifecycle = 1,
+  kEvent = 2,
+};
+
+struct InputCommand {
+  InputKind kind{InputKind::kEvent};
+  Lifecycle lifecycle{};
+  Event event{};
+};
+
 struct QualificationState {
   bool running{false};
   bool draining{false};
@@ -670,7 +681,7 @@ struct SharedOwner {
   std::array<DeadlineSpec, 11> deadline_specs{};
   std::unordered_map<std::uint64_t, ProducerRegistration> producers{};
   std::unordered_map<Digest, Lifecycle, DigestHash, DigestEqual> lifecycles{};
-  std::deque<Event> input_queue{};
+  std::deque<InputCommand> input_queue{};
   std::deque<Output> output_queue{};
   std::unordered_map<std::uint64_t, Action> pending_actions{};
   std::unordered_set<std::uint64_t> consumed_actions{};
@@ -1676,9 +1687,10 @@ void enqueue_next_qualification_events_locked(SharedOwner &owner) {
     }
     const std::uint64_t sequence = qualification.producer_sequences[index];
     bool already_queued = false;
-    for (const Event &queued : owner.input_queue) {
-      if (queued.producer_id == qualification.producer_ids[index] &&
-          queued.producer_sequence == sequence) {
+    for (const InputCommand &queued : owner.input_queue) {
+      if (queued.kind == InputKind::kEvent &&
+          queued.event.producer_id == qualification.producer_ids[index] &&
+          queued.event.producer_sequence == sequence) {
         already_queued = true;
         break;
       }
@@ -1704,10 +1716,28 @@ void enqueue_next_qualification_events_locked(SharedOwner &owner) {
                             "qualification input queue overflowed");
       return;
     }
-    owner.input_queue.push_back(std::move(event));
+    InputCommand command{};
+    command.kind = InputKind::kEvent;
+    command.event = std::move(event);
+    owner.input_queue.push_back(std::move(command));
     ++qualification.producer_sequences[index];
   }
   signal_fd_locked(owner, owner.input_fd);
+}
+
+void register_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle,
+                               const Event *trigger) {
+  const auto existing = owner.lifecycles.find(lifecycle.binding.digest);
+  if (existing == owner.lifecycles.end()) {
+    owner.lifecycles.emplace(lifecycle.binding.digest, std::move(lifecycle));
+    owner.condition.notify_all();
+    return;
+  }
+  const std::string reason =
+      same_binding(existing->second.binding, lifecycle.binding)
+          ? "binding was already registered"
+          : "binding digest collision changed full payload";
+  quarantine_all_locked(owner, FatalCode::kDuplicateBinding, trigger, reason);
 }
 
 void dispatch_event_locked(SharedOwner &owner, const Event &event) {
@@ -1878,7 +1908,6 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
       return;
     }
     for (;;) {
-      Event event{};
       {
         std::lock_guard<std::mutex> lock(owner->mutex);
         if (owner->input_queue.empty()) {
@@ -1887,12 +1916,17 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
             break;
           }
         }
-        event = std::move(owner->input_queue.front());
+        InputCommand command = std::move(owner->input_queue.front());
         owner->input_queue.pop_front();
         if (owner->fatal_code != FatalCode::kNone) {
           continue;
         }
-        dispatch_event_locked(*owner, event);
+        if (command.kind == InputKind::kRegisterLifecycle) {
+          register_lifecycle_locked(*owner, std::move(command.lifecycle),
+                                    nullptr);
+        } else {
+          dispatch_event_locked(*owner, command.event);
+        }
       }
     }
   }
@@ -1909,7 +1943,31 @@ int submit_event_locked(SharedOwner &owner, Event event) noexcept {
                           "native producer input queue overflowed");
     return ENOBUFS;
   }
-  owner.input_queue.push_back(std::move(event));
+  InputCommand command{};
+  command.kind = InputKind::kEvent;
+  command.event = std::move(event);
+  owner.input_queue.push_back(std::move(command));
+  signal_fd_locked(owner, owner.input_fd);
+  return owner.fatal_code == FatalCode::kNone ? 0 : EIO;
+}
+
+int submit_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle) noexcept {
+  std::lock_guard<std::mutex> lock(owner.mutex);
+  if (owner.closed || !owner.admission_open ||
+      owner.fatal_code != FatalCode::kNone) {
+    return ESHUTDOWN;
+  }
+  if (owner.input_queue.size() >= owner.input_capacity) {
+    Event trigger{};
+    trigger.binding_digest = lifecycle.binding.digest;
+    quarantine_all_locked(owner, FatalCode::kInputQueueOverflow, &trigger,
+                          "native lifecycle registration queue overflowed");
+    return ENOBUFS;
+  }
+  InputCommand command{};
+  command.kind = InputKind::kRegisterLifecycle;
+  command.lifecycle = std::move(lifecycle);
+  owner.input_queue.push_back(std::move(command));
   signal_fd_locked(owner, owner.input_fd);
   return owner.fatal_code == FatalCode::kNone ? 0 : EIO;
 }
@@ -2039,6 +2097,9 @@ public:
     }
     owner_->started = true;
     owner_->reactor = std::thread(reactor_main, owner_);
+    if (!owner_->input_queue.empty()) {
+      signal_fd_locked(*owner_, owner_->input_fd);
+    }
   }
 
   void register_producer(std::uint64_t producer_id, const std::string &name,
@@ -2084,13 +2145,11 @@ public:
     }
   }
 
-  void register_source(const py::dict &registration) {
+  int register_source(const py::dict &registration) {
     RequestBinding binding =
         binding_from_python(py::cast<py::dict>(registration["binding"]));
     PublicationIdentity publication = publication_from_python(
         py::cast<py::dict>(registration["publication_identity"]));
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    require_registration_open_locked(binding);
     if (binding.owner.role != OwnerRole::kSource ||
         publication.room_id != binding.room_id ||
         publication.request_generation != binding.request_generation) {
@@ -2104,14 +2163,13 @@ public:
     lifecycle.live_resources = kSourceResourceMask;
     add_trusted_issuers(registration, lifecycle);
     lifecycle.trusted_issuers.insert(owner_->owner_identity.digest);
-    owner_->lifecycles.emplace(binding.digest, std::move(lifecycle));
+    py::gil_scoped_release release;
+    return submit_lifecycle_locked(*owner_, std::move(lifecycle));
   }
 
-  void register_decode(const py::dict &registration) {
+  int register_decode(const py::dict &registration) {
     RequestBinding binding =
         binding_from_python(py::cast<py::dict>(registration["binding"]));
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    require_registration_open_locked(binding);
     if (binding.owner.role != OwnerRole::kDecode ||
         !registration["publication_identity"].is_none()) {
       throw std::invalid_argument("decode registration identities disagree");
@@ -2123,7 +2181,8 @@ public:
     lifecycle.live_resources = kDecodeResourceMask;
     add_trusted_issuers(registration, lifecycle);
     lifecycle.trusted_issuers.insert(owner_->owner_identity.digest);
-    owner_->lifecycles.emplace(binding.digest, std::move(lifecycle));
+    py::gil_scoped_release release;
+    return submit_lifecycle_locked(*owner_, std::move(lifecycle));
   }
 
   int submit_event(const py::dict &value) {
@@ -2204,6 +2263,23 @@ public:
   py::dict inventory() const {
     std::lock_guard<std::mutex> lock(owner_->mutex);
     return inventory_locked();
+  }
+
+  bool wait_for_lifecycle_registration(const py::bytes &binding_digest,
+                                       double timeout_seconds) {
+    if (timeout_seconds <= 0.0) {
+      throw std::invalid_argument("registration wait must be positive");
+    }
+    const Digest digest =
+        exact_bytes<kDigestBytes>(binding_digest, "binding digest");
+    py::gil_scoped_release release;
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    const bool reached = owner_->condition.wait_for(
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return owner_->lifecycles.count(digest) == 1 ||
+                 owner_->fatal_code != FatalCode::kNone || owner_->closed;
+        });
+    return reached && owner_->lifecycles.count(digest) == 1;
   }
 
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
@@ -2533,20 +2609,6 @@ public:
   }
 
 private:
-  void require_registration_open_locked(const RequestBinding &binding) {
-    if (owner_->started || owner_->closed || !owner_->admission_open) {
-      throw std::runtime_error("lifecycle registration is closed");
-    }
-    const auto existing = owner_->lifecycles.find(binding.digest);
-    if (existing == owner_->lifecycles.end()) {
-      return;
-    }
-    if (!same_binding(existing->second.binding, binding)) {
-      throw std::runtime_error("binding digest collision changed full payload");
-    }
-    throw std::runtime_error("binding was already registered");
-  }
-
   static void add_trusted_issuers(const py::dict &registration,
                                   Lifecycle &lifecycle) {
     for (const py::handle item : py::cast<py::sequence>(
@@ -2734,6 +2796,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            &NativeTerminalOwnerBridge::acknowledge_action,
            py::arg("action_id"), py::call_guard<py::gil_scoped_release>())
       .def("inventory", &NativeTerminalOwnerBridge::inventory)
+      .def("wait_for_lifecycle_registration",
+           &NativeTerminalOwnerBridge::wait_for_lifecycle_registration,
+           py::arg("binding_digest"), py::arg("timeout_seconds"))
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
       .def("lifecycle_snapshot",
            &NativeTerminalOwnerBridge::lifecycle_snapshot,
