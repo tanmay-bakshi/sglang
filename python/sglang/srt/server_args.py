@@ -58,12 +58,6 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentRole,
     load_terminal_deployment_cohort,
 )
-from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
-    build_terminal_startup_cohort_expectation,
-)
-from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
-    TerminalStartupCohortExpectation,
-)
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -3044,11 +3038,6 @@ class ServerArgs:
         Arg(no_cli=True),
         NS("disagg"),
     ] = dataclasses.field(default=None, init=False, repr=False)
-    pd_terminal_startup_expectation: A[
-        TerminalStartupCohortExpectation | None,
-        Arg(no_cli=True),
-        NS("disagg"),
-    ] = dataclasses.field(default=None, init=False, repr=False)
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
@@ -3924,9 +3913,6 @@ class ServerArgs:
             raise ValueError("local KV-layout fingerprint differs from terminal cohort")
         self.pd_terminal_deployment_cohort = cohort
         self.pd_terminal_local_membership = membership
-        self.pd_terminal_startup_expectation = (
-            build_terminal_startup_cohort_expectation(cohort, membership)
-        )
 
     def pd_process_advertisement(
         self, runtime_capabilities: PdProcessRuntimeCapabilities | None

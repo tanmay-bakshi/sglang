@@ -3,9 +3,14 @@
 import os
 
 from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
-from sglang.srt.disaggregation.nixl import NixlKVBootstrapServer
+from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
+    build_terminal_startup_cohort_expectation,
+)
+from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
+    TerminalDeploymentCohort,
+    TerminalDeploymentLocalService,
+)
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
-    TerminalStartupCohortExpectation,
     TerminalStartupCohortRegistry,
 )
 from sglang.srt.disaggregation.utils import (
@@ -25,12 +30,15 @@ def start_disagg_service(
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
     if disagg_mode == DisaggregationMode.PREFILL:
-        startup_expectation = server_args.pd_terminal_startup_expectation
-        if startup_expectation is not None:
-            if type(startup_expectation) is not TerminalStartupCohortExpectation:
-                raise TypeError(
-                    "pd_terminal_startup_expectation has an invalid type"
-                )
+        deployment_cohort = server_args.pd_terminal_deployment_cohort
+        local_membership = server_args.pd_terminal_local_membership
+        if (deployment_cohort is None) != (local_membership is None):
+            raise ValueError("packed-terminal deployment binding is incomplete")
+        if deployment_cohort is not None:
+            if type(deployment_cohort) is not TerminalDeploymentCohort:
+                raise TypeError("pd_terminal_deployment_cohort has an invalid type")
+            if type(local_membership) is not TerminalDeploymentLocalService:
+                raise TypeError("pd_terminal_local_membership has an invalid type")
             if transfer_backend != TransferBackend.NIXL:
                 raise ValueError(
                     "packed-terminal startup requires the NIXL transfer backend"
@@ -38,11 +46,18 @@ def start_disagg_service(
             timeout_seconds = server_args.pd_terminal_startup_timeout_seconds
             if timeout_seconds is None:
                 raise ValueError("packed-terminal startup timeout is absent")
+            startup_expectation = build_terminal_startup_cohort_expectation(
+                deployment_cohort,
+                local_membership,
+            )
+            kv_bootstrap_server_class = get_kv_class(
+                transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
             registry = TerminalStartupCohortRegistry(
                 startup_expectation,
                 timeout_seconds=timeout_seconds,
             )
-            return NixlKVBootstrapServer(
+            return kv_bootstrap_server_class(
                 host=server_args.host,
                 port=server_args.disaggregation_bootstrap_port,
                 terminal_startup_registry=registry,

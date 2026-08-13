@@ -86,8 +86,6 @@ def test_prefill_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
     assert args.pd_terminal_deployment_cohort == _cohort()
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "prefill-a"
-    assert args.pd_terminal_startup_expectation is not None
-    assert args.pd_terminal_startup_expectation.expected_rank_count == 3
 
 
 def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
@@ -112,8 +110,6 @@ def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
 
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "decode-a"
-    assert args.pd_terminal_startup_expectation is not None
-    assert args.pd_terminal_startup_expectation.expected_rank_count == 3
 
 
 def test_terminal_cohort_arguments_are_all_or_none(tmp_path: Path) -> None:
