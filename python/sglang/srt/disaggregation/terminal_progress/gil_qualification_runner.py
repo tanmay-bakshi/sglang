@@ -605,6 +605,19 @@ def _trace_dict(trace: GILNativeHopTrace) -> dict[str, int]:
     }
 
 
+def prepare_gil_qualification_output_root(output_root: Path) -> None:
+    """Create a new or empty qualification evidence root.
+
+    :param output_root: Concrete platform path chosen for evidence.
+    """
+
+    if not isinstance(output_root, Path):
+        raise TypeError("output_root must be a Path")
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError("output_root must be new or empty")
+    output_root.mkdir(parents=True, exist_ok=True)
+
+
 def write_gil_qualification_artifacts(
     output_root: Path,
     receipt: GILQualificationRunReceipt,
@@ -618,11 +631,7 @@ def write_gil_qualification_artifacts(
     :returns: Receipt, trace, and checksum paths.
     """
 
-    if type(output_root) is not Path:
-        raise TypeError("output_root must be a Path")
-    if output_root.exists() and any(output_root.iterdir()):
-        raise FileExistsError("output_root must be new or empty")
-    output_root.mkdir(parents=True, exist_ok=True)
+    prepare_gil_qualification_output_root(output_root)
     receipt_path = output_root / "gil-qualification-receipt.json"
     traces_path = output_root / "gil-qualification-traces.ndjson"
     checksums_path = output_root / "SHA256SUMS"

@@ -1,10 +1,12 @@
 import json
+from pathlib import Path
 
 import pytest
 from sglang.srt.disaggregation.terminal_progress.gil_qualification_runner import (
     GILQualificationExecutionConfig,
     GILQualificationRunMode,
     canonical_json_bytes,
+    prepare_gil_qualification_output_root,
     require_frozen_switch_interval,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -46,3 +48,15 @@ def test_canonical_receipt_serialization_is_byte_deterministic() -> None:
     assert first == second
     assert first.endswith(b"\n")
     assert json.loads(first) == {"a": {"b": True}, "z": [3, 2, 1]}
+
+
+def test_artifact_writer_accepts_concrete_path_subclasses(tmp_path: Path) -> None:
+    """The platform's concrete ``PosixPath`` is a valid artifact root."""
+
+    output_root = tmp_path / "evidence"
+    prepare_gil_qualification_output_root(output_root)
+    assert output_root.is_dir()
+
+    (output_root / "existing").write_text("sealed", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="new or empty"):
+        prepare_gil_qualification_output_root(output_root)
