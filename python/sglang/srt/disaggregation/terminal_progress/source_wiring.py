@@ -17,8 +17,8 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalReceipt,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
-    FrozenTerminalGatewayPublication,
     FrozenTerminalGatewayOutputProjection,
+    FrozenTerminalGatewayPublication,
     TerminalGatewayPublicationFailure,
     TerminalGatewayPublicationResult,
     TerminalGatewayPublicationSuccess,
@@ -27,7 +27,10 @@ from sglang.srt.disaggregation.terminal_progress.receipts import TerminalReceipt
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
-from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
+from sglang.srt.disaggregation.terminal_progress.wire import (
+    IssuedTerminalWireReceipt,
+    TerminalWireReceipt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,13 @@ class NativeTerminalSourceRuntime(Protocol):
 
     def control_producer(self, issuer_digest: bytes) -> object:
         """Return the authenticated producer for one remote issuer.
+
+        :param issuer_digest: Exact remote process-identity digest.
+        :returns: Opaque producer registered by the process runtime.
+        """
+
+    def receipt_producer(self, issuer_digest: bytes) -> object:
+        """Return the authenticated receipt producer for one remote issuer.
 
         :param issuer_digest: Exact remote process-identity digest.
         :returns: Opaque producer registered by the process runtime.
@@ -367,7 +377,7 @@ class PackedTerminalSourceWiring:
         if wire_receipt.binding != binding or local_receipt.binding != binding:
             raise RuntimeError("request-ready authority targets another binding")
         native_receipt = NativeTerminalReceipt.from_wire_receipt(wire_receipt)
-        producer = self._runtime.control_producer(authenticated_issuer.digest)
+        producer = self._runtime.receipt_producer(authenticated_issuer.digest)
         self._runtime.submit(
             producer,
             binding_digest,
@@ -428,49 +438,60 @@ class PackedTerminalSourceWiring:
         :param result: Exactly-once publisher success or failure.
         """
 
-        if type(result) is TerminalGatewayPublicationFailure:
-            publication = result.publication
-            record = self._record(publication.canonical_binding.digest)
-            self._runtime.submit(
-                self._runtime.local_events,
-                publication.canonical_binding.digest,
-                NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED,
-                reason=result.reason,
-            )
-            with self._lock:
-                record.publication_terminal = True
-            self._emit_metric_once(
-                publication.canonical_binding.digest,
-                NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED,
-            )
-            return
-        if type(result) is not TerminalGatewayPublicationSuccess:
+        if type(result) not in (
+            TerminalGatewayPublicationSuccess,
+            TerminalGatewayPublicationFailure,
+        ):
             raise TypeError("result must be a terminal gateway publication result")
         publication = result.publication
-        local_binding = publication.canonical_binding
-        local_receipt = next(
-            (
-                issued.wire_receipt
-                for issued in result.source_receipts
-                if issued.wire_receipt.binding == local_binding
-            ),
-            None,
+        record, local_issued_receipt = self._local_publication_result(
+            publication,
+            result.source_receipts,
         )
-        if local_receipt is None:
-            raise RuntimeError("publisher success omitted the local source receipt")
-        record = self._record(local_binding.digest)
-        producer = self._runtime.control_producer(local_receipt.issuer.digest)
+        local_receipt = local_issued_receipt.wire_receipt
+        producer = self._runtime.receipt_producer(local_receipt.issuer.digest)
+        kind = NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED
+        reason = None
+        if type(result) is TerminalGatewayPublicationFailure:
+            kind = NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED
+            reason = result.reason
         self._runtime.submit(
             producer,
-            local_binding.digest,
-            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            local_receipt.binding.digest,
+            kind,
             receipt=NativeTerminalReceipt.from_wire_receipt(local_receipt),
+            reason=reason,
         )
         with self._lock:
             record.publication_terminal = True
         self._emit_metric_once(
-            local_binding.digest,
-            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            local_receipt.binding.digest,
+            kind,
+        )
+
+    def publisher_died(self, binding_digest: bytes, reason: str) -> None:
+        """Fail one publication identity after its publisher thread dies.
+
+        :param binding_digest: Exact local source binding awaiting publication.
+        :param reason: Stable process-fatal publisher evidence.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        record = self._record(binding_digest)
+        if record.submission.identity.local_binding.owner.tp_rank != 0:
+            raise RuntimeError("only the canonical publisher rank owns thread death")
+        self._runtime.submit(
+            self._runtime.local_events,
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED,
+            reason=reason,
+        )
+        with self._lock:
+            record.publication_terminal = True
+        self._emit_metric_once(
+            binding_digest,
+            NativeTerminalOwnerEventKind.SOURCE_PUBLISHER_DIED,
         )
 
     def retire(self, binding_digest: bytes) -> PackedTerminalSourceSubmission:
@@ -518,6 +539,47 @@ class PackedTerminalSourceWiring:
             if record.publication_submitted:
                 raise RuntimeError("source gateway publication was submitted twice")
             record.publication_submitted = True
+
+    def _local_publication_result(
+        self,
+        publication: FrozenTerminalGatewayPublication,
+        source_receipts: tuple[IssuedTerminalWireReceipt, ...],
+    ) -> tuple[_SourceRecord, IssuedTerminalWireReceipt]:
+        """Resolve this rank's authenticated result without rank-zero inference.
+
+        :param publication: Exact request-global publication attempt.
+        :param source_receipts: Canonically ordered per-rank result authority.
+        :returns: Local side-effect record and its exact issued receipt.
+        """
+
+        with self._lock:
+            matches = tuple(
+                (self._records[issued.wire_receipt.binding.digest], issued)
+                for issued in source_receipts
+                if issued.wire_receipt.binding.digest in self._records
+            )
+        if len(matches) != 1:
+            raise RuntimeError(
+                "publisher result must contain exactly one live local source receipt"
+            )
+        record, local_receipt = matches[0]
+        identity = record.submission.identity
+        if (
+            publication.identity != identity.publication_identity
+            or publication.canonical_binding != identity.source_bindings[0]
+            or publication.source_bindings != identity.source_bindings
+        ):
+            raise RuntimeError("publisher result differs from the source identity plan")
+        if record.request_ready_receipt is None:
+            raise RuntimeError("publisher result preceded local request readiness")
+        if (
+            identity.local_binding.owner.tp_rank == 0
+            and not record.publication_submitted
+        ):
+            raise RuntimeError("canonical publisher result preceded publication submit")
+        if record.publication_terminal:
+            raise RuntimeError("publisher result was delivered twice")
+        return record, local_receipt
 
     def _submit_local(
         self,
@@ -573,7 +635,7 @@ class PackedTerminalSourceWiring:
                     timestamp_ns=self._clock_ns(),
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.error(
                 "Terminal source metric projection failed without gating progress:\n%s",
                 traceback.format_exc(),
