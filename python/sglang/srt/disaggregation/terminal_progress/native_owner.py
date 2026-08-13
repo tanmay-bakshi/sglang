@@ -373,6 +373,26 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
     )
 
 
+def native_terminal_owner_producer_abi(*, testing: bool = False) -> dict[str, object]:
+    """Return the owner DSO's compiled producer ABI layout.
+
+    :param testing: Whether to inspect the independently built test variant.
+    :returns: Version, flags, structure sizes, and event-field offsets.
+    """
+
+    module = load_native_terminal_owner_module(testing=testing)
+    offsets = module.PRODUCER_EVENT_OFFSETS
+    if not isinstance(offsets, Mapping):
+        raise TypeError("native producer ABI offsets must be a mapping")
+    return {
+        "abi_version": int(module.PRODUCER_ABI_VERSION),
+        "api_struct_size": int(module.PRODUCER_API_SIZE),
+        "event_struct_size": int(module.PRODUCER_EVENT_POD_SIZE),
+        "required_flags": int(module.PRODUCER_API_FLAGS),
+        "event_offsets": {str(key): int(value) for key, value in offsets.items()},
+    }
+
+
 class NativeTerminalOwner:
     """Typed process-lifetime facade over the authoritative native reducer."""
 
