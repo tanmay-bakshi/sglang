@@ -164,6 +164,7 @@ def _wait_for_phase(
     """
 
     deadline = time.monotonic() + _WAIT_SECONDS
+    snapshot = None
     while time.monotonic() < deadline:
         try:
             snapshot = owner.lifecycle_snapshot_for_testing(binding_digest)
@@ -173,7 +174,11 @@ def _wait_for_phase(
         if snapshot.phase == int(phase):
             return
         time.sleep(0.001)
-    raise TimeoutError(f"native decode lifecycle did not reach {phase.name}")
+    inventory = owner.inventory()
+    raise TimeoutError(
+        "native decode lifecycle did not reach "
+        f"{phase.name}: snapshot={snapshot}, inventory={inventory}"
+    )
 
 
 def _retire_and_abort(
