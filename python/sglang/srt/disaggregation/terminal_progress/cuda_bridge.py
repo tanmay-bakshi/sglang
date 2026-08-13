@@ -8,11 +8,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Protocol, cast
 
-from torch.utils.cpp_extension import load
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
 )
+from torch.utils.cpp_extension import CUDA_HOME, load
 
 
 class CudaCompletionFatalCode(enum.StrEnum):
@@ -54,8 +53,7 @@ class CudaCompletionIdentity:
             raise TypeError("generation must be bytes")
         if len(self.generation) != PACKED_REQUEST_GENERATION_BYTES:
             raise ValueError(
-                "generation must contain "
-                f"{PACKED_REQUEST_GENERATION_BYTES} bytes"
+                f"generation must contain {PACKED_REQUEST_GENERATION_BYTES} bytes"
             )
 
 
@@ -234,9 +232,7 @@ class _NativeCudaCompletionBridge(Protocol):
         :returns: Complete native lifecycle mapping.
         """
 
-    def _complete_synchronously_for_test(
-        self, cookie: int, generation: bytes
-    ) -> None:
+    def _complete_synchronously_for_test(self, cookie: int, generation: bytes) -> None:
         """Complete one armed test identity.
 
         :param cookie: Process-local owner cookie.
@@ -245,6 +241,12 @@ class _NativeCudaCompletionBridge(Protocol):
 
     def _break_eventfd_for_test(self) -> None:
         """Break the native eventfd in a test build."""
+
+    def _complete_concurrently_for_test(self, tokens: list[tuple[int, bytes]]) -> None:
+        """Publish armed identities from concurrent native threads.
+
+        :param tokens: Exact cookie and generation pairs.
+        """
 
 
 @lru_cache(maxsize=2)
@@ -257,6 +259,9 @@ def _load_native_cuda_completion_bridge(testing: bool = False) -> ModuleType:
 
     if not sys.platform.startswith("linux"):
         raise RuntimeError("CUDA completion bridge requires Linux eventfd")
+    if CUDA_HOME is None:
+        raise RuntimeError("CUDA completion bridge requires a CUDA toolkit")
+    cuda_home = Path(CUDA_HOME).resolve()
     source_path = _native_source_path()
     source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()[:12]
     variant = "test" if testing else "runtime"
@@ -273,8 +278,8 @@ def _load_native_cuda_completion_bridge(testing: bool = False) -> ModuleType:
     return load(
         name=module_name,
         sources=[str(source_path)],
-        extra_cflags=[*extra_cflags, "-I/usr/local/cuda/include"],
-        extra_ldflags=["-L/usr/local/cuda/lib64", "-lcudart"],
+        extra_cflags=[*extra_cflags, f"-I{cuda_home / 'include'}"],
+        extra_ldflags=[f"-L{cuda_home / 'lib64'}", "-lcudart"],
         build_directory=build_directory,
         with_cuda=False,
         verbose=False,
@@ -393,9 +398,7 @@ class CudaCompletionBridge:
         value: dict[str, object] = self._native.inventory()
         return CudaCompletionInventory.from_native(value)
 
-    def complete_synchronously_for_test(
-        self, identity: CudaCompletionIdentity
-    ) -> None:
+    def complete_synchronously_for_test(self, identity: CudaCompletionIdentity) -> None:
         """Drive the callback publication body without CUDA in a test build.
 
         :param identity: Exact identity already armed on this bridge.
@@ -416,3 +419,21 @@ class CudaCompletionBridge:
         if not self._testing:
             raise RuntimeError("eventfd fault injection requires a test build")
         self._native._break_eventfd_for_test()
+
+    def complete_concurrently_for_test(
+        self, identities: tuple[CudaCompletionIdentity, ...]
+    ) -> None:
+        """Drive armed identities from independent native producer threads.
+
+        :param identities: Exact callback identities already armed on this bridge.
+        """
+
+        if not self._testing:
+            raise RuntimeError("concurrent completion requires a test build")
+        if type(identities) is not tuple or any(
+            type(identity) is not CudaCompletionIdentity for identity in identities
+        ):
+            raise TypeError("identities must be a tuple of CudaCompletionIdentity")
+        self._native._complete_concurrently_for_test(
+            [(identity.cookie, identity.generation) for identity in identities]
+        )
