@@ -1,5 +1,7 @@
 import selectors
+import threading
 import time
+from unittest import mock
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -70,6 +72,8 @@ def _runtime(
     *,
     scheduler_capacity: int = 16,
     observation_capacity: int = 64,
+    output_capacity: int = 64,
+    maximum_live_lifecycles: int = 16,
 ) -> tuple[
     NativeTerminalRuntime,
     NativeTerminalProcessIdentity,
@@ -80,6 +84,8 @@ def _runtime(
     :param role: Lifecycle role owned by the runtime.
     :param scheduler_capacity: Scheduler action bound.
     :param observation_capacity: Non-authoritative observation bound.
+    :param output_capacity: Native normal-action queue bound.
+    :param maximum_live_lifecycles: Admission and fail-closed reserve bound.
     :returns: Runtime, owner identity, and remote peer identity.
     """
 
@@ -150,7 +156,8 @@ def _runtime(
         producer_specs=specs,
         fatal_producer_id=_LOCAL_PRODUCER_ID,
         input_capacity=64,
-        output_capacity=64,
+        output_capacity=output_capacity,
+        maximum_live_lifecycles=maximum_live_lifecycles,
         scheduler_capacity=scheduler_capacity,
         coordinator_capacity=16,
         lifecycle_capacity=16,
@@ -247,14 +254,16 @@ def _drain_actions(
     :returns: Non-empty immutable FIFO population.
     """
 
+    expires_at = time.monotonic() + _WAIT_SECONDS
     with selectors.DefaultSelector() as selector:
         selector.register(inbox.fileno(), selectors.EVENT_READ)
-        if len(selector.select(_WAIT_SECONDS)) == 0:
-            raise TimeoutError("terminal runtime action inbox did not wake")
-    actions = inbox.drain()
-    if len(actions) == 0:
-        raise RuntimeError("terminal runtime wake carried no action")
-    return actions
+        while True:
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0.0 or len(selector.select(remaining)) == 0:
+                raise TimeoutError("terminal runtime action inbox did not wake")
+            actions = inbox.drain()
+            if len(actions) > 0:
+                return actions
 
 
 def _drain_observations(runtime: NativeTerminalRuntime) -> None:
@@ -292,8 +301,9 @@ def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
     if runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.STOPPED:
         return
     runtime.begin_abort()
-    _retire_all_producers(runtime)
-    runtime.join_producers()
+    if not runtime.snapshot().producers_joined:
+        _retire_all_producers(runtime)
+        runtime.join_producers()
     action_inboxes = (
         runtime.scheduler_actions,
         runtime.coordinator_actions,
@@ -692,4 +702,169 @@ def test_runtime_queue_overflow_enters_one_process_fatal_path() -> None:
         assert "scheduler" in snapshot.fatal_reason
         assert snapshot.output_reactor_alive
     finally:
+        _finish_fail_closed(runtime)
+
+
+def test_abort_preserves_every_registration_and_quarantine_identity() -> None:
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registrations = (
+        _registration(owner, remote, 91),
+        _registration(owner, remote, 92),
+    )
+    runtime.start()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+        runtime.begin_abort()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+
+        actions = _drain_actions(runtime.lifecycle_actions)
+        assert len(actions) == len(registrations)
+        assert all(
+            action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+            for action in actions
+        )
+        assert {action.binding.digest for action in actions} == {
+            registration.binding.digest for registration in registrations
+        }
+        for action in actions:
+            runtime.acknowledge_aborted_action(action)
+        _drain_observations(runtime)
+
+        snapshot = runtime.snapshot()
+        assert snapshot.scheduler_live_count == 0
+        assert set(snapshot.quarantined_binding_digests) == {
+            registration.binding.digest for registration in registrations
+        }
+        assert set(snapshot.owner.quarantined_binding_digests) == set(
+            snapshot.quarantined_binding_digests
+        )
+        runtime.finish_abort_close()
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_close_waits_for_swapped_output_before_rejecting_consumer_inventory() -> None:
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registration = _registration(owner, remote, 93)
+    route_entered = threading.Event()
+    release_route = threading.Event()
+    original_route = NativeTerminalRuntime._route_output
+
+    def blocked_route(
+        candidate: NativeTerminalRuntime,
+        output: object,
+    ) -> None:
+        """Hold one swapped native batch outside its queue inventory.
+
+        :param candidate: Runtime whose sole consumer owns the batch.
+        :param output: Typed native output pending Python routing.
+        """
+
+        route_entered.set()
+        if not release_route.wait(_WAIT_SECONDS):
+            raise TimeoutError("test output-route barrier expired")
+        original_route(candidate, output)  # type: ignore[arg-type]
+
+    runtime.start()
+    try:
+        with mock.patch.object(NativeTerminalRuntime, "_route_output", blocked_route):
+            runtime.register_lifecycle(registration)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            assert route_entered.wait(_WAIT_SECONDS)
+            runtime.stop_admission()
+            _retire_all_producers(runtime)
+            runtime.join_producers()
+
+            close_errors: list[BaseException] = []
+
+            def close_runtime() -> None:
+                """Attempt clean close while one native batch is swapped."""
+
+                try:
+                    runtime.close_clean()
+                except NativeTerminalRuntimeError as error:
+                    close_errors.append(error)
+
+            close_thread = threading.Thread(target=close_runtime)
+            close_thread.start()
+            close_thread.join(timeout=0.05)
+            assert close_thread.is_alive()
+            release_route.set()
+            close_thread.join(timeout=_WAIT_SECONDS)
+            assert not close_thread.is_alive()
+            assert len(close_errors) == 1
+            assert "consumer" in str(close_errors[0])
+            snapshot = runtime.snapshot()
+            assert snapshot.output_reactor_alive
+            assert snapshot.disposition is NativeTerminalRuntimeDisposition.DRAINING
+    finally:
+        release_route.set()
+        _finish_fail_closed(runtime)
+
+
+def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        output_capacity=1,
+        maximum_live_lifecycles=3,
+    )
+    registrations = tuple(_registration(owner, remote, room_id) for room_id in range(94, 97))
+    drain_entered = threading.Event()
+    release_drain = threading.Event()
+    original_drain = runtime._owner.drain_outputs
+
+    def blocked_drain() -> tuple[object, ...]:
+        """Hold the sole consumer before it swaps the saturated queues.
+
+        :returns: Native outputs after the deterministic barrier releases.
+        """
+
+        drain_entered.set()
+        if not release_drain.wait(_WAIT_SECONDS):
+            raise TimeoutError("test native-drain barrier expired")
+        return original_drain()
+
+    runtime._owner.drain_outputs = blocked_drain  # type: ignore[method-assign]
+    runtime.start()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+        for registration in registrations[:2]:
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+        assert drain_entered.wait(_WAIT_SECONDS)
+        inventory = runtime.snapshot().owner
+        assert inventory.queued_output_count == 4
+        assert inventory.queued_fatal_output_count == 3
+        assert inventory.pending_action_count == 4
+
+        release_drain.set()
+        with selectors.DefaultSelector() as selector:
+            selector.register(runtime.lifecycle_actions.fileno(), selectors.EVENT_READ)
+            assert len(selector.select(_WAIT_SECONDS)) > 0
+        runtime.begin_abort()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _finish_fail_closed(runtime)
+    finally:
+        release_drain.set()
         _finish_fail_closed(runtime)

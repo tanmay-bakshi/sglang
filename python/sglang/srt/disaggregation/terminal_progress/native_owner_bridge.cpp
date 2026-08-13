@@ -1056,6 +1056,13 @@ void add_action_locked(SharedOwner &owner, Lifecycle &lifecycle, Output &output,
   output.actions.push_back(std::move(action));
 }
 
+void discard_unpublished_actions_locked(SharedOwner &owner,
+                                        const Output &output) noexcept {
+  for (const Action &action : output.actions) {
+    owner.pending_actions.erase(action.action_id);
+  }
+}
+
 bool reduce_source_locked(SharedOwner &owner, Lifecycle &lifecycle,
                           const Event &event, Output &output,
                           std::uint64_t completed_ns) {
@@ -1557,6 +1564,14 @@ void expire_deadlines_locked(SharedOwner &owner) {
       add_action_locked(owner, lifecycle, output,
                         ActionKind::kRequestQuarantined, now_ns);
       if (owner.output_queue.size() >= owner.output_capacity) {
+        if (owner.fatal_output_queue.size() >=
+            owner.maximum_live_lifecycles) {
+          discard_unpublished_actions_locked(owner, output);
+          quarantine_all_locked(owner, FatalCode::kInternalError, nullptr,
+                                "deadline fatal-output reserve overflowed");
+          return;
+        }
+        owner.fatal_output_queue.push_back(std::move(output));
         quarantine_all_locked(owner, FatalCode::kOutputQueueOverflow, nullptr,
                               "deadline output overflowed");
         return;
@@ -1972,6 +1987,7 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
                                             output);
     if (!output.actions.empty()) {
       if (owner.output_queue.size() >= owner.output_capacity) {
+        discard_unpublished_actions_locked(owner, output);
         quarantine_all_locked(owner, FatalCode::kOutputQueueOverflow, &event,
                               "production action queue overflowed");
         return;

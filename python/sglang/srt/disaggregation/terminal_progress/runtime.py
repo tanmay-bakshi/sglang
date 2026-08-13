@@ -542,6 +542,7 @@ class NativeTerminalRuntime:
         fatal_producer_id: int,
         input_capacity: int,
         output_capacity: int,
+        maximum_live_lifecycles: int,
         scheduler_capacity: int,
         coordinator_capacity: int,
         lifecycle_capacity: int,
@@ -558,6 +559,8 @@ class NativeTerminalRuntime:
             death and bounded-inbox overflow.
         :param input_capacity: Native owner input capacity.
         :param output_capacity: Native owner action capacity.
+        :param maximum_live_lifecycles: Bound for lifecycle admission and
+            complete fail-closed output reserve.
         :param scheduler_capacity: Scheduler inbox capacity.
         :param coordinator_capacity: Request-coordinator inbox capacity.
         :param lifecycle_capacity: Teardown and health inbox capacity.
@@ -581,6 +584,7 @@ class NativeTerminalRuntime:
         capacities = (
             input_capacity,
             output_capacity,
+            maximum_live_lifecycles,
             scheduler_capacity,
             coordinator_capacity,
             lifecycle_capacity,
@@ -631,7 +635,7 @@ class NativeTerminalRuntime:
             input_capacity=input_capacity,
             output_capacity=output_capacity,
             owner_identity=owner_identity,
-            maximum_live_lifecycles=input_capacity,
+            maximum_live_lifecycles=maximum_live_lifecycles,
         )
         for spec in producer_specs:
             owner.register_producer(spec.registration)
@@ -1221,14 +1225,6 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "clean close requires external producer join"
                 )
-            if (
-                len(self._scheduler_live) != 0
-                or len(self._scheduler_pending) != 0
-                or len(self._consumer_pending) != 0
-            ):
-                raise NativeTerminalRuntimeError(
-                    "clean close retains scheduler request generations"
-                )
         inboxes: Sequence[_BoundedFdInbox[object]] = (
             self._scheduler_actions,
             self._coordinator_actions,
@@ -1238,8 +1234,6 @@ class NativeTerminalRuntime:
             self._publisher_actions,
             self._observations,
         )
-        if any(inbox.snapshot().queued_count != 0 for inbox in inboxes):
-            raise NativeTerminalRuntimeError("clean close retains consumer actions")
         if not self._owner.wait_for_output_quiescence(
             self._OUTPUT_QUIESCENCE_TIMEOUT_SECONDS
         ):
@@ -1490,6 +1484,11 @@ class NativeTerminalRuntime:
 
         if type(output) is not NativeTerminalOwnerOutput:
             raise TypeError("output must be NativeTerminalOwnerOutput")
+        if output.process_fatal:
+            with self._condition:
+                self._enter_runtime_fatal_locked(
+                    f"native terminal owner entered {output.fatal_code.name}"
+                )
         for action in output.actions:
             try:
                 self._route_action(action)
