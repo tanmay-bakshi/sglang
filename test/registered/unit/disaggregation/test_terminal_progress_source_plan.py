@@ -96,9 +96,10 @@ def test_source_plan_round_trip_is_exact_and_canonical() -> None:
     payload = encode_packed_terminal_source_plan(plan)
 
     assert decode_packed_terminal_source_plan(payload) == plan
-    assert encode_packed_terminal_source_plan(
-        decode_packed_terminal_source_plan(payload)
-    ) == payload
+    assert (
+        encode_packed_terminal_source_plan(decode_packed_terminal_source_plan(payload))
+        == payload
+    )
 
 
 def test_source_plan_preserves_explicit_writer_process_association() -> None:
@@ -125,7 +126,7 @@ def test_source_plan_rejects_unknown_fields_and_versions() -> None:
 
     unknown_version = dict(envelope)
     unknown_version["version"] = 99
-    with pytest.raises(PackedTerminalSourcePlanError, match="unsupported.*version"):
+    with pytest.raises(PackedTerminalSourcePlanError, match=r"unsupported.*version"):
         decode_packed_terminal_source_plan(msgspec.msgpack.encode(unknown_version))
 
 
