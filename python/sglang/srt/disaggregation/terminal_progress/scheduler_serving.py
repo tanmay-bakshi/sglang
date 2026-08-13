@@ -570,9 +570,7 @@ class TerminalSchedulerServing:
         if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
             raise ValueError("timeout_seconds must be a positive float")
         try:
-            quiescent = runtime.wait_for_output_projection_quiescence(
-                timeout_seconds
-            )
+            quiescent = runtime.wait_for_output_projection_quiescence(timeout_seconds)
         except Exception:
             runtime.begin_abort()
             logger.error(
@@ -591,10 +589,7 @@ class TerminalSchedulerServing:
         """Close a clean serving adapter with no retained native action."""
 
         with self._lock:
-            if (
-                len(self._actions_by_receipt) > 0
-                or len(self._receipt_by_request) > 0
-            ):
+            if len(self._actions_by_receipt) > 0 or len(self._receipt_by_request) > 0:
                 raise RuntimeError("scheduler serving retains native actions")
         self._inbox.close()
 
