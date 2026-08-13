@@ -504,8 +504,12 @@ def test_owner_mints_immutable_adoption_authority_and_tracks_ack() -> None:
                 event=DecodeLifecycleEvent(kind=event_kind),
             )
         )
+    readable, _, _ = select.select((owner.output_fileno(),), (), (), 2.0)
+    assert readable == [owner.output_fileno()]
     owner.wait_for_output_count(minimum_count=1, timeout_seconds=2.0)
     outputs = owner.drain_outputs()
+    readable, _, _ = select.select((owner.output_fileno(),), (), (), 0.0)
+    assert readable == []
     assert len(outputs) == 1
     emission = outputs[0]
     assert type(emission) is TerminalOwnerReceiptEmission
