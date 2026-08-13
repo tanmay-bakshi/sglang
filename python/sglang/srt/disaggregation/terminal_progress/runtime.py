@@ -1040,9 +1040,11 @@ class NativeTerminalRuntime:
                 NativeTerminalOwnerActionKind.PROCESS_FATAL,
             ):
                 self._quarantined_bindings.add(binding_digest)
-            if binding_digest in self._quarantined_bindings:
-                if binding_digest not in self._scheduler_pending:
-                    self._scheduler_live.pop(binding_digest, None)
+            if (
+                binding_digest in self._quarantined_bindings
+                and binding_digest not in self._scheduler_pending
+            ):
+                self._scheduler_live.pop(binding_digest, None)
             self._condition.notify_all()
 
     def complete_work_action(

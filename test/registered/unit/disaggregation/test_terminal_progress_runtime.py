@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerFatalCode,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
@@ -831,7 +832,9 @@ def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
         output_capacity=1,
         maximum_live_lifecycles=3,
     )
-    registrations = tuple(_registration(owner, remote, room_id) for room_id in range(94, 97))
+    registrations = tuple(
+        _registration(owner, remote, room_id) for room_id in range(94, 97)
+    )
     drain_entered = threading.Event()
     release_drain = threading.Event()
     original_drain = runtime._owner.drain_outputs
@@ -864,7 +867,17 @@ def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             )
         assert drain_entered.wait(_WAIT_SECONDS)
-        inventory = runtime.snapshot().owner
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while True:
+            inventory = runtime.snapshot().owner
+            if (
+                inventory.fatal_code
+                is NativeTerminalOwnerFatalCode.OUTPUT_QUEUE_OVERFLOW
+            ):
+                break
+            if time.monotonic() >= expires_at:
+                raise TimeoutError("native fatal reserve did not settle")
+            time.sleep(0.001)
         assert inventory.queued_output_count == 4
         assert inventory.queued_fatal_output_count == 3
         assert inventory.pending_action_count == 4

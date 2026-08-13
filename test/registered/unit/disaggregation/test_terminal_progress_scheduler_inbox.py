@@ -8,7 +8,9 @@ import select
 import threading
 
 import pytest
-import sglang.srt.disaggregation.terminal_progress.scheduler_inbox as scheduler_inbox_module
+from sglang.srt.disaggregation.terminal_progress import (
+    scheduler_inbox as scheduler_inbox_module,
+)
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
 )
