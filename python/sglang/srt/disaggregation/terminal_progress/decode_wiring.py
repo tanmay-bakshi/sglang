@@ -1,4 +1,7 @@
 import dataclasses
+import logging
+import traceback
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from sglang.srt.disaggregation.common.packed_staging_wire import PackedWireMessage
@@ -32,6 +35,8 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourcePlan,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -235,9 +240,7 @@ class PackedTerminalDecodeWiring:
         )
         self._runtime.register_lifecycle(
             NativeTerminalLifecycleRegistration(
-                binding=NativeTerminalRequestBinding.from_binding(
-                    registration.binding
-                ),
+                binding=NativeTerminalRequestBinding.from_binding(registration.binding),
                 publication_identity=None,
                 trusted_issuers=tuple(
                     NativeTerminalProcessIdentity.from_identity(issuer)
@@ -368,14 +371,32 @@ class PackedTerminalDecodeWiring:
     def consume_adoption_action(
         self,
         action: NativeTerminalOwnerAction,
+        adopt_request: Callable[[object], None],
+        finalize_request: Callable[[object], None],
     ) -> object:
-        """Adopt pages and release metadata under scheduler authority.
+        """Adopt pages and publish readiness under scheduler authority.
+
+        The first callback copies request metadata and installs the exact
+        retained request into scheduler-owned structures while the auxiliary
+        row remains pinned. The actor then releases that row and publishes its
+        metadata-consumed transition. The second callback clears the
+        scheduler's transaction-local fields before local-ready authority can
+        enter the native owner. This ordering prevents a runnable request from
+        being announced before its mutable scheduler state is complete.
 
         :param action: Exact owner-minted adoption authority.
+        :param adopt_request: Scheduler-affine metadata-copy and request-adoption
+            operation.
+        :param finalize_request: Scheduler-affine transaction finalization
+            operation.
         :returns: Retained request owner adopted by the scheduler.
         """
 
         self._require_action(action, NativeTerminalOwnerActionKind.ADOPTION_READY)
+        if not callable(adopt_request):
+            raise TypeError("adopt_request must be callable")
+        if not callable(finalize_request):
+            raise TypeError("finalize_request must be callable")
         transaction = self._actor.terminal_owner_transaction(action.binding.digest)
         try:
             owner = self._actor.consume_terminal_owner_adoption(transaction)
@@ -384,25 +405,65 @@ class PackedTerminalDecodeWiring:
                 action,
                 NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
             )
+            adopt_request(owner)
             self._actor.complete_terminal_owner_metadata_consumption(transaction)
             self._runtime.submit(
                 self._local_producer_id,
                 action.binding.digest,
                 NativeTerminalOwnerEventKind.DECODE_METADATA_CONSUMED,
             )
+            finalize_request(owner)
             self._runtime.submit(
                 self._local_producer_id,
                 action.binding.digest,
                 NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
             )
             return owner
-        except (OSError, RuntimeError, TypeError, ValueError):
-            self._actor.quarantine(transaction, "decode scheduler adoption failed")
-            self._submit_local_failure(
-                action.binding.digest,
-                "decode scheduler adoption failed",
+        except Exception:
+            reason = "decode scheduler adoption failed"
+            formatted_traceback = traceback.format_exc()
+            try:
+                self._actor.quarantine(transaction, reason)
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Decode transaction quarantine failed after adoption error:\n%s",
+                    traceback.format_exc(),
+                )
+            try:
+                self._submit_local_failure(action.binding.digest, reason)
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Decode native failure publication failed after adoption "
+                    "error:\n%s",
+                    traceback.format_exc(),
+                )
+            logger.error(
+                "Decode scheduler adoption failed closed:\n%s",
+                formatted_traceback,
             )
             raise
+
+    def quarantine_transaction(
+        self,
+        transaction: PackedDecodeRequestTransaction,
+        reason: str,
+    ) -> None:
+        """Retain one ambiguous decode transaction against resource reuse.
+
+        This boundary is used when scheduler-inbox or composition failure makes
+        adoption authority ambiguous before a concrete action reaches the
+        scheduler. It mutates no scheduler queue and publishes no replacement
+        lifecycle event.
+
+        :param transaction: Exact request-scoped packed actor transaction.
+        :param reason: Stable fail-closed evidence.
+        """
+
+        if type(transaction) is not PackedDecodeRequestTransaction:
+            raise TypeError("transaction must be PackedDecodeRequestTransaction")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        self._actor.quarantine(transaction, reason)
 
     def request_ready(
         self,
