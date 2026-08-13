@@ -239,7 +239,9 @@ def test_request_failure_after_publication_quarantine_is_notification_idempotent
         result.observed.before.live_resources
         | result.observed.before.quarantined_resources
     )
-    assert result.observed.actions == ()
+    assert result.observed.actions == (
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+    )
 
 
 def test_active_qualification_abort_is_bounded_and_closes_the_reactor() -> None:

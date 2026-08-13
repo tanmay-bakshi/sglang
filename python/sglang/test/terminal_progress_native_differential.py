@@ -825,12 +825,17 @@ def _compare_step(
             not in (
                 OracleOwnerAction.STATE_COMMITTED,
                 OracleOwnerAction.REQUEST_QUARANTINED,
+                OracleOwnerAction.PROCESS_FATAL,
             )
         )
         native_actions = tuple(
             OracleOwnerAction[action.name]
             for action in observed.actions
-            if action is not NativeTerminalOwnerActionKind.REQUEST_QUARANTINED
+            if action
+            not in (
+                NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+                NativeTerminalOwnerActionKind.PROCESS_FATAL,
+            )
         )
         if native_actions != expected_actions:
             mismatches.append(
