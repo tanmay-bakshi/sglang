@@ -522,6 +522,7 @@ class NativeTerminalRuntime:
     _known_bindings: dict[bytes, NativeTerminalLifecycleRegistration]
     _quarantined_bindings: set[bytes]
     _condition: threading.Condition
+    _output_projection_lock: threading.Lock
     _disposition: NativeTerminalRuntimeDisposition
     _fatal_reason: str | None
     _output_reactor_alive: bool
@@ -676,6 +677,7 @@ class NativeTerminalRuntime:
         self._known_bindings = {}
         self._quarantined_bindings = set()
         self._condition = threading.Condition()
+        self._output_projection_lock = threading.Lock()
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
         self._output_reactor_alive = False
@@ -1215,6 +1217,28 @@ class NativeTerminalRuntime:
                 fatal_reason=self._fatal_reason,
             )
 
+    def wait_for_output_projection_quiescence(self, timeout_seconds: float) -> bool:
+        """Fence native output through the complete Python projection.
+
+        :param timeout_seconds: Positive bound shared by both ownership domains.
+        :returns: Whether native work and an already-swapped Python projection
+            both became quiescent within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("output projection timeout must be a positive float")
+        deadline = time.monotonic() + timeout_seconds
+        if not self._owner.wait_for_output_quiescence(timeout_seconds):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        acquired = self._output_projection_lock.acquire(timeout=remaining)
+        if not acquired:
+            return False
+        self._output_projection_lock.release()
+        return True
+
     def close_clean(self) -> None:
         """Close only after exact-zero native and consumer inventories."""
 
@@ -1234,38 +1258,42 @@ class NativeTerminalRuntime:
             self._publisher_actions,
             self._observations,
         )
-        if not self._owner.wait_for_output_quiescence(
+        if not self.wait_for_output_projection_quiescence(
             self._OUTPUT_QUIESCENCE_TIMEOUT_SECONDS
         ):
             self.begin_abort()
             raise NativeTerminalRuntimeError(
                 "clean close timed out and entered fail-closed drain"
             )
-        with self._condition:
-            if (
-                len(self._scheduler_live) != 0
-                or len(self._scheduler_pending) != 0
-                or len(self._consumer_pending) != 0
-            ):
+        # Native quiescence covers work retained by the C++ owner. The
+        # projection lock fences an output already swapped into Python, which
+        # otherwise has no native queue entry while it is being routed.
+        with self._output_projection_lock:
+            with self._condition:
+                if (
+                    len(self._scheduler_live) != 0
+                    or len(self._scheduler_pending) != 0
+                    or len(self._consumer_pending) != 0
+                ):
+                    raise NativeTerminalRuntimeError(
+                        "clean close acquired new consumer authority during drain"
+                    )
+            if any(inbox.snapshot().queued_count != 0 for inbox in inboxes):
                 raise NativeTerminalRuntimeError(
-                    "clean close acquired new consumer authority during drain"
+                    "clean close acquired new consumer actions during drain"
                 )
-        if any(inbox.snapshot().queued_count != 0 for inbox in inboxes):
-            raise NativeTerminalRuntimeError(
-                "clean close acquired new consumer actions during drain"
-            )
-        inventory = self._owner.inventory()
-        if (
-            inventory.queued_input_count != 0
-            or inventory.queued_output_count != 0
-            or inventory.pending_action_count != 0
-            or inventory.active_source_count != 0
-            or inventory.active_decode_count != 0
-            or inventory.quarantined_count != 0
-            or inventory.armed_deadline_count != 0
-            or inventory.output_drain_active
-        ):
-            raise NativeTerminalRuntimeError("clean close retains native work")
+            inventory = self._owner.inventory()
+            if (
+                inventory.queued_input_count != 0
+                or inventory.queued_output_count != 0
+                or inventory.pending_action_count != 0
+                or inventory.active_source_count != 0
+                or inventory.active_decode_count != 0
+                or inventory.quarantined_count != 0
+                or inventory.armed_deadline_count != 0
+                or inventory.output_drain_active
+            ):
+                raise NativeTerminalRuntimeError("clean close retains native work")
         self._stop_output_reactor()
         self._owner.close()
         self._close_inboxes(require_empty=True)
@@ -1314,28 +1342,31 @@ class NativeTerminalRuntime:
             self._publisher_actions,
             self._observations,
         )
-        if not self._owner.wait_for_output_quiescence(
+        if not self.wait_for_output_projection_quiescence(
             self._OUTPUT_QUIESCENCE_TIMEOUT_SECONDS
         ):
             raise NativeTerminalRuntimeError(
                 "abort retained unrouted native terminal authority"
             )
-        with self._condition:
-            if (
-                len(self._scheduler_live) != 0
-                or len(self._scheduler_pending) != 0
-                or len(self._consumer_pending) != 0
-            ):
+        with self._output_projection_lock:
+            with self._condition:
+                if (
+                    len(self._scheduler_live) != 0
+                    or len(self._scheduler_pending) != 0
+                    or len(self._consumer_pending) != 0
+                ):
+                    raise NativeTerminalRuntimeError(
+                        "abort finish retains unaccepted consumer authority"
+                    )
+            if any(inbox.snapshot().queued_count != 0 for inbox in inboxes):
                 raise NativeTerminalRuntimeError(
-                    "abort finish retains unaccepted consumer authority"
+                    "abort finish retains consumer actions"
                 )
-        if any(inbox.snapshot().queued_count != 0 for inbox in inboxes):
-            raise NativeTerminalRuntimeError("abort finish retains consumer actions")
-        inventory = self._owner.inventory()
-        if set(inventory.quarantined_binding_digests) != self._quarantined_bindings:
-            raise NativeTerminalRuntimeError(
-                "native and consumer quarantine identities disagree"
-            )
+            inventory = self._owner.inventory()
+            if set(inventory.quarantined_binding_digests) != self._quarantined_bindings:
+                raise NativeTerminalRuntimeError(
+                    "native and consumer quarantine identities disagree"
+                )
         self._stop_output_reactor()
         self._owner.close_aborted()
         self._close_inboxes(require_empty=True)
@@ -1452,11 +1483,12 @@ class NativeTerminalRuntime:
                         self._drain_stop_wake()
                         should_stop = True
                         continue
-                    outputs = self._owner.drain_outputs()
-                    for output in outputs:
-                        current_binding = output.binding.digest
-                        self._route_output(output)
-                        current_binding = None
+                    with self._output_projection_lock:
+                        outputs = self._owner.drain_outputs()
+                        for output in outputs:
+                            current_binding = output.binding.digest
+                            self._route_output(output)
+                            current_binding = None
                 if should_stop:
                     break
         except Exception:  # noqa: BLE001
@@ -1491,6 +1523,7 @@ class NativeTerminalRuntime:
                 self._enter_runtime_fatal_locked(
                     f"native terminal owner entered {output.fatal_code.name}"
                 )
+        delivered_actions: list[NativeTerminalOwnerAction] = []
         for action in output.actions:
             try:
                 self._route_action(action)
@@ -1503,13 +1536,15 @@ class NativeTerminalRuntime:
                 with self._condition:
                     self._enter_runtime_fatal_locked(formatted_traceback)
                 continue
-            self._owner.acknowledge_action(action)
+            delivered_actions.append(action)
         try:
             self._observations._enqueue(output)
         except NativeTerminalRuntimeOverflowError:
             with self._condition:
                 self._dropped_observation_count += 1
                 self._condition.notify_all()
+        for action in delivered_actions:
+            self._owner.acknowledge_action(action)
 
     def _route_action(self, action: NativeTerminalOwnerAction) -> None:
         """Route one action to its sole owning execution context.

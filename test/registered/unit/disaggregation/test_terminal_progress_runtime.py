@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
@@ -29,6 +30,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalActionInbox,
+    NativeTerminalObservationInbox,
     NativeTerminalProducerDelivery,
     NativeTerminalRuntime,
     NativeTerminalRuntimeClosedError,
@@ -273,20 +275,12 @@ def _drain_observations(runtime: NativeTerminalRuntime) -> None:
     :param runtime: Runtime being prepared for exact clean close.
     """
 
-    expires_at = time.monotonic() + _WAIT_SECONDS
+    assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
     while True:
         if runtime.observations.snapshot().queued_count > 0:
             runtime.observations.drain()
-        if runtime.snapshot().owner.queued_output_count == 0:
-            if runtime.observations.snapshot().queued_count > 0:
-                continue
+        if runtime.observations.snapshot().queued_count == 0:
             return
-        remaining = expires_at - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("terminal observations did not reach quiescence")
-        with selectors.DefaultSelector() as selector:
-            selector.register(runtime.observations.fileno(), selectors.EVENT_READ)
-            selector.select(remaining)
 
 
 def _retire_all_producers(runtime: NativeTerminalRuntime) -> None:
@@ -487,9 +481,9 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
         assert snapshot.scheduler_pending_count == 0
         assert snapshot.consumer_pending_count == 0
         assert snapshot.dropped_observation_count > 0
-        _drain_observations(runtime)
         _retire_all_producers(runtime)
         runtime.join_producers()
+        _drain_observations(runtime)
         with pytest.raises(NativeTerminalRuntimeClosedError):
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
@@ -500,6 +494,49 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
         runtime.close_clean()
     finally:
         _finish_fail_closed(runtime)
+
+
+def test_native_quiescence_waits_for_complete_output_projection() -> None:
+    """Native delivery stays retained through the non-authoritative projection."""
+
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registration = _registration(owner, remote, 72)
+    projection_started = threading.Event()
+    release_projection = threading.Event()
+    observation_type = type(runtime.observations)
+    original_enqueue = observation_type._enqueue
+
+    def delayed_enqueue(
+        inbox: NativeTerminalObservationInbox,
+        output: NativeTerminalOwnerOutput,
+    ) -> None:
+        if any(
+            action.kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
+            for action in output.actions
+        ):
+            projection_started.set()
+            if not release_projection.wait(_WAIT_SECONDS):
+                raise TimeoutError("terminal output projection was not released")
+        original_enqueue(inbox, output)
+
+    with mock.patch.object(observation_type, "_enqueue", delayed_enqueue):
+        runtime.start()
+        try:
+            runtime.register_lifecycle(registration)
+            runtime.stop_admission()
+            _complete_source(runtime, registration, owner, remote)
+
+            assert projection_started.wait(_WAIT_SECONDS)
+            assert runtime.snapshot().owner.pending_action_count == 1
+
+            release_projection.set()
+            _retire_all_producers(runtime)
+            runtime.join_producers()
+            _drain_observations(runtime)
+            runtime.close_clean()
+        finally:
+            release_projection.set()
+            _finish_fail_closed(runtime)
 
 
 def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
