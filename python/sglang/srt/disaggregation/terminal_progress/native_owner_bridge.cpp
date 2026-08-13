@@ -515,8 +515,6 @@ Receipt receipt_from_python(const py::dict &value) {
 Event event_from_python(const py::dict &value) {
   Event result{};
   result.producer_id = py::cast<std::uint64_t>(value["producer_id"]);
-  result.producer_sequence =
-      py::cast<std::uint64_t>(value["producer_sequence"]);
   result.binding_digest =
       exact_bytes<kDigestBytes>(value["binding_digest"], "binding digest");
   result.kind = static_cast<EventKind>(py::cast<int>(value["kind"]));
