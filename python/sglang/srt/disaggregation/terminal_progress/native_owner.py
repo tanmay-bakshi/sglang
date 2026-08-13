@@ -177,10 +177,21 @@ class _NativeTerminalOwnerBridge(Protocol):
     def stop_admission(self) -> None:
         """Close lifecycle and event admission."""
 
-    def retire_python_producer(self, producer_id: int) -> None:
-        """Retire one Python-owned producer namespace.
+    def retire_python_producer(self, producer_id: int) -> int:
+        """Order one Python producer's retirement behind accepted events.
 
         :param producer_id: Exact registered producer identity.
+        :returns: Zero on ordered admission, otherwise a positive errno value.
+        """
+
+    def wait_for_producer_retirement(
+        self, producer_id: int, timeout_seconds: float
+    ) -> bool:
+        """Wait for an ordered producer retirement to commit.
+
+        :param producer_id: Exact registered producer identity.
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether retirement committed within the bound.
         """
 
     def join_producers(self) -> bool:
@@ -726,14 +737,38 @@ class NativeTerminalOwner:
         self._native.stop_admission()
 
     def retire_python_producer(self, producer_id: int) -> None:
-        """Retire one Python producer after its execution context joins.
+        """Order one Python producer's retirement after its context joins.
 
         :param producer_id: Exact registered Python producer namespace.
+        :raises OSError: If retirement cannot enter the ordered input domain.
         """
 
         if type(producer_id) is not int or producer_id < 0:
             raise ValueError("producer_id must be a non-negative integer")
-        self._native.retire_python_producer(producer_id)
+        status = int(self._native.retire_python_producer(producer_id))
+        if status != 0:
+            raise OSError(status, os.strerror(status))
+
+    def wait_for_producer_retirement(
+        self, producer_id: int, timeout_seconds: float
+    ) -> bool:
+        """Wait for one ordered producer retirement fence to commit.
+
+        :param producer_id: Exact registered producer identity.
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether retirement committed within the bound.
+        """
+
+        if type(producer_id) is not int or producer_id < 0:
+            raise ValueError("producer_id must be a non-negative integer")
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(
+            self._native.wait_for_producer_retirement(
+                producer_id,
+                timeout_seconds,
+            )
+        )
 
     def join_producers(self) -> bool:
         """Verify that every native and Python producer retired.

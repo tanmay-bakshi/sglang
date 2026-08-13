@@ -2922,12 +2922,26 @@ public:
     return owner_->producers_joined;
   }
 
-  void retire_python_producer(std::uint64_t producer_id) {
-    const int status = submit_producer_retirement_locked(*owner_, producer_id);
-    if (status != 0) {
-      throw std::system_error(status, std::generic_category(),
-                              "producer retirement failed");
+  int retire_python_producer(std::uint64_t producer_id) {
+    return submit_producer_retirement_locked(*owner_, producer_id);
+  }
+
+  bool wait_for_producer_retirement(std::uint64_t producer_id,
+                                    double timeout_seconds) {
+    if (timeout_seconds <= 0.0) {
+      throw std::invalid_argument("producer retirement wait must be positive");
     }
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    if (owner_->producers.count(producer_id) != 1) {
+      throw std::invalid_argument("producer retirement requires registration");
+    }
+    return owner_->condition.wait_for(
+               lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+                 return owner_->producers.at(producer_id).retired ||
+                        owner_->fatal_code != FatalCode::kNone ||
+                        owner_->closed;
+               }) &&
+           owner_->producers.at(producer_id).retired;
   }
 
   bool wait_for_output_quiescence(double timeout_seconds) {
@@ -3332,6 +3346,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("retire_python_producer",
            &NativeTerminalOwnerBridge::retire_python_producer,
            py::arg("producer_id"), py::call_guard<py::gil_scoped_release>())
+      .def("wait_for_producer_retirement",
+           &NativeTerminalOwnerBridge::wait_for_producer_retirement,
+           py::arg("producer_id"), py::arg("timeout_seconds"),
+           py::call_guard<py::gil_scoped_release>())
       .def("wait_for_output_quiescence",
            &NativeTerminalOwnerBridge::wait_for_output_quiescence,
            py::arg("timeout_seconds"),
