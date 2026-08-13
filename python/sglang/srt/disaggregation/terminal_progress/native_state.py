@@ -937,7 +937,6 @@ class NativeTerminalOwnerEvent:
     """Producer-bound event submitted to the authoritative native reducer.
 
     :ivar producer_id: Registered native producer identity.
-    :ivar producer_sequence: Gap-free producer-local sequence.
     :ivar binding_digest: Exact 32-byte lifecycle lookup key.
     :ivar kind: Closed lifecycle event, never a producer-selected phase.
     :ivar enqueued_ns: Producer-side ``CLOCK_MONOTONIC_RAW`` timestamp.
@@ -946,7 +945,6 @@ class NativeTerminalOwnerEvent:
     """
 
     producer_id: int
-    producer_sequence: int
     binding_digest: bytes
     kind: NativeTerminalOwnerEventKind
     enqueued_ns: int
@@ -957,7 +955,6 @@ class NativeTerminalOwnerEvent:
         """Validate one structurally complete native owner event."""
 
         _require_uint(self.producer_id, _UINT64_MAX, "producer_id")
-        _require_uint(self.producer_sequence, _UINT64_MAX, "producer_sequence")
         _require_exact_bytes(self.binding_digest, _DIGEST_BYTES, "binding_digest")
         if type(self.kind) is not NativeTerminalOwnerEventKind:
             raise TypeError("kind must be NativeTerminalOwnerEventKind")
@@ -992,7 +989,6 @@ class NativeTerminalOwnerEvent:
         receipt = self.receipt
         return {
             "producer_id": self.producer_id,
-            "producer_sequence": self.producer_sequence,
             "binding_digest": self.binding_digest,
             "kind": int(self.kind),
             "enqueued_ns": self.enqueued_ns,
@@ -1269,7 +1265,7 @@ class NativeTerminalOwnerInventory:
     :ivar queued_input_count: Inputs not yet committed.
     :ivar queued_output_count: Earned actions not yet consumed.
     :ivar registered_producer_count: Exact producer registry size.
-    :ivar joined_producer_count: Producers explicitly joined at drain.
+    :ivar joined_producer_count: Producers with committed retirement fences.
     :ivar active_source_count: Source generations with live resources.
     :ivar active_decode_count: Decode generations with live resources.
     :ivar safely_retired_count: Fully retired request generations.
@@ -1279,7 +1275,8 @@ class NativeTerminalOwnerInventory:
     :ivar action_count: Production actions earned since construction.
     :ivar qualification_trace_count: Test-only retained correlated traces.
     :ivar started: Whether the native reactor started.
-    :ivar admission_open: Whether registrations and events remain accepted.
+    :ivar admission_open: Whether new lifecycle registrations remain accepted.
+    :ivar event_admission_open: Whether unretired producers may submit events.
     :ivar draining: Whether fail-closed drain began.
     :ivar closed: Whether exact clean closure completed.
     :ivar input_eventfd_open: Whether the native input descriptor remains open.
@@ -1305,6 +1302,7 @@ class NativeTerminalOwnerInventory:
     qualification_trace_count: int
     started: bool
     admission_open: bool
+    event_admission_open: bool
     draining: bool
     closed: bool
     input_eventfd_open: bool
@@ -1345,6 +1343,7 @@ class NativeTerminalOwnerInventory:
         flags = (
             self.started,
             self.admission_open,
+            self.event_admission_open,
             self.draining,
             self.closed,
             self.input_eventfd_open,
@@ -1362,7 +1361,7 @@ class NativeTerminalOwnerInventory:
             self.deadline_table_digest, _DIGEST_BYTES, "deadline_table_digest"
         )
         if self.closed:
-            if self.admission_open:
+            if self.admission_open or self.event_admission_open:
                 raise ValueError("closed native inventory cannot accept admission")
             if self.joined_producer_count != self.registered_producer_count:
                 raise ValueError("closed native inventory has unjoined producers")
@@ -1406,6 +1405,7 @@ class NativeTerminalOwnerInventory:
             qualification_trace_count=int(value["qualification_trace_count"]),
             started=bool(value["started"]),
             admission_open=bool(value["admission_open"]),
+            event_admission_open=bool(value["event_admission_open"]),
             draining=bool(value["draining"]),
             closed=bool(value["closed"]),
             input_eventfd_open=bool(value["input_eventfd_open"]),

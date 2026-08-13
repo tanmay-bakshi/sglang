@@ -1,4 +1,6 @@
+import concurrent.futures
 import dataclasses
+import errno
 import sys
 import time
 
@@ -353,9 +355,7 @@ def test_native_deadline_expiry_is_exact_and_preserves_lifetime_proof(
         if context.role is TerminalOwnerRole.DECODE:
             expected_phase = int(NativeDecodeLifecyclePhase.QUARANTINED)
         assert step.after.phase == expected_phase
-        assert step.actions == (
-            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
-        )
+        assert step.actions == (NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,)
         assert step.fatal_code is NativeTerminalOwnerFatalCode.NONE
         assert not step.after.process_fatal
         return
@@ -383,7 +383,7 @@ def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
     try:
         first = _make_dynamic_source_registration(identity, room_id=801)
         owner.register_lifecycle(first)
-        _submit_dynamic_source_start(owner, first.binding, producer_sequence=0)
+        _submit_dynamic_source_start(owner, first.binding)
         first_snapshot = _wait_for_source_phase(
             owner,
             first.binding.digest,
@@ -392,7 +392,7 @@ def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
 
         second = _make_dynamic_source_registration(identity, room_id=802)
         owner.register_lifecycle(second)
-        _submit_dynamic_source_start(owner, second.binding, producer_sequence=1)
+        _submit_dynamic_source_start(owner, second.binding)
         second_snapshot = _wait_for_source_phase(
             owner,
             second.binding.digest,
@@ -404,6 +404,91 @@ def test_dynamic_registration_and_first_event_share_reactor_order() -> None:
         inventory = owner.inventory()
         assert inventory.active_source_count == 2
         assert inventory.transition_count == 2
+        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
+    finally:
+        owner.abort_and_close()
+
+
+def test_producer_retirement_is_ordered_behind_every_accepted_event() -> None:
+    owner, identity = _make_dynamic_source_owner(start=False)
+    registration = _make_dynamic_source_registration(identity, room_id=807)
+    try:
+        owner.register_lifecycle(registration)
+        _submit_dynamic_source_start(owner, registration.binding)
+        owner.retire_python_producer(_DYNAMIC_PRODUCER_ID)
+        retired_fence_inventory = owner.inventory()
+
+        with pytest.raises(OSError) as duplicate_retirement:
+            owner.retire_python_producer(_DYNAMIC_PRODUCER_ID)
+        assert duplicate_retirement.value.errno == errno.EALREADY
+        assert owner.inventory() == retired_fence_inventory
+
+        with pytest.raises(OSError) as post_retirement_event:
+            _submit_dynamic_source_start(owner, registration.binding)
+        assert post_retirement_event.value.errno == errno.ESHUTDOWN
+        assert owner.inventory() == retired_fence_inventory
+
+        owner.start()
+        snapshot = _wait_for_source_phase(
+            owner,
+            registration.binding.digest,
+            NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER,
+        )
+
+        assert snapshot.live_resources != 0
+        assert owner.wait_for_producer_retirement(
+            _DYNAMIC_PRODUCER_ID,
+            _DYNAMIC_WAIT_SECONDS,
+        )
+        assert owner.join_producers()
+        inventory = owner.inventory()
+        assert inventory.transition_count == 1
+        assert inventory.joined_producer_count == 1
+        assert not inventory.event_admission_open
+        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
+    finally:
+        owner.abort_and_close()
+
+
+def test_concurrent_producers_receive_gap_free_queue_insertion_order() -> None:
+    owner, identity = _make_dynamic_source_owner(start=False)
+    registrations = tuple(
+        _make_dynamic_source_registration(identity, room_id=900 + index)
+        for index in range(32)
+    )
+    try:
+        for registration in registrations:
+            owner.register_lifecycle(registration)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = tuple(
+                executor.submit(
+                    _submit_dynamic_source_start,
+                    owner,
+                    registration.binding,
+                )
+                for registration in registrations
+            )
+            for future in futures:
+                future.result()
+
+        owner.retire_python_producer(_DYNAMIC_PRODUCER_ID)
+        owner.start()
+        for registration in registrations:
+            _wait_for_source_phase(
+                owner,
+                registration.binding.digest,
+                NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER,
+            )
+
+        assert owner.wait_for_producer_retirement(
+            _DYNAMIC_PRODUCER_ID,
+            _DYNAMIC_WAIT_SECONDS,
+        )
+        assert owner.join_producers()
+        inventory = owner.inventory()
+        assert inventory.transition_count == len(registrations)
+        assert inventory.joined_producer_count == 1
         assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
     finally:
         owner.abort_and_close()
@@ -422,7 +507,7 @@ def test_event_ordered_before_registration_fails_closed_as_unknown_binding() -> 
     owner, identity = _make_dynamic_source_owner(start=False)
     registration = _make_dynamic_source_registration(identity, room_id=803)
     try:
-        _submit_dynamic_source_start(owner, registration.binding, producer_sequence=0)
+        _submit_dynamic_source_start(owner, registration.binding)
         owner.register_lifecycle(registration)
         owner.start()
 
@@ -583,20 +668,16 @@ def _make_dynamic_source_registration(
 def _submit_dynamic_source_start(
     owner: NativeTerminalOwner,
     binding: NativeTerminalRequestBinding,
-    *,
-    producer_sequence: int,
 ) -> None:
     """Submit the first event for one dynamically admitted source lifecycle.
 
     :param owner: Process-lifetime native owner.
     :param binding: Exact target lifecycle binding.
-    :param producer_sequence: Gap-free local producer sequence.
     """
 
     owner.submit(
         NativeTerminalOwnerEvent(
             producer_id=_DYNAMIC_PRODUCER_ID,
-            producer_sequence=producer_sequence,
             binding_digest=binding.digest,
             kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
             enqueued_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),

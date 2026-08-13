@@ -170,8 +170,28 @@ class _NativeTerminalOwnerBridge(Protocol):
     def stop_admission(self) -> None:
         """Close lifecycle and event admission."""
 
-    def join_producers(self) -> None:
-        """Record that every external producer has stopped."""
+    def retire_python_producer(self, producer_id: int) -> int:
+        """Order one Python producer's retirement behind accepted events.
+
+        :param producer_id: Exact registered producer identity.
+        :returns: Zero on ordered admission, otherwise a positive errno value.
+        """
+
+    def wait_for_producer_retirement(
+        self, producer_id: int, timeout_seconds: float
+    ) -> bool:
+        """Wait for an ordered producer retirement to commit.
+
+        :param producer_id: Exact registered producer identity.
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether retirement committed within the bound.
+        """
+
+    def join_producers(self) -> bool:
+        """Verify that every registered producer retired.
+
+        :returns: Whether event admission closed after exact retirement.
+        """
 
     def close(self) -> None:
         """Close a fully drained and retired owner."""
@@ -274,6 +294,15 @@ def _native_source_path() -> Path:
     return Path(__file__).with_name("native_owner_bridge.cpp")
 
 
+def _native_producer_header_path() -> Path:
+    """Return the shared native producer ABI header.
+
+    :returns: Absolute packaged header path.
+    """
+
+    return Path(__file__).with_name("native_producer_api.h")
+
+
 @lru_cache(maxsize=2)
 def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
     """Compile and load the CPU-only authoritative owner bridge.
@@ -289,9 +318,18 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
     if not sys.platform.startswith("linux"):
         raise RuntimeError("native terminal owner requires Linux eventfd and timerfd")
     source_path = _native_source_path()
-    if not source_path.is_file():
-        raise RuntimeError(f"native terminal owner source is absent: {source_path}")
-    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()[:12]
+    header_path = _native_producer_header_path()
+    for required_path in (source_path, header_path):
+        if not required_path.is_file():
+            raise RuntimeError(
+                f"native terminal owner source is absent: {required_path}"
+            )
+    source_hasher = hashlib.sha256()
+    for required_path in (source_path, header_path):
+        source_hasher.update(required_path.name.encode("utf-8"))
+        source_hasher.update(b"\0")
+        source_hasher.update(required_path.read_bytes())
+    source_digest = source_hasher.hexdigest()[:12]
     variant = "test" if testing else "runtime"
     module_name = f"sglang_terminal_owner_bridge_{source_digest}_{variant}"
     extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
@@ -307,6 +345,7 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
         name=module_name,
         sources=[str(source_path)],
         extra_cflags=extra_cflags,
+        extra_include_paths=[str(source_path.parent)],
         extra_ldflags=["-pthread"],
         build_directory=build_directory,
         with_cuda=False,
@@ -653,14 +692,55 @@ class NativeTerminalOwner:
         return summary
 
     def stop_admission(self) -> None:
-        """Close lifecycle and event admission before drain."""
+        """Stop new lifecycle registration while existing events drain."""
 
         self._native.stop_admission()
 
-    def join_producers(self) -> None:
-        """Record that every native and external producer has stopped."""
+    def retire_python_producer(self, producer_id: int) -> None:
+        """Order one Python producer's retirement after its accepted events.
 
-        self._native.join_producers()
+        The caller must first join the producer's execution context. Native
+        CUDA and NIXL bindings use the equivalent capsule operation so their
+        callback lifetime and producer lifetime remain one ownership unit.
+
+        :param producer_id: Exact registered producer identity.
+        :raises OSError: If retirement cannot enter the ordered input domain.
+        """
+
+        if type(producer_id) is not int or producer_id < 0:
+            raise ValueError("producer_id must be a non-negative integer")
+        status = int(self._native.retire_python_producer(producer_id))
+        if status != 0:
+            raise OSError(status, os.strerror(status))
+
+    def wait_for_producer_retirement(
+        self, producer_id: int, timeout_seconds: float
+    ) -> bool:
+        """Wait for one ordered retirement fence to commit.
+
+        :param producer_id: Exact registered producer identity.
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether retirement committed within the bound.
+        """
+
+        if type(producer_id) is not int or producer_id < 0:
+            raise ValueError("producer_id must be a non-negative integer")
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(
+            self._native.wait_for_producer_retirement(
+                producer_id,
+                timeout_seconds,
+            )
+        )
+
+    def join_producers(self) -> bool:
+        """Close event admission only after every producer retired.
+
+        :returns: Whether the complete registered producer population retired.
+        """
+
+        return bool(self._native.join_producers())
 
     def close(self) -> None:
         """Close a fully drained owner exactly once."""

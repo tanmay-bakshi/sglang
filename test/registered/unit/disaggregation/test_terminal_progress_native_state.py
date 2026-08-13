@@ -223,7 +223,6 @@ def test_native_event_has_no_producer_selected_phase() -> None:
     )
     event = NativeTerminalOwnerEvent(
         producer_id=4,
-        producer_sequence=12,
         binding_digest=binding.digest,
         kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
         enqueued_ns=123,
@@ -231,7 +230,6 @@ def test_native_event_has_no_producer_selected_phase() -> None:
 
     assert set(event.to_native()) == {
         "producer_id",
-        "producer_sequence",
         "binding_digest",
         "kind",
         "enqueued_ns",
