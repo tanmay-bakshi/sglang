@@ -1,6 +1,11 @@
 import dataclasses
 import enum
+import itertools
 from collections.abc import Callable
+
+from sglang.srt.disaggregation.terminal_progress.gil_qualification_native import (
+    GILNativeHopTrace,
+)
 
 GIL_QUALIFICATION_LIVE_MACHINE_COUNT = 16
 GIL_QUALIFICATION_MINIMUM_TRANSITIONS = 100_000
@@ -148,10 +153,12 @@ class GILHopLatencySample:
     """One correlated seven-hop owner completion path.
 
     :ivar machine_index: Closed-loop machine producing the sample.
+    :ivar generation_index: Gap-free request generation within the machine.
     :ivar hop_latencies_ns: Ordered latency for every owner transition.
     """
 
     machine_index: int
+    generation_index: int
     hop_latencies_ns: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -163,6 +170,8 @@ class GILHopLatencySample:
             or self.machine_index >= GIL_QUALIFICATION_LIVE_MACHINE_COUNT
         ):
             raise ValueError("machine_index must identify one frozen live machine")
+        if type(self.generation_index) is not int or self.generation_index < 0:
+            raise ValueError("generation_index must be a non-negative integer")
         if type(self.hop_latencies_ns) is not tuple:
             raise TypeError("hop_latencies_ns must be a tuple")
         if len(self.hop_latencies_ns) != GIL_QUALIFICATION_OWNER_HOP_COUNT:
@@ -320,6 +329,15 @@ def evaluate_gil_qualification(
     for sample in samples:
         if type(sample) is not GILHopLatencySample:
             raise TypeError("samples entries must be GILHopLatencySample")
+    samples_by_machine: dict[int, list[GILHopLatencySample]] = {}
+    for sample in samples:
+        samples_by_machine.setdefault(sample.machine_index, []).append(sample)
+    for machine_samples in samples_by_machine.values():
+        observed_generations = sorted(
+            sample.generation_index for sample in machine_samples
+        )
+        if observed_generations != list(range(len(observed_generations))):
+            raise ValueError("sample generations must be unique and gap-free")
 
     hop_p99_ns = tuple(
         _p99_nearest_rank(
@@ -346,10 +364,12 @@ class GILStressCollection:
     """Raw evidence returned by a concrete event-storm producer.
 
     :ivar samples: Correlated latency samples observed during the storm.
+    :ivar native_hop_traces: Raw native enqueue and committed-dispatch evidence.
     :ivar elapsed_seconds: Measured sustained storm duration.
     """
 
     samples: tuple[GILHopLatencySample, ...]
+    native_hop_traces: tuple[GILNativeHopTrace, ...]
     elapsed_seconds: float
 
     def __post_init__(self) -> None:
@@ -359,8 +379,94 @@ class GILStressCollection:
             raise ValueError("samples must be a non-empty tuple")
         if any(type(sample) is not GILHopLatencySample for sample in self.samples):
             raise TypeError("samples must contain GILHopLatencySample values")
+        if type(self.native_hop_traces) is not tuple:
+            raise TypeError("native_hop_traces must be a tuple")
+        if any(
+            type(trace) is not GILNativeHopTrace for trace in self.native_hop_traces
+        ):
+            raise TypeError("native_hop_traces must contain GILNativeHopTrace values")
+        if len(self.native_hop_traces) > 0:
+            correlated = correlate_gil_native_traces(self.native_hop_traces)
+            if correlated != self.samples:
+                raise ValueError("native traces do not reproduce correlated samples")
         if type(self.elapsed_seconds) is not float or self.elapsed_seconds <= 0.0:
             raise ValueError("elapsed_seconds must be a positive float")
+
+
+def correlate_gil_native_traces(
+    traces: tuple[GILNativeHopTrace, ...],
+) -> tuple[GILHopLatencySample, ...]:
+    """Validate and correlate raw native traces into seven-hop requests.
+
+    The validation proves global source order, all 16 machine identities,
+    gap-free request generations and hop indices, and the one-outstanding-event
+    closed-loop invariant. No aggregate percentile can repair a malformed raw
+    population.
+
+    :param traces: Native enqueue and post-dispatch completion evidence.
+    :returns: Deterministically ordered correlated request samples.
+    """
+
+    if type(traces) is not tuple or len(traces) == 0:
+        raise ValueError("traces must be a non-empty tuple")
+    if any(type(trace) is not GILNativeHopTrace for trace in traces):
+        raise TypeError("traces must contain GILNativeHopTrace values")
+    ordered = tuple(sorted(traces, key=lambda trace: trace.event.producer_sequence))
+    sequences = tuple(trace.event.producer_sequence for trace in ordered)
+    if sequences != tuple(range(len(ordered))):
+        raise ValueError("native producer sequences must be gap-free from zero")
+
+    grouped: dict[tuple[int, int], list[GILNativeHopTrace]] = {}
+    machine_traces: dict[int, list[GILNativeHopTrace]] = {}
+    for trace in ordered:
+        event = trace.event
+        if event.machine_index >= GIL_QUALIFICATION_LIVE_MACHINE_COUNT:
+            raise ValueError("native trace machine is outside the frozen population")
+        if event.hop_index >= GIL_QUALIFICATION_OWNER_HOP_COUNT:
+            raise ValueError("native trace hop is outside the frozen request path")
+        grouped.setdefault((event.machine_index, event.generation_index), []).append(
+            trace
+        )
+        machine_traces.setdefault(event.machine_index, []).append(trace)
+
+    if set(machine_traces) != set(range(GIL_QUALIFICATION_LIVE_MACHINE_COUNT)):
+        raise ValueError("native traces must cover exactly all frozen machines")
+    for machine_index, current_traces in machine_traces.items():
+        generations = sorted({trace.event.generation_index for trace in current_traces})
+        if generations != list(range(len(generations))):
+            raise ValueError(
+                f"machine {machine_index} generations must be gap-free from zero"
+            )
+        ordered_machine = sorted(
+            current_traces,
+            key=lambda trace: (
+                trace.event.generation_index,
+                trace.event.hop_index,
+            ),
+        )
+        for previous, current in itertools.pairwise(ordered_machine):
+            if current.event.enqueued_ns < previous.completed_ns:
+                raise ValueError(
+                    "a machine published a successor before dispatch acknowledgment"
+                )
+
+    samples: list[GILHopLatencySample] = []
+    for (machine_index, generation_index), current_traces in sorted(grouped.items()):
+        ordered_hops = tuple(
+            sorted(current_traces, key=lambda trace: trace.event.hop_index)
+        )
+        if tuple(trace.event.hop_index for trace in ordered_hops) != tuple(
+            range(GIL_QUALIFICATION_OWNER_HOP_COUNT)
+        ):
+            raise ValueError("each native generation must contain seven exact hops")
+        samples.append(
+            GILHopLatencySample(
+                machine_index=machine_index,
+                generation_index=generation_index,
+                hop_latencies_ns=tuple(trace.latency_ns for trace in ordered_hops),
+            )
+        )
+    return tuple(samples)
 
 
 GILStressCollector = Callable[[GILStressPlan], GILStressCollection]
@@ -389,6 +495,8 @@ def execute_gil_stress_plan(
     collection = collector(plan)
     if type(collection) is not GILStressCollection:
         raise TypeError("collector must return GILStressCollection")
+    if plan.authoritative_producer and len(collection.native_hop_traces) == 0:
+        raise ValueError("authoritative production requires raw native hop traces")
     return evaluate_gil_qualification(
         plan=plan,
         samples=collection.samples,

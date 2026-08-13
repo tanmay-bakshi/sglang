@@ -14,8 +14,13 @@ from sglang.srt.disaggregation.terminal_progress.gil_qualification import (
     GILSchedulerPressure,
     GILStressCollection,
     GILStressPlan,
+    correlate_gil_native_traces,
     evaluate_gil_qualification,
     execute_gil_stress_plan,
+)
+from sglang.srt.disaggregation.terminal_progress.gil_qualification_native import (
+    GILNativeEventRecord,
+    GILNativeHopTrace,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -37,6 +42,7 @@ def _complete_samples(
     return tuple(
         GILHopLatencySample(
             machine_index=index % GIL_QUALIFICATION_LIVE_MACHINE_COUNT,
+            generation_index=index // GIL_QUALIFICATION_LIVE_MACHINE_COUNT,
             hop_latencies_ns=(latency_ns,) * GIL_QUALIFICATION_OWNER_HOP_COUNT,
         )
         for index in range(sample_count)
@@ -109,6 +115,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=(
             GILHopLatencySample(
                 machine_index=0,
+                generation_index=0,
                 hop_latencies_ns=(1_000_000,) * 7,
             ),
         ),
@@ -123,6 +130,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=tuple(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=(
                     GIL_QUALIFICATION_PER_HOP_P99_LIMIT_NS + 1,
                     1,
@@ -144,6 +152,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         samples=tuple(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=(2_000_000,) * 7,
             )
             for index in range(100)
@@ -161,6 +170,7 @@ def test_population_and_both_latency_bounds_are_independent() -> None:
         distributed_tail_samples.append(
             GILHopLatencySample(
                 machine_index=index % 16,
+                generation_index=index // 16,
                 hop_latencies_ns=tuple(hop_latencies),
             )
         )
@@ -184,6 +194,7 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
     samples = tuple(
         GILHopLatencySample(
             machine_index=index % 16,
+            generation_index=index // 16,
             hop_latencies_ns=((10_000_000 if index >= 98 else 1_000_000),) * 7,
         )
         for index in range(100)
@@ -197,9 +208,17 @@ def test_nearest_rank_p99_and_sample_validation_are_deterministic() -> None:
     assert result.seven_hop_p99_ns == 70_000_000
 
     with pytest.raises(ValueError):
-        GILHopLatencySample(machine_index=16, hop_latencies_ns=(1,) * 7)
+        GILHopLatencySample(
+            machine_index=16,
+            generation_index=0,
+            hop_latencies_ns=(1,) * 7,
+        )
     with pytest.raises(ValueError):
-        GILHopLatencySample(machine_index=0, hop_latencies_ns=(1,) * 6)
+        GILHopLatencySample(
+            machine_index=0,
+            generation_index=0,
+            hop_latencies_ns=(1,) * 6,
+        )
     with pytest.raises(ValueError):
         evaluate_gil_qualification(plan=plan, samples=(), elapsed_seconds=1.0)
 
@@ -221,7 +240,11 @@ def test_executable_scaffold_preserves_collector_authority() -> None:
         """
 
         assert plan is python_plan
-        return GILStressCollection(samples=samples, elapsed_seconds=60.0)
+        return GILStressCollection(
+            samples=samples,
+            native_hop_traces=(),
+            elapsed_seconds=60.0,
+        )
 
     result = execute_gil_stress_plan(python_plan, collect)
     assert result.population_complete
@@ -236,14 +259,94 @@ def test_executable_scaffold_accepts_native_collector_results() -> None:
         config=GILQualificationConfig(),
         producer=GILQualificationProducer.NATIVE_OR_GIL_RELEASING,
     )
+    traces = _native_traces(generation_count=1)
+    samples = correlate_gil_native_traces(traces)
     result = execute_gil_stress_plan(
         native_plan,
         lambda plan: GILStressCollection(
-            samples=_complete_samples(latency_ns=1_000_000),
+            samples=samples,
+            native_hop_traces=traces,
             elapsed_seconds=plan.config.minimum_duration_seconds,
         ),
     )
-    assert result.qualified
+    assert result.plan.authoritative_producer
+    assert not result.population_complete
 
     with pytest.raises(TypeError):
         execute_gil_stress_plan(native_plan, lambda plan: object())  # type: ignore[arg-type,return-value]
+
+
+def _native_traces(generation_count: int) -> tuple[GILNativeHopTrace, ...]:
+    """Build deterministic gap-free native traces for every live machine.
+
+    :param generation_count: Complete generations created per machine.
+    :returns: Globally sequenced one-outstanding native trace population.
+    """
+
+    traces: list[GILNativeHopTrace] = []
+    sequence = 0
+    machine_available_ns = [0] * GIL_QUALIFICATION_LIVE_MACHINE_COUNT
+    for generation_index in range(generation_count):
+        for hop_index in range(GIL_QUALIFICATION_OWNER_HOP_COUNT):
+            for machine_index in range(GIL_QUALIFICATION_LIVE_MACHINE_COUNT):
+                enqueued_ns = max(
+                    sequence * 2_000_000,
+                    machine_available_ns[machine_index],
+                )
+                completed_ns = enqueued_ns + 1_000_000
+                traces.append(
+                    GILNativeHopTrace(
+                        event=GILNativeEventRecord(
+                            producer_sequence=sequence,
+                            machine_index=machine_index,
+                            generation_index=generation_index,
+                            hop_index=hop_index,
+                            enqueued_ns=enqueued_ns,
+                        ),
+                        completed_ns=completed_ns,
+                    )
+                )
+                machine_available_ns[machine_index] = completed_ns
+                sequence += 1
+    return tuple(traces)
+
+
+def test_native_trace_correlation_rejects_gaps_and_pre_ack_successors() -> None:
+    """Raw sequence and closed-loop authority are independently enforced."""
+
+    traces = _native_traces(generation_count=2)
+    samples = correlate_gil_native_traces(traces)
+    assert len(samples) == 32
+    assert samples[0].machine_index == 0
+    assert samples[0].generation_index == 0
+
+    with pytest.raises(ValueError, match="producer sequences"):
+        correlate_gil_native_traces(traces[1:])
+
+    second = traces[16]
+    premature = dataclasses.replace(
+        second,
+        event=dataclasses.replace(second.event, enqueued_ns=0),
+        completed_ns=1_000_000,
+    )
+    malformed = (*traces[:16], premature, *traces[17:])
+    with pytest.raises(ValueError, match="before dispatch acknowledgment"):
+        correlate_gil_native_traces(malformed)
+
+
+def test_authoritative_scaffold_rejects_missing_raw_native_evidence() -> None:
+    """An enum claim cannot upgrade aggregate samples to native authority."""
+
+    plan = GILStressPlan(
+        config=GILQualificationConfig(),
+        producer=GILQualificationProducer.NATIVE_OR_GIL_RELEASING,
+    )
+    with pytest.raises(ValueError, match="raw native hop traces"):
+        execute_gil_stress_plan(
+            plan,
+            lambda current: GILStressCollection(
+                samples=_complete_samples(latency_ns=1_000_000),
+                native_hop_traces=(),
+                elapsed_seconds=current.config.minimum_duration_seconds,
+            ),
+        )

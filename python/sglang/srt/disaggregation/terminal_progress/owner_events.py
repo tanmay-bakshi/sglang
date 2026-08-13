@@ -435,16 +435,33 @@ class TerminalOwnerEventSource(abc.ABC):
         """Release this source after every producer has joined."""
 
 
+class TerminalOwnerDispatchObserver(abc.ABC):
+    """Post-dispatch authority for a source requiring closed-loop progress."""
+
+    @abc.abstractmethod
+    def acknowledge_dispatch(
+        self,
+        envelope: TerminalOwnerEventEnvelope,
+    ) -> None:
+        """Observe one command only after its owner transition committed.
+
+        :param envelope: Exact source envelope committed by the owner.
+        """
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class TerminalOwnerEventSourceRegistration:
     """One event source registered before the reactor starts.
 
     :ivar source: Explicit fd-driven event-source adapter.
     :ivar close_on_shutdown: Whether the owner owns final source closure.
+    :ivar dispatch_observer: Optional source authority notified only after a
+        transition commits.
     """
 
     source: TerminalOwnerEventSource
     close_on_shutdown: bool
+    dispatch_observer: TerminalOwnerDispatchObserver | None = None
 
     def __post_init__(self) -> None:
         """Validate one source registration."""
@@ -453,6 +470,13 @@ class TerminalOwnerEventSourceRegistration:
             raise TypeError("source must inherit TerminalOwnerEventSource")
         if type(self.close_on_shutdown) is not bool:
             raise TypeError("close_on_shutdown must be a bool")
+        if self.dispatch_observer is not None and not isinstance(
+            self.dispatch_observer,
+            TerminalOwnerDispatchObserver,
+        ):
+            raise TypeError(
+                "dispatch_observer must inherit TerminalOwnerDispatchObserver"
+            )
         if type(self.source.name) is not str or len(self.source.name) == 0:
             raise ValueError("event source name must be non-empty")
         if type(self.source.fileno()) is not int or self.source.fileno() < 0:

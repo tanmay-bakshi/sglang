@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.terminal_progress.owner_events import (
     ScheduleTerminalDeadline,
     TerminalOwnerClosedError,
     TerminalOwnerCommandValue,
+    TerminalOwnerDispatchObserver,
     TerminalOwnerDisposition,
     TerminalOwnerError,
     TerminalOwnerEventEnvelope,
@@ -55,13 +56,13 @@ from sglang.srt.disaggregation.terminal_progress.owner_events import (
     TerminalOwnerEventSourceRegistration,
     TerminalOwnerFatalCause,
     TerminalOwnerOutput,
+    TerminalOwnerOverflowError,
     TerminalOwnerPulse,
     TerminalOwnerQuarantineEntry,
     TerminalOwnerReceiptEmission,
     TerminalOwnerSnapshot,
     TerminalOwnerTimingAnchor,
     TerminalOwnerTimingSample,
-    TerminalOwnerOverflowError,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceipt,
@@ -92,6 +93,7 @@ class PackedTerminalProgressOwner:
     _output_pulse_source: TerminalOwnerPulseEventSource
     _registrations: tuple[TerminalOwnerEventSourceRegistration, ...]
     _sources_by_name: dict[str, TerminalOwnerEventSource]
+    _dispatch_observers_by_name: dict[str, TerminalOwnerDispatchObserver]
     _source_next_sequence: dict[str, int]
     _output_capacity: int
     _outputs: collections.deque[TerminalOwnerOutput]
@@ -195,6 +197,11 @@ class PackedTerminalProgressOwner:
         self._sources_by_name = {
             registration.source.name: registration.source
             for registration in registrations
+        }
+        self._dispatch_observers_by_name = {
+            registration.source.name: registration.dispatch_observer
+            for registration in registrations
+            if registration.dispatch_observer is not None
         }
         self._source_next_sequence = {name: 0 for name in names}
         self._output_capacity = output_capacity
@@ -531,6 +538,36 @@ class PackedTerminalProgressOwner:
                         reason=(
                             f"terminal owner rejected {source.name} sequence "
                             f"{envelope.producer_sequence}"
+                        ),
+                        formatted_traceback=formatted_traceback,
+                    )
+                return
+            observer = self._dispatch_observers_by_name.get(source.name)
+            if observer is None:
+                continue
+            try:
+                observer.acknowledge_dispatch(envelope)
+            except TerminalOwnerOverflowError as error:
+                formatted_traceback = traceback.format_exc()
+                with self._condition:
+                    self._inventory_overflow_registrations_locked(error)
+                    self._enter_fatal_locked(
+                        cause=TerminalOwnerFatalCause.SUBMISSION_QUEUE_OVERFLOW,
+                        reason=(
+                            f"event source {source.name} overflowed while "
+                            "acknowledging owner dispatch"
+                        ),
+                        formatted_traceback=formatted_traceback,
+                    )
+                return
+            except Exception:
+                formatted_traceback = traceback.format_exc()
+                with self._condition:
+                    self._enter_fatal_locked(
+                        cause=TerminalOwnerFatalCause.EVENT_SOURCE_FAILURE,
+                        reason=(
+                            f"event source {source.name} failed while "
+                            "acknowledging owner dispatch"
                         ),
                         formatted_traceback=formatted_traceback,
                     )
