@@ -5,7 +5,8 @@ import time
 import uuid
 
 import requests
-from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+from sglang.srt.disaggregation.nixl.conn import NixlKVBootstrapServer
 from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
     TerminalStartupCohortExpectation,
@@ -122,7 +123,7 @@ def test_http_join_releases_complete_cohort_without_blocking_event_loop() -> Non
     expectation = _expectation()
     registry = TerminalStartupCohortRegistry(expectation, timeout_seconds=2.0)
     port = _free_port()
-    server = CommonKVBootstrapServer(
+    server = NixlKVBootstrapServer(
         host="127.0.0.1",
         port=port,
         terminal_startup_registry=registry,
@@ -165,7 +166,7 @@ def test_unconfigured_bootstrap_has_no_terminal_startup_route() -> None:
     """A direct baseline cannot accidentally expose cohort admission."""
 
     port = _free_port()
-    server = CommonKVBootstrapServer(host="127.0.0.1", port=port)
+    server = NixlKVBootstrapServer(host="127.0.0.1", port=port)
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_for_server(base_url)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -37,6 +38,8 @@ from sglang.srt.disaggregation.common.asymmetric_kv_geometry import (
 )
 from sglang.srt.disaggregation.common.conn import (
     NIXL_BOOTSTRAP_PEER_PROTOCOL,
+    BootstrapPostRoute,
+    BootstrapRouteHandler,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -98,6 +101,13 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortRegistry,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_http import (
+    TERMINAL_STARTUP_ROUTE,
+    handle_terminal_startup_join,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -2980,8 +2990,7 @@ class NixlKVManager(CommonKVManager):
             )
             require_uniform_asymmetric_kv_entry_geometry(
                 source_item_lens=tuple(
-                    self.kv_args.kv_item_lens[source_index]
-                    for source_index, _ in pairs
+                    self.kv_args.kv_item_lens[source_index] for source_index, _ in pairs
                 ),
                 destination_item_lens=tuple(
                     decode_kv_args.dst_kv_item_lens[destination_index]
@@ -5550,4 +5559,40 @@ class NixlKVReceiver(CommonKVReceiver):
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):
-    pass
+    """NIXL bootstrap listener with optional terminal cohort admission."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        terminal_startup_registry: TerminalStartupCohortRegistry | None = None,
+    ):
+        """Construct the NIXL bootstrap listener.
+
+        :param host: Listener host.
+        :param port: Listener port.
+        :param terminal_startup_registry: Exact immutable startup registry.
+        """
+
+        if (
+            terminal_startup_registry is not None
+            and type(terminal_startup_registry) is not TerminalStartupCohortRegistry
+        ):
+            raise TypeError(
+                "terminal_startup_registry must be TerminalStartupCohortRegistry"
+            )
+        additional_post_route: BootstrapPostRoute | None = None
+        if terminal_startup_registry is not None:
+            terminal_startup_handler: BootstrapRouteHandler = functools.partial(
+                handle_terminal_startup_join,
+                terminal_startup_registry,
+            )
+            additional_post_route = BootstrapPostRoute(
+                path=TERMINAL_STARTUP_ROUTE,
+                handler=terminal_startup_handler,
+            )
+        super().__init__(
+            host=host,
+            port=port,
+            additional_post_route=additional_post_route,
+        )

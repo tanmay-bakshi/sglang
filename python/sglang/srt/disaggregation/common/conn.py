@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -20,6 +21,7 @@ import torch
 import torch.distributed as dist
 import zmq
 from aiohttp import web
+
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -33,13 +35,6 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLease,
     DecodeAllocationLeaseAuthority,
-)
-from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
-    TerminalStartupCohortRegistry,
-)
-from sglang.srt.disaggregation.terminal_progress.startup_http import (
-    TERMINAL_STARTUP_ROUTE,
-    handle_terminal_startup_join,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -72,6 +67,26 @@ SERIALIZED_RANK_LIMIT = 1 << 32
 NIXL_AGENT_NAME_MAX_BYTES = 256
 NIXL_AGENT_METADATA_MAX_BYTES = 512 * 1024
 NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH = 4 * ((NIXL_AGENT_METADATA_MAX_BYTES + 2) // 3)
+
+BootstrapRouteHandler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class BootstrapPostRoute:
+    """One optional POST route composed by a concrete transfer backend.
+
+    :ivar path: Absolute HTTP path registered on the bootstrap listener.
+    :ivar handler: Asynchronous request handler owned by the composing backend.
+    """
+
+    path: str
+    handler: BootstrapRouteHandler
+
+    def __post_init__(self) -> None:
+        """Validate the route identity before the listener thread starts."""
+
+        if type(self.path) is not str or not self.path.startswith("/"):
+            raise ValueError("bootstrap POST route path must be an absolute path")
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -1875,18 +1890,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self,
         host: str,
         port: int,
-        terminal_startup_registry: TerminalStartupCohortRegistry | None = None,
+        additional_post_route: BootstrapPostRoute | None = None,
     ):
         self.host = host
         self.port = port
         if (
-            terminal_startup_registry is not None
-            and type(terminal_startup_registry) is not TerminalStartupCohortRegistry
+            additional_post_route is not None
+            and type(additional_post_route) is not BootstrapPostRoute
         ):
-            raise TypeError(
-                "terminal_startup_registry must be TerminalStartupCohortRegistry"
-            )
-        self.terminal_startup_registry = terminal_startup_registry
+            raise TypeError("additional_post_route must be BootstrapPostRoute")
+        self.additional_post_route = additional_post_route
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -1975,30 +1988,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
-        if self.terminal_startup_registry is not None:
+        if self.additional_post_route is not None:
             self.app.router.add_post(
-                TERMINAL_STARTUP_ROUTE,
-                self._handle_terminal_startup_join,
+                self.additional_post_route.path,
+                self.additional_post_route.handler,
             )
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
         self.app.router.add_get("/ready", self._handle_readiness_check)
-
-    async def _handle_terminal_startup_join(
-        self,
-        request: web.Request,
-    ) -> web.Response:
-        """Join one native rank to the configured immutable cohort.
-
-        :param request: Exact canonical startup advertisement.
-        :returns: Complete sealed matrix or bounded rejection evidence.
-        """
-
-        registry = self.terminal_startup_registry
-        if registry is None:
-            return web.Response(text="terminal startup is not configured", status=404)
-        return await handle_terminal_startup_join(registry, request)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
