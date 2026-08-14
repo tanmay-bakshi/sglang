@@ -456,27 +456,29 @@ class PackedTerminalSourceWiring:
 
         if type(observation) is not NativeTerminalOwnerObservation:
             raise TypeError("observation must be NativeTerminalOwnerObservation")
+        binding = observation.binding.to_binding()
         expected_owner = NativeTerminalProcessIdentity.from_identity(
             self._local_identity
         )
         if observation.binding.owner != expected_owner:
             raise RuntimeError("submission observation belongs to another source rank")
-        binding = observation.binding.to_binding()
-        digest = observation.binding.digest
+        if observation.producer_id != self._local_producer_id:
+            raise RuntimeError("submission observation belongs to another producer")
+        digest = binding.digest
         record = self._record(digest)
+        if binding != record.submission.identity.local_binding:
+            raise RuntimeError("submission observation differs from its source binding")
         with self._lock:
             current = self._records.get(digest)
             if current is not record:
                 raise RuntimeError("source record changed during commit observation")
-            if current.submission.identity.local_binding != binding:
-                raise RuntimeError("submission observation changed request identity")
             if current.submission_commit_observed:
                 raise RuntimeError("source submission commit was observed twice")
             current.submission_commit_observed = True
         self._timing.emit_interval(
             binding=binding,
             field=TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF,
-            sample_key=f"source-rank-{observation.producer_rank}",
+            sample_key=f"source-rank-{binding.owner.tp_rank}",
             started_ns=observation.enqueued_ns,
             completed_ns=observation.completed_ns,
         )

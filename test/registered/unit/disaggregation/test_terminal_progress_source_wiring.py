@@ -500,24 +500,31 @@ def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
 def _submission_observation(
     harness: _Harness,
     *,
-    enqueued_ns: int,
-    completed_ns: int,
+    binding: NativeTerminalRequestBinding | None = None,
+    producer_id: int = _LOCAL_PRODUCER_ID,
+    enqueued_ns: int = 10,
+    completed_ns: int = 20,
 ) -> NativeTerminalOwnerObservation:
     """Build one exact actionless native submission observation.
 
     :param harness: Source lifecycle fixture.
+    :param binding: Native binding override for validation tests.
+    :param producer_id: Native producer identity carried by the observation.
     :param enqueued_ns: Producer enqueue timestamp.
     :param completed_ns: Native commit timestamp.
     :returns: Evidence-only source commit observation.
     """
 
-    binding = harness.identity.local_binding
+    local_binding = harness.identity.local_binding
+    native_binding = binding
+    if native_binding is None:
+        native_binding = NativeTerminalRequestBinding.from_binding(local_binding)
     return NativeTerminalOwnerObservation(
-        binding=NativeTerminalRequestBinding.from_binding(binding),
+        binding=native_binding,
         owner_sequence=0,
-        producer_id=_LOCAL_PRODUCER_ID,
+        producer_id=producer_id,
         producer_sequence=0,
-        producer_rank=binding.owner.tp_rank,
+        producer_rank=local_binding.owner.tp_rank,
         event_kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
         enqueued_ns=enqueued_ns,
         completed_ns=completed_ns,
@@ -739,30 +746,32 @@ def test_source_timing_projects_two_main_members_and_one_dflash_boundary(
     }
 
 
-def test_submission_observation_validates_full_binding_before_marking() -> None:
-    """Reject a digest-inconsistent binding without consuming exact evidence."""
+def test_submission_observation_requires_complete_binding_before_one_shot() -> None:
+    """Malformed evidence cannot consume the valid submission projection."""
 
     harness = _harness()
-    valid = _submission_observation(
-        harness,
-        enqueued_ns=100,
-        completed_ns=110,
+    native_binding = NativeTerminalRequestBinding.from_binding(
+        harness.identity.local_binding
     )
-    invalid = dataclasses.replace(
-        valid,
-        binding=dataclasses.replace(
-            valid.binding,
-            allocation_digest=bytes.fromhex("ff" * 32),
-        ),
+    malformed_binding = dataclasses.replace(
+        native_binding,
+        room_id=native_binding.room_id + 1,
     )
 
-    with pytest.raises(ValueError, match="digest is inconsistent"):
-        harness.wiring.submission_committed(invalid)
+    with pytest.raises(ValueError, match="binding digest is inconsistent"):
+        harness.wiring.submission_committed(
+            _submission_observation(harness, binding=malformed_binding)
+        )
+    with pytest.raises(RuntimeError, match="another producer"):
+        harness.wiring.submission_committed(
+            _submission_observation(harness, producer_id=_LOCAL_PRODUCER_ID + 1)
+        )
+
+    valid = _submission_observation(harness)
     harness.wiring.submission_committed(valid)
+    assert harness.metrics.submission_commits == [valid]
     with pytest.raises(RuntimeError, match="observed twice"):
         harness.wiring.submission_committed(valid)
-
-    assert harness.metrics.submission_commits == [valid]
 
 
 def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
