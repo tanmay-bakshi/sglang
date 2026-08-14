@@ -79,6 +79,7 @@ def _base_scheduler() -> _Scheduler:
     scheduler.device = 0
     scheduler.forward_stream = "forward-stream"
     scheduler.disagg_prefill_inflight_queue = []
+    scheduler.drain_terminal_scheduler_receipts = lambda: None
     scheduler.maybe_prefetch_staging_for_batch = lambda _batch: None
     scheduler.on_idle = lambda: None
     return scheduler
