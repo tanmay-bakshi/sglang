@@ -1685,8 +1685,7 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     )
 
     assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
-    with pytest.raises(RuntimeError, match="duplicated"):
-        runtime.deliver_terminal_owner_ready(peer, ready)
+    assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
 
     main_handle = object()
     auxiliary_handle = object()
@@ -1820,6 +1819,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
         runtime.deliver_terminal_owner_teardown(peer, teardown)
         == identity.local_binding
     )
+    assert runtime.deliver_terminal_owner_teardown(peer, teardown) is None
     assert manager.agent.released_handles == []
     released: list[object] = []
     acknowledgement = runtime.settle_terminal_owner_teardown(

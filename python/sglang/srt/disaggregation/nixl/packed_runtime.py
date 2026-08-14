@@ -730,6 +730,7 @@ class _PrefillRequestRecord:
     terminal_identity: PackedTerminalSourceIdentityPlan | None = None
     terminal_prepare: PackedPrepare | None = None
     terminal_prepare_sent: bool = False
+    terminal_ready: PackedReady | None = None
     terminal_gather_started: bool = False
     terminal_gather_posted: bool = False
     terminal_teardown: PackedRequestTeardown | None = None
@@ -946,12 +947,26 @@ class PackedPrefillRuntime:
             if not record.terminal_prepare_sent:
                 raise RuntimeError("terminal READY preceded PREPARE publication")
             if record.source_transfer is not None:
-                raise RuntimeError("terminal READY was duplicated")
-        transfer = self._ready.handle_ready(message, authenticated_decode_peer)
+                if record.terminal_ready == message:
+                    return identity.local_binding
+                self._quarantine_terminal_record(
+                    record,
+                    "terminal READY conflicts with prior delivery",
+                )
+                raise RuntimeError("terminal READY conflicts with prior delivery")
+        try:
+            transfer = self._ready.handle_ready(message, authenticated_decode_peer)
+        except (RuntimeError, TypeError, ValueError):
+            self._quarantine_terminal_record(
+                record,
+                "terminal READY validation failed",
+            )
+            raise
         with record.condition:
             if record.source_transfer is not None:
                 raise RuntimeError("terminal READY raced another delivery")
             record.source_transfer = transfer
+            record.terminal_ready = message
             record.condition.notify_all()
         return identity.local_binding
 
@@ -992,7 +1007,8 @@ class PackedPrefillRuntime:
             record.terminal_gather_started = True
         try:
             if canonical:
-                assert post_auxiliary is not None
+                if post_auxiliary is None:
+                    raise RuntimeError("terminal auxiliary poster disappeared")
                 auxiliary_handle = post_auxiliary(record.submission)
                 if auxiliary_handle is None:
                     raise RuntimeError("terminal auxiliary poster returned no handle")
@@ -1007,6 +1023,10 @@ class PackedPrefillRuntime:
                     raise RuntimeError("terminal main post lost actor ownership")
                 record.terminal_gather_posted = True
         except Exception:
+            logger.error(
+                "Terminal source gather or transfer post failed:\n%s",
+                traceback.format_exc(),
+            )
             self._quarantine_terminal_record(
                 record,
                 "terminal source gather or transfer post failed",
@@ -1063,8 +1083,8 @@ class PackedPrefillRuntime:
             self._validate_terminal_main_outcome(record, main_outcome)
             auxiliary_outcome: PackedAuxiliaryOutcome | None = None
             if canonical:
-                assert auxiliary_handle is not None
-                assert settle_auxiliary is not None
+                if auxiliary_handle is None or settle_auxiliary is None:
+                    raise RuntimeError("terminal auxiliary settlement disappeared")
                 auxiliary_outcome = settle_auxiliary(auxiliary_handle, action)
                 self._validate_terminal_auxiliary_outcome(record, auxiliary_outcome)
             with record.condition:
@@ -1078,6 +1098,10 @@ class PackedPrefillRuntime:
             self._emit_transfer_stats(record)
             return main_outcome, auxiliary_outcome
         except Exception:
+            logger.error(
+                "Terminal source outcome settlement or publication failed:\n%s",
+                traceback.format_exc(),
+            )
             self._quarantine_terminal_record(
                 record,
                 "terminal source outcome settlement or publication failed",
@@ -1088,12 +1112,13 @@ class PackedPrefillRuntime:
         self,
         authenticated_decode_peer: PackedPeerIdentity,
         request: PackedRequestTeardown,
-    ) -> TerminalRequestBinding:
+    ) -> TerminalRequestBinding | None:
         """Retain authenticated teardown without releasing any resource.
 
         :param authenticated_decode_peer: Decoder proved by control routing.
         :param request: Exact writer-specific teardown request.
-        :returns: Local binding whose native lifecycle receives teardown.
+        :returns: Local binding for a new teardown, otherwise ``None`` for an
+            exact duplicate which must not be resubmitted to native state.
         """
 
         if type(authenticated_decode_peer) is not PackedPeerIdentity:
@@ -1109,7 +1134,7 @@ class PackedPrefillRuntime:
                 previous = record.terminal_teardown
                 if previous is not None:
                     if previous == request:
-                        return identity.local_binding
+                        return None
                     raise RuntimeError(
                         "terminal teardown conflicts with prior delivery"
                     )
@@ -1167,8 +1192,8 @@ class PackedPrefillRuntime:
                 record.main_handle = None
                 record.main_lane = None
             if canonical:
-                assert auxiliary_handle is not None
-                assert release_auxiliary is not None
+                if auxiliary_handle is None or release_auxiliary is None:
+                    raise RuntimeError("terminal auxiliary release disappeared")
                 release_auxiliary(auxiliary_handle)
                 with record.condition:
                     record.auxiliary_handle_released = True
@@ -1187,6 +1212,10 @@ class PackedPrefillRuntime:
                 record.terminal_ack_sent = True
             return acknowledgement
         except Exception:
+            logger.error(
+                "Terminal source teardown settlement or ACK failed:\n%s",
+                traceback.format_exc(),
+            )
             self._quarantine_terminal_record(
                 record,
                 "terminal source teardown settlement or ACK failed",
