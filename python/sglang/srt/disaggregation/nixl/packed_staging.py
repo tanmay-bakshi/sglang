@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
 )
 from sglang.srt.disaggregation.terminal_progress.nixl_owner_boundary import (
     NixlTerminalOwnerBoundary,
@@ -2627,6 +2628,8 @@ class PackedTransferLane:
     _state: PackedTransferLaneState
     _tensor: torch.Tensor | None
     _terminal_binding_digest: bytes | None
+    _terminal_failure_settled: bool
+    _terminal_outcome: PackedWriterOutcome | None
     _terminal_transfer: object | None
     _transport_handle: object | None
     _transport_owners: tuple[object, ...]
@@ -2731,6 +2734,8 @@ class PackedTransferLane:
         self._state = PackedTransferLaneState.IDLE
         self._tensor = tensor
         self._terminal_binding_digest = None
+        self._terminal_failure_settled = False
+        self._terminal_outcome = None
         self._terminal_transfer = None
         self._transport_handle = None
         self._transport_owners = ()
@@ -2820,6 +2825,8 @@ class PackedTransferLane:
                 )
             self._active_transfer = transfer
             self._terminal_binding_digest = binding_digest
+            self._terminal_failure_settled = False
+            self._terminal_outcome = None
             self._state = PackedTransferLaneState.RESERVED
 
     def arm_submission(
@@ -3002,7 +3009,7 @@ class PackedTransferLane:
         self,
         action: NativeTerminalOwnerAction,
     ) -> PackedWriterOutcome:
-        """Settle and release only after authoritative owner terminality.
+        """Construct the outcome while retaining all transfer authority.
 
         :param action: Matching one-shot ``SOURCE_OUTCOME_READY`` action.
         :returns: Exact successful packed writer outcome.
@@ -3014,14 +3021,23 @@ class PackedTransferLane:
             direct_owner, terminal_transfer, transfer = (
                 self._terminal_settlement_authority_locked()
             )
+            if self._terminal_outcome is not None:
+                raise RuntimeError("terminal completion was already settled")
+            if self._terminal_failure_settled:
+                raise RuntimeError("failed terminal transfer cannot complete")
             try:
                 receipt = direct_owner.settle_success(terminal_transfer, action)
                 visibility = self._validate_native_completion_receipt_locked(
                     transfer,
                     receipt,
                 )
-                outcome = self._commit_success_locked(transfer, visibility)
-                direct_owner.release_transfer(terminal_transfer)
+                self._visibility_policy.validate_evidence(visibility)
+                outcome = self._outcome_locked(
+                    transfer,
+                    PackedWriterOutcomeStatus.DONE,
+                    visibility,
+                    None,
+                )
             except BaseException:
                 logger.error(
                     "Direct terminal completion settlement failed:\n%s",
@@ -3032,8 +3048,56 @@ class PackedTransferLane:
                         "direct terminal completion settlement failed"
                     )
                 raise
-            self._terminal_transfer = None
+            self._terminal_outcome = outcome
             return outcome
+
+    def release_terminal_transfer(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Release a successful transfer only under teardown-ACK authority.
+
+        :param action: Matching one-shot ``SOURCE_ACK_READY`` action.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
+            raise ValueError("terminal transfer release requires SOURCE_ACK_READY")
+        with self._lock:
+            direct_owner, terminal_transfer, _ = (
+                self._terminal_settlement_authority_locked()
+            )
+            binding_digest = self._terminal_binding_digest
+            if binding_digest is None or action.binding.digest != binding_digest:
+                raise RuntimeError("terminal release action belongs to another binding")
+            if self._terminal_outcome is None:
+                raise RuntimeError("terminal release preceded successful completion")
+            if self._terminal_failure_settled:
+                raise RuntimeError("failed terminal transfer cannot be released")
+            try:
+                direct_owner.release_transfer(terminal_transfer)
+            except BaseException:
+                logger.error(
+                    "Direct terminal transfer release failed:\n%s",
+                    traceback.format_exc(),
+                )
+                if self._state is not PackedTransferLaneState.POISONED:
+                    self._poison_and_retain_locked(
+                        "direct terminal transfer release failed"
+                    )
+                raise
+            self._active_transfer = None
+            self._terminal_binding_digest = None
+            self._terminal_failure_settled = False
+            self._terminal_outcome = None
+            self._terminal_transfer = None
+            self._transport_handle = None
+            self._transport_owners = ()
+            if self._poison_reason is None:
+                self._state = PackedTransferLaneState.IDLE
+            else:
+                self._state = PackedTransferLaneState.POISONED
 
     def settle_terminal_failure(self, action: NativeTerminalOwnerAction) -> None:
         """Settle failed native terminality without manufacturing an outcome.
@@ -3047,13 +3111,14 @@ class PackedTransferLane:
             direct_owner, terminal_transfer, _ = (
                 self._terminal_settlement_authority_locked()
             )
+            if self._terminal_outcome is not None:
+                raise RuntimeError("successful terminal transfer cannot fail")
+            if self._terminal_failure_settled:
+                raise RuntimeError("terminal failure was already settled")
             if self._state is not PackedTransferLaneState.POISONED:
                 self._poison_and_retain_locked("direct terminal transfer failed")
             direct_owner.settle_failure(terminal_transfer, action)
-            direct_owner.release_transfer(terminal_transfer)
-            self._terminal_transfer = None
-            self._transport_handle = None
-            self._transport_owners = ()
+            self._terminal_failure_settled = True
 
     def cancel_terminal_submission(self) -> None:
         """Request direct-owner cancellation while retaining ambiguous state."""
