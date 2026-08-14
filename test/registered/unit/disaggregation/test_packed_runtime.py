@@ -1178,7 +1178,6 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     runtime = object.__new__(PackedPrefillRuntime)
     runtime._manager = manager
     runtime._direct_terminal_owner = None
-    runtime._records_by_terminal_binding = {}
     runtime._lock = runtime_module.threading.RLock()
     outcome = Mock(reason="packed main transfer initialization failed")
     lane = Mock(data_ptr=0x100000)
@@ -1756,9 +1755,12 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     def post_main(
         exact_record: runtime_module._PrefillRequestRecord,
         transfer: object,
+        *,
+        binding_digest: bytes | None = None,
     ) -> tuple[object, object]:
         assert exact_record is record
         assert transfer is source_transfer
+        assert binding_digest == identity.local_binding.digest
         exact_record.main_handle = main_handle
         exact_record.main_lane = main_lane
         return main_handle, main_lane

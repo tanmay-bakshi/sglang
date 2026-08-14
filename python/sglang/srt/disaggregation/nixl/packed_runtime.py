@@ -2001,9 +2001,6 @@ class PackedPrefillRuntime:
                 raise RuntimeError("terminal main completion was already settled")
         outcome = lane.settle_terminal_completion(action)
         with record.condition:
-            if record.main_outcome is not None:
-                raise RuntimeError("terminal main completion raced another settlement")
-            record.main_outcome = outcome
             started_at = record.main_transport_started_at
             if started_at is not None:
                 record.main_transport_duration_ms = (
