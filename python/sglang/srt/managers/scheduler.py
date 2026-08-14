@@ -1346,6 +1346,13 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            assert self.disagg_prefill_bootstrap_queue is not None
+            self.disagg_prefill_bootstrap_queue.kv_manager.activate_terminal_startup()
+        elif self.disaggregation_mode is DisaggregationMode.DECODE:
+            assert self.disagg_decode_prealloc_queue is not None
+            self.disagg_decode_prealloc_queue.kv_manager.activate_terminal_startup()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only

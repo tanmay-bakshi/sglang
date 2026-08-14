@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import functools
@@ -19,6 +20,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 import zmq
+from aiohttp import web
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.decode_allocation_lease import (
@@ -100,6 +102,19 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedDestinationRegistration,
     PackedPeerIdentity,
 )
+from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
+    TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
+    build_terminal_startup_enrollment_ack,
+    decode_terminal_startup_enrollment_ack,
+    encode_terminal_startup_enrollment_ack,
+)
+from sglang.srt.disaggregation.nixl.startup_source_roster import (
+    TERMINAL_NIXL_SOURCE_ROSTER_ROUTE,
+    TerminalNixlSourceRoster,
+    TerminalNixlSourceRoute,
+    encode_terminal_nixl_source_roster,
+    fetch_terminal_nixl_source_roster,
+)
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
@@ -117,8 +132,10 @@ from sglang.srt.disaggregation.terminal_progress.startup_binding import (
     join_terminal_startup_rank,
 )
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortError,
     TerminalStartupCohortRegistry,
     TerminalStartupRankAdvertisement,
+    decode_terminal_startup_rank_advertisement,
 )
 from sglang.srt.disaggregation.terminal_progress.startup_http import (
     TERMINAL_STARTUP_ROUTE,
@@ -747,6 +764,20 @@ class _TerminalStartupPeerEnrollment:
         self.frozen_event.set()
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TerminalDecoderEnrollment:
+    """One source-retained decoder registration awaiting acknowledgement.
+
+    :ivar rank: Exact decoder row from the sealed startup matrix.
+    :ivar registration: Parsed process-lifetime decoder registration.
+    :ivar frames: Complete guarded multipart message retained by the source.
+    """
+
+    rank: TerminalStartupRankAdvertisement
+    registration: KVArgsRegisterInfo
+    frames: tuple[bytes, ...]
+
+
 def expand_page_indices_for_slice(
     page_indices: npt.NDArray[np.int32],
     num_ptr_pairs: int,
@@ -872,6 +903,13 @@ class NixlKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self._terminal_startup_binding = None
+        self._terminal_startup_peer_enrollment = None
+        self._terminal_runtime_activated = threading.Event()
+        self._terminal_activation_lock = threading.Lock()
+        self._terminal_activation_started = False
+        self._terminal_bootstrap_thread: threading.Thread | None = None
+        self._runtime_workers_started = False
         super().__init__(
             args,
             disaggregation_mode,
@@ -1036,26 +1074,58 @@ class NixlKVManager(CommonKVManager):
         # transport identity may leave this manager until all long-lived
         # payload and staging regions are represented in that snapshot.
         self.agent_metadata = bytes(self.agent.get_agent_metadata())
-        self._terminal_startup_binding = self._join_terminal_startup_cohort()
+        terminal_binding = self._join_terminal_startup_cohort()
+        if terminal_binding is not None:
+            self.install_terminal_startup_binding(terminal_binding)
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.register_to_bootstrap()
-            for i, queue in enumerate(self.transfer_queues):
-                staging_buffer = (
-                    self._staging_ctx.buffers[i]
-                    if self.enable_staging and self._staging_ctx.buffers
-                    else None
-                )
-                threading.Thread(
-                    target=self.transfer_worker,
-                    args=(queue, staging_buffer),
-                    daemon=True,
-                ).start()
+            if terminal_binding is not None:
+                self.register_to_bootstrap(max_attempts=1)
+            else:
+                self.register_to_bootstrap()
+                self._start_prefill_runtime_workers()
+        elif terminal_binding is None:
+            self._start_decode_runtime_workers()
+
+    def _start_prefill_runtime_workers(self) -> None:
+        """Start source transfer workers after peer authority is immutable."""
+
+        if self._runtime_workers_started:
+            raise RuntimeError("NIXL runtime workers are already started")
+        if (
+            self.terminal_startup_binding is not None
+            and not self._terminal_runtime_activated.is_set()
+        ):
+            raise RuntimeError("terminal startup is not committed")
+        for worker_index, queue in enumerate(self.transfer_queues):
+            staging_buffer = (
+                self._staging_ctx.buffers[worker_index]
+                if self.enable_staging and self._staging_ctx.buffers
+                else None
+            )
+            threading.Thread(
+                target=self.transfer_worker,
+                args=(queue, staging_buffer),
+                daemon=True,
+            ).start()
+        if self._terminal_bootstrap_thread is None:
             self._start_bootstrap_thread()
-        else:
-            if self.enable_staging:
-                self._start_decode_staging_thread()
-            self._start_heartbeat_checker_thread()
+        self._runtime_workers_started = True
+
+    def _start_decode_runtime_workers(self) -> None:
+        """Start decode staging and health workers after startup commit."""
+
+        if self._runtime_workers_started:
+            raise RuntimeError("NIXL runtime workers are already started")
+        if (
+            self.terminal_startup_binding is not None
+            and not self._terminal_runtime_activated.is_set()
+        ):
+            raise RuntimeError("terminal startup is not committed")
+        if self.enable_staging:
+            self._start_decode_staging_thread()
+        self._start_heartbeat_checker_thread()
+        self._runtime_workers_started = True
 
     @property
     def terminal_startup_binding(self) -> TerminalStartupRankBinding | None:
@@ -1287,6 +1357,283 @@ class NixlKVManager(CommonKVManager):
             nixl_agent_metadata=self.agent_metadata,
             timeout_seconds=timeout_seconds,
         )
+
+    def _terminal_bootstrap_address(self) -> NetworkAddress:
+        """Return the static source-owned startup control address.
+
+        :returns: Exact cohort bootstrap address.
+        :raises RuntimeError: If terminal startup configuration is incomplete.
+        """
+
+        cohort = self.server_args.pd_terminal_deployment_cohort
+        if type(cohort) is not TerminalDeploymentCohort:
+            raise RuntimeError("terminal deployment cohort is unavailable")
+        endpoint = cohort.prefill.bootstrap_endpoint
+        return NetworkAddress(endpoint.host, endpoint.port)
+
+    def _terminal_startup_timeout_seconds(self) -> float:
+        """Return the hash-bound terminal startup deadline.
+
+        :returns: Positive finite timeout in seconds.
+        :raises RuntimeError: If the deadline is absent or malformed.
+        """
+
+        timeout_seconds = self.server_args.pd_terminal_startup_timeout_seconds
+        if (
+            type(timeout_seconds) is not float
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0.0
+        ):
+            raise RuntimeError("terminal startup timeout is unavailable")
+        return timeout_seconds
+
+    def _enroll_terminal_source_routes(
+        self,
+        deadline: float,
+    ) -> TerminalNixlSourceRoster:
+        """Fetch, authenticate, and retain the complete source peer roster.
+
+        :param deadline: Absolute monotonic startup deadline.
+        :returns: Canonical source routes used for one-time registration.
+        :raises RuntimeError: If this rank is not a decoder or enrollment fails.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        binding = enrollment.binding
+        if binding.advertisement.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("only a terminal decoder enrolls source routes")
+        address = self._terminal_bootstrap_address()
+        endpoint = address.to_url() + TERMINAL_NIXL_SOURCE_ROSTER_ROUTE
+        roster = fetch_terminal_nixl_source_roster(
+            endpoint,
+            binding.advertisement,
+            binding.matrix,
+            NIXL_BOOTSTRAP_PEER_PROTOCOL,
+            self._remaining_terminal_startup_seconds(deadline),
+        )
+        self.enroll_terminal_prefill_routes(
+            address.to_host_port_str(),
+            tuple(route.bootstrap_info() for route in roster.routes),
+        )
+        return roster
+
+    @staticmethod
+    def _remaining_terminal_startup_seconds(deadline: float) -> float:
+        """Return positive time remaining before one startup deadline.
+
+        :param deadline: Absolute monotonic deadline.
+        :returns: Positive remaining seconds.
+        :raises RuntimeError: If the deadline is exhausted or malformed.
+        """
+
+        if type(deadline) is not float or not math.isfinite(deadline):
+            raise ValueError("terminal startup deadline must be finite")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError("terminal startup activation timed out")
+        return remaining
+
+    def _receive_terminal_startup_frames(
+        self,
+        deadline: float,
+    ) -> tuple[bytes, ...]:
+        """Receive one startup multipart message through an fd-backed wait.
+
+        This method is the sole owner of ``server_socket`` until activation
+        commits. Ownership transfers once to the role-specific runtime worker.
+
+        :param deadline: Absolute monotonic startup deadline.
+        :returns: Exact multipart message.
+        :raises RuntimeError: If no message arrives before the deadline.
+        """
+
+        remaining = self._remaining_terminal_startup_seconds(deadline)
+        timeout_ms = max(1, math.ceil(remaining * 1000.0))
+        events = self.server_socket.poll(timeout=timeout_ms, flags=zmq.POLLIN)
+        if events & zmq.POLLIN == 0:
+            raise RuntimeError("terminal startup activation timed out")
+        frames = tuple(self.server_socket.recv_multipart())
+        if len(frames) == 0:
+            raise RuntimeError("terminal startup received an empty message")
+        return frames
+
+    def _receive_terminal_decoder_enrollments(
+        self,
+        deadline: float,
+    ) -> tuple[_TerminalDecoderEnrollment, ...]:
+        """Retain the exact decoder roster before source workers start.
+
+        :param deadline: Absolute monotonic startup deadline.
+        :returns: Canonically matrix-ordered decoder enrollments.
+        :raises RuntimeError: If traffic or membership differs from the matrix.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        binding = enrollment.binding
+        if binding.advertisement.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("only a terminal source receives decoder enrollment")
+
+        received: dict[tuple[str, int], _TerminalDecoderEnrollment] = {}
+        while len(received) < len(enrollment.expected_remote_ranks):
+            frames = self._receive_terminal_startup_frames(deadline)
+            if (
+                len(frames) != _PACKED_REGISTRATION_FRAME_COUNT + 1
+                or frames[0] != GUARD
+                or frames[1] != b"None"
+            ):
+                raise RuntimeError(
+                    "source received runtime traffic before terminal startup commit"
+                )
+            registration = KVArgsRegisterInfo.from_zmq(list(frames[1:]))
+            rank = self.enroll_terminal_decoder_peer(registration)
+            if rank.key in received:
+                raise RuntimeError("terminal decoder enrollment was duplicated")
+            received[rank.key] = _TerminalDecoderEnrollment(
+                rank=rank,
+                registration=registration,
+                frames=frames,
+            )
+
+        if not self.terminal_peer_enrollment_frozen:
+            raise RuntimeError("terminal decoder roster did not freeze")
+        return tuple(received[rank.key] for rank in enrollment.expected_remote_ranks)
+
+    def _send_terminal_startup_ack(
+        self,
+        enrollment: _TerminalDecoderEnrollment,
+    ) -> None:
+        """Acknowledge one decoder after the complete source roster freezes.
+
+        :param enrollment: Exact retained decoder registration and matrix row.
+        :raises RuntimeError: If the decoder acknowledgement route is invalid.
+        """
+
+        binding = self._require_terminal_startup_peer_enrollment().binding
+        acknowledgement = build_terminal_startup_enrollment_ack(
+            binding.matrix,
+            binding.advertisement,
+            enrollment.rank,
+            enrollment.frames,
+        )
+        endpoint = enrollment.registration.endpoint
+        port = enrollment.registration.dst_port
+        if type(endpoint) is not str or len(endpoint) == 0:
+            raise RuntimeError("terminal decoder acknowledgement address is absent")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise RuntimeError("terminal decoder acknowledgement port is invalid")
+        address = NetworkAddress(endpoint, port)
+        payload = encode_terminal_startup_enrollment_ack(acknowledgement)
+        with self._packed_control_send_lock:
+            socket = self._connect(address.to_tcp(), is_ipv6=address.is_ipv6)
+            socket.send_multipart((TERMINAL_STARTUP_ENROLLMENT_ACK_TAG, payload))
+
+    def _wait_for_terminal_source_acks(
+        self,
+        registration_frames: tuple[bytes, ...],
+        deadline: float,
+    ) -> None:
+        """Require one exact enrollment acknowledgement from every source rank.
+
+        :param registration_frames: Complete registration sent to every source.
+        :param deadline: Absolute monotonic startup deadline.
+        :raises RuntimeError: If any acknowledgement is absent or conflicts.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        binding = enrollment.binding
+        local_rank = binding.advertisement
+        if local_rank.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("only a terminal decoder receives source ACKs")
+
+        received: set[tuple[str, int]] = set()
+        expected = enrollment.expected_keys
+        while received != expected:
+            frames = self._receive_terminal_startup_frames(deadline)
+            if len(frames) != 2 or frames[0] != TERMINAL_STARTUP_ENROLLMENT_ACK_TAG:
+                raise RuntimeError(
+                    "decoder received runtime traffic before terminal startup commit"
+                )
+            acknowledgement = decode_terminal_startup_enrollment_ack(frames[1])
+            acknowledgement.require_matrix(binding.matrix)
+            acknowledgement.require_decoder_registration(registration_frames)
+            if (
+                acknowledgement.target_decoder_service_id != local_rank.service_id
+                or acknowledgement.target_decoder_tensor_parallel_rank
+                != local_rank.tensor_parallel_rank
+                or acknowledgement.target_decoder_process_generation
+                != local_rank.process_generation
+            ):
+                raise RuntimeError(
+                    "terminal enrollment acknowledgement targets another decoder"
+                )
+            source_key = (
+                acknowledgement.source_service_id,
+                acknowledgement.source_tensor_parallel_rank,
+            )
+            if source_key not in expected:
+                raise RuntimeError(
+                    "terminal enrollment acknowledgement has an unknown source"
+                )
+            if source_key in received:
+                raise RuntimeError(
+                    "terminal enrollment acknowledgement was received twice"
+                )
+            received.add(source_key)
+
+    def _activate_terminal_source(self, deadline: float) -> None:
+        """Commit source peer authority and hand off to runtime workers.
+
+        :param deadline: Absolute monotonic startup deadline.
+        """
+
+        enrollments = self._receive_terminal_decoder_enrollments(deadline)
+        for enrollment in enrollments:
+            self._send_terminal_startup_ack(enrollment)
+
+    def _activate_terminal_decoder(self, deadline: float) -> None:
+        """Commit decoder peer authority and hand off to runtime workers.
+
+        :param deadline: Absolute monotonic startup deadline.
+        """
+
+        roster = self._enroll_terminal_source_routes(deadline)
+        if not self.terminal_peer_enrollment_frozen:
+            raise RuntimeError("terminal source roster did not freeze")
+        registration_frames = self._decode_registration_frames()
+        for route in roster.routes:
+            self._send_terminal_decoder_registration(
+                route.bootstrap_info(),
+                registration_frames,
+            )
+        self._wait_for_terminal_source_acks(registration_frames, deadline)
+
+    def activate_terminal_startup(self) -> None:
+        """Commit immutable cross-role peers before exposing service readiness.
+
+        :raises RuntimeError: If activation repeats or startup fails closed.
+        """
+
+        binding = self.terminal_startup_binding
+        if binding is None:
+            return
+        with self._terminal_activation_lock:
+            if self._terminal_activation_started:
+                raise RuntimeError("terminal startup activation cannot repeat")
+            self._terminal_activation_started = True
+
+        deadline = time.monotonic() + self._terminal_startup_timeout_seconds()
+        if binding.advertisement.role is TerminalOwnerRole.SOURCE:
+            self._activate_terminal_source(deadline)
+        else:
+            self._activate_terminal_decoder(deadline)
+        if not self.terminal_peer_enrollment_frozen:
+            raise RuntimeError("terminal native peer roster is not frozen")
+
+        self._terminal_runtime_activated.set()
+        if binding.advertisement.role is TerminalOwnerRole.SOURCE:
+            self._start_prefill_runtime_workers()
+        else:
+            self._start_decode_runtime_workers()
 
     def _bootstrap_transport_registration(self) -> dict[str, object]:
         """Publish this prefill rank's exact native NIXL identity.
@@ -1530,9 +1877,7 @@ class NixlKVManager(CommonKVManager):
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
         )
-        packed_kv_data_mem_kinds = _pack_kv_mem_kinds(
-            self.kv_args.kv_data_mem_kinds
-        )
+        packed_kv_data_mem_kinds = _pack_kv_mem_kinds(self.kv_args.kv_data_mem_kinds)
         packed_kv_item_lens = b"".join(
             struct.pack("Q", item_len) for item_len in self.kv_args.kv_item_lens
         )
@@ -1542,18 +1887,12 @@ class NixlKVManager(CommonKVManager):
         packed_aux_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.aux_data_ptrs
         )
-        packed_state_data_ptrs = pack_int_lists(
-            self.kv_args.state_data_ptrs or [], "Q"
-        )
-        packed_state_item_lens = pack_int_lists(
-            self.kv_args.state_item_lens or [], "I"
-        )
+        packed_state_data_ptrs = pack_int_lists(self.kv_args.state_data_ptrs or [], "Q")
+        packed_state_item_lens = pack_int_lists(self.kv_args.state_item_lens or [], "I")
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_args.state_dim_per_tensor or [], "I"
         )
-        packed_state_layer_ids = pack_int_lists(
-            self.kv_args.state_layer_ids, "I"
-        )
+        packed_state_layer_ids = pack_int_lists(self.kv_args.state_layer_ids, "I")
         if self.enable_staging and self._staging_ctx.allocator is not None:
             allocator = self._staging_ctx.allocator
             packed_staging_base_ptr = struct.pack("Q", allocator.get_base_ptr())
@@ -2987,9 +3326,7 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("terminal prefill route is not exact DP1/CP1/PP1 TP")
 
         try:
-            agent_name = validate_nixl_agent_name(
-                bootstrap_info.get("nixl_agent_name")
-            )
+            agent_name = validate_nixl_agent_name(bootstrap_info.get("nixl_agent_name"))
             agent_metadata = decode_nixl_agent_metadata(
                 bootstrap_info.get("nixl_agent_metadata")
             )
@@ -3024,11 +3361,11 @@ class NixlKVManager(CommonKVManager):
         bootstrap_addr: str,
         bootstrap_infos: tuple[dict[str, object], ...],
     ) -> tuple[_NixlPrefillPeer, ...]:
-        """Load every source peer and send this decoder registration once.
+        """Authenticate, retain, and freeze every source peer.
 
-        All routes are authenticated before the first native handle or network
-        send is created. The local source roster freezes only after every full
-        decoder registration has been issued successfully.
+        All routes are authenticated before the first native handle is created.
+        Startup activation publishes the decoder registration only after this
+        complete local roster is immutable.
 
         :param bootstrap_addr: Exact source-owned bootstrap service address.
         :param bootstrap_infos: Canonical full-metadata source rank routes.
@@ -3063,16 +3400,8 @@ class NixlKVManager(CommonKVManager):
             )
 
         peers = tuple(
-            self._load_prefill_peer(bootstrap_addr, info)
-            for _, info in authenticated
+            self._load_prefill_peer(bootstrap_addr, info) for _, info in authenticated
         )
-        registration_frames = self._decode_registration_frames()
-        for _, bootstrap_info in authenticated:
-            self._send_terminal_decoder_registration(
-                bootstrap_info,
-                registration_frames,
-            )
-
         with enrollment.lock:
             if enrollment.frozen or len(enrollment.prefill_peers) > 0:
                 raise RuntimeError("terminal prefill enrollment changed concurrently")
@@ -3568,10 +3897,11 @@ class NixlKVManager(CommonKVManager):
     def enroll_terminal_decoder_peer(
         self,
         decode_kv_args: KVArgsRegisterInfo,
-    ) -> None:
+    ) -> TerminalStartupRankAdvertisement:
         """Authenticate, retain, and roster one startup decoder rank.
 
         :param decode_kv_args: Complete full-metadata decoder registration.
+        :returns: Exact decoder row authenticated by the registration.
         :raises RuntimeError: If the rank is stale, duplicate, or post-freeze.
         """
 
@@ -3603,6 +3933,7 @@ class NixlKVManager(CommonKVManager):
                 raise RuntimeError("terminal decoder enrollment changed concurrently")
             enrollment.decoder_peers[rank.key] = retained
             enrollment.freeze_if_complete()
+        return rank
 
     def _retain_decoder_peer(self, decode_kv_args: KVArgsRegisterInfo) -> None:
         """Create or resolve one validated decoder native handle.
@@ -5553,6 +5884,9 @@ class NixlKVManager(CommonKVManager):
             socket.send_multipart(frames)
 
     def _start_bootstrap_thread(self):
+        if self._terminal_bootstrap_thread is not None:
+            raise RuntimeError("NIXL bootstrap listener is already started")
+
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
@@ -5560,6 +5894,20 @@ class NixlKVManager(CommonKVManager):
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
+
+                if (
+                    self.terminal_startup_binding is not None
+                    and not self._terminal_runtime_activated.is_set()
+                    and not (
+                        len(waiting_req_bytes) >= 2
+                        and waiting_req_bytes[0] == GUARD
+                        and waiting_req_bytes[1] == b"None"
+                    )
+                ):
+                    logger.error(
+                        "Rejected NIXL runtime traffic before terminal peer commit"
+                    )
+                    continue
 
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
@@ -5588,9 +5936,9 @@ class NixlKVManager(CommonKVManager):
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
+                assert waiting_req_bytes[0] == GUARD, (
+                    f"First message should be {GUARD}. Foreign traffic?"
+                )
                 waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":
@@ -5687,7 +6035,13 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        thread = threading.Thread(
+            target=bootstrap_thread,
+            name="nixl-prefill-control",
+            daemon=True,
+        )
+        self._terminal_bootstrap_thread = thread
+        thread.start()
 
 
 class NixlKVSender(CommonKVSender):
@@ -6157,6 +6511,8 @@ class NixlKVReceiver(CommonKVReceiver):
 class NixlKVBootstrapServer(CommonKVBootstrapServer):
     """NIXL bootstrap listener with optional terminal cohort admission."""
 
+    _terminal_startup_registry: TerminalStartupCohortRegistry | None
+
     def __init__(
         self,
         host: str,
@@ -6177,18 +6533,156 @@ class NixlKVBootstrapServer(CommonKVBootstrapServer):
             raise TypeError(
                 "terminal_startup_registry must be TerminalStartupCohortRegistry"
             )
-        additional_post_route: BootstrapPostRoute | None = None
+        self._terminal_startup_registry = terminal_startup_registry
+        additional_post_routes: tuple[BootstrapPostRoute, ...] = ()
         if terminal_startup_registry is not None:
             terminal_startup_handler: BootstrapRouteHandler = functools.partial(
                 handle_terminal_startup_join,
                 terminal_startup_registry,
             )
-            additional_post_route = BootstrapPostRoute(
-                path=TERMINAL_STARTUP_ROUTE,
-                handler=terminal_startup_handler,
+            additional_post_routes = (
+                BootstrapPostRoute(
+                    path=TERMINAL_STARTUP_ROUTE,
+                    handler=terminal_startup_handler,
+                ),
+                BootstrapPostRoute(
+                    path=TERMINAL_NIXL_SOURCE_ROSTER_ROUTE,
+                    handler=self._handle_terminal_source_roster,
+                ),
             )
         super().__init__(
             host=host,
             port=port,
-            additional_post_route=additional_post_route,
+            additional_post_routes=additional_post_routes,
         )
+
+    async def _handle_terminal_source_roster(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        """Return every matrix-authenticated source route to one decoder.
+
+        Route-table readiness waits off the HTTP event loop. The response is
+        emitted once from the frozen source topology and cannot select a
+        request-era subset.
+
+        :param request: Exact decoder rank advertisement.
+        :returns: Canonical complete source roster or bounded failure evidence.
+        """
+
+        registry = self._terminal_startup_registry
+        if registry is None:
+            return web.Response(text="terminal startup is not configured", status=404)
+        try:
+            requester = decode_terminal_startup_rank_advertisement(await request.read())
+            matrix = registry.sealed_matrix_for(requester)
+            if requester.role is not TerminalOwnerRole.DECODE:
+                raise TerminalStartupCohortError(
+                    "only a decoder rank may request source routes"
+                )
+            await asyncio.to_thread(
+                self.wait_until_ready,
+                registry.timeout_seconds,
+            )
+            source_ranks = tuple(
+                rank for rank in matrix.ranks if rank.role is TerminalOwnerRole.SOURCE
+            )
+            async with self.lock:
+                routes = tuple(
+                    self._terminal_source_route(rank) for rank in source_ranks
+                )
+            roster = TerminalNixlSourceRoster(
+                matrix_sha256=matrix.digest,
+                requester_service_id=requester.service_id,
+                requester_tensor_parallel_rank=requester.tensor_parallel_rank,
+                requester_process_generation=requester.process_generation,
+                routes=routes,
+            )
+            roster.require_matrix(
+                matrix,
+                requester,
+                NIXL_BOOTSTRAP_PEER_PROTOCOL,
+            )
+        except TerminalStartupCohortError as error:
+            return web.Response(text=str(error), status=409)
+        except Exception:
+            reason = (
+                "terminal source-route roster failed after cohort sealing:\n"
+                f"{traceback.format_exc()}"
+            )
+            registry.fail(reason)
+            logger.error(reason)
+            return web.Response(
+                text="terminal source-route roster failed",
+                status=500,
+            )
+        return web.Response(
+            body=encode_terminal_nixl_source_roster(roster),
+            content_type="application/json",
+            status=200,
+        )
+
+    def _terminal_source_route(
+        self,
+        rank: TerminalStartupRankAdvertisement,
+    ) -> TerminalNixlSourceRoute:
+        """Resolve one exact matrix row from the frozen transfer route table.
+
+        :param rank: Source rank from the sealed startup matrix.
+        :returns: Complete native source route.
+        :raises RuntimeError: If the route table differs from startup identity.
+        """
+
+        if rank.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("terminal source route requires a source rank")
+        try:
+            route = self.prefill_port_table[0][0][rank.tensor_parallel_rank][0]
+        except KeyError as error:
+            raise RuntimeError("terminal source route table is incomplete") from error
+        try:
+            metadata = decode_nixl_agent_metadata(route.nixl_agent_metadata)
+            agent_name = validate_nixl_agent_name(route.nixl_agent_name)
+        except ValueError as error:
+            raise RuntimeError("terminal source route identity is invalid") from error
+        if route.nixl_agent_metadata_sha256 != hashlib.sha256(metadata).hexdigest():
+            raise RuntimeError("terminal source route metadata digest mismatch")
+        process_generation = self._canonical_route_generation(route.process_generation)
+        return TerminalNixlSourceRoute(
+            service_id=rank.service_id,
+            tensor_parallel_rank=rank.tensor_parallel_rank,
+            tensor_parallel_size=rank.tensor_parallel_size,
+            process_generation=uuid.UUID(process_generation).bytes,
+            nixl_agent_name=agent_name,
+            nixl_agent_metadata=metadata,
+            rank_ip=route.rank_ip,
+            rank_port=route.rank_port,
+            attn_dp_rank=route.attn_dp_rank,
+            attn_cp_rank=route.attn_cp_rank,
+            attn_tp_rank=route.attn_tp_rank,
+            pp_rank=route.pp_rank,
+            transfer_source_rank=(
+                -1 if route.transfer_source_rank is None else route.transfer_source_rank
+            ),
+            transport_protocol=(
+                "" if route.transport_protocol is None else route.transport_protocol
+            ),
+        )
+
+    @staticmethod
+    def _canonical_route_generation(value: object) -> str:
+        """Validate one canonical route process generation.
+
+        :param value: Candidate route generation.
+        :returns: Canonical UUID string.
+        :raises RuntimeError: If the generation is malformed.
+        """
+
+        if type(value) is not str:
+            raise RuntimeError("terminal source route generation is absent")
+        try:
+            generation = uuid.UUID(value)
+        except ValueError as error:
+            raise RuntimeError("terminal source route generation is invalid") from error
+        if generation.int == 0 or str(generation) != value:
+            raise RuntimeError("terminal source route generation is not canonical")
+        return value

@@ -360,7 +360,7 @@ def test_decode_eagerly_loads_and_freezes_complete_source_roster() -> None:
         b"prefill-metadata-0",
         b"prefill-metadata-1",
     ]
-    assert manager._send_terminal_decoder_registration.call_count == 2
+    manager._send_terminal_decoder_registration.assert_not_called()
 
 
 def test_terminal_receiver_resolves_only_pre_enrolled_peers_without_send() -> None:
@@ -404,6 +404,7 @@ def test_terminal_receiver_resolves_only_pre_enrolled_peers_without_send() -> No
         b"prefill-metadata-0",
         b"prefill-metadata-1",
     ]
+    manager._send_terminal_decoder_registration.assert_not_called()
 
 
 def test_decode_rejects_matrix_drift_before_creating_native_handle() -> None:
@@ -501,7 +502,7 @@ def test_binding_install_rejects_local_metadata_drift() -> None:
 
 
 def test_terminal_decoder_registration_serializes_one_complete_frozen_image() -> None:
-    """Eager and legacy registration share one exact multipart serializer."""
+    """Process-lifetime registration has one exact multipart image."""
 
     binding = _binding("decode-a", 0)
     manager = _manager(binding, {})
