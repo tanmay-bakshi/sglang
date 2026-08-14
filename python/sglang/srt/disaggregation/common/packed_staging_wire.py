@@ -1,11 +1,12 @@
 import msgspec
-
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryDestinationSegment,
     PackedAuxiliaryOutcome,
     PackedAuxiliaryPlan,
     PackedChunkKey,
+    PackedDFlashBoundaryMetadata,
+    PackedDFlashBoundaryOutcome,
     PackedLayoutSpec,
     PackedPrepare,
     PackedReady,
@@ -28,7 +29,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingWriterId,
 )
 
-PACKED_WIRE_VERSION: int = 7
+PACKED_WIRE_VERSION: int = 8
 MAX_PACKED_WIRE_BYTES: int = 1024 * 1024
 
 
@@ -270,6 +271,42 @@ class _WireAuxiliaryOutcome(
     evidence_digest: bytes
 
 
+class _WireDFlashBoundaryMetadata(
+    msgspec.Struct,
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Wire representation of source-authored DFlash boundary metadata."""
+
+    boundary_token_id: int
+    cached_tokens: int
+    cached_tokens_device: int
+    cached_tokens_host: int
+    cached_tokens_storage: int
+    image_tokens: int
+    audio_tokens: int
+    video_tokens: int
+
+
+class _WireDFlashBoundaryOutcome(
+    msgspec.Struct,
+    tag="dflash_boundary_outcome",
+    tag_field="kind",
+    frozen=True,
+    forbid_unknown_fields=True,
+):
+    """Versioned terminal all-VRAM DFlash boundary outcome."""
+
+    version: int
+    plan: _WireAuxiliaryPlanFields
+    writer_id: _WireWriterId
+    native_handle_generation: int
+    descriptor_digest: bytes
+    evidence_digest: bytes
+    metadata: _WireDFlashBoundaryMetadata
+    outcome_digest: bytes
+
+
 class _WireRequestTeardown(
     msgspec.Struct,
     tag="request_teardown",
@@ -325,6 +362,7 @@ class _WireTerminalReceipt(
 PackedWireMessage = (
     PackedAuxiliaryPlan
     | PackedAuxiliaryOutcome
+    | PackedDFlashBoundaryOutcome
     | PackedPrepare
     | PackedReady
     | PackedWriterOutcome
@@ -335,6 +373,7 @@ PackedWireMessage = (
 _WireMessage = (
     _WireAuxiliaryPlan
     | _WireAuxiliaryOutcome
+    | _WireDFlashBoundaryOutcome
     | _WirePrepare
     | _WireReady
     | _WireWriterOutcome
@@ -702,6 +741,48 @@ def _decode_layout_spec(spec: _WireLayoutSpec) -> PackedLayoutSpec:
     )
 
 
+def _encode_dflash_boundary_metadata(
+    metadata: PackedDFlashBoundaryMetadata,
+) -> _WireDFlashBoundaryMetadata:
+    """Convert frozen DFlash boundary metadata into its wire shape.
+
+    :param metadata: Exact source-authored scalar metadata.
+    :returns: Immutable wire metadata.
+    """
+
+    return _WireDFlashBoundaryMetadata(
+        boundary_token_id=metadata.boundary_token_id,
+        cached_tokens=metadata.cached_tokens,
+        cached_tokens_device=metadata.cached_tokens_device,
+        cached_tokens_host=metadata.cached_tokens_host,
+        cached_tokens_storage=metadata.cached_tokens_storage,
+        image_tokens=metadata.image_tokens,
+        audio_tokens=metadata.audio_tokens,
+        video_tokens=metadata.video_tokens,
+    )
+
+
+def _decode_dflash_boundary_metadata(
+    metadata: _WireDFlashBoundaryMetadata,
+) -> PackedDFlashBoundaryMetadata:
+    """Convert wire DFlash boundary metadata into its validated domain shape.
+
+    :param metadata: Decoded wire metadata.
+    :returns: Validated immutable scalar metadata.
+    """
+
+    return PackedDFlashBoundaryMetadata(
+        boundary_token_id=metadata.boundary_token_id,
+        cached_tokens=metadata.cached_tokens,
+        cached_tokens_device=metadata.cached_tokens_device,
+        cached_tokens_host=metadata.cached_tokens_host,
+        cached_tokens_storage=metadata.cached_tokens_storage,
+        image_tokens=metadata.image_tokens,
+        audio_tokens=metadata.audio_tokens,
+        video_tokens=metadata.video_tokens,
+    )
+
+
 def encode_packed_message(message: PackedWireMessage) -> bytes:
     """Encode one versioned packed staging envelope.
 
@@ -728,6 +809,17 @@ def encode_packed_message(message: PackedWireMessage) -> bytes:
             native_dram_handle_generation=(message.native_dram_handle_generation),
             descriptor_digest=message.descriptor_digest,
             evidence_digest=message.evidence_digest,
+        )
+    elif type(message) is PackedDFlashBoundaryOutcome:
+        wire_message = _WireDFlashBoundaryOutcome(
+            version=PACKED_WIRE_VERSION,
+            plan=_encode_auxiliary_plan(message.plan),
+            writer_id=_encode_writer_id(message.writer_id),
+            native_handle_generation=message.native_handle_generation,
+            descriptor_digest=message.descriptor_digest,
+            evidence_digest=message.evidence_digest,
+            metadata=_encode_dflash_boundary_metadata(message.metadata),
+            outcome_digest=message.outcome_digest,
         )
     elif type(message) is PackedPrepare:
         wire_message = _WirePrepare(
@@ -839,6 +931,16 @@ def decode_packed_message(payload: bytes) -> PackedWireMessage:
                 ),
                 descriptor_digest=wire_message.descriptor_digest,
                 evidence_digest=wire_message.evidence_digest,
+            )
+        if type(wire_message) is _WireDFlashBoundaryOutcome:
+            return PackedDFlashBoundaryOutcome(
+                plan=_decode_auxiliary_plan(wire_message.plan),
+                writer_id=_decode_writer_id(wire_message.writer_id),
+                native_handle_generation=wire_message.native_handle_generation,
+                descriptor_digest=wire_message.descriptor_digest,
+                evidence_digest=wire_message.evidence_digest,
+                metadata=_decode_dflash_boundary_metadata(wire_message.metadata),
+                outcome_digest=wire_message.outcome_digest,
             )
         if type(wire_message) is _WirePrepare:
             return PackedPrepare(

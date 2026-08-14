@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+import hashlib
 import logging
 import threading
 import traceback
@@ -32,6 +33,7 @@ PACKED_REQUEST_DIGEST_BYTES = 32
 PACKED_TEARDOWN_GENERATION_BYTES = 16
 PACKED_VISIBILITY_POLICY_DIGEST_BYTES = 32
 PACKED_NATIVE_ATTESTATION_DIGEST_BYTES = 32
+PACKED_DFLASH_BOUNDARY_BYTES = 8
 MAX_PACKED_AUXILIARY_DESTINATION_SEGMENTS = 4096
 MAX_PACKED_WRITER_ERROR_BYTES = 4096
 MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES = 512
@@ -342,6 +344,253 @@ class PackedAuxiliaryOutcome:
             self.evidence_digest,
             "auxiliary evidence_digest",
         )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedDFlashBoundaryMetadata:
+    """Source-authored scalar state accompanying one DFlash boundary token.
+
+    The boundary token itself is transferred between registered device rows.
+    Its scalar value is repeated here from the producer-complete gateway result
+    slot so decode can update CPU request state without reading the device row.
+
+    :ivar boundary_token_id: Target token sampled at the PD boundary.
+    :ivar cached_tokens: Aggregate prefill cache-hit token count.
+    :ivar cached_tokens_device: Tokens restored from device cache.
+    :ivar cached_tokens_host: Tokens restored from host cache.
+    :ivar cached_tokens_storage: Tokens restored from durable storage.
+    :ivar image_tokens: Expanded image-token count.
+    :ivar audio_tokens: Expanded audio-token count.
+    :ivar video_tokens: Expanded video-token count.
+    """
+
+    boundary_token_id: int
+    cached_tokens: int
+    cached_tokens_device: int
+    cached_tokens_host: int
+    cached_tokens_storage: int
+    image_tokens: int
+    audio_tokens: int
+    video_tokens: int
+
+    def __post_init__(self) -> None:
+        """Validate exact unsigned scalar metadata."""
+
+        for label, value in self._items:
+            _validate_nonnegative_uint64(value, label)
+
+    @property
+    def digest(self) -> bytes:
+        """Return the canonical scalar-metadata identity.
+
+        :returns: SHA-256 over every named scalar in canonical order.
+        """
+
+        digest = hashlib.sha256()
+        digest.update(b"sglang.packed-dflash-boundary-metadata.v1")
+        for label, value in self._items:
+            encoded_label = label.encode("ascii")
+            digest.update(len(encoded_label).to_bytes(2, "big"))
+            digest.update(encoded_label)
+            digest.update(value.to_bytes(8, "big"))
+        return digest.digest()
+
+    @property
+    def _items(self) -> tuple[tuple[str, int], ...]:
+        """Return named scalar fields in their canonical digest order.
+
+        :returns: Immutable field-name and value pairs.
+        """
+
+        return (
+            ("boundary_token_id", self.boundary_token_id),
+            ("cached_tokens", self.cached_tokens),
+            ("cached_tokens_device", self.cached_tokens_device),
+            ("cached_tokens_host", self.cached_tokens_host),
+            ("cached_tokens_storage", self.cached_tokens_storage),
+            ("image_tokens", self.image_tokens),
+            ("audio_tokens", self.audio_tokens),
+            ("video_tokens", self.video_tokens),
+        )
+
+
+def _validate_dflash_boundary_plan(plan: PackedAuxiliaryPlan) -> None:
+    """Validate the exact one-row DFlash destination capability.
+
+    :param plan: Candidate decoder-authored boundary plan.
+    """
+
+    if type(plan) is not PackedAuxiliaryPlan:
+        raise TypeError("DFlash boundary outcome plan must be PackedAuxiliaryPlan")
+    if (
+        len(plan.destination_segments) != 1
+        or plan.destination_segments[0].item_length != PACKED_DFLASH_BOUNDARY_BYTES
+    ):
+        raise ValueError(
+            "DFlash boundary outcome plan must contain one eight-byte segment"
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedDFlashBoundaryOutcome:
+    """Authenticated terminal outcome for one all-VRAM boundary transfer.
+
+    :ivar plan: Decoder-authored registered destination-row plan.
+    :ivar writer_id: Canonical source writer which posted the boundary token.
+    :ivar native_handle_generation: Exact terminal native transfer generation.
+    :ivar descriptor_digest: Native digest of the all-VRAM descriptors.
+    :ivar evidence_digest: Native endpoint and runtime evidence digest.
+    :ivar metadata: Frozen source-authored scalar control metadata.
+    :ivar outcome_digest: Canonical identity binding plan, native evidence, and
+        every scalar metadata field.
+    """
+
+    plan: PackedAuxiliaryPlan
+    writer_id: StagingWriterId
+    native_handle_generation: int
+    descriptor_digest: bytes
+    evidence_digest: bytes
+    metadata: PackedDFlashBoundaryMetadata
+    outcome_digest: bytes
+
+    def __post_init__(self) -> None:
+        """Validate the complete boundary outcome identity."""
+
+        _validate_dflash_boundary_plan(self.plan)
+        if type(self.writer_id) is not StagingWriterId:
+            raise TypeError("DFlash boundary writer_id must be StagingWriterId")
+        if self.writer_id != self.plan.canonical_writer_id:
+            raise ValueError("DFlash boundary writer differs from its plan")
+        _validate_positive_uint64(
+            self.native_handle_generation,
+            "DFlash boundary native_handle_generation",
+        )
+        _validate_request_digest(
+            self.descriptor_digest,
+            "DFlash boundary descriptor_digest",
+        )
+        _validate_request_digest(
+            self.evidence_digest,
+            "DFlash boundary evidence_digest",
+        )
+        if type(self.metadata) is not PackedDFlashBoundaryMetadata:
+            raise TypeError(
+                "DFlash boundary metadata must be PackedDFlashBoundaryMetadata"
+            )
+        _validate_request_digest(
+            self.outcome_digest,
+            "DFlash boundary outcome_digest",
+        )
+        expected = _dflash_boundary_outcome_digest(
+            plan=self.plan,
+            writer_id=self.writer_id,
+            native_handle_generation=self.native_handle_generation,
+            descriptor_digest=self.descriptor_digest,
+            evidence_digest=self.evidence_digest,
+            metadata=self.metadata,
+        )
+        if self.outcome_digest != expected:
+            raise ValueError("DFlash boundary outcome digest differs from its fields")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        plan: PackedAuxiliaryPlan,
+        writer_id: StagingWriterId,
+        native_handle_generation: int,
+        descriptor_digest: bytes,
+        evidence_digest: bytes,
+        metadata: PackedDFlashBoundaryMetadata,
+    ) -> "PackedDFlashBoundaryOutcome":
+        """Construct one outcome with its canonical identity digest.
+
+        :param plan: Exact decoder-authored boundary-row plan.
+        :param writer_id: Canonical source writer.
+        :param native_handle_generation: Exact native transfer generation.
+        :param descriptor_digest: Native all-VRAM descriptor digest.
+        :param evidence_digest: Native runtime evidence digest.
+        :param metadata: Frozen boundary token and cache counters.
+        :returns: Fully bound immutable boundary outcome.
+        """
+
+        outcome_digest = _dflash_boundary_outcome_digest(
+            plan=plan,
+            writer_id=writer_id,
+            native_handle_generation=native_handle_generation,
+            descriptor_digest=descriptor_digest,
+            evidence_digest=evidence_digest,
+            metadata=metadata,
+        )
+        return cls(
+            plan=plan,
+            writer_id=writer_id,
+            native_handle_generation=native_handle_generation,
+            descriptor_digest=descriptor_digest,
+            evidence_digest=evidence_digest,
+            metadata=metadata,
+            outcome_digest=outcome_digest,
+        )
+
+
+def _dflash_boundary_outcome_digest(
+    *,
+    plan: PackedAuxiliaryPlan,
+    writer_id: StagingWriterId,
+    native_handle_generation: int,
+    descriptor_digest: bytes,
+    evidence_digest: bytes,
+    metadata: PackedDFlashBoundaryMetadata,
+) -> bytes:
+    """Hash one complete DFlash boundary outcome identity.
+
+    :param plan: Decoder-authored destination capability.
+    :param writer_id: Canonical source writer.
+    :param native_handle_generation: Exact transfer generation.
+    :param descriptor_digest: Native descriptor digest.
+    :param evidence_digest: Native endpoint/runtime evidence digest.
+    :param metadata: Frozen scalar control metadata.
+    :returns: Canonical SHA-256 identity.
+    """
+
+    _validate_dflash_boundary_plan(plan)
+    if type(writer_id) is not StagingWriterId:
+        raise TypeError("writer_id must be StagingWriterId")
+    _validate_nonnegative_uint64(plan.key.room_id, "DFlash boundary room_id")
+    _validate_positive_uint64(
+        native_handle_generation,
+        "DFlash boundary native_handle_generation",
+    )
+    _validate_request_digest(descriptor_digest, "DFlash descriptor_digest")
+    _validate_request_digest(evidence_digest, "DFlash evidence_digest")
+    if type(metadata) is not PackedDFlashBoundaryMetadata:
+        raise TypeError("metadata must be PackedDFlashBoundaryMetadata")
+
+    digest = hashlib.sha256()
+    digest.update(b"sglang.packed-dflash-boundary-outcome.v1")
+    digest.update(plan.key.room_id.to_bytes(8, "big"))
+    digest.update(plan.key.request_generation)
+    digest.update(plan.request_slot_generation.to_bytes(8, "big"))
+    digest.update(plan.metadata_buffer_index.to_bytes(8, "big"))
+    digest.update(plan.metadata_slot_generation)
+    for segment in plan.destination_segments:
+        digest.update(segment.address.to_bytes(8, "big"))
+        digest.update(segment.item_length.to_bytes(8, "big"))
+    for rank in (
+        writer_id.transfer_source_rank,
+        writer_id.source_attn_tp_rank,
+        writer_id.source_pp_rank,
+        writer_id.source_cp_rank,
+    ):
+        digest.update(rank.to_bytes(4, "big"))
+    digest.update(plan.destination_process_generation)
+    digest.update(plan.native_route_digest)
+    digest.update(plan.runtime_cohort_digest)
+    digest.update(native_handle_generation.to_bytes(8, "big"))
+    digest.update(descriptor_digest)
+    digest.update(evidence_digest)
+    digest.update(metadata.digest)
+    return digest.digest()
 
 
 @dataclasses.dataclass(frozen=True)
