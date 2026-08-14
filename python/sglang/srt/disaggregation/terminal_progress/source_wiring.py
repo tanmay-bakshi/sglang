@@ -466,7 +466,9 @@ class PackedTerminalSourceWiring:
     def consume_gather_ready(
         self,
         action: NativeTerminalOwnerAction,
-        post_gather: Callable[[PackedTerminalSourceSubmission], None],
+        post_gather: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
     ) -> None:
         """Post gather only under exact native gather authority.
 
@@ -485,7 +487,9 @@ class PackedTerminalSourceWiring:
     def consume_outcome_ready(
         self,
         action: NativeTerminalOwnerAction,
-        send_outcomes: Callable[[PackedTerminalSourceSubmission], None],
+        send_outcomes: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
     ) -> None:
         """Send immutable outcomes only under exact native authority.
 
@@ -529,7 +533,9 @@ class PackedTerminalSourceWiring:
     def consume_ack_ready(
         self,
         action: NativeTerminalOwnerAction,
-        send_ack: Callable[[PackedTerminalSourceSubmission], None],
+        send_ack: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
     ) -> None:
         """Send the exact teardown ACK only under native authority.
 
@@ -890,7 +896,9 @@ class PackedTerminalSourceWiring:
         *,
         action: NativeTerminalOwnerAction,
         expected_kind: NativeTerminalOwnerActionKind,
-        side_effect: Callable[[PackedTerminalSourceSubmission], None],
+        side_effect: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
         followup_kind: NativeTerminalOwnerEventKind,
         failure_label: str,
     ) -> None:
@@ -907,7 +915,7 @@ class PackedTerminalSourceWiring:
             raise TypeError("side_effect must be callable")
         record = self._claim_action(action, expected_kind)
         try:
-            side_effect(record.submission)
+            side_effect(record.submission, action)
             self._runtime.complete_work_action(
                 self._local_producer_id,
                 action,

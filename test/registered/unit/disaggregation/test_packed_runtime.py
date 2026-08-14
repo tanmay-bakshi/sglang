@@ -70,9 +70,13 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourceIdentityPlan,
     PackedTerminalSourcePlan,
     PackedTerminalSourceWriter,
 )
@@ -957,6 +961,143 @@ def _terminal_decode_binding(
     )
 
 
+def _terminal_prefill_identity(
+    manager: _FakeManager,
+    peer: PackedPeerIdentity,
+    key: PackedRequestKey,
+) -> PackedTerminalSourceIdentityPlan:
+    """Build an actor identity matching one fake manager and decoder peer.
+
+    :param manager: Exact source process fixture.
+    :param peer: Authenticated destination process.
+    :param key: Exact packed request generation.
+    :returns: Complete rank-local source terminal identity.
+    """
+
+    source = TerminalProcessIdentity(
+        process_generation=uuid.UUID(manager.process_generation).bytes,
+        role=TerminalOwnerRole.SOURCE,
+        tp_rank=manager.attn_tp_rank,
+        tp_size=manager.attn_tp_size,
+    )
+    decode = TerminalProcessIdentity(
+        process_generation=peer.agent_generation,
+        role=TerminalOwnerRole.DECODE,
+        tp_rank=0,
+        tp_size=1,
+    )
+    binding = TerminalRequestBinding(
+        request_key=key,
+        owner=source,
+        rank_manifest_digest=b"w" * 32,
+        allocation_digest=b"l" * 32,
+    )
+    return PackedTerminalSourceIdentityPlan(
+        local_binding=binding,
+        source_bindings=(binding,),
+        publication_identity=TerminalPublicationIdentity(
+            request_key=key,
+            publisher_process_generation=source.process_generation,
+            publication_generation=b"g" * 16,
+        ),
+        request_ready_issuer=decode,
+        publisher_issuer=source,
+    )
+
+
+def _terminal_prefill_action(
+    identity: PackedTerminalSourceIdentityPlan,
+    kind: NativeTerminalOwnerActionKind,
+    action_id: int,
+) -> NativeTerminalOwnerAction:
+    """Build one native source action for an actor fixture.
+
+    :param identity: Exact rank-local source identity.
+    :param kind: Closed source owner action kind.
+    :param action_id: Stable one-shot action identity.
+    :returns: Native action carrying the exact local binding.
+    """
+
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=kind,
+        binding=NativeTerminalRequestBinding.from_binding(identity.local_binding),
+        commit_timestamp_ns=action_id * 1_000,
+        receipt=None,
+    )
+
+
+def _terminal_prefill_record(
+    runtime: PackedPrefillRuntime,
+    submission: PackedPrefillSubmission,
+    identity: PackedTerminalSourceIdentityPlan,
+) -> runtime_module._PrefillRequestRecord:
+    """Seed one already-published terminal actor record without CUDA work.
+
+    :param runtime: Exact source actor fixture.
+    :param submission: Control-only packed submission.
+    :param identity: Matching terminal identity graph.
+    :returns: Mutable actor record owned by the sole request registry.
+    """
+
+    key = submission.plan.key
+    record = runtime_module._PrefillRequestRecord(
+        submission=submission,
+        writer_id=runtime.writer_id,
+        chunk_key=PackedChunkKey(
+            room_id=key.room_id,
+            chunk_id=0,
+            request_generation=key.request_generation,
+        ),
+        terminal_identity=identity,
+        terminal_prepare=_unvalidated_prepare(
+            PackedChunkKey(
+                room_id=key.room_id,
+                chunk_id=0,
+                request_generation=key.request_generation,
+            ),
+            runtime.writer_id,
+        ),
+        terminal_prepare_sent=True,
+    )
+    runtime._records[key] = record
+    return record
+
+
+def _terminal_prefill_actor_fixture() -> tuple[
+    PackedPrefillRuntime,
+    _FakeManager,
+    PackedPeerIdentity,
+    list[object],
+    PackedPrefillSubmission,
+    PackedTerminalSourceIdentityPlan,
+    runtime_module._PrefillRequestRecord,
+]:
+    """Build one terminal source actor without acquiring CUDA resources.
+
+    :returns: Runtime, manager, peer, sent messages, submission, identity, and
+        actor record.
+    """
+
+    manager = _FakeManager(attn_tp_size=1)
+    artifacts = _runtime_artifacts()
+    policy = build_same_host_visibility_policy(artifacts)
+    runtime = PackedPrefillRuntime(manager, artifacts, policy)
+    peer = PackedPeerIdentity("decoder-agent", b"d" * 16)
+    sent_messages: list[object] = []
+    submission = _unvalidated_submission(
+        _plan(peer),
+        PackedDecodeControlSender(
+            peer=peer,
+            remote_handle=object(),
+            send_message=sent_messages.append,
+        ),
+    )
+    identity = _terminal_prefill_identity(manager, peer, submission.plan.key)
+    record = _terminal_prefill_record(runtime, submission, identity)
+    return runtime, manager, peer, sent_messages, submission, identity, record
+
+
 def _unvalidated_submission(
     plan: PackedAuxiliaryPlan,
     control: PackedDecodeControlSender,
@@ -1448,6 +1589,310 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     ) in caplog.messages
 
 
+def test_prefill_terminal_binding_publishes_prepare_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind PREPARE before publication and exclude every legacy wait path."""
+
+    manager = _FakeManager(attn_tp_size=1)
+    artifacts = _runtime_artifacts()
+    runtime = PackedPrefillRuntime(
+        manager,
+        artifacts,
+        build_same_host_visibility_policy(artifacts),
+    )
+    peer = PackedPeerIdentity("decoder-agent", b"d" * 16)
+    sent_messages: list[object] = []
+    submission = _unvalidated_submission(
+        _plan(peer),
+        PackedDecodeControlSender(peer, object(), sent_messages.append),
+    )
+    identity = _terminal_prefill_identity(manager, peer, submission.plan.key)
+    chunk_key = PackedChunkKey(
+        room_id=submission.plan.key.room_id,
+        chunk_id=0,
+        request_generation=submission.plan.key.request_generation,
+    )
+    record = runtime_module._PrefillRequestRecord(
+        submission=submission,
+        writer_id=runtime.writer_id,
+        chunk_key=chunk_key,
+    )
+    prepare = _unvalidated_prepare(chunk_key, runtime.writer_id)
+
+    def prepare_submission(
+        exact_submission: PackedPrefillSubmission,
+    ) -> runtime_module._PrefillRequestRecord:
+        assert exact_submission is submission
+        runtime._records[submission.plan.key] = record
+        return record
+
+    monkeypatch.setattr(runtime, "_prepare_submission", prepare_submission)
+    monkeypatch.setattr(runtime, "_register_prepare", lambda exact: prepare)
+
+    assert runtime.bind_terminal_owner(submission, identity) is prepare
+    assert sent_messages == []
+    assert runtime.terminal_owner_inventory().active_bindings == (
+        identity.local_binding.digest,
+    )
+
+    runtime.publish_terminal_owner_prepare(submission)
+
+    assert sent_messages == [prepare]
+    with pytest.raises(RuntimeError, match="cannot use blocking execution"):
+        runtime.execute(submission)
+    with pytest.raises(RuntimeError, match="explicit actor delivery"):
+        runtime.handle_control(
+            peer,
+            PackedReady(
+                key=chunk_key,
+                writer_id=runtime.writer_id,
+                digest=b"d" * 32,
+                visibility_policy_digest=b"v" * 32,
+                lease_id=1,
+                lease_base_address=0x1000,
+                projection_offset=0,
+                projection_length=4096,
+            ),
+        )
+    with pytest.raises(RuntimeError, match="cannot use a blocking wait"):
+        runtime._wait_for_ready(record)
+    with pytest.raises(RuntimeError, match="requires an owner action"):
+        runtime._wait_for_main_outcome(record)
+    with pytest.raises(RuntimeError, match="device-resident storage"):
+        runtime._post_auxiliary_transfer(record)
+
+
+def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advance READY and direct posts without condition or receipt polling."""
+
+    runtime, _, peer, _, submission, identity, record = (
+        _terminal_prefill_actor_fixture()
+    )
+    source_transfer = object()
+    runtime._ready = _ReadyCoordinator(source_transfer)
+    ready = PackedReady(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        visibility_policy_digest=b"v" * 32,
+        lease_id=9,
+        lease_base_address=0x400000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+
+    assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
+    with pytest.raises(RuntimeError, match="duplicated"):
+        runtime.deliver_terminal_owner_ready(peer, ready)
+
+    main_handle = object()
+    auxiliary_handle = object()
+    main_lane = Mock()
+
+    def post_main(
+        exact_record: runtime_module._PrefillRequestRecord,
+        transfer: object,
+    ) -> tuple[object, object]:
+        assert exact_record is record
+        assert transfer is source_transfer
+        exact_record.main_handle = main_handle
+        exact_record.main_lane = main_lane
+        return main_handle, main_lane
+
+    auxiliary_posts: list[PackedPrefillSubmission] = []
+    monkeypatch.setattr(runtime, "_post_main_transfer", post_main)
+    monkeypatch.setattr(
+        runtime,
+        "_wait_for_main_outcome",
+        lambda exact: pytest.fail("terminal actor entered main polling"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_wait_for_auxiliary_outcome",
+        lambda exact: pytest.fail("terminal actor entered auxiliary polling"),
+    )
+
+    runtime.begin_terminal_owner_transfer(
+        _terminal_prefill_action(
+            identity,
+            NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+            1,
+        ),
+        lambda exact_submission: (
+            auxiliary_posts.append(exact_submission) or auxiliary_handle
+        ),
+    )
+
+    assert auxiliary_posts == [submission]
+    assert record.terminal_gather_posted
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.main_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.lane_bindings == (identity.local_binding.digest,)
+    with pytest.raises(RuntimeError, match="already started"):
+        runtime.begin_terminal_owner_transfer(
+            _terminal_prefill_action(
+                identity,
+                NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+                2,
+            ),
+            lambda exact_submission: object(),
+        )
+
+
+def test_prefill_terminal_outcomes_retain_resources_until_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep lanes and handles live through outcome publication and teardown."""
+
+    runtime, manager, peer, sent, submission, identity, record = (
+        _terminal_prefill_actor_fixture()
+    )
+    record.source_transfer = Mock()
+    record.terminal_gather_started = True
+    record.terminal_gather_posted = True
+    record.main_transport_started_at = runtime_module.time.perf_counter()
+    main_handle = object()
+    auxiliary_handle = object()
+    main_lane = Mock()
+    record.main_handle = main_handle
+    record.auxiliary_handle = auxiliary_handle
+    record.main_lane = main_lane
+    visibility = PackedWriterVisibilityEvidence(
+        policy_digest=runtime._visibility_policy.digest,
+        transport_path=runtime._visibility_policy.transport_path,
+        lane_identifier=runtime._visibility_policy.lane_identifier,
+        completion_mechanism=runtime._visibility_policy.completion_mechanism,
+        writer_action=runtime._visibility_policy.expected_writer_action,
+        native_handle_generation=11,
+        native_descriptor_digest=b"d" * 32,
+        native_evidence_digest=b"e" * 32,
+    )
+    main_outcome = PackedWriterOutcome(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        lease_id=9,
+        status=PackedWriterOutcomeStatus.DONE,
+        visibility=visibility,
+    )
+    auxiliary_outcome = PackedAuxiliaryOutcome(
+        plan=submission.plan,
+        writer_id=runtime.writer_id,
+        native_dram_handle_generation=12,
+        descriptor_digest=b"a" * 32,
+        evidence_digest=b"b" * 32,
+    )
+    settled: list[tuple[object, NativeTerminalOwnerAction]] = []
+    monkeypatch.setattr(runtime, "_emit_transfer_stats", lambda exact: None)
+
+    outcomes = runtime.send_terminal_owner_outcomes(
+        _terminal_prefill_action(
+            identity,
+            NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+            3,
+        ),
+        lambda lane, action: settled.append((lane, action)) or main_outcome,
+        lambda handle, action: settled.append((handle, action)) or auxiliary_outcome,
+    )
+
+    assert outcomes == (main_outcome, auxiliary_outcome)
+    assert sent == [main_outcome, auxiliary_outcome]
+    assert tuple(value[0] for value in settled) == (main_lane, auxiliary_handle)
+    assert manager.agent.released_handles == []
+    before_teardown = runtime.terminal_owner_inventory()
+    assert before_teardown.main_handle_bindings == (identity.local_binding.digest,)
+    assert before_teardown.lane_bindings == (identity.local_binding.digest,)
+
+    teardown = PackedRequestTeardown(
+        key=submission.plan.key,
+        writer_id=runtime.writer_id,
+        request_slot_generation=submission.plan.request_slot_generation,
+        writer_manifest_digest=identity.local_binding.rank_manifest_digest,
+        allocation_digest=identity.local_binding.allocation_digest,
+        teardown_generation=b"t" * 16,
+        auxiliary_handle_generation=12,
+    )
+    assert (
+        runtime.deliver_terminal_owner_teardown(peer, teardown)
+        == identity.local_binding
+    )
+    assert manager.agent.released_handles == []
+    released: list[object] = []
+    acknowledgement = runtime.settle_terminal_owner_teardown(
+        _terminal_prefill_action(
+            identity,
+            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            4,
+        ),
+        lambda lane, handle: released.extend((lane, handle)),
+        released.append,
+    )
+
+    assert acknowledgement == PackedRequestTeardownAck(
+        key=teardown.key,
+        writer_id=teardown.writer_id,
+        request_slot_generation=teardown.request_slot_generation,
+        writer_manifest_digest=teardown.writer_manifest_digest,
+        allocation_digest=teardown.allocation_digest,
+        teardown_generation=teardown.teardown_generation,
+        auxiliary_handle_generation=teardown.auxiliary_handle_generation,
+    )
+    assert released == [main_lane, main_handle, auxiliary_handle]
+    assert sent[-1] == acknowledgement
+    after_ack = runtime.terminal_owner_inventory()
+    assert after_ack.active_bindings == (identity.local_binding.digest,)
+    assert after_ack.main_handle_bindings == ()
+    assert after_ack.auxiliary_handle_bindings == ()
+    assert after_ack.lane_bindings == ()
+
+    retired = runtime.retire_terminal_owner_request(
+        _terminal_prefill_action(
+            identity,
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+            5,
+        )
+    )
+    assert retired is submission
+    assert runtime.terminal_owner_inventory().active_bindings == ()
+
+
+def test_prefill_terminal_failure_keeps_exact_quarantine_inventory() -> None:
+    """Retain every ambiguous handle and lane under one actor identity."""
+
+    runtime, manager, _, _, _, identity, record = _terminal_prefill_actor_fixture()
+    record.main_handle = object()
+    record.auxiliary_handle = object()
+    record.main_lane = Mock()
+    action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        6,
+    )
+
+    runtime.quarantine_terminal_owner_request(action, "synthetic ambiguity")
+    runtime.quarantine_terminal_owner_request(action, "duplicate observation")
+
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.active_bindings == (identity.local_binding.digest,)
+    assert inventory.quarantined_bindings == (identity.local_binding.digest,)
+    assert inventory.main_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.lane_bindings == (identity.local_binding.digest,)
+    assert manager.failures == [(record.chunk_key.room_id, "synthetic ambiguity")]
+    with pytest.raises(RuntimeError, match="cannot retire"):
+        runtime.retire_terminal_owner_request(
+            _terminal_prefill_action(
+                identity,
+                NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+                7,
+            )
+        )
+
+
 def test_decode_outcome_ack_commit_and_metadata_consumption() -> None:
     """Drive decoder control evidence through scheduler commit and row release."""
 
@@ -1812,7 +2257,9 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
         runtime.terminal_owner_transaction(binding.digest)
 
 
-def test_terminal_owner_rejects_scatter_terminality_before_callback_attachment() -> None:
+def test_terminal_owner_rejects_scatter_terminality_before_callback_attachment() -> (
+    None
+):
     """Terminality without a confirmed callback quarantines the actor record."""
 
     manager = _FakeManager()

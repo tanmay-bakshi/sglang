@@ -60,9 +60,15 @@ class PackedTerminalSourceWork:
     :ivar observe_output: Consume non-gating native output evidence.
     """
 
-    post_gather: Callable[[PackedTerminalSourceSubmission], None]
-    send_outcomes: Callable[[PackedTerminalSourceSubmission], None]
-    send_ack: Callable[[PackedTerminalSourceSubmission], None]
+    post_gather: Callable[
+        [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+    ]
+    send_outcomes: Callable[
+        [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+    ]
+    send_ack: Callable[
+        [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+    ]
     observe_output: Callable[[NativeTerminalOwnerOutput], None]
 
     def __post_init__(self) -> None:

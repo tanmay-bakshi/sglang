@@ -617,16 +617,16 @@ def test_full_source_success_uses_runtime_completion_surfaces() -> None:
     harness.wiring.producer_completed(digest)
     harness.wiring.consume_gather_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 1),
-        lambda submission: None,
+        lambda submission, action: None,
     )
     harness.wiring.consume_outcome_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY, 2),
-        lambda submission: None,
+        lambda submission, action: None,
     )
     harness.wiring.teardown_received(digest, harness.identity.request_ready_issuer)
     harness.wiring.consume_ack_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 3),
-        lambda submission: None,
+        lambda submission, action: None,
     )
     _ready(harness)
     reclaim = _action(
@@ -696,12 +696,17 @@ def test_source_work_failure_returns_request_failure_to_runtime() -> None:
         30,
     )
 
-    def fail_gather(submission: PackedTerminalSourceSubmission) -> None:
+    def fail_gather(
+        submission: PackedTerminalSourceSubmission,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
         """Reject one synthetic gather.
 
         :param submission: Exact immutable source submission.
+        :param action: Exact native owner authority.
         """
 
+        del submission, action
         raise RuntimeError("synthetic gather failure")
 
     with pytest.raises(RuntimeError, match="synthetic gather failure"):

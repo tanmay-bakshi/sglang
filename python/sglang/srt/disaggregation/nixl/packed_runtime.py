@@ -14,7 +14,6 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 import numpy.typing as npt
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -103,9 +102,12 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourceIdentityPlan,
     PackedTerminalSourcePlan,
 )
 
@@ -725,6 +727,59 @@ class _PrefillRequestRecord:
     source_gather_copy_duration_ms: float | None = None
     main_transport_started_at: float | None = None
     main_transport_duration_ms: float | None = None
+    terminal_identity: PackedTerminalSourceIdentityPlan | None = None
+    terminal_prepare: PackedPrepare | None = None
+    terminal_prepare_sent: bool = False
+    terminal_gather_started: bool = False
+    terminal_gather_posted: bool = False
+    terminal_teardown: PackedRequestTeardown | None = None
+    terminal_ack_sent: bool = False
+    terminal_quarantined: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedPrefillOwnerInventory:
+    """Exact packed source resources retained by terminal-owner requests.
+
+    :ivar active_bindings: Every live terminal source lifecycle.
+    :ivar quarantined_bindings: Lifecycles retaining ambiguous resources.
+    :ivar waiting_for_ready_bindings: PREPARE publications without READY.
+    :ivar main_handle_bindings: Lifecycles retaining a main NIXL handle.
+    :ivar auxiliary_handle_bindings: Lifecycles retaining an auxiliary handle.
+    :ivar lane_bindings: Lifecycles retaining an exact packed transfer lane.
+    """
+
+    active_bindings: tuple[bytes, ...]
+    quarantined_bindings: tuple[bytes, ...]
+    waiting_for_ready_bindings: tuple[bytes, ...]
+    main_handle_bindings: tuple[bytes, ...]
+    auxiliary_handle_bindings: tuple[bytes, ...]
+    lane_bindings: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        """Validate sorted exact-identity resource inventories."""
+
+        collections = (
+            self.active_bindings,
+            self.quarantined_bindings,
+            self.waiting_for_ready_bindings,
+            self.main_handle_bindings,
+            self.auxiliary_handle_bindings,
+            self.lane_bindings,
+        )
+        if any(type(values) is not tuple for values in collections):
+            raise TypeError("prefill owner inventory collections must be tuples")
+        if any(
+            type(value) is not bytes or len(value) != 32
+            for values in collections
+            for value in values
+        ):
+            raise ValueError("prefill owner inventory bindings must contain 32 bytes")
+        if any(values != tuple(sorted(values)) for values in collections):
+            raise ValueError("prefill owner inventory bindings must use digest order")
+        active = set(self.active_bindings)
+        if any(not set(values).issubset(active) for values in collections[1:]):
+            raise ValueError("prefill owner resource bindings must remain active")
 
 
 class PackedPrefillRuntime:
@@ -781,6 +836,719 @@ class PackedPrefillRuntime:
         """
 
         return self._writer_id
+
+    def bind_terminal_owner(
+        self,
+        submission: PackedPrefillSubmission,
+        identity: PackedTerminalSourceIdentityPlan,
+    ) -> PackedPrepare:
+        """Bind one source lifecycle and register PREPARE without waiting.
+
+        The returned message is retained by the actor and is not sent until
+        :meth:`publish_terminal_owner_prepare`. This lets process composition
+        publish native lifecycle ownership before control traffic can return a
+        READY message.
+
+        :param submission: Immutable packed transport submission.
+        :param identity: Decoder-authored rank-local terminal identity.
+        :returns: Exact PREPARE registered by the source coordinator.
+        """
+
+        if type(submission) is not PackedPrefillSubmission:
+            raise TypeError("submission must be PackedPrefillSubmission")
+        if type(identity) is not PackedTerminalSourceIdentityPlan:
+            raise TypeError("identity must be PackedTerminalSourceIdentityPlan")
+        self._validate_terminal_identity(submission, identity)
+        record = self._prepare_submission(submission)
+        with self._lock:
+            record.terminal_identity = identity
+        try:
+            prepare = self._register_prepare(record)
+        except (RuntimeError, TypeError, ValueError):
+            self._cancel_terminal_record_before_publish(record)
+            raise
+        with self._lock:
+            current = self._records.get(identity.request_key)
+            if current is not record:
+                raise RuntimeError("packed source registry changed during owner bind")
+            record.terminal_prepare = prepare
+        return prepare
+
+    def publish_terminal_owner_prepare(
+        self,
+        submission: PackedPrefillSubmission,
+    ) -> None:
+        """Send one actor-registered PREPARE without entering a wait path.
+
+        :param submission: Exact submission previously bound to terminal owner.
+        """
+
+        record = self._terminal_record_for_submission(submission)
+        with self._lock:
+            prepare = record.terminal_prepare
+            if prepare is None:
+                raise RuntimeError("terminal PREPARE was not registered")
+            if record.terminal_prepare_sent:
+                raise RuntimeError("terminal PREPARE was already published")
+            record.terminal_prepare_sent = True
+        try:
+            submission.control.send_message(prepare)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._quarantine_terminal_record(
+                record,
+                "terminal PREPARE publication became ambiguous",
+            )
+            raise
+
+    def cancel_terminal_owner_unpublished(
+        self,
+        submission: PackedPrefillSubmission,
+    ) -> None:
+        """Cancel an actor binding before PREPARE or native work is published.
+
+        :param submission: Exact unpublished terminal submission.
+        """
+
+        record = self._terminal_record_for_submission(submission)
+        with self._lock:
+            if (
+                record.terminal_prepare_sent
+                or record.source_transfer is not None
+                or record.terminal_gather_started
+                or record.main_handle is not None
+                or record.auxiliary_handle is not None
+            ):
+                raise RuntimeError("published terminal source request cannot cancel")
+        self._cancel_terminal_record_before_publish(record)
+
+    def deliver_terminal_owner_ready(
+        self,
+        authenticated_decode_peer: PackedPeerIdentity,
+        message: PackedReady,
+    ) -> TerminalRequestBinding:
+        """Deliver one authenticated READY without waking a blocking waiter.
+
+        :param authenticated_decode_peer: Decoder proved by control routing.
+        :param message: Exact READY for the actor's sole packed chunk.
+        :returns: Rank-local lifecycle binding made ready for owner work.
+        """
+
+        if type(authenticated_decode_peer) is not PackedPeerIdentity:
+            raise TypeError("authenticated_decode_peer must be PackedPeerIdentity")
+        if type(message) is not PackedReady:
+            raise TypeError("message must be PackedReady")
+        record = self._terminal_record_for_key(
+            PackedRequestKey.from_chunk_key(message.key)
+        )
+        identity = self._require_terminal_identity(record)
+        self._validate_terminal_decode_peer(record, authenticated_decode_peer)
+        with self._lock:
+            if not record.terminal_prepare_sent:
+                raise RuntimeError("terminal READY preceded PREPARE publication")
+            if record.source_transfer is not None:
+                raise RuntimeError("terminal READY was duplicated")
+        transfer = self._ready.handle_ready(message, authenticated_decode_peer)
+        with record.condition:
+            if record.source_transfer is not None:
+                raise RuntimeError("terminal READY raced another delivery")
+            record.source_transfer = transfer
+            record.condition.notify_all()
+        return identity.local_binding
+
+    def begin_terminal_owner_transfer(
+        self,
+        action: NativeTerminalOwnerAction,
+        post_auxiliary: Callable[[PackedPrefillSubmission], object] | None,
+    ) -> None:
+        """Post gather and direct transfers only under owner authorization.
+
+        The canonical writer must supply a device-resident auxiliary poster.
+        This actor intentionally does not call the legacy DRAM auxiliary path.
+        The callback must return the exact retained native handle and must not
+        wait for terminality.
+
+        :param action: Exact ``SOURCE_GATHER_READY`` owner action.
+        :param post_auxiliary: Nonblocking DFlash auxiliary transfer poster on
+            the canonical writer, otherwise ``None``.
+        """
+
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        canonical = self._writer_id == record.submission.plan.canonical_writer_id
+        if canonical and not callable(post_auxiliary):
+            raise TypeError("canonical terminal source requires auxiliary poster")
+        if not canonical and post_auxiliary is not None:
+            raise ValueError("noncanonical terminal source cannot post auxiliary data")
+        with self._lock:
+            if not record.terminal_prepare_sent:
+                raise RuntimeError("terminal gather preceded PREPARE publication")
+            transfer = record.source_transfer
+            if transfer is None:
+                raise RuntimeError("terminal gather preceded authenticated READY")
+            if record.terminal_gather_started:
+                raise RuntimeError("terminal gather was already started")
+            record.terminal_gather_started = True
+        try:
+            if canonical:
+                assert post_auxiliary is not None
+                auxiliary_handle = post_auxiliary(record.submission)
+                if auxiliary_handle is None:
+                    raise RuntimeError("terminal auxiliary poster returned no handle")
+                with record.condition:
+                    record.auxiliary_handle = auxiliary_handle
+            main_handle, main_lane = self._post_main_transfer(record, transfer)
+            with record.condition:
+                if (
+                    record.main_handle is not main_handle
+                    or record.main_lane is not main_lane
+                ):
+                    raise RuntimeError("terminal main post lost actor ownership")
+                record.terminal_gather_posted = True
+        except Exception:
+            self._quarantine_terminal_record(
+                record,
+                "terminal source gather or transfer post failed",
+            )
+            raise
+
+    def send_terminal_owner_outcomes(
+        self,
+        action: NativeTerminalOwnerAction,
+        settle_main: Callable[
+            [PackedTransferLane, NativeTerminalOwnerAction], PackedWriterOutcome
+        ],
+        settle_auxiliary: Callable[
+            [object, NativeTerminalOwnerAction], PackedAuxiliaryOutcome
+        ]
+        | None,
+    ) -> tuple[PackedWriterOutcome, PackedAuxiliaryOutcome | None]:
+        """Construct and send outcomes under exact native terminal authority.
+
+        Settlement callbacks may consume take-once native completion receipts,
+        but must retain the native handles and packed lane. Teardown authority,
+        not transport completion, owns their release.
+
+        :param action: Exact ``SOURCE_OUTCOME_READY`` owner action.
+        :param settle_main: Main-lane terminal receipt settlement.
+        :param settle_auxiliary: Canonical auxiliary receipt settlement.
+        :returns: Main and optional canonical auxiliary outcomes sent on control.
+        """
+
+        if not callable(settle_main):
+            raise TypeError("settle_main must be callable")
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        )
+        canonical = self._writer_id == record.submission.plan.canonical_writer_id
+        if canonical and not callable(settle_auxiliary):
+            raise TypeError("canonical terminal source requires auxiliary settlement")
+        if not canonical and settle_auxiliary is not None:
+            raise ValueError("noncanonical terminal source has no auxiliary settlement")
+        with self._lock:
+            if not record.terminal_gather_posted:
+                raise RuntimeError("terminal outcomes preceded transfer post")
+            if record.main_outcome is not None or record.outcomes_sent:
+                raise RuntimeError("terminal outcomes were already constructed")
+            lane = record.main_lane
+            auxiliary_handle = record.auxiliary_handle
+            if lane is None or record.main_handle is None:
+                raise RuntimeError("terminal outcome lost main native ownership")
+            if canonical and auxiliary_handle is None:
+                raise RuntimeError("terminal outcome lost auxiliary ownership")
+        try:
+            main_outcome = settle_main(lane, action)
+            self._validate_terminal_main_outcome(record, main_outcome)
+            auxiliary_outcome: PackedAuxiliaryOutcome | None = None
+            if canonical:
+                assert auxiliary_handle is not None
+                assert settle_auxiliary is not None
+                auxiliary_outcome = settle_auxiliary(auxiliary_handle, action)
+                self._validate_terminal_auxiliary_outcome(record, auxiliary_outcome)
+            with record.condition:
+                record.main_outcome = main_outcome
+                record.auxiliary_outcome = auxiliary_outcome
+            record.submission.control.send_message(main_outcome)
+            if auxiliary_outcome is not None:
+                record.submission.control.send_message(auxiliary_outcome)
+            with record.condition:
+                record.outcomes_sent = True
+            self._emit_transfer_stats(record)
+            return main_outcome, auxiliary_outcome
+        except Exception:
+            self._quarantine_terminal_record(
+                record,
+                "terminal source outcome settlement or publication failed",
+            )
+            raise
+
+    def deliver_terminal_owner_teardown(
+        self,
+        authenticated_decode_peer: PackedPeerIdentity,
+        request: PackedRequestTeardown,
+    ) -> TerminalRequestBinding:
+        """Retain authenticated teardown without releasing any resource.
+
+        :param authenticated_decode_peer: Decoder proved by control routing.
+        :param request: Exact writer-specific teardown request.
+        :returns: Local binding whose native lifecycle receives teardown.
+        """
+
+        if type(authenticated_decode_peer) is not PackedPeerIdentity:
+            raise TypeError("authenticated_decode_peer must be PackedPeerIdentity")
+        if type(request) is not PackedRequestTeardown:
+            raise TypeError("request must be PackedRequestTeardown")
+        record = self._terminal_record_for_key(request.key)
+        identity = self._require_terminal_identity(record)
+        self._validate_terminal_decode_peer(record, authenticated_decode_peer)
+        try:
+            self._validate_terminal_teardown(record, request)
+            with self._lock:
+                previous = record.terminal_teardown
+                if previous is not None:
+                    if previous == request:
+                        return identity.local_binding
+                    raise RuntimeError(
+                        "terminal teardown conflicts with prior delivery"
+                    )
+                record.terminal_teardown = request
+            return identity.local_binding
+        except (RuntimeError, TypeError, ValueError):
+            self._quarantine_terminal_record(
+                record,
+                "terminal source teardown validation failed",
+            )
+            raise
+
+    def settle_terminal_owner_teardown(
+        self,
+        action: NativeTerminalOwnerAction,
+        release_main: Callable[[PackedTransferLane, object], None],
+        release_auxiliary: Callable[[object], None] | None,
+    ) -> PackedRequestTeardownAck:
+        """Release exact handles and ACK only under teardown owner authority.
+
+        :param action: Exact ``SOURCE_ACK_READY`` owner action.
+        :param release_main: Main lane and handle release operation.
+        :param release_auxiliary: Canonical auxiliary handle release operation.
+        :returns: Exact acknowledgement sent to the decoder.
+        """
+
+        if not callable(release_main):
+            raise TypeError("release_main must be callable")
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+        canonical = self._writer_id == record.submission.plan.canonical_writer_id
+        if canonical and not callable(release_auxiliary):
+            raise TypeError("canonical terminal source requires auxiliary release")
+        if not canonical and release_auxiliary is not None:
+            raise ValueError("noncanonical terminal source has no auxiliary release")
+        with self._lock:
+            request = record.terminal_teardown
+            if request is None:
+                raise RuntimeError("terminal ACK preceded authenticated teardown")
+            if record.terminal_ack_sent:
+                raise RuntimeError("terminal ACK authority was replayed")
+            lane = record.main_lane
+            main_handle = record.main_handle
+            auxiliary_handle = record.auxiliary_handle
+            if lane is None or main_handle is None:
+                raise RuntimeError("terminal teardown lost main native ownership")
+            if canonical and auxiliary_handle is None:
+                raise RuntimeError("terminal teardown lost auxiliary ownership")
+        try:
+            release_main(lane, main_handle)
+            with record.condition:
+                record.main_handle_released = True
+                record.main_handle = None
+                record.main_lane = None
+            if canonical:
+                assert auxiliary_handle is not None
+                assert release_auxiliary is not None
+                release_auxiliary(auxiliary_handle)
+                with record.condition:
+                    record.auxiliary_handle_released = True
+                    record.auxiliary_handle = None
+            acknowledgement = PackedRequestTeardownAck(
+                key=request.key,
+                writer_id=request.writer_id,
+                request_slot_generation=request.request_slot_generation,
+                writer_manifest_digest=request.writer_manifest_digest,
+                allocation_digest=request.allocation_digest,
+                teardown_generation=request.teardown_generation,
+                auxiliary_handle_generation=request.auxiliary_handle_generation,
+            )
+            record.submission.control.send_message(acknowledgement)
+            with record.condition:
+                record.terminal_ack_sent = True
+            return acknowledgement
+        except Exception:
+            self._quarantine_terminal_record(
+                record,
+                "terminal source teardown settlement or ACK failed",
+            )
+            raise
+
+    def quarantine_terminal_owner_request(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> None:
+        """Retain every ambiguous source resource under native quarantine.
+
+        :param action: Exact quarantine or process-fatal owner action.
+        :param reason: Stable fail-closed evidence.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        ):
+            raise ValueError("source quarantine requires a failure owner action")
+        record = self._terminal_record_for_action(action, action.kind)
+        self._quarantine_terminal_record(record, reason)
+
+    def retire_terminal_owner_request(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> PackedPrefillSubmission:
+        """Remove actor identity only after native joined retirement.
+
+        :param action: Exact ``REQUEST_RETIRED`` owner action.
+        :returns: Transport submission whose actor resources are exhausted.
+        """
+
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        with self._lock:
+            if record.terminal_quarantined:
+                raise RuntimeError("quarantined terminal source cannot retire")
+            if not record.terminal_ack_sent:
+                raise RuntimeError("terminal source retirement preceded ACK")
+            if (
+                record.main_handle is not None
+                or record.auxiliary_handle is not None
+                or record.main_lane is not None
+            ):
+                raise RuntimeError(
+                    "terminal source retirement retains native resources"
+                )
+            key = record.submission.plan.key
+            current = self._records.get(key)
+            if current is not record:
+                raise RuntimeError("packed source registry changed during retirement")
+            del self._records[key]
+        return record.submission
+
+    def terminal_owner_inventory(self) -> PackedPrefillOwnerInventory:
+        """Return exact actor-owned terminal source resource identities.
+
+        :returns: Active, quarantine, READY, native-handle, and lane inventory.
+        """
+
+        with self._lock:
+            records = tuple(
+                record
+                for record in self._records.values()
+                if record.terminal_identity is not None
+            )
+            active = tuple(
+                sorted(
+                    self._require_terminal_identity(record).local_binding.digest
+                    for record in records
+                )
+            )
+
+            def selected(
+                predicate: Callable[[_PrefillRequestRecord], bool],
+            ) -> tuple[bytes, ...]:
+                return tuple(
+                    sorted(
+                        self._require_terminal_identity(record).local_binding.digest
+                        for record in records
+                        if predicate(record)
+                    )
+                )
+
+            return PackedPrefillOwnerInventory(
+                active_bindings=active,
+                quarantined_bindings=selected(
+                    lambda record: record.terminal_quarantined
+                ),
+                waiting_for_ready_bindings=selected(
+                    lambda record: (
+                        record.terminal_prepare_sent and record.source_transfer is None
+                    )
+                ),
+                main_handle_bindings=selected(
+                    lambda record: record.main_handle is not None
+                ),
+                auxiliary_handle_bindings=selected(
+                    lambda record: record.auxiliary_handle is not None
+                ),
+                lane_bindings=selected(lambda record: record.main_lane is not None),
+            )
+
+    def _validate_terminal_identity(
+        self,
+        submission: PackedPrefillSubmission,
+        identity: PackedTerminalSourceIdentityPlan,
+    ) -> None:
+        """Validate one actor binding before it enters the sole registry.
+
+        :param submission: Candidate packed source submission.
+        :param identity: Candidate terminal identity graph.
+        """
+
+        binding = identity.local_binding
+        owner = binding.owner
+        if identity.request_key != submission.plan.key:
+            raise RuntimeError("terminal identity belongs to another packed request")
+        if owner.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("terminal identity does not belong to source")
+        if (
+            owner.tp_rank != self._manager.attn_tp_rank
+            or owner.tp_size != self._manager.attn_tp_size
+            or owner.tp_rank != self._writer_id.source_attn_tp_rank
+        ):
+            raise RuntimeError("terminal identity belongs to another source rank")
+        local_process_generation = uuid.UUID(self._manager.process_generation).bytes
+        if owner.process_generation != local_process_generation:
+            raise RuntimeError("terminal identity belongs to another source process")
+        if (
+            identity.request_ready_issuer.process_generation
+            != submission.control.peer.agent_generation
+            or submission.plan.destination_process_generation
+            != submission.control.peer.agent_generation
+        ):
+            raise RuntimeError("terminal identity names another decoder process")
+
+    def _terminal_record_for_submission(
+        self,
+        submission: PackedPrefillSubmission,
+    ) -> _PrefillRequestRecord:
+        """Resolve an exact terminal record without another request registry.
+
+        :param submission: Exact actor-owned transport submission.
+        :returns: Matching terminal request record.
+        """
+
+        if type(submission) is not PackedPrefillSubmission:
+            raise TypeError("submission must be PackedPrefillSubmission")
+        record = self._terminal_record_for_key(submission.plan.key)
+        if record.submission is not submission:
+            raise RuntimeError("terminal actor owns another submission instance")
+        return record
+
+    def _terminal_record_for_key(
+        self,
+        key: PackedRequestKey,
+    ) -> _PrefillRequestRecord:
+        """Resolve the sole actor record for one terminal request key.
+
+        :param key: Exact packed request generation.
+        :returns: Matching terminal request record.
+        """
+
+        if type(key) is not PackedRequestKey:
+            raise TypeError("key must be PackedRequestKey")
+        with self._lock:
+            record = self._records.get(key)
+        if record is None:
+            raise RuntimeError("terminal source references an unknown request")
+        self._require_terminal_identity(record)
+        return record
+
+    def _terminal_record_for_action(
+        self,
+        action: NativeTerminalOwnerAction,
+        expected_kind: NativeTerminalOwnerActionKind,
+    ) -> _PrefillRequestRecord:
+        """Resolve an owner action through the actor's sole request registry.
+
+        :param action: Exact native owner action.
+        :param expected_kind: Action kind required by the actor operation.
+        :returns: Matching terminal request record.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(expected_kind) is not NativeTerminalOwnerActionKind:
+            raise TypeError("expected_kind must be NativeTerminalOwnerActionKind")
+        if action.kind is not expected_kind:
+            raise ValueError(f"terminal source operation requires {expected_kind.name}")
+        binding = action.binding.to_binding()
+        record = self._terminal_record_for_key(binding.request_key)
+        identity = self._require_terminal_identity(record)
+        if binding != identity.local_binding:
+            raise RuntimeError("terminal owner action belongs to another binding")
+        return record
+
+    @staticmethod
+    def _require_terminal_identity(
+        record: _PrefillRequestRecord,
+    ) -> PackedTerminalSourceIdentityPlan:
+        """Return the exact terminal identity retained by one actor record.
+
+        :param record: Candidate source actor record.
+        :returns: Bound rank-local source identity.
+        """
+
+        identity = record.terminal_identity
+        if identity is None:
+            raise RuntimeError("packed source request has no terminal owner binding")
+        return identity
+
+    def _validate_terminal_decode_peer(
+        self,
+        record: _PrefillRequestRecord,
+        authenticated_decode_peer: PackedPeerIdentity,
+    ) -> None:
+        """Join transport authentication with the frozen terminal identity.
+
+        :param record: Exact terminal source record.
+        :param authenticated_decode_peer: Peer proved by control routing.
+        """
+
+        identity = self._require_terminal_identity(record)
+        if authenticated_decode_peer != record.submission.control.peer:
+            raise RuntimeError("terminal control came from another decoder route")
+        if (
+            authenticated_decode_peer.agent_generation
+            != identity.request_ready_issuer.process_generation
+        ):
+            raise RuntimeError("terminal control came from another decoder process")
+
+    def _cancel_terminal_record_before_publish(
+        self,
+        record: _PrefillRequestRecord,
+    ) -> None:
+        """Remove one request whose external publication never began.
+
+        :param record: Exact unpublished actor record.
+        """
+
+        self._ready.retire_pending(
+            record.chunk_key,
+            record.submission.control.peer,
+        )
+        with self._lock:
+            key = record.submission.plan.key
+            current = self._records.get(key)
+            if current is not record:
+                raise RuntimeError("packed source registry changed during cancellation")
+            del self._records[key]
+
+    def _validate_terminal_main_outcome(
+        self,
+        record: _PrefillRequestRecord,
+        outcome: PackedWriterOutcome,
+    ) -> None:
+        """Validate main transport settlement before control publication.
+
+        :param record: Exact terminal source record.
+        :param outcome: Candidate main terminal outcome.
+        """
+
+        if type(outcome) is not PackedWriterOutcome:
+            raise TypeError("main settlement must return PackedWriterOutcome")
+        if (
+            outcome.key != record.chunk_key
+            or outcome.writer_id != self._writer_id
+            or outcome.status is not PackedWriterOutcomeStatus.DONE
+        ):
+            raise RuntimeError("main settlement outcome differs from actor ownership")
+
+    def _validate_terminal_auxiliary_outcome(
+        self,
+        record: _PrefillRequestRecord,
+        outcome: PackedAuxiliaryOutcome,
+    ) -> None:
+        """Validate auxiliary settlement before control publication.
+
+        :param record: Exact terminal source record.
+        :param outcome: Candidate canonical auxiliary outcome.
+        """
+
+        if type(outcome) is not PackedAuxiliaryOutcome:
+            raise TypeError("auxiliary settlement must return PackedAuxiliaryOutcome")
+        if (
+            outcome.plan != record.submission.plan
+            or outcome.writer_id != self._writer_id
+        ):
+            raise RuntimeError(
+                "auxiliary settlement outcome differs from actor ownership"
+            )
+
+    def _validate_terminal_teardown(
+        self,
+        record: _PrefillRequestRecord,
+        request: PackedRequestTeardown,
+    ) -> None:
+        """Validate teardown against outcomes and frozen source identity.
+
+        :param record: Exact terminal source record.
+        :param request: Candidate authenticated teardown.
+        """
+
+        identity = self._require_terminal_identity(record)
+        if not record.outcomes_sent:
+            raise RuntimeError("terminal teardown preceded outcome publication")
+        if request.key != record.submission.plan.key:
+            raise RuntimeError("terminal teardown belongs to another request")
+        if request.writer_id != self._writer_id:
+            raise RuntimeError("terminal teardown targets another writer")
+        if (
+            request.request_slot_generation
+            != record.submission.plan.request_slot_generation
+            or request.writer_manifest_digest
+            != identity.local_binding.rank_manifest_digest
+            or request.allocation_digest != identity.local_binding.allocation_digest
+        ):
+            raise RuntimeError("terminal teardown differs from frozen allocation")
+        auxiliary_outcome = record.auxiliary_outcome
+        if self._writer_id == record.submission.plan.canonical_writer_id:
+            if auxiliary_outcome is None:
+                raise RuntimeError("canonical terminal teardown lacks aux outcome")
+            if (
+                request.auxiliary_handle_generation
+                != auxiliary_outcome.native_dram_handle_generation
+            ):
+                raise RuntimeError("terminal teardown names another aux handle")
+        elif request.auxiliary_handle_generation is not None:
+            raise RuntimeError("noncanonical terminal teardown names an aux handle")
+
+    def _quarantine_terminal_record(
+        self,
+        record: _PrefillRequestRecord,
+        reason: str,
+    ) -> None:
+        """Mark one terminal record ambiguous without releasing any resource.
+
+        :param record: Exact actor-owned terminal record.
+        :param reason: Stable fail-closed evidence.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        with record.condition:
+            newly_quarantined = not record.terminal_quarantined
+            record.terminal_quarantined = True
+            if record.failure_reason is None:
+                record.failure_reason = reason
+            record.condition.notify_all()
+        if newly_quarantined:
+            room = record.chunk_key.room_id
+            self._manager.record_failure(room, reason)
+            self._manager.update_status(room, KVPoll.Failed)
 
     def build_destination_capability(
         self,
@@ -858,6 +1626,12 @@ class PackedPrefillRuntime:
         :param submission: Complete source-local request inputs.
         """
 
+        with self._lock:
+            existing = self._records.get(submission.plan.key)
+        if existing is not None and existing.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner source request cannot use blocking execution"
+            )
         record = self._prepare_submission(submission)
         try:
             record.submission.control.send_message(self._register_prepare(record))
@@ -926,6 +1700,10 @@ class PackedPrefillRuntime:
             raise RuntimeError("packed decoder control references an unknown request")
         if authenticated_decode_peer != record.submission.control.peer:
             raise RuntimeError("packed decoder control came from another process")
+        if record.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner source control requires explicit actor delivery"
+            )
         try:
             if type(message) is PackedReady:
                 transfer = self._ready.handle_ready(
@@ -1012,6 +1790,8 @@ class PackedPrefillRuntime:
         )
 
     def _wait_for_ready(self, record: _PrefillRequestRecord) -> PackedSourceTransfer:
+        if record.terminal_identity is not None:
+            raise RuntimeError("terminal-owner READY cannot use a blocking wait")
         deadline = time.monotonic() + PACKED_CONTROL_TIMEOUT_SECONDS
         with record.condition:
             while record.source_transfer is None and record.failure_reason is None:
@@ -1142,6 +1922,10 @@ class PackedPrefillRuntime:
         self,
         record: _PrefillRequestRecord,
     ) -> PackedWriterOutcome:
+        if record.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner main completion requires an owner action"
+            )
         lane = record.main_lane
         if lane is None:
             raise RuntimeError("packed main lane was not retained")
@@ -1156,6 +1940,10 @@ class PackedPrefillRuntime:
             time.sleep(0)
 
     def _post_auxiliary_transfer(self, record: _PrefillRequestRecord) -> object:
+        if record.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner auxiliary transport requires device-resident storage"
+            )
         plan = record.submission.plan
         source_ptrs = tuple(self._manager.kv_args.aux_data_ptrs)
         source_item_lens = tuple(self._manager.kv_args.aux_item_lens)
@@ -1211,6 +1999,10 @@ class PackedPrefillRuntime:
         self,
         record: _PrefillRequestRecord,
     ) -> PackedAuxiliaryOutcome:
+        if record.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner auxiliary completion requires an owner action"
+            )
         handle = record.auxiliary_handle
         if handle is None:
             raise RuntimeError("packed auxiliary handle was not retained")
@@ -1300,6 +2092,10 @@ class PackedPrefillRuntime:
         record: _PrefillRequestRecord,
         request: PackedRequestTeardown,
     ) -> None:
+        if record.terminal_identity is not None:
+            raise RuntimeError(
+                "terminal-owner teardown requires explicit owner settlement"
+            )
         if request.writer_id != self._writer_id:
             raise RuntimeError("packed teardown targets another source writer")
         with record.condition:
@@ -1910,9 +2706,7 @@ class PackedDecodeRuntime:
             self._records_by_terminal_binding[binding.digest] = (
                 transaction.snapshot().key
             )
-            issuers = tuple(
-                writer.process_identity for writer in source_plan.writers
-            )
+            issuers = tuple(writer.process_identity for writer in source_plan.writers)
             coordinator = source_plan.request_ready_issuer
             if coordinator.digest not in tuple(issuer.digest for issuer in issuers):
                 issuers = (*issuers, coordinator)
@@ -2675,7 +3469,10 @@ class PackedDecodeRuntime:
                 )
             if record.commit_receipt is None or record.ack_manifest_reported:
                 return tuple(signals)
-            if record.transaction.state is not PackedRequestTransactionState.COMMIT_READY:
+            if (
+                record.transaction.state
+                is not PackedRequestTransactionState.COMMIT_READY
+            ):
                 raise RuntimeError(
                     "decode commit receipt exists before ACK-manifest completion"
                 )

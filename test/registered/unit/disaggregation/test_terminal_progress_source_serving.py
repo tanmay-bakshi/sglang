@@ -292,9 +292,9 @@ def _serving(
         physical_capacity=8,
         process_fatal_handler=fatal_inventories.append,
         work=PackedTerminalSourceWork(
-            post_gather=lambda submission: work_labels.append("gather"),
-            send_outcomes=lambda submission: work_labels.append("outcome"),
-            send_ack=lambda submission: work_labels.append("ack"),
+            post_gather=lambda submission, action: work_labels.append("gather"),
+            send_outcomes=lambda submission, action: work_labels.append("outcome"),
+            send_ack=lambda submission, action: work_labels.append("ack"),
             observe_output=lambda output: None,
         ),
         retire_native_producers=lambda: runtime._owner.retire_python_producer(
