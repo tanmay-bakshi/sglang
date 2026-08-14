@@ -69,6 +69,7 @@ def _isolated_logger(name: str) -> logging.Logger:
 
     logger = logging.getLogger(name)
     logger.handlers.clear()
+    logger.setLevel(logging.INFO)
     logger.propagate = False
     return logger
 
