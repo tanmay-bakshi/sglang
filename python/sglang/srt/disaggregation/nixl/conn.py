@@ -102,6 +102,18 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
+from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
+    build_terminal_startup_cohort_expectation,
+)
+from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
+    TerminalDeploymentCohort,
+    TerminalDeploymentLocalService,
+    TerminalDeploymentRole,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_binding import (
+    TerminalStartupRankBinding,
+    join_terminal_startup_rank,
+)
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
     TerminalStartupCohortRegistry,
 )
@@ -785,6 +797,8 @@ class TransferStatus:
 
 
 class NixlKVManager(CommonKVManager):
+    _terminal_startup_binding: TerminalStartupRankBinding | None
+
     def __init__(
         self,
         args: KVArgs,
@@ -956,6 +970,7 @@ class NixlKVManager(CommonKVManager):
         # transport identity may leave this manager until all long-lived
         # payload and staging regions are represented in that snapshot.
         self.agent_metadata = bytes(self.agent.get_agent_metadata())
+        self._terminal_startup_binding = self._join_terminal_startup_cohort()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.register_to_bootstrap()
@@ -975,6 +990,68 @@ class NixlKVManager(CommonKVManager):
             if self.enable_staging:
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
+
+    @property
+    def terminal_startup_binding(self) -> TerminalStartupRankBinding | None:
+        """Return this rank's immutable startup epoch and producer authority.
+
+        :returns: Complete rank binding, or ``None`` outside terminal deployments.
+        """
+
+        return self._terminal_startup_binding
+
+    def _join_terminal_startup_cohort(self) -> TerminalStartupRankBinding | None:
+        """Freeze complete native membership before any manager thread starts.
+
+        :returns: Complete immutable rank binding, or ``None`` when unconfigured.
+        :raises ValueError: If terminal configuration or local topology is partial.
+        """
+
+        cohort = self.server_args.pd_terminal_deployment_cohort
+        local_membership = self.server_args.pd_terminal_local_membership
+        timeout_seconds = self.server_args.pd_terminal_startup_timeout_seconds
+        configured_values = (cohort, local_membership, timeout_seconds)
+        if all(value is None for value in configured_values):
+            return None
+        if any(value is None for value in configured_values):
+            raise ValueError(
+                "terminal startup cohort, local membership, and timeout must be "
+                "configured together"
+            )
+        if type(cohort) is not TerminalDeploymentCohort:
+            raise TypeError("pd_terminal_deployment_cohort has an invalid type")
+        if type(local_membership) is not TerminalDeploymentLocalService:
+            raise TypeError("pd_terminal_local_membership has an invalid type")
+        expected_role = (
+            TerminalDeploymentRole.PREFILL
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else TerminalDeploymentRole.DECODE
+        )
+        if local_membership.role is not expected_role:
+            raise ValueError("terminal local membership role differs from NIXL manager")
+        if self.pp_size != 1 or self.attn_cp_size != 1:
+            raise ValueError("terminal startup binding requires PP1 and attention CP1")
+        if local_membership.tensor_parallel_size != self.attn_tp_size:
+            raise ValueError(
+                "terminal local membership TP width differs from NIXL manager"
+            )
+        if type(timeout_seconds) is not float:
+            raise TypeError("pd_terminal_startup_timeout_seconds must be a float")
+
+        expectation = build_terminal_startup_cohort_expectation(
+            cohort,
+            local_membership,
+        )
+        return join_terminal_startup_rank(
+            cohort,
+            local_membership,
+            expectation,
+            tensor_parallel_rank=self.attn_tp_rank,
+            process_generation=self.process_generation,
+            nixl_agent_name=self.agent.name,
+            nixl_agent_metadata=self.agent_metadata,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _bootstrap_transport_registration(self) -> dict[str, object]:
         """Publish this prefill rank's exact native NIXL identity.
