@@ -1885,15 +1885,16 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
     )
     assert runtime.deliver_terminal_owner_teardown(peer, teardown) is None
     assert manager.agent.released_handles == []
-    released: list[object] = []
+    released: list[tuple[object, NativeTerminalOwnerAction]] = []
+    ack_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        4,
+    )
     acknowledgement = runtime.settle_terminal_owner_teardown(
-        _terminal_prefill_action(
-            identity,
-            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
-            4,
-        ),
-        lambda lane, handle: released.extend((lane, handle)),
-        released.append,
+        ack_action,
+        lambda lane, action: released.append((lane, action)),
+        lambda handle, action: released.append((handle, action)),
     )
 
     assert acknowledgement == PackedRequestTeardownAck(
@@ -1905,7 +1906,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
         teardown_generation=teardown.teardown_generation,
         auxiliary_handle_generation=teardown.auxiliary_handle_generation,
     )
-    assert released == [main_lane, main_handle, auxiliary_handle]
+    assert released == [(main_lane, ack_action), (auxiliary_handle, ack_action)]
     assert sent[-1] == acknowledgement
     after_ack = runtime.terminal_owner_inventory()
     assert after_ack.active_bindings == (identity.local_binding.digest,)

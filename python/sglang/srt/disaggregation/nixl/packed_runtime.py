@@ -1189,14 +1189,17 @@ class PackedPrefillRuntime:
     def settle_terminal_owner_teardown(
         self,
         action: NativeTerminalOwnerAction,
-        release_main: Callable[[PackedTransferLane, object], None],
-        release_auxiliary: Callable[[object], None] | None,
+        release_main: Callable[
+            [PackedTransferLane, NativeTerminalOwnerAction], None
+        ],
+        release_auxiliary: Callable[[object, NativeTerminalOwnerAction], None] | None,
     ) -> PackedRequestTeardownAck:
         """Release exact handles and ACK only under teardown owner authority.
 
         :param action: Exact ``SOURCE_ACK_READY`` owner action.
-        :param release_main: Main lane and handle release operation.
-        :param release_auxiliary: Canonical auxiliary handle release operation.
+        :param release_main: Main lane release under exact ACK authority.
+        :param release_auxiliary: Canonical auxiliary release under the same
+            exact ACK authority.
         :returns: Exact acknowledgement sent to the decoder.
         """
 
@@ -1225,7 +1228,7 @@ class PackedPrefillRuntime:
             if canonical and auxiliary_handle is None:
                 raise RuntimeError("terminal teardown lost auxiliary ownership")
         try:
-            release_main(lane, main_handle)
+            release_main(lane, action)
             with record.condition:
                 record.main_handle_released = True
                 record.main_handle = None
@@ -1233,7 +1236,7 @@ class PackedPrefillRuntime:
             if canonical:
                 if auxiliary_handle is None or release_auxiliary is None:
                     raise RuntimeError("terminal auxiliary release disappeared")
-                release_auxiliary(auxiliary_handle)
+                release_auxiliary(auxiliary_handle, action)
                 with record.condition:
                     record.auxiliary_handle_released = True
                     record.auxiliary_handle = None
