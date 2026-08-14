@@ -1013,6 +1013,9 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     manager.kv_args.gpu_id = 0
     runtime = object.__new__(PackedPrefillRuntime)
     runtime._manager = manager
+    runtime._direct_terminal_owner = None
+    runtime._records_by_terminal_binding = {}
+    runtime._lock = runtime_module.threading.RLock()
     outcome = Mock(reason="packed main transfer initialization failed")
     lane = Mock(data_ptr=0x100000)
     lane.abort_before_submit.return_value = outcome

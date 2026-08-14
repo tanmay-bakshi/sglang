@@ -3,16 +3,18 @@ import contextlib
 import dataclasses
 import enum
 import gc
+import inspect
 import sys
+import textwrap
 import threading
 import weakref
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
@@ -78,6 +80,16 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     derive_destination_visibility_proof,
     derive_nixl_ucx_runtime_artifact_components,
     writer_layout_for,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
+    NativeTerminalOwnerRole,
+    NativeTerminalProcessIdentity,
+    NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.nixl_owner_boundary import (
+    NixlTerminalOwnerBoundary,
 )
 from sglang.srt.disaggregation.utils import resolve_kv_layer_ids
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -201,6 +213,110 @@ class RecordingMemoryAgent:
         """
 
         return self.completion_receipts.pop(handle, None)
+
+
+class RecordingTerminalOwner(NixlTerminalOwnerBoundary):
+    """Deterministic direct-owner boundary for packed lane integration tests."""
+
+    calls: list[str]
+    receipt: "NativeCompletionReceipt | None"
+    transfer: object | None
+
+    def __init__(self) -> None:
+        """Initialize an owner without armed transfer authority."""
+
+        self.calls = []
+        self.receipt = None
+        self.transfer = None
+
+    def arm_transfer(self, handle: object, binding_digest: bytes) -> object:
+        """Record exact arm ordering and return one opaque authority.
+
+        :param handle: Exact initialized transfer handle.
+        :param binding_digest: Exact terminal lifecycle identity.
+        :returns: Opaque exact-generation authority.
+        """
+
+        if self.transfer is not None or len(binding_digest) != 32:
+            raise RuntimeError("invalid direct terminal arm")
+        transfer = (handle, binding_digest)
+        self.transfer = transfer
+        self.calls.append("arm")
+        return transfer
+
+    def post_transfer(
+        self,
+        transfer: object,
+        post: Callable[[object], object],
+    ) -> object:
+        """Post only the exact authority returned by :meth:`arm_transfer`.
+
+        :param transfer: Exact armed transfer authority.
+        :param post: External NIXL post operation.
+        :returns: Existing post result.
+        """
+
+        if transfer is not self.transfer:
+            raise RuntimeError("terminal post changed transfer authority")
+        self.calls.append("post")
+        return post(transfer[0])
+
+    def settle_success(
+        self,
+        transfer: object,
+        action: NativeTerminalOwnerAction,
+    ) -> object:
+        """Return one planned receipt under the matching owner action.
+
+        :param transfer: Exact posted transfer authority.
+        :param action: Matching successful owner action.
+        :returns: Planned native completion receipt.
+        """
+
+        if transfer is not self.transfer or action.binding.digest != transfer[1]:
+            raise RuntimeError("terminal settlement changed authority")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
+            raise RuntimeError("terminal success received another action")
+        if self.receipt is None:
+            raise RuntimeError("terminal success has no receipt")
+        self.calls.append("settle_success")
+        return self.receipt
+
+    def settle_failure(
+        self,
+        transfer: object,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Record one authoritative failure settlement.
+
+        :param transfer: Exact posted transfer authority.
+        :param action: Matching failed owner action.
+        """
+
+        if transfer is not self.transfer or action.binding.digest != transfer[1]:
+            raise RuntimeError("terminal failure changed authority")
+        self.calls.append("settle_failure")
+
+    def cancel_transfer(self, transfer: object) -> None:
+        """Record cancellation without discarding retained authority.
+
+        :param transfer: Exact posted transfer authority.
+        """
+
+        if transfer is not self.transfer:
+            raise RuntimeError("terminal cancellation changed authority")
+        self.calls.append("cancel")
+
+    def release_transfer(self, transfer: object) -> None:
+        """Release one settled transfer exactly once.
+
+        :param transfer: Exact settled transfer authority.
+        """
+
+        if transfer is not self.transfer:
+            raise RuntimeError("terminal release changed authority")
+        self.calls.append("release")
+        self.transfer = None
 
 
 class RetainedTransferOwner:
@@ -793,6 +909,43 @@ def _native_completion_receipt(
         descriptorDigest="11" * 32,
         evidenceDigest="22" * 32,
         error="",
+    )
+
+
+def _terminal_owner_action(
+    binding_digest: bytes,
+    kind: NativeTerminalOwnerActionKind = (
+        NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY
+    ),
+) -> NativeTerminalOwnerAction:
+    """Build one exact source owner action for packed lane tests.
+
+    :param binding_digest: Exact lifecycle identity.
+    :param kind: Closed owner action kind.
+    :returns: Valid native owner action.
+    """
+
+    owner = NativeTerminalProcessIdentity(
+        process_generation=b"p" * 16,
+        role=NativeTerminalOwnerRole.SOURCE,
+        tp_rank=0,
+        tp_size=1,
+        digest=b"o" * 32,
+    )
+    binding = NativeTerminalRequestBinding(
+        room_id=KEY.room_id,
+        request_generation=KEY.request_generation,
+        owner=owner,
+        rank_manifest_digest=b"m" * 32,
+        allocation_digest=b"a" * 32,
+        digest=binding_digest,
+    )
+    return NativeTerminalOwnerAction(
+        action_id=17,
+        kind=kind,
+        binding=binding,
+        commit_timestamp_ns=31,
+        receipt=None,
     )
 
 
@@ -1391,6 +1544,45 @@ def _registered_ready(
     return coordinator, prepare, ready, peer
 
 
+def _direct_terminal_lane() -> tuple[
+    PackedTransferLane,
+    PackedSourceTransfer,
+    RecordingMemoryAgent,
+    RecordingTerminalOwner,
+    object,
+    bytes,
+]:
+    """Build one armed direct-owner lane with a valid planned receipt.
+
+    :returns: Lane, transfer, agent, owner, handle, and binding digest.
+    """
+
+    coordinator, _, ready, peer = _registered_ready()
+    transfer = coordinator.handle_ready(ready, peer)
+    agent = RecordingMemoryAgent()
+    owner = RecordingTerminalOwner()
+    lane = PackedTransferLane(
+        agent=agent,
+        destination_route=transfer.destination.route,
+        visibility_policy=_policy(),
+        direct_terminal_owner=owner,
+        expected_runtime_artifacts=_runtime_artifacts(),
+        gpu_id=3,
+        tensor=torch.empty(transfer.length_bytes, dtype=torch.uint8),
+        quarantine=PackedRegistrationQuarantine(),
+    )
+    binding_digest = b"b" * 32
+    handle = RetainedTransferOwner()
+    lane.reserve(transfer, binding_digest=binding_digest)
+    lane.arm_submission(handle)
+    owner.receipt = _native_completion_receipt(
+        agent=agent,
+        transfer=transfer,
+        source_address=lane.data_ptr,
+    )
+    return lane, transfer, agent, owner, handle, binding_digest
+
+
 def test_ready_coordinator_returns_only_canonical_transfer_shape() -> None:
     """Validated READY produces only locally derived canonical transfer work."""
 
@@ -1715,6 +1907,107 @@ def test_transfer_lane_takes_exact_native_receipt_before_done(
     with pytest.raises(RuntimeError, match="completion requires"):
         lane.take_transport_completion()
     lane.close()
+
+
+def test_terminal_lane_settles_callback_before_post_returns() -> None:
+    """A fast owner callback cannot be overwritten by the post return path."""
+
+    lane, _, _, owner, handle, digest = _direct_terminal_lane()
+    outcomes: list[PackedWriterOutcome] = []
+
+    def post(exact_handle: object) -> object:
+        if exact_handle is not handle:
+            raise AssertionError("post changed the exact transfer handle")
+        terminal = threading.Thread(
+            target=lambda: outcomes.append(
+                lane.settle_terminal_completion(_terminal_owner_action(digest))
+            )
+        )
+        terminal.start()
+        terminal.join(timeout=2)
+        assert not terminal.is_alive()
+        return exact_handle
+
+    lane.post_submission(post)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].status is PackedWriterOutcomeStatus.DONE
+    assert owner.calls == ["arm", "post", "settle_success", "release"]
+    assert lane.state is PackedTransferLaneState.IDLE
+
+
+def test_terminal_lane_async_completion_is_one_shot() -> None:
+    """Asynchronous action settlement validates and releases exactly once."""
+
+    lane, _, _, owner, _, digest = _direct_terminal_lane()
+    lane.post_submission(lambda exact_handle: exact_handle)
+
+    outcome = lane.settle_terminal_completion(_terminal_owner_action(digest))
+
+    assert outcome.status is PackedWriterOutcomeStatus.DONE
+    assert owner.calls == ["arm", "post", "settle_success", "release"]
+    with pytest.raises(RuntimeError, match="settlement requires"):
+        lane.settle_terminal_completion(_terminal_owner_action(digest))
+    assert owner.calls.count("settle_success") == 1
+    assert owner.calls.count("release") == 1
+
+
+def test_terminal_lane_post_failure_remains_poisoned_until_owner_failure() -> None:
+    """An external post exception cannot manufacture no-submit authority."""
+
+    lane, _, _, owner, _, digest = _direct_terminal_lane()
+
+    def fail_post(_: object) -> object:
+        raise RuntimeError("injected ambiguous post")
+
+    with pytest.raises(RuntimeError, match="injected ambiguous post"):
+        lane.post_submission(fail_post)
+
+    assert lane.state is PackedTransferLaneState.POISONED
+    assert owner.calls == ["arm", "post"]
+    lane.settle_terminal_failure(
+        _terminal_owner_action(
+            digest,
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        )
+    )
+    assert owner.calls == ["arm", "post", "settle_failure", "release"]
+    assert lane.state is PackedTransferLaneState.POISONED
+
+
+def test_terminal_lane_cancellation_retains_until_matching_failure() -> None:
+    """Cancellation poisons reuse and leaves release to owner terminality."""
+
+    lane, _, _, owner, _, digest = _direct_terminal_lane()
+    lane.post_submission(lambda exact_handle: exact_handle)
+
+    lane.cancel_terminal_submission()
+
+    assert lane.state is PackedTransferLaneState.POISONED
+    assert owner.calls == ["arm", "post", "cancel"]
+    lane.settle_terminal_failure(
+        _terminal_owner_action(
+            digest,
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        )
+    )
+    assert owner.calls == ["arm", "post", "cancel", "settle_failure", "release"]
+
+
+def test_terminal_lane_has_no_polling_completion_path() -> None:
+    """Terminal settlement source cannot reach the polling receipt API."""
+
+    source = textwrap.dedent(inspect.getsource(PackedTransferLane))
+    terminal_start = source.index("    def settle_terminal_completion(")
+    terminal_end = source.index("    def _take_visibility_evidence_locked(")
+    terminal_source = source[terminal_start:terminal_end]
+    assert "take_xfer_completion_receipt" not in terminal_source
+
+    lane, _, agent, _, handle, _ = _direct_terminal_lane()
+    agent.completion_receipts[handle] = object()
+    with pytest.raises(RuntimeError, match="requires an owner action"):
+        lane.take_transport_completion()
+    assert handle in agent.completion_receipts
 
 
 @pytest.mark.parametrize(

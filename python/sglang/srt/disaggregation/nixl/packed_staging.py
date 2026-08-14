@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import traceback
+from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
@@ -49,6 +50,12 @@ from sglang.srt.disaggregation.common.staging_runtime import (
     StagingEndpoint,
     StagingEndpointBufferBinding,
     bind_staging_endpoint_buffers,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+)
+from sglang.srt.disaggregation.terminal_progress.nixl_owner_boundary import (
+    NixlTerminalOwnerBoundary,
 )
 
 logger = logging.getLogger(__name__)
@@ -2609,6 +2616,7 @@ class PackedTransferLane:
     _agent: PackedMemoryAgent
     _destination_route: PackedDestinationRouteBinding
     _direct_cuda_event_authority: PackedDirectCudaEventAuthority | None
+    _direct_terminal_owner: NixlTerminalOwnerBoundary | None
     _expected_runtime_artifacts: PackedNixlRuntimeArtifactCohort | None
     _gpu_id: int
     _lock: threading.Lock
@@ -2618,6 +2626,8 @@ class PackedTransferLane:
     _registration: object | None
     _state: PackedTransferLaneState
     _tensor: torch.Tensor | None
+    _terminal_binding_digest: bytes | None
+    _terminal_transfer: object | None
     _transport_handle: object | None
     _transport_owners: tuple[object, ...]
     _visibility_policy: PackedDestinationVisibilityPolicy
@@ -2631,6 +2641,7 @@ class PackedTransferLane:
         gpu_id: int,
         tensor: torch.Tensor,
         direct_cuda_event_authority: PackedDirectCudaEventAuthority | None = None,
+        direct_terminal_owner: NixlTerminalOwnerBoundary | None = None,
         expected_runtime_artifacts: PackedNixlRuntimeArtifactCohort | None = None,
         quarantine: PackedRegistrationQuarantine = PACKED_REGISTRATION_QUARANTINE,
     ) -> None:
@@ -2643,6 +2654,8 @@ class PackedTransferLane:
         :param tensor: Presized route-owned byte tensor.
         :param direct_cuda_event_authority: Exact direct CUDA event owner,
             required only for the exported-event mechanism.
+        :param direct_terminal_owner: Optional process-lifetime direct NIXL
+            terminal owner. Request authority remains unbound until reservation.
         :param expected_runtime_artifacts: Exact native runtime acceptance
             policy required only for the NIXL completion mechanism.
         :param quarantine: Strong-retention owner for ambiguous cleanup.
@@ -2690,12 +2703,24 @@ class PackedTransferLane:
                 raise ValueError(
                     "native runtime artifact cohort differs from route policy"
                 )
+        if direct_terminal_owner is not None and not isinstance(
+            direct_terminal_owner,
+            NixlTerminalOwnerBoundary,
+        ):
+            raise TypeError(
+                "direct_terminal_owner must inherit NixlTerminalOwnerBoundary"
+            )
+        if direct_cuda_event and direct_terminal_owner is not None:
+            raise ValueError(
+                "direct CUDA-event policy must not contain a NIXL terminal owner"
+            )
         _validate_packed_byte_tensor(tensor, "packed transfer lane")
         registration = _register_packed_tensor(agent, tensor, gpu_id)
         self._active_transfer = None
         self._agent = agent
         self._destination_route = destination_route
         self._direct_cuda_event_authority = direct_cuda_event_authority
+        self._direct_terminal_owner = direct_terminal_owner
         self._expected_runtime_artifacts = expected_runtime_artifacts
         self._gpu_id = gpu_id
         self._lock = threading.Lock()
@@ -2705,6 +2730,8 @@ class PackedTransferLane:
         self._registration = registration
         self._state = PackedTransferLaneState.IDLE
         self._tensor = tensor
+        self._terminal_binding_digest = None
+        self._terminal_transfer = None
         self._transport_handle = None
         self._transport_owners = ()
         self._visibility_policy = visibility_policy
@@ -2747,10 +2774,17 @@ class PackedTransferLane:
 
         return self._require_tensor()
 
-    def reserve(self, transfer: PackedSourceTransfer) -> None:
+    def reserve(
+        self,
+        transfer: PackedSourceTransfer,
+        *,
+        binding_digest: bytes | None = None,
+    ) -> None:
         """Reserve this route lane for one exact canonical transfer.
 
         :param transfer: Source transfer produced by validated READY.
+        :param binding_digest: Exact terminal lifecycle authority. Required
+            only when this lane has a direct terminal owner.
         """
 
         with self._lock:
@@ -2775,7 +2809,17 @@ class PackedTransferLane:
                     "packed transfer exceeds presized lane capacity: "
                     f"{transfer.length_bytes} > {tensor.numel()}"
                 )
+            if self._direct_terminal_owner is None:
+                if binding_digest is not None:
+                    raise ValueError(
+                        "non-terminal transfer lane cannot bind a lifecycle digest"
+                    )
+            elif type(binding_digest) is not bytes or len(binding_digest) != 32:
+                raise ValueError(
+                    "terminal transfer lane requires a 32-byte binding digest"
+                )
             self._active_transfer = transfer
+            self._terminal_binding_digest = binding_digest
             self._state = PackedTransferLaneState.RESERVED
 
     def arm_submission(
@@ -2803,7 +2847,63 @@ class PackedTransferLane:
                 raise ValueError("transport_handle must not be None")
             self._transport_handle = transport_handle
             self._transport_owners = tuple(owners)
+            direct_owner = self._direct_terminal_owner
+            if direct_owner is not None:
+                binding_digest = self._terminal_binding_digest
+                if binding_digest is None:
+                    raise RuntimeError(
+                        "terminal transfer submission lost its binding digest"
+                    )
+                try:
+                    self._terminal_transfer = direct_owner.arm_transfer(
+                        transport_handle,
+                        binding_digest,
+                    )
+                except BaseException:
+                    logger.error(
+                        "Direct terminal transfer arming failed:\n%s",
+                        traceback.format_exc(),
+                    )
+                    self._poison_and_retain_locked(
+                        "direct terminal transfer arming became ambiguous"
+                    )
+                    raise
             self._state = PackedTransferLaneState.IN_FLIGHT
+
+    def post_submission(self, post: Callable[[object], object]) -> object:
+        """Post the exact armed transfer through its sole completion owner.
+
+        :param post: Existing external NIXL post operation.
+        :returns: Existing post operation result.
+        """
+
+        if not callable(post):
+            raise TypeError("post must be callable")
+        with self._lock:
+            if self._state is not PackedTransferLaneState.IN_FLIGHT:
+                raise RuntimeError("packed transfer post requires in-flight ownership")
+            handle = self._transport_handle
+            if handle is None:
+                raise RuntimeError("packed transfer post lost its exact handle")
+            direct_owner = self._direct_terminal_owner
+            terminal_transfer = self._terminal_transfer
+            if direct_owner is not None and terminal_transfer is None:
+                raise RuntimeError("terminal transfer post lost owner authority")
+        try:
+            if direct_owner is not None:
+                return direct_owner.post_transfer(terminal_transfer, post)
+            return post(handle)
+        except BaseException:
+            logger.error(
+                "Packed NIXL submission failed:\n%s",
+                traceback.format_exc(),
+            )
+            with self._lock:
+                if self._state is PackedTransferLaneState.IN_FLIGHT:
+                    self._poison_and_retain_locked(
+                        "packed NIXL submission became ambiguous"
+                    )
+            raise
 
     def abort_before_submit(
         self,
@@ -2830,6 +2930,7 @@ class PackedTransferLane:
             )
             self._active_transfer = None
             if source_stream_quiesced:
+                self._terminal_binding_digest = None
                 self._state = PackedTransferLaneState.IDLE
                 return outcome
             self._poison_and_retain_locked(
@@ -2865,6 +2966,10 @@ class PackedTransferLane:
         """
 
         with self._lock:
+            if self._direct_terminal_owner is not None:
+                raise RuntimeError(
+                    "terminal-owned transfer completion requires an owner action"
+                )
             if self._state not in (
                 PackedTransferLaneState.IN_FLIGHT,
                 PackedTransferLaneState.POISONED,
@@ -2891,21 +2996,88 @@ class PackedTransferLane:
                 raise
             if visibility is None:
                 return None
-            self._visibility_policy.validate_evidence(visibility)
-            outcome = self._outcome_locked(
-                transfer,
-                PackedWriterOutcomeStatus.DONE,
-                visibility,
-                None,
+            return self._commit_success_locked(transfer, visibility)
+
+    def settle_terminal_completion(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> PackedWriterOutcome:
+        """Settle and release only after authoritative owner terminality.
+
+        :param action: Matching one-shot ``SOURCE_OUTCOME_READY`` action.
+        :returns: Exact successful packed writer outcome.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        with self._lock:
+            direct_owner, terminal_transfer, transfer = (
+                self._terminal_settlement_authority_locked()
             )
-            self._active_transfer = None
+            try:
+                receipt = direct_owner.settle_success(terminal_transfer, action)
+                visibility = self._validate_native_completion_receipt_locked(
+                    transfer,
+                    receipt,
+                )
+                outcome = self._commit_success_locked(transfer, visibility)
+                direct_owner.release_transfer(terminal_transfer)
+            except BaseException:
+                logger.error(
+                    "Direct terminal completion settlement failed:\n%s",
+                    traceback.format_exc(),
+                )
+                if self._state is not PackedTransferLaneState.POISONED:
+                    self._poison_and_retain_locked(
+                        "direct terminal completion settlement failed"
+                    )
+                raise
+            self._terminal_transfer = None
+            return outcome
+
+    def settle_terminal_failure(self, action: NativeTerminalOwnerAction) -> None:
+        """Settle failed native terminality without manufacturing an outcome.
+
+        :param action: Matching quarantine or process-fatal owner action.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        with self._lock:
+            direct_owner, terminal_transfer, _ = (
+                self._terminal_settlement_authority_locked()
+            )
+            if self._state is not PackedTransferLaneState.POISONED:
+                self._poison_and_retain_locked("direct terminal transfer failed")
+            direct_owner.settle_failure(terminal_transfer, action)
+            direct_owner.release_transfer(terminal_transfer)
+            self._terminal_transfer = None
             self._transport_handle = None
             self._transport_owners = ()
-            if self._poison_reason is None:
-                self._state = PackedTransferLaneState.IDLE
-            else:
-                self._state = PackedTransferLaneState.POISONED
-            return outcome
+
+    def cancel_terminal_submission(self) -> None:
+        """Request direct-owner cancellation while retaining ambiguous state."""
+
+        with self._lock:
+            direct_owner, terminal_transfer, _ = (
+                self._terminal_settlement_authority_locked()
+            )
+            try:
+                direct_owner.cancel_transfer(terminal_transfer)
+            finally:
+                if self._state is not PackedTransferLaneState.POISONED:
+                    self._poison_and_retain_locked(
+                        "direct terminal transfer cancellation requested"
+                    )
+
+    @property
+    def terminal_owned(self) -> bool:
+        """Return whether owner actions are the sole completion authority.
+
+        :returns: Whether this process-lifetime lane uses direct ownership.
+        """
+
+        return self._direct_terminal_owner is not None
 
     def _take_visibility_evidence_locked(
         self,
@@ -3029,6 +3201,58 @@ class PackedTransferLane:
             native_descriptor_digest=descriptor_digest,
             native_evidence_digest=evidence_digest,
         )
+
+    def _commit_success_locked(
+        self,
+        transfer: PackedSourceTransfer,
+        visibility: PackedWriterVisibilityEvidence,
+    ) -> PackedWriterOutcome:
+        """Commit validated visibility and retire local lane ownership.
+
+        :param transfer: Exact active canonical transfer.
+        :param visibility: Fully validated successful visibility evidence.
+        :returns: Exact successful packed writer outcome.
+        """
+
+        self._visibility_policy.validate_evidence(visibility)
+        outcome = self._outcome_locked(
+            transfer,
+            PackedWriterOutcomeStatus.DONE,
+            visibility,
+            None,
+        )
+        self._active_transfer = None
+        self._transport_handle = None
+        self._transport_owners = ()
+        self._terminal_binding_digest = None
+        if self._poison_reason is None:
+            self._state = PackedTransferLaneState.IDLE
+        else:
+            self._state = PackedTransferLaneState.POISONED
+        return outcome
+
+    def _terminal_settlement_authority_locked(
+        self,
+    ) -> tuple[NixlTerminalOwnerBoundary, object, PackedSourceTransfer]:
+        """Resolve the exact direct-owner authority while holding the lane lock.
+
+        :returns: Process owner, transfer token, and canonical packed transfer.
+        """
+
+        if self._state not in (
+            PackedTransferLaneState.IN_FLIGHT,
+            PackedTransferLaneState.POISONED,
+        ):
+            raise RuntimeError(
+                "terminal settlement requires in-flight or poisoned ownership"
+            )
+        direct_owner = self._direct_terminal_owner
+        if direct_owner is None:
+            raise RuntimeError("transfer lane has no direct terminal owner")
+        terminal_transfer = self._terminal_transfer
+        if terminal_transfer is None:
+            raise RuntimeError("terminal transfer authority was already consumed")
+        return direct_owner, terminal_transfer, self._require_active_transfer_locked()
 
     def _validate_native_segment_locked(
         self,
@@ -3350,6 +3574,12 @@ class PackedTransferLane:
         transport_owners = (transport_handle,) if transport_handle is not None else ()
         direct_authority = self._direct_cuda_event_authority
         direct_owners = (direct_authority,) if direct_authority is not None else ()
+        terminal_owner = self._direct_terminal_owner
+        terminal_owners = (terminal_owner,) if terminal_owner is not None else ()
+        terminal_transfer = self._terminal_transfer
+        terminal_transfers = (
+            (terminal_transfer,) if terminal_transfer is not None else ()
+        )
         self._quarantine.retain(
             tensor,
             registration,
@@ -3357,6 +3587,8 @@ class PackedTransferLane:
             owners=(
                 self._agent,
                 *direct_owners,
+                *terminal_owners,
+                *terminal_transfers,
                 *self._transport_owners,
                 *transport_owners,
             ),
@@ -3499,6 +3731,7 @@ class PackedCopyExecutor:
         transfer: PackedSourceTransfer,
         source_lane: PackedTransferLane,
         producer_event: torch.cuda.Event,
+        binding_digest: bytes | None = None,
     ) -> int:
         """Gather one writer projection and wait until NIC-visible.
 
@@ -3509,6 +3742,8 @@ class PackedCopyExecutor:
         :param transfer: Canonical work produced by validated READY.
         :param source_lane: Presized route-owned registered staging lane.
         :param producer_event: Event recorded after every source KV write.
+        :param binding_digest: Exact terminal lifecycle authority, when the
+            source lane uses direct NIXL completion ownership.
         :returns: Exact contiguous DMA length.
         :raises PackedGatherError: If no destination DMA was submitted.
         """
@@ -3516,7 +3751,7 @@ class PackedCopyExecutor:
         writer_layout = writer_layout_for(transfer.layout, transfer.writer_id)
         if transfer.length_bytes != writer_layout.length_bytes:
             raise ValueError("source transfer length differs from canonical writer")
-        source_lane.reserve(transfer)
+        source_lane.reserve(transfer, binding_digest=binding_digest)
         retained: list[torch.Tensor] = []
         try:
             with torch.cuda.stream(self._source_stream):
