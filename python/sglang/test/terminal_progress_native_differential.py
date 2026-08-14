@@ -360,6 +360,7 @@ class _NativeOracleRuntime:
         self._owner = NativeTerminalOwner(
             input_capacity=64,
             output_capacity=64,
+            observation_capacity=64,
             owner_identity=owner_identity,
             testing=True,
         )

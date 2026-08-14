@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
-    NativeTerminalOwnerOutput,
 )
 from sglang.srt.disaggregation.terminal_progress.owner_events import (
     TerminalOwnerTimingField,
@@ -62,6 +61,7 @@ from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalObservation,
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
     NativeTerminalRuntimeSnapshot,
@@ -163,7 +163,7 @@ class PackedTerminalDecodeWork:
     """
 
     send_delivery: Callable[[PackedTerminalDecodeWireDelivery], None]
-    observe_output: Callable[[NativeTerminalOwnerOutput], None]
+    observe_output: Callable[[NativeTerminalObservation], None]
 
     def __post_init__(self) -> None:
         """Validate process-lifetime decode work callbacks."""
@@ -813,10 +813,12 @@ class PackedTerminalDecodeServing:
             try:
                 self._work.observe_output(output)
             except Exception:  # noqa: BLE001
+                formatted_traceback = traceback.format_exc()
+                self._runtime.report_observation_loss(output)
                 logger.error(
                     "Decode terminal observation callback failed without gating "
                     "progress:\n%s",
-                    traceback.format_exc(),
+                    formatted_traceback,
                 )
         self._propagate_runtime_fatal()
         return len(observations)

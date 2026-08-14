@@ -24,6 +24,8 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerObservation,
+    NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalReceipt,
@@ -97,6 +99,7 @@ class _Metrics:
     """Non-gating source metric ledger fixture."""
 
     values: list[PackedTerminalSourceMetric]
+    submission_commits: list[NativeTerminalOwnerObservation]
     fail: bool
 
     def __init__(self, *, fail: bool = False) -> None:
@@ -106,6 +109,7 @@ class _Metrics:
         """
 
         self.values = []
+        self.submission_commits = []
         self.fail = fail
 
     def emit(self, metric: PackedTerminalSourceMetric) -> None:
@@ -117,6 +121,18 @@ class _Metrics:
         if self.fail:
             raise RuntimeError("synthetic metric failure")
         self.values.append(metric)
+
+    def emit_submission_commit(
+        self, observation: NativeTerminalOwnerObservation
+    ) -> None:
+        """Record or reject one exact native submission interval.
+
+        :param observation: Evidence-only native commit.
+        """
+
+        if self.fail:
+            raise RuntimeError("synthetic metric failure")
+        self.submission_commits.append(observation)
 
 
 class _Publisher:
@@ -481,6 +497,34 @@ def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
     )
 
 
+def _submission_observation(
+    harness: _Harness,
+    *,
+    enqueued_ns: int,
+    completed_ns: int,
+) -> NativeTerminalOwnerObservation:
+    """Build one exact actionless native submission observation.
+
+    :param harness: Source lifecycle fixture.
+    :param enqueued_ns: Producer enqueue timestamp.
+    :param completed_ns: Native commit timestamp.
+    :returns: Evidence-only source commit observation.
+    """
+
+    binding = harness.identity.local_binding
+    return NativeTerminalOwnerObservation(
+        binding=NativeTerminalRequestBinding.from_binding(binding),
+        owner_sequence=0,
+        producer_id=_LOCAL_PRODUCER_ID,
+        producer_sequence=0,
+        producer_rank=binding.owner.tp_rank,
+        event_kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        enqueued_ns=enqueued_ns,
+        completed_ns=completed_ns,
+        role=NativeTerminalOwnerRole.SOURCE,
+    )
+
+
 def _action(
     harness: _Harness,
     kind: NativeTerminalOwnerActionKind,
@@ -638,7 +682,13 @@ def test_source_timing_projects_two_main_members_and_one_dflash_boundary(
     ):
         for rank, harness in enumerate(harnesses):
             binding = harness.identity.local_binding
-            harness.wiring.submission_committed(binding, 100 + rank, 110 + rank)
+            harness.wiring.submission_committed(
+                _submission_observation(
+                    harness,
+                    enqueued_ns=100 + rank,
+                    completed_ns=110 + rank,
+                )
+            )
             timings = [
                 GroupedNixlMemberTiming(
                     member=GroupedNixlTransferMember.MAIN,
@@ -687,6 +737,32 @@ def test_source_timing_projects_two_main_members_and_one_dflash_boundary(
         "main:writer-1",
         "boundary:writer-0",
     }
+
+
+def test_submission_observation_validates_full_binding_before_marking() -> None:
+    """Reject a digest-inconsistent binding without consuming exact evidence."""
+
+    harness = _harness()
+    valid = _submission_observation(
+        harness,
+        enqueued_ns=100,
+        completed_ns=110,
+    )
+    invalid = dataclasses.replace(
+        valid,
+        binding=dataclasses.replace(
+            valid.binding,
+            allocation_digest=bytes.fromhex("ff" * 32),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="digest is inconsistent"):
+        harness.wiring.submission_committed(invalid)
+    harness.wiring.submission_committed(valid)
+    with pytest.raises(RuntimeError, match="observed twice"):
+        harness.wiring.submission_committed(valid)
+
+    assert harness.metrics.submission_commits == [valid]
 
 
 def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:

@@ -177,6 +177,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerObservation,
 )
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     PrefillTerminalGatewayOutputProjection,
@@ -971,6 +972,25 @@ class _NixlTerminalSourceMetrics(PackedTerminalSourceMetricsSink):
             metric.event_kind.name,
             metric.binding_digest.hex(),
             metric.timestamp_ns,
+        )
+
+    def emit_submission_commit(
+        self, observation: NativeTerminalOwnerObservation
+    ) -> None:
+        """Emit the exact producer-to-owner native commit interval.
+
+        :param observation: Evidence-only actionless source commit.
+        """
+
+        if type(observation) is not NativeTerminalOwnerObservation:
+            raise TypeError("observation must be NativeTerminalOwnerObservation")
+        logger.debug(
+            "terminal source submission binding=%s rank=%d enqueued_ns=%d "
+            "completed_ns=%d",
+            observation.binding.digest.hex(),
+            observation.producer_rank,
+            observation.enqueued_ns,
+            observation.completed_ns,
         )
 
 

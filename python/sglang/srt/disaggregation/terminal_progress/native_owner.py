@@ -1,7 +1,9 @@
 import dataclasses
 import hashlib
+import logging
 import os
 import sys
+import traceback
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +17,8 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerInventory,
+    NativeTerminalOwnerObservation,
+    NativeTerminalOwnerObservationBatch,
     NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
@@ -23,6 +27,8 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     native_terminal_deadline_table_digest,
 )
 from torch.utils.cpp_extension import load
+
+logger = logging.getLogger(__name__)
 
 
 class _NativeTerminalOwnerBridge(Protocol):
@@ -92,6 +98,18 @@ class _NativeTerminalOwnerBridge(Protocol):
         """Drain every production action committed before the wake.
 
         :returns: Immutable output records.
+        """
+
+    def observation_fileno(self) -> int:
+        """Return the non-authoritative observation eventfd.
+
+        :returns: Open pollable descriptor.
+        """
+
+    def drain_observations(self) -> list[Mapping[str, object]]:
+        """Drain every actionless commit observation before the wake.
+
+        :returns: Immutable evidence-only observation records.
         """
 
     def acknowledge_action(self, action_id: int) -> None:
@@ -404,6 +422,7 @@ class NativeTerminalOwner:
         self,
         input_capacity: int,
         output_capacity: int,
+        observation_capacity: int,
         owner_identity: NativeTerminalProcessIdentity,
         *,
         maximum_live_lifecycles: int | None = None,
@@ -413,6 +432,7 @@ class NativeTerminalOwner:
 
         :param input_capacity: Bounded native event capacity.
         :param output_capacity: Bounded production-action capacity.
+        :param observation_capacity: Bounded evidence-only commit capacity.
         :param owner_identity: Exact process and tensor-parallel identity.
         :param maximum_live_lifecycles: Bound for complete fail-closed output.
         :param testing: Whether the native test variant is required.
@@ -420,7 +440,12 @@ class NativeTerminalOwner:
 
         if maximum_live_lifecycles is None:
             maximum_live_lifecycles = input_capacity
-        capacities = (input_capacity, output_capacity, maximum_live_lifecycles)
+        capacities = (
+            input_capacity,
+            output_capacity,
+            observation_capacity,
+            maximum_live_lifecycles,
+        )
         if any(type(value) is not int or value <= 0 for value in capacities):
             raise ValueError("native owner capacities must be positive integers")
         if type(owner_identity) is not NativeTerminalProcessIdentity:
@@ -438,6 +463,7 @@ class NativeTerminalOwner:
             module.NativeTerminalOwnerBridge(
                 input_capacity,
                 output_capacity,
+                observation_capacity,
                 maximum_live_lifecycles,
                 owner_identity.to_native(),
                 deadline_table,
@@ -594,6 +620,38 @@ class NativeTerminalOwner:
 
         values = self._native.drain_outputs()
         return tuple(NativeTerminalOwnerOutput.from_native(value) for value in values)
+
+    def observation_fileno(self) -> int:
+        """Return the non-authoritative commit-observation eventfd.
+
+        :returns: Open pollable descriptor.
+        """
+
+        return int(self._native.observation_fileno())
+
+    def drain_observations(self) -> NativeTerminalOwnerObservationBatch:
+        """Drain actionless commit evidence without affecting authority.
+
+        :returns: Validated observations plus exact Python projection losses.
+        """
+
+        values = self._native.drain_observations()
+        observations: list[NativeTerminalOwnerObservation] = []
+        dropped_count = 0
+        for value in values:
+            try:
+                observations.append(NativeTerminalOwnerObservation.from_native(value))
+            except Exception:  # noqa: BLE001
+                formatted_traceback = traceback.format_exc()
+                dropped_count += 1
+                logger.error(
+                    "Native observation projection failed without gating lifecycle: %s",
+                    formatted_traceback,
+                )
+        return NativeTerminalOwnerObservationBatch(
+            observations=tuple(observations),
+            dropped_count=dropped_count,
+        )
 
     def acknowledge_action(self, action: NativeTerminalOwnerAction) -> None:
         """Acknowledge one exact one-shot production action.

@@ -99,6 +99,7 @@ def _make_owner() -> tuple[
     owner = NativeTerminalOwner(
         input_capacity=128,
         output_capacity=128,
+        observation_capacity=128,
         owner_identity=identity,
         testing=True,
     )
@@ -225,6 +226,7 @@ def _make_waiting_source_owner() -> tuple[
     owner = NativeTerminalOwner(
         input_capacity=128,
         output_capacity=128,
+        observation_capacity=128,
         owner_identity=identity,
         testing=True,
     )
