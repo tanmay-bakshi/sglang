@@ -51,6 +51,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -70,7 +71,10 @@ from sglang.srt.disaggregation.decode_reservation_service import (
     DecodeReservationSchedulerService,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+    NixlTerminalRuntimeInstallation,
+)
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -84,17 +88,27 @@ from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer impor
     PackedTerminalDecodeSchedulerRegistration,
     PackedTerminalDecodeServingComposition,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeServing,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalRequestBinding,
 )
+from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
+    SchedulerReceiptInboxInventory,
+)
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServing,
     TerminalSchedulerServingInventory,
     TerminalSchedulerServingRole,
+)
+from sglang.srt.disaggregation.terminal_progress.source_serving import (
+    PackedTerminalSourceServing,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -400,6 +414,9 @@ class Scheduler(
         self.terminal_scheduler_serving: TerminalSchedulerServing | None = None
         self.terminal_decode_serving_composition: (
             PackedTerminalDecodeServingComposition | None
+        ) = None
+        self.terminal_scheduler_process_fatal_inventory: (
+            SchedulerReceiptInboxInventory | None
         ) = None
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
@@ -1360,10 +1377,14 @@ class Scheduler(
 
         if self.disaggregation_mode is DisaggregationMode.PREFILL:
             assert self.disagg_prefill_bootstrap_queue is not None
-            self.disagg_prefill_bootstrap_queue.kv_manager.activate_terminal_startup()
+            self._activate_terminal_kv_manager(
+                self.disagg_prefill_bootstrap_queue.kv_manager
+            )
         elif self.disaggregation_mode is DisaggregationMode.DECODE:
             assert self.disagg_decode_prealloc_queue is not None
-            self.disagg_decode_prealloc_queue.kv_manager.activate_terminal_startup()
+            self._activate_terminal_kv_manager(
+                self.disagg_decode_prealloc_queue.kv_manager
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1380,6 +1401,114 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def _activate_terminal_kv_manager(self, manager: CommonKVManager) -> None:
+        """Install role-specific terminal dependencies, then activate startup.
+
+        Managers outside a packed terminal cohort retain the existing no-op
+        activation boundary. A cohort-bound NIXL manager cannot activate until
+        its scheduler-owned serving dependencies are installed.
+
+        :param manager: Role-local KV transfer manager.
+        """
+
+        if not isinstance(manager, CommonKVManager):
+            raise TypeError("manager must be CommonKVManager")
+        if not isinstance(manager, NixlKVManager):
+            manager.activate_terminal_startup()
+            return
+        binding = manager.terminal_startup_binding
+        if binding is None:
+            manager.activate_terminal_startup()
+            return
+
+        terminal_request_capacity = manager.kv_args.terminal_request_capacity
+        if (
+            type(terminal_request_capacity) is not int
+            or terminal_request_capacity <= 0
+        ):
+            raise ValueError(
+                "terminal NIXL manager requires a positive request capacity"
+            )
+        local_rank = binding.advertisement
+        gateway_endpoint: str | None = None
+        bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None = (
+            None
+        )
+        bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None = (
+            None
+        )
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            if local_rank.role is not TerminalOwnerRole.SOURCE:
+                raise RuntimeError("prefill scheduler received a decode startup row")
+            if local_rank.tensor_parallel_rank == 0:
+                gateway_endpoint = self.terminal_gateway_endpoint
+            bind_source_serving = self.bind_terminal_source_serving
+        elif self.disaggregation_mode is DisaggregationMode.DECODE:
+            if local_rank.role is not TerminalOwnerRole.DECODE:
+                raise RuntimeError("decode scheduler received a source startup row")
+            bind_decode_serving = self.bind_terminal_decode_serving
+        else:
+            raise RuntimeError("terminal NIXL startup requires a PD scheduler role")
+
+        manager.install_terminal_runtime(
+            NixlTerminalRuntimeInstallation(
+                terminal_request_capacity=terminal_request_capacity,
+                gateway_endpoint=gateway_endpoint,
+                bind_source_serving=bind_source_serving,
+                bind_decode_serving=bind_decode_serving,
+                scheduler_process_fatal_handler=(
+                    self.retain_terminal_scheduler_process_fatal
+                ),
+                owner_dead_handler=self.mark_terminal_owner_dead,
+            )
+        )
+        manager.activate_terminal_startup()
+
+    def bind_terminal_source_serving(
+        self,
+        serving: PackedTerminalSourceServing,
+    ) -> None:
+        """Bind the full source composition into the scheduler boundary.
+
+        :param serving: Manager-owned source serving composition.
+        """
+
+        if type(serving) is not PackedTerminalSourceServing:
+            raise TypeError("serving must be PackedTerminalSourceServing")
+        if self.disaggregation_mode is not DisaggregationMode.PREFILL:
+            raise RuntimeError("source serving requires prefill mode")
+        self.bind_terminal_scheduler_serving(serving.scheduler_serving)
+
+    def bind_terminal_decode_serving(
+        self,
+        serving: PackedTerminalDecodeServing,
+    ) -> None:
+        """Bind one decode composition across queue and scheduler ownership.
+
+        The manager retains the full serving object. The preallocation queue
+        receives that same object for request registration, while the scheduler
+        receives its paired adoption consumer and qualified receipt inbox.
+
+        :param serving: Manager-owned decode serving composition.
+        """
+
+        if type(serving) is not PackedTerminalDecodeServing:
+            raise TypeError("serving must be PackedTerminalDecodeServing")
+        if self.disaggregation_mode is not DisaggregationMode.DECODE:
+            raise RuntimeError("decode serving requires decode mode")
+        queue = self.disagg_decode_prealloc_queue
+        if queue is None:
+            raise RuntimeError("decode preallocation queue is unavailable")
+        if queue.terminal_decode_serving is not None:
+            raise RuntimeError("terminal decode serving is already bound")
+        if self.terminal_decode_serving_composition is not None:
+            raise RuntimeError("terminal decode serving is already bound")
+        if self.terminal_scheduler_serving is not None:
+            raise RuntimeError("terminal scheduler serving is already bound")
+        composition = serving.scheduler_composition
+        self.bind_terminal_decode_serving_composition(composition)
+        queue.bind_terminal_decode_serving(serving)
 
     def bind_terminal_scheduler_serving(
         self,
@@ -1405,9 +1534,9 @@ class Scheduler(
             raise RuntimeError("terminal scheduler serving requires PD disaggregation")
         if serving.role is not expected_role:
             raise ValueError("terminal scheduler serving role differs from scheduler")
-        self.terminal_scheduler_serving = serving
         if self.idle_sleeper is not None:
             self.idle_sleeper.register_file_descriptor(serving.fileno())
+        self.terminal_scheduler_serving = serving
 
     def bind_terminal_decode_serving_composition(
         self,
@@ -1529,6 +1658,31 @@ class Scheduler(
         if serving is None:
             raise RuntimeError("terminal scheduler serving is not bound")
         serving.mark_owner_dead()
+
+    def retain_terminal_scheduler_process_fatal(
+        self,
+        inventory: SchedulerReceiptInboxInventory,
+    ) -> None:
+        """Retain exact fail-closed evidence before the fatal error propagates.
+
+        The receipt serving layer raises its existing typed fatal exception
+        after this scheduler-affine callback returns. This boundary therefore
+        records and validates evidence without replacing the exception that
+        terminates the scheduler process.
+
+        :param inventory: Complete sticky scheduler inbox inventory.
+        """
+
+        if type(inventory) is not SchedulerReceiptInboxInventory:
+            raise TypeError("inventory must be SchedulerReceiptInboxInventory")
+        if inventory.fatal_cause is None:
+            raise ValueError("scheduler process-fatal evidence requires a fatal cause")
+        retained = self.terminal_scheduler_process_fatal_inventory
+        if retained is None:
+            self.terminal_scheduler_process_fatal_inventory = inventory
+            return
+        if retained != inventory:
+            raise RuntimeError("terminal scheduler process-fatal evidence changed")
 
     def drain_terminal_scheduler_receipts(self) -> None:
         """Consume owner authority before selecting scheduler work."""
