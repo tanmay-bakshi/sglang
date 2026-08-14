@@ -4,10 +4,13 @@ import errno
 import inspect
 import os
 import select
+import signal
 import threading
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
+import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -36,6 +39,7 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServingRole,
     TerminalSourceSchedulerConsumer,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler, run_scheduler_process
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -245,6 +249,171 @@ class _RuntimeFence:
         """Record fail-closed entry without closing scheduler consumers."""
 
         self.calls.append(("abort", None))
+
+
+class _ManagerOwnedClose:
+    """Close one scheduler serving object through the manager boundary."""
+
+    serving: TerminalSchedulerServing
+    order: list[str]
+    sleeper: IdleSleeper | None
+    process_fatal_values: list[bool]
+
+    def __init__(
+        self,
+        serving: TerminalSchedulerServing,
+        order: list[str],
+        sleeper: IdleSleeper | None = None,
+    ) -> None:
+        """Create one deterministic terminal manager close.
+
+        :param serving: Scheduler serving object owned by the manager runtime.
+        :param order: Shared teardown-order receipt.
+        :param sleeper: Optional scheduler poll owner used to verify detachment.
+        """
+
+        self.serving = serving
+        self.order = order
+        self.sleeper = sleeper
+        self.process_fatal_values = []
+
+    def close_terminal_runtime(self, *, process_fatal: bool) -> None:
+        """Record and perform the sole serving close.
+
+        :param process_fatal: Whether close must retain ambiguous authority.
+        """
+
+        if self.sleeper is not None:
+            assert self.serving.fileno() not in self.sleeper._file_descriptors
+        self.order.append("manager")
+        self.process_fatal_values.append(process_fatal)
+        if process_fatal:
+            self.serving.close_fail_closed()
+            return
+        self.serving.close()
+
+
+class _MetricsTeardown:
+    """Record scheduler metrics teardown ordering."""
+
+    order: list[str]
+
+    def __init__(self, order: list[str]) -> None:
+        """Retain the shared order receipt.
+
+        :param order: Shared teardown-order receipt.
+        """
+
+        self.order = order
+
+    def _shutdown_fpm(self) -> None:
+        """Record metrics teardown."""
+
+        self.order.append("metrics")
+
+
+class _FailingManagerClose:
+    """Expose one bounded manager close failure."""
+
+    order: list[str]
+    process_fatal_values: list[bool]
+
+    def __init__(self, order: list[str]) -> None:
+        """Retain the shared order receipt.
+
+        :param order: Shared teardown-order receipt.
+        """
+
+        self.order = order
+        self.process_fatal_values = []
+
+    def close_terminal_runtime(self, *, process_fatal: bool) -> None:
+        """Raise after recording the requested disposition.
+
+        :param process_fatal: Requested manager close disposition.
+        """
+
+        self.order.append("manager")
+        self.process_fatal_values.append(process_fatal)
+        raise RuntimeError("synthetic terminal manager close failure")
+
+
+class _SchedulerProcessHarness:
+    """Expose controlled event-loop and release outcomes to the process entrypoint."""
+
+    behavior: str
+    gracefully_exit: bool
+    release_values: list[bool]
+
+    def __init__(self, behavior: str) -> None:
+        """Create one scheduler process outcome.
+
+        :param behavior: ``graceful``, ``unexpected``, or ``exception``.
+        """
+
+        self.behavior = behavior
+        self.gracefully_exit = behavior == "graceful"
+        self.release_values = []
+
+    def get_init_info(self) -> dict[str, str]:
+        """Return the minimal parent handshake.
+
+        :returns: Stable ready receipt.
+        """
+
+        return {"status": "ready"}
+
+    def run_event_loop(self) -> None:
+        """Return or raise according to the configured process outcome."""
+
+        if self.behavior == "exception":
+            raise RuntimeError("synthetic scheduler event-loop failure")
+
+    def release(self, *, process_fatal: bool) -> None:
+        """Record the teardown disposition.
+
+        :param process_fatal: Process failure disposition selected by the entrypoint.
+        """
+
+        self.release_values.append(process_fatal)
+
+
+class _SchedulerParentProcess:
+    """Record scheduler failure notifications."""
+
+    signals: list[int]
+
+    def __init__(self) -> None:
+        """Create one empty signal receipt."""
+
+        self.signals = []
+
+    def send_signal(self, signal_number: int) -> None:
+        """Record a parent-process signal.
+
+        :param signal_number: Operating-system signal number.
+        """
+
+        self.signals.append(signal_number)
+
+
+class _SchedulerPipeWriter:
+    """Record scheduler initialization handshakes."""
+
+    payloads: list[dict[str, str]]
+
+    def __init__(self) -> None:
+        """Create one empty handshake receipt."""
+
+        self.payloads = []
+
+    def send(self, payload: dict[str, str]) -> None:
+        """Record a scheduler handshake.
+
+        :param payload: Initialization payload sent to the parent.
+        """
+
+        self.payloads.append(payload)
 
 
 def _source_serving(
@@ -563,21 +732,31 @@ def test_fail_closed_descriptor_closure_survives_consumer_failure() -> None:
     assert raised.value.errno == errno.EBADF
 
 
-def test_scheduler_process_fatal_teardown_unregisters_and_closes_inbox() -> None:
-    """Scheduler teardown removes the poll target before fail-closed closure."""
+def test_manager_owned_fatal_teardown_detaches_scheduler_poll_target() -> None:
+    """Scheduler detaches its poll target before manager-owned fatal closure."""
 
     consumer = _DecodeConsumer()
     serving = _decode_serving(consumer, capacity=1)
     sleeper = IdleSleeper(sockets=[])
     file_descriptor = serving.fileno()
     sleeper.register_file_descriptor(file_descriptor)
+    order: list[str] = []
+    manager = _ManagerOwnedClose(serving, order, sleeper)
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.terminal_scheduler_serving = serving
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = sleeper
 
-    Scheduler.close_terminal_scheduler_serving(scheduler, process_fatal=True)
+    def resolve_manager() -> _ManagerOwnedClose:
+        """Return the manager boundary used by this scheduler."""
 
+        return manager
+
+    scheduler.terminal_nixl_manager = resolve_manager
+    Scheduler.close_terminal_runtime(scheduler, process_fatal=True)
+
+    assert order == ["manager"]
+    assert manager.process_fatal_values == [True]
     assert scheduler.terminal_scheduler_serving is None
     assert file_descriptor not in sleeper._file_descriptors
     assert len(consumer.fatal_inventories) == 1
@@ -586,26 +765,239 @@ def test_scheduler_process_fatal_teardown_unregisters_and_closes_inbox() -> None
     assert raised.value.errno == errno.EBADF
 
 
-def test_graceful_scheduler_teardown_quarantines_live_generation() -> None:
-    """A graceful process exit cannot retire ambiguous in-flight ownership."""
+def test_scheduler_release_orders_manager_metrics_and_host_resources() -> None:
+    """Graceful host destruction follows the manager-owned serving close."""
+
+    consumer = _SourceConsumer()
+    serving = _source_serving(consumer, capacity=1)
+    order: list[str] = []
+    manager = _ManagerOwnedClose(serving, order)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_scheduler_serving = serving
+    scheduler.terminal_decode_serving_composition = None
+    scheduler.idle_sleeper = None
+    scheduler.metrics_reporter = _MetricsTeardown(order)
+
+    def resolve_manager() -> _ManagerOwnedClose:
+        """Return the manager boundary used by this scheduler."""
+
+        return manager
+
+    def release_host_resources() -> None:
+        """Record host-resource destruction."""
+
+        order.append("host")
+
+    scheduler.terminal_nixl_manager = resolve_manager
+    scheduler.release_host_resources = release_host_resources
+    Scheduler.release(scheduler, process_fatal=False)
+
+    assert order == ["manager", "metrics", "host"]
+    assert manager.process_fatal_values == [False]
+    assert scheduler.terminal_scheduler_serving is None
+    assert serving.inventory().inbox.closed
+
+
+def test_fatal_scheduler_release_retains_host_resources() -> None:
+    """Fatal teardown closes through the manager without touching host pools."""
 
     consumer = _SourceConsumer()
     serving = _source_serving(consumer, capacity=1)
     binding = _binding(41, 41, TerminalOwnerRole.SOURCE)
     serving.register_request(binding)
+    order: list[str] = []
+    manager = _ManagerOwnedClose(serving, order)
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.terminal_scheduler_serving = serving
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = None
+    scheduler.metrics_reporter = _MetricsTeardown(order)
 
-    Scheduler.close_terminal_scheduler_serving(scheduler, process_fatal=False)
+    def resolve_manager() -> _ManagerOwnedClose:
+        """Return the manager boundary used by this scheduler."""
 
-    assert scheduler.terminal_scheduler_serving is None
+        return manager
+
+    def release_host_resources() -> None:
+        """Reject host-resource destruction on the fatal path."""
+
+        raise AssertionError("fatal scheduler release destroyed host resources")
+
+    scheduler.terminal_nixl_manager = resolve_manager
+    scheduler.release_host_resources = release_host_resources
+    Scheduler.release(scheduler, process_fatal=True)
+
+    assert order == ["manager", "metrics"]
+    assert manager.process_fatal_values == [True]
     assert len(consumer.fatal_inventories) == 1
-    inventory = consumer.fatal_inventories[0]
-    assert inventory.live_bindings == (binding,)
-    assert inventory.closed is False
-    assert serving.inventory().inbox.closed
+    assert consumer.fatal_inventories[0].live_bindings == (binding,)
+
+
+def test_terminal_close_failure_still_stops_metrics_and_skips_host_release() -> None:
+    """A bounded manager failure cannot trigger unsafe host destruction."""
+
+    order: list[str] = []
+    manager = _FailingManagerClose(order)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_scheduler_serving = None
+    scheduler.terminal_decode_serving_composition = None
+    scheduler.idle_sleeper = None
+    scheduler.metrics_reporter = _MetricsTeardown(order)
+
+    def resolve_manager() -> _FailingManagerClose:
+        """Return the failing manager boundary."""
+
+        return manager
+
+    def release_host_resources() -> None:
+        """Reject host destruction after terminal close failure."""
+
+        raise AssertionError("failed terminal teardown destroyed host resources")
+
+    scheduler.terminal_nixl_manager = resolve_manager
+    scheduler.release_host_resources = release_host_resources
+
+    with pytest.raises(RuntimeError, match="scheduler service teardown failed"):
+        Scheduler.release(scheduler, process_fatal=False)
+
+    assert order == ["manager", "metrics"]
+    assert scheduler.terminal_scheduler_serving is None
+
+
+@pytest.mark.parametrize(
+    ("skip_tokenizer_init", "expected_endpoint"),
+    (
+        (True, "ipc://tokenizer"),
+        (False, "ipc://detokenizer"),
+    ),
+)
+def test_scheduler_persists_role_correct_gateway_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    skip_tokenizer_init: bool,
+    expected_endpoint: str,
+) -> None:
+    """IPC initialization retains the exact gateway output endpoint."""
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.skip_tokenizer_init = skip_tokenizer_init
+    scheduler.server_args = SimpleNamespace(
+        skip_tokenizer_init=skip_tokenizer_init,
+        enable_metrics=False,
+        enable_metrics_for_all_schedulers=False,
+    )
+    scheduler.ps = SimpleNamespace(
+        pp_rank=1,
+        attn_tp_rank=0,
+        attn_cp_rank=0,
+    )
+    port_args = SimpleNamespace(
+        tokenizer_ipc_name="ipc://tokenizer",
+        detokenizer_ipc_name="ipc://detokenizer",
+    )
+    sentinel_channels = object()
+
+    def create_channels(**kwargs: object) -> object:
+        """Return inert noncanonical-rank IPC channels."""
+
+        return sentinel_channels
+
+    monkeypatch.setattr(
+        scheduler_module.SchedulerIpcChannels,
+        "create",
+        staticmethod(create_channels),
+    )
+
+    Scheduler.init_ipc_channels(scheduler, port_args)
+
+    assert scheduler.ipc_channels is sentinel_channels
+    assert scheduler.terminal_gateway_endpoint == expected_endpoint
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        DisaggregationMode.PREFILL,
+        DisaggregationMode.DECODE,
+    ),
+)
+def test_scheduler_resolves_typed_terminal_nixl_manager(
+    mode: DisaggregationMode,
+) -> None:
+    """Both PD roles resolve the exact startup-bound NIXL manager."""
+
+    manager = object.__new__(scheduler_module.NixlKVManager)
+    manager._terminal_startup_binding = object()
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.disaggregation_mode = mode
+    scheduler.transfer_backend = scheduler_module.TransferBackend.NIXL
+    scheduler.disagg_prefill_bootstrap_queue = None
+    scheduler.disagg_decode_prealloc_queue = None
+    queue = SimpleNamespace(kv_manager=manager)
+    if mode is DisaggregationMode.PREFILL:
+        scheduler.disagg_prefill_bootstrap_queue = queue
+    else:
+        scheduler.disagg_decode_prealloc_queue = queue
+
+    assert Scheduler.terminal_nixl_manager(scheduler) is manager
+    manager._terminal_startup_binding = None
+    assert Scheduler.terminal_nixl_manager(scheduler) is None
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_process_fatal", "expected_signal_count"),
+    (
+        ("graceful", False, 0),
+        ("unexpected", True, 1),
+        ("exception", True, 1),
+    ),
+)
+def test_scheduler_process_selects_graceful_or_fail_closed_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    behavior: str,
+    expected_process_fatal: bool,
+    expected_signal_count: int,
+) -> None:
+    """Every process exit maps to one explicit terminal teardown disposition."""
+
+    scheduler = _SchedulerProcessHarness(behavior)
+    parent = _SchedulerParentProcess()
+    pipe_writer = _SchedulerPipeWriter()
+    server_args = SimpleNamespace(enable_trace=False)
+
+    monkeypatch.setattr(scheduler_module, "load_plugins", lambda: None)
+    monkeypatch.setattr(
+        scheduler_module,
+        "configure_scheduler_process",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        scheduler_module.psutil,
+        "Process",
+        lambda: SimpleNamespace(parent=lambda: parent),
+    )
+    monkeypatch.setattr(scheduler_module, "Scheduler", lambda *args: scheduler)
+    monkeypatch.setattr(
+        scheduler_module.envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION,
+        "get",
+        lambda: False,
+    )
+
+    run_scheduler_process(
+        server_args=server_args,
+        port_args=object(),
+        gpu_id=0,
+        tp_rank=0,
+        attn_cp_rank=0,
+        moe_dp_rank=0,
+        moe_ep_rank=0,
+        pp_rank=0,
+        dp_rank=None,
+        pipe_writer=pipe_writer,
+    )
+
+    assert pipe_writer.payloads == [{"status": "ready"}]
+    assert scheduler.release_values == [expected_process_fatal]
+    assert parent.signals == [signal.SIGQUIT] * expected_signal_count
 
 
 def test_idle_sleeper_registers_raw_terminal_wake_descriptor() -> None:
@@ -662,6 +1054,7 @@ def test_scheduler_process_does_not_close_consumer_before_runtime_drain() -> Non
 
     source = inspect.getsource(run_scheduler_process)
     assert "close_terminal_scheduler_serving" not in source
+    assert "scheduler.release(process_fatal=process_fatal)" in source
 
 
 def test_scheduler_serving_path_contains_no_sleep_or_collective() -> None:

@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.decode_reservation_service import (
     DecodeReservationSchedulerService,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -704,7 +705,18 @@ class Scheduler(
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
-    def init_ipc_channels(self, port_args: PortArgs):
+    def init_ipc_channels(self, port_args: PortArgs) -> None:
+        terminal_gateway_endpoint = (
+            port_args.tokenizer_ipc_name
+            if self.skip_tokenizer_init
+            else port_args.detokenizer_ipc_name
+        )
+        if (
+            type(terminal_gateway_endpoint) is not str
+            or len(terminal_gateway_endpoint) == 0
+        ):
+            raise ValueError("terminal gateway endpoint must be a non-empty string")
+        self.terminal_gateway_endpoint: str = terminal_gateway_endpoint
         is_rank_zero = (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -1567,39 +1579,88 @@ class Scheduler(
             return None
         return serving.inventory()
 
-    def close_terminal_scheduler_serving(self, *, process_fatal: bool) -> None:
-        """Close scheduler wake ownership at process teardown.
+    def terminal_nixl_manager(self) -> NixlKVManager | None:
+        """Resolve the role-local manager owning terminal runtime teardown.
 
-        :param process_fatal: Whether retained identities must remain
-            quarantined as fail-closed evidence.
+        :returns: Configured terminal NIXL manager, otherwise ``None``.
+        """
+
+        if (
+            self.disaggregation_mode is DisaggregationMode.NULL
+            or self.transfer_backend is not TransferBackend.NIXL
+        ):
+            return None
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            queue = self.disagg_prefill_bootstrap_queue
+            if queue is None:
+                raise RuntimeError("prefill KV manager was not initialized")
+            manager = queue.kv_manager
+        elif self.disaggregation_mode is DisaggregationMode.DECODE:
+            queue = self.disagg_decode_prealloc_queue
+            if queue is None:
+                raise RuntimeError("decode KV manager was not initialized")
+            manager = queue.kv_manager
+        else:
+            raise RuntimeError("scheduler has an unknown disaggregation role")
+        if type(manager) is not NixlKVManager:
+            raise TypeError("terminal NIXL role resolved another manager type")
+        if manager.terminal_startup_binding is None:
+            return None
+        return manager
+
+    def close_terminal_runtime(self, *, process_fatal: bool) -> None:
+        """Close the manager-owned runtime before scheduler resources vanish.
+
+        The scheduler removes the wake descriptor from its poll set, but the
+        manager remains the sole owner which drains and closes the serving
+        object. A close failure retains the scheduler references as teardown
+        evidence and cannot fall back to an independent serving close.
+
+        :param process_fatal: Whether ambiguous authority must be quarantined.
         """
 
         if type(process_fatal) is not bool:
             raise TypeError("process_fatal must be bool")
+        manager = self.terminal_nixl_manager()
         serving = self.terminal_scheduler_serving
-        if serving is None:
+        if manager is None:
+            if serving is not None:
+                raise RuntimeError("terminal scheduler serving has no runtime manager")
             return
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.unregister_file_descriptor(serving.fileno())
-        inventory = serving.inventory()
-        retained_inventory = (
-            inventory.inbox.live_count > 0
-            or inventory.inbox.pending_count > 0
-            or len(inventory.inbox.consuming_request_keys) > 0
-            or inventory.inbox.outstanding_publications > 0
-            or len(inventory.retained_action_ids) > 0
-            or inventory.inbox.fatal_cause is not None
-        )
+
+        unregister_error: Exception | None = None
+        if serving is not None and self.idle_sleeper is not None:
+            try:
+                self.idle_sleeper.unregister_file_descriptor(serving.fileno())
+            except Exception as error:
+                unregister_error = error
+                logger.error(
+                    "Terminal scheduler wake removal failed: %s",
+                    get_exception_traceback(),
+                )
+
+        close_error: Exception | None = None
         try:
-            if process_fatal or retained_inventory:
-                serving.close_fail_closed()
-            else:
-                serving.close()
-        finally:
-            composition = self.terminal_decode_serving_composition
-            if composition is not None and composition.scheduler_serving is serving:
-                self.terminal_decode_serving_composition = None
-            self.terminal_scheduler_serving = None
+            manager.close_terminal_runtime(
+                process_fatal=process_fatal or unregister_error is not None,
+            )
+        except Exception as error:
+            close_error = error
+            logger.error(
+                "Terminal runtime manager close failed: %s",
+                get_exception_traceback(),
+            )
+        if close_error is not None:
+            raise RuntimeError("terminal runtime manager close failed") from close_error
+
+        composition = self.terminal_decode_serving_composition
+        if composition is not None and composition.scheduler_serving is serving:
+            self.terminal_decode_serving_composition = None
+        self.terminal_scheduler_serving = None
+        if unregister_error is not None:
+            raise RuntimeError(
+                "terminal scheduler wake removal failed",
+            ) from unregister_error
 
     def init_decode_reservation_control(self) -> None:
         """Initialize prepared-grant control for supported decode replicas."""
@@ -1908,6 +1969,43 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+
+    def release(self, *, process_fatal: bool) -> None:
+        """Release process-owned services in terminal dependency order.
+
+        Terminal teardown owns the scheduler-serving descriptor and must
+        finish before graceful host resources can be destroyed. Fatal exits
+        retain host allocations for process reclamation because synchronizing
+        a failed accelerator can itself block process exit.
+
+        :param process_fatal: Whether the process is leaving through a failed
+            or unexpected event-loop path.
+        """
+
+        if type(process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
+        first_error: Exception | None = None
+        try:
+            self.close_terminal_runtime(process_fatal=process_fatal)
+        except Exception as error:
+            logger.error(
+                "Scheduler terminal teardown failed: %s",
+                get_exception_traceback(),
+            )
+            first_error = error
+        try:
+            self.metrics_reporter._shutdown_fpm()
+        except Exception as error:
+            logger.error(
+                "Scheduler metrics teardown failed: %s",
+                get_exception_traceback(),
+            )
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise RuntimeError("scheduler service teardown failed") from first_error
+        if not process_fatal:
+            self.release_host_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -5203,6 +5301,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    process_fatal = True
     try:
         scheduler = Scheduler(
             server_args,
@@ -5221,6 +5320,9 @@ def run_scheduler_process(
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
+        if not scheduler.gracefully_exit:
+            raise RuntimeError("scheduler event loop returned without shutdown")
+        process_fatal = False
 
     except Exception:
         traceback = get_exception_traceback()
@@ -5235,11 +5337,13 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
-            # The terminal runtime owns scheduler-serving closure. Its output
-            # projection and abort drain must finish while this consumer and
-            # its wake descriptor remain alive.
-            scheduler.metrics_reporter._shutdown_fpm()
-            # Graceful path only: on the exception path the GPU may be wedged
-            # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+            try:
+                scheduler.release(process_fatal=process_fatal)
+            except Exception:
+                teardown_traceback = get_exception_traceback()
+                logger.error(
+                    "Scheduler teardown hit an exception: %s",
+                    teardown_traceback,
+                )
+                if not process_fatal:
+                    parent_process.send_signal(signal.SIGQUIT)
