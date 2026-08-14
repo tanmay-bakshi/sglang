@@ -31,6 +31,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
 )
+from sglang.srt.disaggregation.terminal_progress.nixl_owner_boundary import (
+    NixlTerminalOwnerBoundary,
+)
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalNativeProducerBinding,
     NativeTerminalRuntime,
@@ -1564,7 +1567,7 @@ def _project_direct_producer_inventory(
     return inventory
 
 
-class NixlDirectTerminalOwnerAdapter:
+class NixlDirectTerminalOwnerAdapter(NixlTerminalOwnerBoundary):
     """Typed ownership boundary for direct NIXL terminal publication."""
 
     _agent: NixlDirectTerminalAgentBoundary

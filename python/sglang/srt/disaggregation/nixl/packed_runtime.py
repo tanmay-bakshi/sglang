@@ -106,6 +106,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
 )
+from sglang.srt.disaggregation.terminal_progress.nixl_owner_boundary import (
+    NixlTerminalOwnerBoundary,
+)
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
     PackedTerminalSourcePlan,
@@ -792,18 +795,28 @@ class PackedPrefillRuntime:
         manager: PackedRuntimeManager,
         runtime_artifacts: PackedNixlRuntimeArtifactCohort,
         visibility_policy: PackedDestinationVisibilityPolicy,
+        direct_terminal_owner: NixlTerminalOwnerBoundary | None = None,
     ) -> None:
         """Initialize the process-lifetime source actor.
 
         :param manager: Owning NIXL manager.
         :param runtime_artifacts: Exact native runtime cohort.
         :param visibility_policy: Same-host route visibility policy.
+        :param direct_terminal_owner: Optional process-lifetime direct NIXL
+            completion owner for terminal serving.
         """
 
         if manager.attn_tp_size not in SUPPORTED_PACKED_SOURCE_TP_SIZES:
             raise ValueError("packed source actor requires a supported source TP width")
         if manager.attn_cp_rank != 0 or manager.pp_rank != 0:
             raise ValueError("packed source actor requires CP1 and PP1")
+        if direct_terminal_owner is not None and not isinstance(
+            direct_terminal_owner,
+            NixlTerminalOwnerBoundary,
+        ):
+            raise TypeError(
+                "direct_terminal_owner must inherit NixlTerminalOwnerBoundary"
+            )
         manifest = DecodeWriterManifest.for_tensor_parallel(manager.attn_tp_size)
         writer_id = StagingWriterId(
             transfer_source_rank=manager.transfer_source_rank,
@@ -822,6 +835,7 @@ class PackedPrefillRuntime:
         self._writer_id = writer_id
         self._ready = PackedReadyCoordinator()
         self._copy_executor: PackedCopyExecutor | None = None
+        self._direct_terminal_owner = direct_terminal_owner
         self._lanes: dict[
             PackedDestinationRouteBinding,
             list[PackedTransferLane],
@@ -829,6 +843,26 @@ class PackedPrefillRuntime:
         self._records: dict[PackedRequestKey, _PrefillRequestRecord] = {}
         self._failed_records: list[_PrefillRequestRecord] = []
         self._lock = threading.RLock()
+
+    def bind_direct_terminal_owner(
+        self,
+        owner: NixlTerminalOwnerBoundary,
+    ) -> None:
+        """Attach the process-lifetime owner before any request or lane exists.
+
+        :param owner: Registered direct NIXL terminal owner.
+        """
+
+        if not isinstance(owner, NixlTerminalOwnerBoundary):
+            raise TypeError("owner must inherit NixlTerminalOwnerBoundary")
+        with self._lock:
+            if self._direct_terminal_owner is not None:
+                raise RuntimeError("packed prefill terminal owner is already bound")
+            if len(self._records) != 0 or len(self._lanes) != 0:
+                raise RuntimeError(
+                    "packed prefill terminal owner must precede all request state"
+                )
+            self._direct_terminal_owner = owner
 
     @property
     def writer_id(self) -> StagingWriterId:
@@ -1015,7 +1049,11 @@ class PackedPrefillRuntime:
                     raise RuntimeError("terminal auxiliary poster returned no handle")
                 with record.condition:
                     record.auxiliary_handle = auxiliary_handle
-            main_handle, main_lane = self._post_main_transfer(record, transfer)
+            main_handle, main_lane = self._post_main_transfer(
+                record,
+                transfer,
+                binding_digest=action.binding.digest,
+            )
             with record.condition:
                 if (
                     record.main_handle is not main_handle
@@ -1845,15 +1883,40 @@ class PackedPrefillRuntime:
         self,
         record: _PrefillRequestRecord,
         transfer: PackedSourceTransfer,
+        *,
+        binding_digest: bytes | None = None,
     ) -> tuple[object, PackedTransferLane]:
+        if self._direct_terminal_owner is None:
+            if binding_digest is not None:
+                raise ValueError(
+                    "non-terminal packed runtime cannot bind a lifecycle digest"
+                )
+        elif type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError(
+                "terminal packed runtime requires a 32-byte binding digest"
+            )
+        if binding_digest is not None:
+            identity = self._require_terminal_identity(record)
+            if binding_digest != identity.local_binding.digest:
+                raise RuntimeError(
+                    "packed source terminal binding differs from actor authority"
+                )
         lane = self._acquire_lane(transfer)
         executor = self._source_copy_executor()
         gather_started_at = time.perf_counter()
-        executor.gather(
-            transfer=transfer,
-            source_lane=lane,
-            producer_event=record.submission.producer_event,
-        )
+        if binding_digest is None:
+            executor.gather(
+                transfer=transfer,
+                source_lane=lane,
+                producer_event=record.submission.producer_event,
+            )
+        else:
+            executor.gather(
+                transfer=transfer,
+                source_lane=lane,
+                producer_event=record.submission.producer_event,
+                binding_digest=binding_digest,
+            )
         record.source_gather_copy_duration_ms = (
             time.perf_counter() - gather_started_at
         ) * 1000.0
@@ -1903,18 +1966,85 @@ class PackedPrefillRuntime:
         with record.condition:
             record.main_handle = handle
             record.main_lane = lane
-        try:
-            record.main_transport_started_at = time.perf_counter()
-            self._manager._post_transfer_when_ready(
-                handle,
+        record.main_transport_started_at = time.perf_counter()
+        lane.post_submission(
+            lambda exact_handle: self._manager._post_transfer_when_ready(
+                exact_handle,
                 "packed main NIXL transfer",
             )
-        except Exception:
-            lane.mark_submission_ambiguous(
-                "packed main NIXL submission became ambiguous"
-            )
-            raise
+        )
         return handle, lane
+
+    def settle_terminal_main_transfer(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> PackedWriterOutcome:
+        """Settle one main transfer under its matching native owner action.
+
+        :param action: Exact ``SOURCE_OUTCOME_READY`` action.
+        :returns: Validated packed writer outcome ready for authenticated send.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
+            raise ValueError("terminal main completion requires SOURCE_OUTCOME_READY")
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        )
+        with record.condition:
+            lane = record.main_lane
+            if lane is None:
+                raise RuntimeError("terminal main completion preceded transfer post")
+            if record.main_outcome is not None:
+                raise RuntimeError("terminal main completion was already settled")
+        outcome = lane.settle_terminal_completion(action)
+        with record.condition:
+            if record.main_outcome is not None:
+                raise RuntimeError("terminal main completion raced another settlement")
+            record.main_outcome = outcome
+            started_at = record.main_transport_started_at
+            if started_at is not None:
+                record.main_transport_duration_ms = (
+                    time.perf_counter() - started_at
+                ) * 1000.0
+        return outcome
+
+    def settle_terminal_main_failure(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Settle one failed transfer while retaining its poisoned lane.
+
+        :param action: Matching quarantine or process-fatal owner action.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        ):
+            raise ValueError("terminal main failure requires a failure owner action")
+        record = self._terminal_record_for_action(action, action.kind)
+        if record.main_lane is None:
+            raise RuntimeError("terminal main failure references an unknown transfer")
+        record.main_lane.settle_terminal_failure(action)
+
+    def cancel_terminal_main_transfer(self, binding: TerminalRequestBinding) -> None:
+        """Request cancellation without releasing ambiguous transfer authority.
+
+        :param binding: Exact active terminal lifecycle identity.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        record = self._terminal_record_for_key(binding.request_key)
+        identity = self._require_terminal_identity(record)
+        if binding != identity.local_binding or record.main_lane is None:
+            raise RuntimeError("terminal cancellation references an unknown transfer")
+        record.main_lane.cancel_terminal_submission()
 
     def _emit_transfer_stats(self, record: _PrefillRequestRecord) -> None:
         ready_wait_duration_ms = record.ready_wait_duration_ms
@@ -2203,6 +2333,7 @@ class PackedPrefillRuntime:
                 visibility_policy=self._visibility_policy,
                 gpu_id=self._manager.kv_args.gpu_id,
                 tensor=tensor,
+                direct_terminal_owner=self._direct_terminal_owner,
                 expected_runtime_artifacts=self._runtime_artifacts,
             )
             lanes.append(lane)
