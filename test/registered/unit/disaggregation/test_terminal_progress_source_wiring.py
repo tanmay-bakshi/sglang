@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerObservation,
+    NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalReceipt,
@@ -524,6 +525,38 @@ def _action(
     )
 
 
+def _submission_observation(
+    harness: _Harness,
+    *,
+    binding: NativeTerminalRequestBinding | None = None,
+    producer_id: int = _LOCAL_PRODUCER_ID,
+) -> NativeTerminalOwnerObservation:
+    """Build one exact evidence-only source submission commit.
+
+    :param harness: Source lifecycle fixture.
+    :param binding: Native binding override for validation tests.
+    :param producer_id: Native producer identity carried by the observation.
+    :returns: Complete source submission observation.
+    """
+
+    native_binding = binding
+    if native_binding is None:
+        native_binding = NativeTerminalRequestBinding.from_binding(
+            harness.identity.local_binding
+        )
+    return NativeTerminalOwnerObservation(
+        binding=native_binding,
+        owner_sequence=1,
+        producer_id=producer_id,
+        producer_sequence=1,
+        producer_rank=harness.identity.local_binding.owner.tp_rank,
+        event_kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        enqueued_ns=10,
+        completed_ns=20,
+        role=NativeTerminalOwnerRole.SOURCE,
+    )
+
+
 def _ready(harness: _Harness) -> None:
     """Deliver one authenticated request-ready receipt.
 
@@ -630,6 +663,34 @@ def test_runtime_registration_precedes_first_source_event() -> None:
         NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
     )
     assert harness.wiring.lifecycle_published(harness.identity.local_binding.digest)
+
+
+def test_submission_observation_requires_complete_binding_before_one_shot() -> None:
+    """Malformed evidence cannot consume the valid submission projection."""
+
+    harness = _harness()
+    native_binding = NativeTerminalRequestBinding.from_binding(
+        harness.identity.local_binding
+    )
+    malformed_binding = dataclasses.replace(
+        native_binding,
+        room_id=native_binding.room_id + 1,
+    )
+
+    with pytest.raises(ValueError, match="binding digest is inconsistent"):
+        harness.wiring.submission_committed(
+            _submission_observation(harness, binding=malformed_binding)
+        )
+    with pytest.raises(RuntimeError, match="another producer"):
+        harness.wiring.submission_committed(
+            _submission_observation(harness, producer_id=_LOCAL_PRODUCER_ID + 1)
+        )
+
+    valid = _submission_observation(harness)
+    harness.wiring.submission_committed(valid)
+    assert harness.metrics.submission_commits == [valid]
+    with pytest.raises(RuntimeError, match="observed twice"):
+        harness.wiring.submission_committed(valid)
 
 
 def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:

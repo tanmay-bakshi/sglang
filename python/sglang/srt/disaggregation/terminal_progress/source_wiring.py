@@ -446,13 +446,18 @@ class PackedTerminalSourceWiring:
 
         if type(observation) is not NativeTerminalOwnerObservation:
             raise TypeError("observation must be NativeTerminalOwnerObservation")
+        binding = observation.binding.to_binding()
         expected_owner = NativeTerminalProcessIdentity.from_identity(
             self._local_identity
         )
         if observation.binding.owner != expected_owner:
             raise RuntimeError("submission observation belongs to another source rank")
-        digest = observation.binding.digest
+        if observation.producer_id != self._local_producer_id:
+            raise RuntimeError("submission observation belongs to another producer")
+        digest = binding.digest
         record = self._record(digest)
+        if binding != record.submission.identity.local_binding:
+            raise RuntimeError("submission observation differs from its source binding")
         with self._lock:
             current = self._records.get(digest)
             if current is not record:
