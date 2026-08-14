@@ -1,5 +1,6 @@
 import ast
 import concurrent.futures
+import dataclasses
 import errno
 import inspect
 import os
@@ -8,16 +9,30 @@ import signal
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.nixl.conn import NixlTerminalRuntimeInstallation
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
+    PackedTerminalDecodeServingComposition,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeServing,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
     TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.inbox import (
+    SchedulerInboxFatalCause,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
@@ -38,6 +53,9 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServing,
     TerminalSchedulerServingRole,
     TerminalSourceSchedulerConsumer,
+)
+from sglang.srt.disaggregation.terminal_progress.source_serving import (
+    PackedTerminalSourceServing,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler, run_scheduler_process
@@ -911,6 +929,151 @@ def test_scheduler_persists_role_correct_gateway_endpoint(
 
     assert scheduler.ipc_channels is sentinel_channels
     assert scheduler.terminal_gateway_endpoint == expected_endpoint
+
+
+@pytest.mark.parametrize(
+    ("mode", "role", "tp_rank", "expected_gateway"),
+    (
+        (
+            DisaggregationMode.PREFILL,
+            TerminalOwnerRole.SOURCE,
+            0,
+            "ipc://gateway",
+        ),
+        (DisaggregationMode.PREFILL, TerminalOwnerRole.SOURCE, 1, None),
+        (DisaggregationMode.DECODE, TerminalOwnerRole.DECODE, 0, None),
+    ),
+)
+def test_scheduler_installs_role_runtime_before_activation(
+    mode: DisaggregationMode,
+    role: TerminalOwnerRole,
+    tp_rank: int,
+    expected_gateway: str | None,
+) -> None:
+    """Each terminal rank installs its exact role boundary before activation."""
+
+    order: list[str] = []
+    manager = object.__new__(scheduler_module.NixlKVManager)
+    manager._terminal_startup_binding = SimpleNamespace(
+        advertisement=SimpleNamespace(
+            role=role,
+            tensor_parallel_rank=tp_rank,
+        )
+    )
+    manager.kv_args = SimpleNamespace(terminal_request_capacity=37)
+    manager.install_terminal_runtime = MagicMock(
+        side_effect=lambda installation: order.append("install")
+    )
+    manager.activate_terminal_startup = MagicMock(
+        side_effect=lambda: order.append("activate")
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.disaggregation_mode = mode
+    scheduler.terminal_gateway_endpoint = "ipc://gateway"
+
+    Scheduler._activate_terminal_kv_manager(scheduler, manager)
+
+    assert order == ["install", "activate"]
+    manager.install_terminal_runtime.assert_called_once()
+    installation = manager.install_terminal_runtime.call_args.args[0]
+    assert type(installation) is NixlTerminalRuntimeInstallation
+    assert installation.terminal_request_capacity == 37
+    assert installation.gateway_endpoint == expected_gateway
+    if mode is DisaggregationMode.PREFILL:
+        assert installation.bind_source_serving is not None
+        assert installation.bind_source_serving.__self__ is scheduler
+        assert installation.bind_decode_serving is None
+    else:
+        assert installation.bind_source_serving is None
+        assert installation.bind_decode_serving is not None
+        assert installation.bind_decode_serving.__self__ is scheduler
+    assert installation.scheduler_process_fatal_handler.__self__ is scheduler
+    assert installation.owner_dead_handler.__self__ is scheduler
+
+
+def test_scheduler_leaves_nonterminal_manager_on_noop_activation_boundary() -> None:
+    """A NIXL manager outside the cohort is activated without installation."""
+
+    manager = object.__new__(scheduler_module.NixlKVManager)
+    manager._terminal_startup_binding = None
+    manager.install_terminal_runtime = MagicMock()
+    manager.activate_terminal_startup = MagicMock()
+    scheduler = Scheduler.__new__(Scheduler)
+
+    Scheduler._activate_terminal_kv_manager(scheduler, manager)
+
+    manager.install_terminal_runtime.assert_not_called()
+    manager.activate_terminal_startup.assert_called_once_with()
+
+
+def test_scheduler_source_binder_selects_serving_scheduler_boundary() -> None:
+    """The source installation callback binds only its scheduler adapter."""
+
+    scheduler_serving = object.__new__(TerminalSchedulerServing)
+    scheduler_serving._role = TerminalSchedulerServingRole.SOURCE
+    serving = object.__new__(PackedTerminalSourceServing)
+    serving._scheduler_serving = scheduler_serving
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+    scheduler.terminal_scheduler_serving = None
+    scheduler.idle_sleeper = None
+
+    Scheduler.bind_terminal_source_serving(scheduler, serving)
+
+    assert scheduler.terminal_scheduler_serving is scheduler_serving
+
+
+def test_scheduler_decode_binder_composes_queue_and_scheduler_atomically() -> None:
+    """One callback exposes the same decode serving to both consumers."""
+
+    scheduler_serving = object.__new__(TerminalSchedulerServing)
+    scheduler_serving._role = TerminalSchedulerServingRole.DECODE
+    composition = object.__new__(PackedTerminalDecodeServingComposition)
+    composition._scheduler_serving = scheduler_serving
+    serving = object.__new__(PackedTerminalDecodeServing)
+    serving._decode_composition = composition
+    queue = object.__new__(DecodePreallocQueue)
+    queue._terminal_decode_serving = None
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.disaggregation_mode = DisaggregationMode.DECODE
+    scheduler.disagg_decode_prealloc_queue = queue
+    scheduler.terminal_scheduler_serving = None
+    scheduler.terminal_decode_serving_composition = None
+    scheduler.idle_sleeper = None
+
+    Scheduler.bind_terminal_decode_serving(scheduler, serving)
+
+    assert queue.terminal_decode_serving is serving
+    assert scheduler.terminal_decode_serving_composition is composition
+    assert scheduler.terminal_scheduler_serving is scheduler_serving
+
+
+def test_scheduler_retains_exact_process_fatal_inventory() -> None:
+    """The scheduler preserves one immutable fatal receipt-inbox record."""
+
+    inventory = SchedulerReceiptInboxInventory(
+        physical_capacity=1,
+        live_bindings=(),
+        pending_request_keys=(),
+        consuming_request_keys=(),
+        outstanding_publications=0,
+        wake_armed=True,
+        fatal_cause=SchedulerInboxFatalCause.OWNER_DEATH,
+        closed=False,
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_scheduler_process_fatal_inventory = None
+
+    Scheduler.retain_terminal_scheduler_process_fatal(scheduler, inventory)
+    Scheduler.retain_terminal_scheduler_process_fatal(scheduler, inventory)
+
+    assert scheduler.terminal_scheduler_process_fatal_inventory == inventory
+    changed = dataclasses.replace(inventory, wake_armed=False)
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        Scheduler.retain_terminal_scheduler_process_fatal(scheduler, changed)
+    nonfatal = dataclasses.replace(inventory, fatal_cause=None)
+    with pytest.raises(ValueError, match="requires a fatal cause"):
+        Scheduler.retain_terminal_scheduler_process_fatal(scheduler, nonfatal)
 
 
 @pytest.mark.parametrize(

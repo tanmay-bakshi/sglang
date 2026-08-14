@@ -657,6 +657,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise RuntimeError("terminal decode serving is already bound")
         self._terminal_decode_serving = serving
 
+    @property
+    def terminal_decode_serving(self) -> PackedTerminalDecodeServing | None:
+        """Return the manager-owned serving composition bound at startup.
+
+        :returns: Full decode serving composition, or ``None`` before binding.
+        """
+
+        return self._terminal_decode_serving
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))

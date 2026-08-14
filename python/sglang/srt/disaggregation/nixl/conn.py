@@ -912,8 +912,8 @@ class _TerminalDecoderEnrollment:
 class NixlTerminalRuntimeInstallation:
     """Scheduler-owned dependencies required before terminal activation.
 
-    :ivar physical_capacity: Exact metadata-row capacity governing live request
-        generations and every derived process queue.
+    :ivar terminal_request_capacity: Exact request-generation capacity governing
+        every derived process queue.
     :ivar gateway_endpoint: Canonical source-rank gateway PUSH endpoint.
     :ivar bind_source_serving: Source-only scheduler serving installation.
     :ivar bind_decode_serving: Decode-only scheduler and preallocation-queue
@@ -924,7 +924,7 @@ class NixlTerminalRuntimeInstallation:
         fail closed after a publisher, reactor, or control-owner death.
     """
 
-    physical_capacity: int
+    terminal_request_capacity: int
     gateway_endpoint: str | None
     bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None
     bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None
@@ -934,8 +934,11 @@ class NixlTerminalRuntimeInstallation:
     def __post_init__(self) -> None:
         """Validate the role-neutral installation boundary."""
 
-        if type(self.physical_capacity) is not int or self.physical_capacity <= 0:
-            raise ValueError("physical_capacity must be a positive integer")
+        if (
+            type(self.terminal_request_capacity) is not int
+            or self.terminal_request_capacity <= 0
+        ):
+            raise ValueError("terminal_request_capacity must be a positive integer")
         if self.gateway_endpoint is not None and (
             type(self.gateway_endpoint) is not str or len(self.gateway_endpoint) == 0
         ):
@@ -2568,7 +2571,7 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("terminal grouped NIXL owner is already composed")
         grouped_nixl = GroupedNixlTerminalOwner(
             self.agent,
-            channel_capacity=installation.physical_capacity * 2,
+            channel_capacity=installation.terminal_request_capacity * 2,
         )
         self._terminal_grouped_nixl_owner = grouped_nixl
         actor.bind_direct_terminal_owner(grouped_nixl.main_endpoint)
@@ -2600,7 +2603,7 @@ class NixlKVManager(CommonKVManager):
                 publication_control.publish_result(result)
 
             publisher = PackedTerminalOutputPublisher(
-                capacity=installation.physical_capacity,
+                capacity=installation.terminal_request_capacity,
                 sink_factory=ZmqTerminalGatewaySinkFactory(endpoint),
                 payload_encoder=PrefillTerminalGatewayPayloadEncoder(),
                 wire_issuer=TerminalWireReceiptIssuer(local_identity),
@@ -2626,7 +2629,7 @@ class NixlKVManager(CommonKVManager):
             publisher=publisher,
             metrics_sink=_NixlTerminalSourceMetrics(),
             clock_ns=time.monotonic_ns,
-            physical_capacity=installation.physical_capacity,
+            physical_capacity=installation.terminal_request_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             grouped_nixl=grouped_nixl,
             work=source_work,
@@ -2696,7 +2699,7 @@ class NixlKVManager(CommonKVManager):
             coordinator_issuer=coordinator_issuer,
             coordinator_importers=self._decode_coordinator_importers(binding),
             clock_ns=time.monotonic_ns,
-            physical_capacity=installation.physical_capacity,
+            physical_capacity=installation.terminal_request_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             work=PackedTerminalDecodeWork(
                 send_delivery=self._send_terminal_decode_delivery,
@@ -2712,7 +2715,9 @@ class NixlKVManager(CommonKVManager):
         installation = self._terminal_runtime_installation
         if installation is None:
             raise RuntimeError("terminal runtime dependencies are not installed")
-        config = self._terminal_rank_runtime_config(installation.physical_capacity)
+        config = self._terminal_rank_runtime_config(
+            installation.terminal_request_capacity
+        )
         enrollment = TerminalRankRuntimeEnrollmentFactory(binding, config).create()
         local_role = binding.advertisement.role
         source_serving: PackedTerminalSourceServing | None = None

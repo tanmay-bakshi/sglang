@@ -759,7 +759,7 @@ def test_source_runtime_composition_binds_before_starting_exactly_one_stack() ->
     )
     manager._compose_terminal_source = MagicMock(return_value=(serving, publisher))
     manager._terminal_runtime_installation = SimpleNamespace(
-        physical_capacity=7,
+        terminal_request_capacity=7,
         bind_source_serving=lambda value: order.append("scheduler-bind"),
     )
     manager._start_prefill_runtime_workers = MagicMock()
