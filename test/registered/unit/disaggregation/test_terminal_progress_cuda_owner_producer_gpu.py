@@ -2,8 +2,10 @@ import time
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    CudaTerminalEventKind,
     CudaTerminalProducer,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
@@ -143,6 +145,7 @@ def _build_scatter_owner() -> tuple[
             producer_api=owner.producer_api(),
             producer_context=owner.producer_capsule(_CUDA_PRODUCER_ID),
         ),
+        CudaTerminalEventKind.DECODE_SCATTER_TERMINAL,
         testing=True,
     )
     producer.arm(binding.digest)

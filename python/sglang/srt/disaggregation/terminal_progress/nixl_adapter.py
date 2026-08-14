@@ -27,6 +27,7 @@ from nixl._api import (
     nixl_xfer_handle,
 )
 from nixl._bindings import NIXL_IN_PROG, NIXL_SUCCESS, nixl_status_t
+
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
@@ -1879,14 +1880,27 @@ class NixlDirectTerminalOwnerAdapter(NixlTerminalOwnerBoundary):
                 f"status: {status}"
             )
 
-    def release_transfer(self, transfer: NixlDirectTerminalTransfer) -> None:
-        """Release the exact handle after terminal settlement.
+    def release_transfer(
+        self,
+        transfer: NixlDirectTerminalTransfer,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Release the exact handle under teardown-ACK authority.
 
         :param transfer: Settled adapter-owned transfer.
+        :param action: Exact source ACK action authorizing release.
         """
 
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
+            raise ValueError("direct transfer release requires SOURCE_ACK_READY")
         with self._lock:
             record = self._require_transfer_locked(transfer)
+            if action.binding.digest != record.public.binding_digest:
+                raise NixlTerminalLifecycleError(
+                    "release action belongs to another transfer binding"
+                )
             if record.phase is not NixlDirectTerminalTransferPhase.SETTLED:
                 raise NixlTerminalLifecycleError(
                     "direct transfer release requires terminal settlement"

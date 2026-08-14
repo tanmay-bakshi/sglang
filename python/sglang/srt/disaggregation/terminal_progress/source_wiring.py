@@ -5,6 +5,9 @@ import traceback
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
+from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlTerminalResult,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -463,6 +466,35 @@ class PackedTerminalSourceWiring:
             binding_digest,
             NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
         )
+
+    def grouped_native_terminal(self, result: GroupedNixlTerminalResult) -> None:
+        """Commit one request-level grouped NIXL terminal result.
+
+        Main KV and the canonical DFlash boundary have independent native
+        handles. Their grouped owner emits success only after the complete
+        predeclared member set reaches terminality, or emits failure at the
+        first failed member, so the native reducer sees exactly one source
+        transition.
+
+        :param result: Exact aggregate result claimed from the source channel.
+        """
+
+        if type(result) is not GroupedNixlTerminalResult:
+            raise TypeError("result must be GroupedNixlTerminalResult")
+        self._record(result.binding_digest)
+        kind = NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL
+        reason = None
+        if not result.successful:
+            kind = NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED
+            reason = result.reason
+        self._runtime.submit(
+            self._local_producer_id,
+            result.binding_digest,
+            kind,
+            reason=reason,
+            enqueued_ns=result.native_timestamp_ns,
+        )
+        self._emit_metric_once(result.binding_digest, kind)
 
     def consume_gather_ready(
         self,

@@ -13,6 +13,7 @@ import numpy.typing as npt
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     MAX_PACKED_VISIBILITY_LANE_IDENTIFIER_BYTES,
@@ -3076,7 +3077,7 @@ class PackedTransferLane:
             if self._terminal_failure_settled:
                 raise RuntimeError("failed terminal transfer cannot be released")
             try:
-                direct_owner.release_transfer(terminal_transfer)
+                direct_owner.release_transfer(terminal_transfer, action)
             except BaseException:
                 logger.error(
                     "Direct terminal transfer release failed:\n%s",

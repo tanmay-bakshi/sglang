@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 import pytest
 from nixl._api import nixl_terminal_event_kind_t
 from nixl._bindings import NIXL_IN_PROG, NIXL_SUCCESS, nixl_status_t
+
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
@@ -437,11 +438,12 @@ def test_arms_before_post_and_consumes_exact_completion_authority_once() -> None
     ]
     assert subscription.release_calls == 1
     assert adapter.query_inventory().settled_count == 1
-    adapter.release_transfer(transfer)
+    ack = _action(digest, NativeTerminalOwnerActionKind.SOURCE_ACK_READY)
+    adapter.release_transfer(transfer, ack)
     assert handle.release_calls == 1
     assert adapter.query_inventory().transfer_count == 0
     with pytest.raises(NixlTerminalLifecycleError, match="not owned"):
-        adapter.release_transfer(transfer)
+        adapter.release_transfer(transfer, ack)
 
 
 def test_fast_terminal_callback_during_post_preserves_settled_state() -> None:
@@ -554,8 +556,8 @@ def test_failure_settlement_never_takes_success_receipt() -> None:
 
     assert "take_receipt" not in agent.calls
     assert subscription.release_calls == 1
-    adapter.release_transfer(transfer)
-    assert handle.release_calls == 1
+    assert handle.release_calls == 0
+    assert adapter.query_inventory().settled_count == 1
 
 
 def test_pending_cancellation_retains_authority_until_terminal_failure() -> None:

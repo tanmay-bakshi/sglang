@@ -2,14 +2,17 @@ import gc
 import time
 
 import pytest
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    CudaTerminalEventKind,
     CudaTerminalProducer,
     cuda_terminal_producer_abi,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
+    TerminalPublicationIdentity,
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_owner import (
@@ -18,7 +21,9 @@ from sglang.srt.disaggregation.terminal_progress.native_owner import (
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeDecodeLifecyclePhase,
+    NativeSourceLifecyclePhase,
     NativeTerminalLifecycleRegistration,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
@@ -26,6 +31,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+    NativeTerminalPublicationIdentity,
     NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
@@ -200,6 +206,113 @@ def _cuda_binding(owner: NativeTerminalOwner) -> NativeTerminalNativeProducerBin
     )
 
 
+def _make_waiting_source_owner() -> tuple[
+    NativeTerminalOwner,
+    NativeTerminalRequestBinding,
+]:
+    """Create one source lifecycle waiting on direct CUDA completion.
+
+    :returns: Native source owner and its registered request binding.
+    """
+
+    process = TerminalProcessIdentity(
+        process_generation=bytes.fromhex("1234567890abcdef1234567890abcdef"),
+        role=TerminalOwnerRole.SOURCE,
+        tp_rank=0,
+        tp_size=1,
+    )
+    identity = NativeTerminalProcessIdentity.from_identity(process)
+    owner = NativeTerminalOwner(
+        input_capacity=128,
+        output_capacity=128,
+        owner_identity=identity,
+        testing=True,
+    )
+    for registration in (
+        NativeTerminalProducerRegistration(
+            producer_id=_LOCAL_PRODUCER_ID,
+            name="source-local",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.SOURCE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CUDA_PRODUCER_ID,
+            name="source-cuda-completion",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.SOURCE,
+            authenticated_issuer=None,
+        ),
+        NativeTerminalProducerRegistration(
+            producer_id=_CONTROL_PRODUCER_ID,
+            name="source-control",
+            producer_class=NativeTerminalProducerClass.CONTROL,
+            allowed_role=NativeTerminalOwnerRole.SOURCE,
+            authenticated_issuer=identity,
+        ),
+    ):
+        owner.register_producer(registration)
+    request_key = PackedRequestKey(
+        room_id=301,
+        request_generation=bytes.fromhex("00112233445566778899aabbccddeeff"),
+    )
+    binding = NativeTerminalRequestBinding.from_binding(
+        TerminalRequestBinding(
+            request_key=request_key,
+            owner=process,
+            rank_manifest_digest=b"r" * 32,
+            allocation_digest=b"a" * 32,
+        )
+    )
+    owner.register_lifecycle(
+        NativeTerminalLifecycleRegistration(
+            binding=binding,
+            publication_identity=NativeTerminalPublicationIdentity.from_identity(
+                TerminalPublicationIdentity(
+                    request_key=request_key,
+                    publisher_process_generation=process.process_generation,
+                    publication_generation=b"p" * 16,
+                )
+            ),
+            trusted_issuers=(identity,),
+        )
+    )
+    owner.submit(
+        NativeTerminalOwnerEvent(
+            producer_id=_LOCAL_PRODUCER_ID,
+            binding_digest=binding.digest,
+            kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
+        )
+    )
+    return owner, binding
+
+
+def _wait_for_source_phase(
+    owner: NativeTerminalOwner,
+    binding_digest: bytes,
+    phase: NativeSourceLifecyclePhase,
+) -> None:
+    """Wait for one direct source lifecycle transition.
+
+    :param owner: Process-lifetime native source owner.
+    :param binding_digest: Exact lifecycle identity.
+    :param phase: Required source lifecycle phase.
+    """
+
+    deadline = time.monotonic() + _WAIT_SECONDS
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = owner.lifecycle_snapshot_for_testing(binding_digest)
+        if snapshot.phase == int(phase):
+            return
+        time.sleep(0.001)
+    raise TimeoutError(
+        "native source lifecycle did not reach "
+        f"{phase.name}: snapshot={snapshot}, inventory={owner.inventory()}"
+    )
+
+
 def _wait_for_phase(
     owner: NativeTerminalOwner,
     binding_digest: bytes,
@@ -259,7 +372,11 @@ def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
         source_identity,
         room_id=401,
     )
-    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
+    producer = CudaTerminalProducer(
+        _cuda_binding(owner),
+        CudaTerminalEventKind.DECODE_SCATTER_TERMINAL,
+        testing=True,
+    )
     producer.arm(binding.digest)
     owner.start()
     producer.complete_synchronously_for_testing(binding.digest)
@@ -271,6 +388,42 @@ def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
     assert inventory.retained_count == 0
     assert inventory.fatal_code == "none"
     assert owner.inventory().fatal_code is NativeTerminalOwnerFatalCode.NONE
+    _retire_and_abort(owner, producer)
+
+
+def test_source_callback_reaches_producer_completed_without_python_drain() -> None:
+    """A source CUDA callback directly earns native gather authority."""
+
+    owner, binding = _make_waiting_source_owner()
+    producer = CudaTerminalProducer(
+        _cuda_binding(owner),
+        CudaTerminalEventKind.SOURCE_PRODUCER_COMPLETED,
+        testing=True,
+    )
+    producer.arm(binding.digest)
+    owner.start()
+    _wait_for_source_phase(
+        owner,
+        binding.digest,
+        NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER,
+    )
+
+    producer.complete_synchronously_for_testing(binding.digest)
+
+    _wait_for_source_phase(
+        owner,
+        binding.digest,
+        NativeSourceLifecyclePhase.GATHERING,
+    )
+    outputs = owner.drain_outputs()
+    assert len(outputs) == 1
+    assert tuple(action.kind for action in outputs[0].actions) == (
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+    )
+    inventory = producer.inventory()
+    assert inventory.total_submissions == 1
+    assert inventory.total_delivered == 1
+    assert inventory.retained_count == 0
     _retire_and_abort(owner, producer)
 
 
@@ -287,7 +440,11 @@ def test_concurrent_callbacks_preserve_owner_assigned_queue_order() -> None:
         )
         for index in range(16)
     )
-    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
+    producer = CudaTerminalProducer(
+        _cuda_binding(owner),
+        CudaTerminalEventKind.DECODE_SCATTER_TERMINAL,
+        testing=True,
+    )
     for binding in bindings:
         producer.arm(binding.digest)
     owner.start()
@@ -319,7 +476,11 @@ def test_close_with_live_callback_fails_closed_and_keeps_capsule_lifetime() -> N
         source_identity,
         room_id=601,
     )
-    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
+    producer = CudaTerminalProducer(
+        _cuda_binding(owner),
+        CudaTerminalEventKind.DECODE_SCATTER_TERMINAL,
+        testing=True,
+    )
     producer.arm(binding.digest)
     owner.start()
     producer.begin_held_callback_for_testing(binding.digest)

@@ -8,6 +8,10 @@ from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
 )
+from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlTerminalOwner,
+    GroupedNixlTerminalOwnerInventory,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -59,6 +63,7 @@ class PackedTerminalSourceWork:
     :ivar post_gather: Post the immutable gather and transport submission.
     :ivar send_outcomes: Send immutable writer outcome messages.
     :ivar send_ack: Send one exact-generation teardown acknowledgement.
+    :ivar quarantine: Retain actor and transport resources under failure authority.
     :ivar observe_output: Consume non-gating native output evidence.
     """
 
@@ -71,6 +76,7 @@ class PackedTerminalSourceWork:
     send_ack: Callable[
         [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
     ]
+    quarantine: Callable[[NativeTerminalOwnerAction], None]
     observe_output: Callable[[NativeTerminalOwnerOutput], None]
 
     def __post_init__(self) -> None:
@@ -80,6 +86,7 @@ class PackedTerminalSourceWork:
             self.post_gather,
             self.send_outcomes,
             self.send_ack,
+            self.quarantine,
             self.observe_output,
         )
         if any(not callable(callback) for callback in callbacks):
@@ -94,6 +101,7 @@ class PackedTerminalSourceServingInventory:
     :ivar wiring: Immutable source side-effect inventory.
     :ivar scheduler_consumer: Scheduler-affine resource inventory.
     :ivar scheduler_serving: Qualified scheduler receipt inventory.
+    :ivar grouped_nixl: Request-level main and DFlash transfer inventory.
     :ivar owner_dead_marked: Whether scheduler failure wake was published.
     :ivar native_producers_retired: Whether native producer contexts joined.
     """
@@ -102,6 +110,7 @@ class PackedTerminalSourceServingInventory:
     wiring: PackedTerminalSourceInventory
     scheduler_consumer: PackedTerminalSourceSchedulerInventory
     scheduler_serving: TerminalSchedulerServingInventory
+    grouped_nixl: GroupedNixlTerminalOwnerInventory
     owner_dead_marked: bool
     native_producers_retired: bool
 
@@ -120,6 +129,8 @@ class PackedTerminalSourceServingInventory:
             raise TypeError(
                 "scheduler_serving must be TerminalSchedulerServingInventory"
             )
+        if type(self.grouped_nixl) is not GroupedNixlTerminalOwnerInventory:
+            raise TypeError("grouped_nixl must be GroupedNixlTerminalOwnerInventory")
         if type(self.owner_dead_marked) is not bool:
             raise TypeError("owner_dead_marked must be bool")
         if type(self.native_producers_retired) is not bool:
@@ -139,6 +150,7 @@ class PackedTerminalSourceServing:
     _wiring: PackedTerminalSourceWiring
     _scheduler_consumer: PackedTerminalSourceSchedulerConsumer
     _scheduler_serving: TerminalSchedulerServing
+    _grouped_nixl: GroupedNixlTerminalOwner
     _work: PackedTerminalSourceWork
     _retire_native_producers: Callable[[], None]
     _retire_submission: Callable[[PackedTerminalSourceSubmission], None]
@@ -158,6 +170,7 @@ class PackedTerminalSourceServing:
         clock_ns: Callable[[], int],
         physical_capacity: int,
         process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None],
+        grouped_nixl: GroupedNixlTerminalOwner,
         work: PackedTerminalSourceWork,
         retire_native_producers: Callable[[], None],
         retire_submission: Callable[[PackedTerminalSourceSubmission], None],
@@ -171,6 +184,7 @@ class PackedTerminalSourceServing:
         :param clock_ns: Local monotonic nanosecond clock.
         :param physical_capacity: Maximum configured in-flight generations.
         :param process_fatal_handler: Scheduler-affine fail-closed handler.
+        :param grouped_nixl: Sole request-grouped native completion owner.
         :param work: Algorithm-neutral source work callbacks.
         :param retire_native_producers: Native event-channel retirement fence.
         :param retire_submission: Process-lifetime control-state retirement
@@ -187,6 +201,8 @@ class PackedTerminalSourceServing:
             raise ValueError("physical_capacity must be a positive integer")
         if not callable(process_fatal_handler):
             raise TypeError("process_fatal_handler must be callable")
+        if not isinstance(grouped_nixl, GroupedNixlTerminalOwner):
+            raise TypeError("grouped_nixl must be GroupedNixlTerminalOwner")
         if type(work) is not PackedTerminalSourceWork:
             raise TypeError("work must be PackedTerminalSourceWork")
         if not callable(retire_native_producers):
@@ -213,6 +229,7 @@ class PackedTerminalSourceServing:
         self._wiring = wiring
         self._scheduler_consumer = scheduler_consumer
         self._scheduler_serving = scheduler_serving
+        self._grouped_nixl = grouped_nixl
         self._work = work
         self._retire_native_producers = retire_native_producers
         self._retire_submission = retire_submission
@@ -263,6 +280,7 @@ class PackedTerminalSourceServing:
             self._runtime.publisher_actions.fileno(),
             self._runtime.lifecycle_actions.fileno(),
             self._runtime.observations.fileno(),
+            self._grouped_nixl.fileno(),
         )
 
     def start(self) -> None:
@@ -322,6 +340,7 @@ class PackedTerminalSourceServing:
         consumed = 0
         consumed += self._drain_scheduler_actions()
         consumed += self._drain_source_work_actions()
+        consumed += self._drain_grouped_nixl()
         consumed += self._drain_publisher_actions()
         consumed += self._drain_lifecycle_actions()
         observations = self._runtime.observations.drain()
@@ -356,6 +375,7 @@ class PackedTerminalSourceServing:
             wiring=self._wiring.inventory(),
             scheduler_consumer=self._scheduler_consumer.inventory(),
             scheduler_serving=self._scheduler_serving.inventory(),
+            grouped_nixl=self._grouped_nixl.inventory(),
             owner_dead_marked=owner_dead_marked,
             native_producers_retired=native_producers_retired,
         )
@@ -364,6 +384,7 @@ class PackedTerminalSourceServing:
         """Close admission and join every native and Python producer context."""
 
         self._require_open()
+        self._grouped_nixl.stop_admission()
         self._runtime.stop_admission()
         self._retire_native_producers()
         with self._lock:
@@ -400,8 +421,11 @@ class PackedTerminalSourceServing:
             or len(inventory.wiring.active_binding_digests) != 0
             or len(inventory.scheduler_consumer.active_binding_digests) != 0
             or inventory.scheduler_serving.inbox.live_count != 0
+            or inventory.grouped_nixl.active_group_count != 0
+            or inventory.grouped_nixl.active_transfer_count != 0
         ):
             raise RuntimeError("clean source serving close retains lifecycle authority")
+        self._grouped_nixl.close_clean()
         self._runtime.close_clean()
         self._scheduler_serving.close()
         with self._lock:
@@ -433,6 +457,12 @@ class PackedTerminalSourceServing:
         self.drain_runtime_actions()
         self._scheduler_serving.close_fail_closed()
         inventory = self.inventory()
+        if (
+            inventory.grouped_nixl.active_group_count == 0
+            and inventory.grouped_nixl.active_transfer_count == 0
+            and inventory.grouped_nixl.unowned_handle_count == 0
+        ):
+            self._grouped_nixl.close_clean()
         self._runtime.finish_abort_close()
         with self._lock:
             self._closed = True
@@ -569,6 +599,31 @@ class PackedTerminalSourceServing:
                 raise
         return len(actions)
 
+    def _drain_grouped_nixl(self) -> int:
+        """Commit complete request-level native transfer results.
+
+        This drain runs after source work in the same process reactor. Even if
+        a member completes inside its post call, ``SOURCE_GATHER_POSTED`` is
+        therefore producer-ordered before the aggregate terminal transition.
+
+        :returns: Number of aggregate results committed to native lifecycle.
+        """
+
+        results = self._grouped_nixl.drain()
+        for result in results:
+            try:
+                self._wiring.grouped_native_terminal(result)
+                self._grouped_nixl.acknowledge_result(result)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                logger.error(
+                    "Grouped NIXL lifecycle ingress failed:\n%s",
+                    traceback.format_exc(),
+                )
+                self._mark_owner_dead()
+                self._runtime.begin_abort()
+                raise
+        return len(results)
+
     def _drain_publisher_actions(self) -> int:
         """Transfer publication authority into the dedicated publisher.
 
@@ -601,6 +656,7 @@ class PackedTerminalSourceServing:
         for action in actions:
             if action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL:
                 self._mark_owner_dead()
+                self._work.quarantine(action)
                 if self._aborting:
                     self._runtime.acknowledge_aborted_action(action)
                 else:
@@ -610,6 +666,8 @@ class PackedTerminalSourceServing:
                 self._runtime.acknowledge_aborted_action(action)
                 continue
             try:
+                if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
+                    self._work.quarantine(action)
                 retired = self._wiring.consume_terminal_action(action)
                 if retired is not None:
                     self._retire_submission(retired)

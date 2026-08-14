@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
+
 from sglang.srt.disaggregation.runtime_capabilities import KvTransferProtocol
 
 if TYPE_CHECKING:
     import torch
+
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.server_args import ServerArgs
 
@@ -38,6 +40,7 @@ class KVTransferMetric:
 
 class KVArgs:
     engine_rank: int
+    terminal_request_capacity: int | None
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]

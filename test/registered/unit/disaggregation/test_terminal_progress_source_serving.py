@@ -1,10 +1,16 @@
 import dataclasses
 import hashlib
+import os
 import select
 import sys
 
 import pytest
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
+from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlTerminalOwner,
+    GroupedNixlTerminalOwnerInventory,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -18,6 +24,11 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+)
+from sglang.srt.disaggregation.terminal_progress.nixl_adapter import (
+    NixlTerminalBackendLifecycleInventory,
+    NixlTerminalChannelFatal,
+    NixlTerminalChannelInventory,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
@@ -121,6 +132,105 @@ class _Publisher:
 
         self.values.append(publication)
         return True
+
+
+class _EmptyGroupedNixlOwner(GroupedNixlTerminalOwner):
+    """Nominal empty grouped owner for source-composition tests."""
+
+    _descriptor: int
+    _admission_open: bool
+    _closed: bool
+
+    def __init__(self) -> None:
+        """Create one readable-descriptor-compatible empty owner."""
+
+        self._descriptor = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+        self._admission_open = True
+        self._closed = False
+
+    def fileno(self) -> int:
+        """Return the borrowed process-reactor descriptor.
+
+        :returns: Open nonblocking eventfd.
+        """
+
+        return self._descriptor
+
+    def drain(self) -> tuple[object, ...]:
+        """Return the permanently empty aggregate-result population.
+
+        :returns: Empty result tuple.
+        """
+
+        return ()
+
+    def stop_admission(self) -> None:
+        """Permanently close fixture admission."""
+
+        self._admission_open = False
+
+    def inventory(self) -> GroupedNixlTerminalOwnerInventory:
+        """Return exact-zero grouped and native inventory.
+
+        :returns: Empty immutable inventory.
+        """
+
+        backend = NixlTerminalBackendLifecycleInventory(
+            source_deliveries_outstanding=0,
+            source_local_pending=0,
+            source_receipt_pending=0,
+            destination_pending=0,
+            destination_admitting=0,
+            destination_committed=0,
+            destination_replaying=0,
+            destination_quarantined=0,
+            active_native_deadlines=0,
+            source_deliveries=(),
+            destination_deliveries=(),
+            native_deadlines=(),
+        )
+        native = NixlTerminalChannelInventory(
+            capacity=8,
+            queued_channel_events=0,
+            active_channel_subscriptions=0,
+            retained_public_subscriptions=0,
+            backend_producers=0,
+            active_callback_slots=0,
+            queued_owner_continuations=0,
+            backend_lifecycle=backend,
+            accepting_subscriptions=self._admission_open,
+            closed=self._closed,
+            fatal=NixlTerminalChannelFatal.NONE,
+            eventfd_error=0,
+        )
+        return GroupedNixlTerminalOwnerInventory(
+            native=native,
+            admission_open=self._admission_open,
+            closed=self._closed,
+            active_group_count=0,
+            sealed_group_count=0,
+            pending_result_count=0,
+            acknowledged_result_count=0,
+            active_transfer_count=0,
+            terminal_transfer_count=0,
+            settled_transfer_count=0,
+            quarantined_transfer_count=0,
+            released_transfer_count=0,
+            unowned_handle_count=0,
+        )
+
+    def close_clean(self) -> GroupedNixlTerminalOwnerInventory:
+        """Close the exact-zero fixture owner once.
+
+        :returns: Final clean inventory.
+        """
+
+        if self._closed:
+            raise RuntimeError("empty grouped owner already closed")
+        self._admission_open = False
+        os.close(self._descriptor)
+        self._closed = True
+        return self.inventory()
 
 
 def _identity(*, local_rank: int = 0) -> PackedTerminalSourceIdentityPlan:
@@ -291,10 +401,12 @@ def _serving(
         clock_ns=lambda: 1_000,
         physical_capacity=8,
         process_fatal_handler=fatal_inventories.append,
+        grouped_nixl=_EmptyGroupedNixlOwner(),
         work=PackedTerminalSourceWork(
             post_gather=lambda submission, action: work_labels.append("gather"),
             send_outcomes=lambda submission, action: work_labels.append("outcome"),
             send_ack=lambda submission, action: work_labels.append("ack"),
+            quarantine=lambda action: work_labels.append("quarantine"),
             observe_output=lambda output: None,
         ),
         retire_native_producers=lambda: runtime._owner.retire_python_producer(
