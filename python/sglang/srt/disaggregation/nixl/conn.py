@@ -6,6 +6,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import struct
 import threading
 import time
@@ -110,12 +111,14 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentLocalService,
     TerminalDeploymentRole,
 )
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
 from sglang.srt.disaggregation.terminal_progress.startup_binding import (
     TerminalStartupRankBinding,
     join_terminal_startup_rank,
 )
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
     TerminalStartupCohortRegistry,
+    TerminalStartupRankAdvertisement,
 )
 from sglang.srt.disaggregation.terminal_progress.startup_http import (
     TERMINAL_STARTUP_ROUTE,
@@ -682,6 +685,68 @@ class _NixlPrefillPeer:
     handle: nixl_remote_agent_handle
 
 
+@dataclasses.dataclass(slots=True)
+class _TerminalStartupPeerEnrollment:
+    """Manager-owned cross-role native peer roster for one startup epoch.
+
+    :ivar binding: Exact immutable startup rank binding.
+    :ivar expected_remote_ranks: Canonical cross-role matrix population.
+    :ivar prefill_peers: Decode-owned source peers keyed by static rank.
+    :ivar decoder_peers: Source-owned decoder peers keyed by static rank.
+    :ivar frozen: Whether the complete expected roster has been retained.
+    :ivar lock: Serializes roster validation, publication, and freeze.
+    :ivar frozen_event: Event-driven completion observed by startup composition.
+    """
+
+    binding: TerminalStartupRankBinding
+    expected_remote_ranks: tuple[TerminalStartupRankAdvertisement, ...]
+    prefill_peers: dict[tuple[str, int], _NixlPrefillPeer] = dataclasses.field(
+        default_factory=dict
+    )
+    decoder_peers: dict[tuple[str, int], KVArgsRegisterInfo] = dataclasses.field(
+        default_factory=dict
+    )
+    frozen: bool = False
+    lock: threading.RLock = dataclasses.field(default_factory=threading.RLock)
+    frozen_event: threading.Event = dataclasses.field(default_factory=threading.Event)
+
+    @property
+    def expected_keys(self) -> frozenset[tuple[str, int]]:
+        """Return the exact cross-role static rank keys.
+
+        :returns: Immutable expected service-rank population.
+        """
+
+        return frozenset(rank.key for rank in self.expected_remote_ranks)
+
+    @property
+    def enrolled_keys(self) -> frozenset[tuple[str, int]]:
+        """Return the retained cross-role native rank keys.
+
+        :returns: Immutable retained service-rank population.
+        """
+
+        local_role = self.binding.advertisement.role
+        if local_role is TerminalOwnerRole.SOURCE:
+            return frozenset(self.decoder_peers)
+        return frozenset(self.prefill_peers)
+
+    def freeze_if_complete(self) -> None:
+        """Freeze the roster exactly when every expected peer is retained.
+
+        :raises RuntimeError: If an impossible extra peer entered the roster.
+        """
+
+        enrolled_keys = self.enrolled_keys
+        expected_keys = self.expected_keys
+        if not enrolled_keys.issubset(expected_keys):
+            raise RuntimeError("terminal startup roster contains an unexpected peer")
+        if enrolled_keys != expected_keys:
+            return
+        self.frozen = True
+        self.frozen_event.set()
+
+
 def expand_page_indices_for_slice(
     page_indices: npt.NDArray[np.int32],
     num_ptr_pairs: int,
@@ -797,7 +862,8 @@ class TransferStatus:
 
 
 class NixlKVManager(CommonKVManager):
-    _terminal_startup_binding: TerminalStartupRankBinding | None
+    _terminal_startup_binding: TerminalStartupRankBinding | None = None
+    _terminal_startup_peer_enrollment: _TerminalStartupPeerEnrollment | None = None
 
     def __init__(
         self,
@@ -999,6 +1065,175 @@ class NixlKVManager(CommonKVManager):
         """
 
         return self._terminal_startup_binding
+
+    @property
+    def terminal_peer_enrollment_frozen(self) -> bool:
+        """Return whether every matrix-authorized remote peer is retained.
+
+        :returns: ``True`` only after the exact cross-role roster freezes.
+        """
+
+        enrollment = self._terminal_startup_peer_enrollment
+        return enrollment is not None and enrollment.frozen
+
+    def install_terminal_startup_binding(
+        self,
+        binding: TerminalStartupRankBinding,
+    ) -> None:
+        """Install one sealed matrix as this manager's native peer authority.
+
+        The startup join owns construction of ``binding``. This method proves
+        its local row against the already initialized manager before any full
+        metadata route can create a remote native handle.
+
+        :param binding: Complete generation-authenticated startup rank binding.
+        :raises RuntimeError: If a binding is replaced or local identity drifts.
+        """
+
+        if type(binding) is not TerminalStartupRankBinding:
+            raise TypeError("binding must be TerminalStartupRankBinding")
+        if self._terminal_startup_peer_enrollment is not None:
+            raise RuntimeError("terminal startup binding is already installed")
+        current_binding = self._terminal_startup_binding
+        if current_binding is not None and current_binding != binding:
+            raise RuntimeError("terminal startup binding cannot be replaced")
+
+        local_rank = binding.advertisement
+        expected_role = (
+            TerminalOwnerRole.SOURCE
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else TerminalOwnerRole.DECODE
+        )
+        if local_rank.role is not expected_role:
+            raise RuntimeError("terminal startup binding has another manager role")
+        try:
+            process_generation = uuid.UUID(self.process_generation)
+        except (AttributeError, ValueError) as error:
+            raise RuntimeError("manager process generation is invalid") from error
+        if str(process_generation) != self.process_generation:
+            raise RuntimeError("manager process generation is not canonical")
+        if local_rank.process_generation != process_generation.bytes:
+            raise RuntimeError("terminal startup binding has another generation")
+        if local_rank.nixl_agent_name != self.agent.name:
+            raise RuntimeError("terminal startup binding has another NIXL agent")
+        metadata_digest = hashlib.sha256(self.agent_metadata).digest()
+        if local_rank.nixl_agent_metadata_sha256 != metadata_digest:
+            raise RuntimeError("terminal startup binding has another NIXL metadata")
+        if (
+            local_rank.tensor_parallel_rank != self.attn_tp_rank
+            or local_rank.tensor_parallel_size != self.attn_tp_size
+        ):
+            raise RuntimeError("terminal startup binding has another TP identity")
+
+        remote_role = (
+            TerminalOwnerRole.DECODE
+            if expected_role is TerminalOwnerRole.SOURCE
+            else TerminalOwnerRole.SOURCE
+        )
+        expected_remote_ranks = tuple(
+            rank for rank in binding.matrix.ranks if rank.role is remote_role
+        )
+        if len(expected_remote_ranks) == 0:
+            raise RuntimeError("terminal startup matrix has no cross-role peers")
+        self._terminal_startup_binding = binding
+        self._terminal_startup_peer_enrollment = _TerminalStartupPeerEnrollment(
+            binding=binding,
+            expected_remote_ranks=expected_remote_ranks,
+        )
+
+    def wait_for_terminal_peer_enrollment(self, timeout_seconds: float) -> None:
+        """Wait event-first for the exact cross-role native roster to freeze.
+
+        :param timeout_seconds: Positive finite enrollment deadline.
+        :raises RuntimeError: If enrollment is absent or remains incomplete.
+        """
+
+        if (
+            type(timeout_seconds) is not float
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0.0
+        ):
+            raise ValueError("timeout_seconds must be a positive finite float")
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        if enrollment.frozen_event.wait(timeout_seconds):
+            return
+        with enrollment.lock:
+            enrolled_count = len(enrollment.enrolled_keys)
+            expected_count = len(enrollment.expected_keys)
+        raise RuntimeError(
+            "terminal native peer enrollment did not freeze: "
+            f"{enrolled_count}/{expected_count} peers retained"
+        )
+
+    def _require_terminal_startup_peer_enrollment(
+        self,
+    ) -> _TerminalStartupPeerEnrollment:
+        """Return the installed peer authority for a terminal deployment.
+
+        :returns: Exact mutable-until-frozen manager-owned enrollment.
+        :raises RuntimeError: If composition bypassed binding installation.
+        """
+
+        binding = self.terminal_startup_binding
+        if binding is None:
+            raise RuntimeError("terminal startup binding is not configured")
+        enrollment = self._terminal_startup_peer_enrollment
+        if enrollment is None or enrollment.binding != binding:
+            raise RuntimeError(
+                "terminal startup binding has no manager-owned peer enrollment"
+            )
+        return enrollment
+
+    def _terminal_remote_rank(
+        self,
+        *,
+        agent_name: str,
+        agent_metadata: bytes,
+        process_generation: str,
+        role: TerminalOwnerRole,
+        tensor_parallel_rank: int,
+        tensor_parallel_size: int,
+    ) -> TerminalStartupRankAdvertisement:
+        """Authenticate full native metadata against one sealed matrix row.
+
+        :param agent_name: Native metadata-selected remote agent name.
+        :param agent_metadata: Complete remote NIXL agent metadata.
+        :param process_generation: Canonical remote process generation.
+        :param role: Required cross-role owner role.
+        :param tensor_parallel_rank: Remote rank within its service.
+        :param tensor_parallel_size: Exact remote service TP width.
+        :returns: Sole matching static-member-bound matrix row.
+        :raises RuntimeError: If any full-metadata identity field differs.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        try:
+            canonical_name = validate_nixl_agent_name(agent_name)
+            canonical_metadata = validate_nixl_agent_metadata(agent_metadata)
+        except ValueError as error:
+            raise RuntimeError("terminal remote NIXL identity is invalid") from error
+        canonical_generation = self._canonical_process_generation(process_generation)
+        generation_bytes = uuid.UUID(canonical_generation).bytes
+        metadata_digest = hashlib.sha256(canonical_metadata).digest()
+        matches = tuple(
+            rank
+            for rank in enrollment.expected_remote_ranks
+            if rank.nixl_agent_name == canonical_name
+        )
+        if len(matches) != 1:
+            raise RuntimeError("terminal remote agent is absent from sealed matrix")
+        rank = matches[0]
+        if (
+            rank.role is not role
+            or rank.process_generation != generation_bytes
+            or rank.nixl_agent_metadata_sha256 != metadata_digest
+            or rank.tensor_parallel_rank != tensor_parallel_rank
+            or rank.tensor_parallel_size != tensor_parallel_size
+        ):
+            raise RuntimeError(
+                "terminal full-metadata peer differs from sealed matrix identity"
+            )
+        return rank
 
     def _join_terminal_startup_cohort(self) -> TerminalStartupRankBinding | None:
         """Freeze complete native membership before any manager thread starts.
@@ -1283,6 +1518,89 @@ class NixlKVManager(CommonKVManager):
             advertisement.visibility_policy_digest,
             advertisement.runtime_cohort_digest,
             str(advertisement.page_size).encode("ascii"),
+        )
+
+    def _decode_registration_frames(self) -> tuple[bytes, ...]:
+        """Serialize this decoder's complete process-lifetime registration.
+
+        :returns: Exact guarded multipart frames accepted by source managers.
+        :raises RuntimeError: If a terminal decoder is not fully initialized.
+        """
+
+        packed_kv_data_ptrs = b"".join(
+            struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
+        )
+        packed_kv_data_mem_kinds = _pack_kv_mem_kinds(
+            self.kv_args.kv_data_mem_kinds
+        )
+        packed_kv_item_lens = b"".join(
+            struct.pack("Q", item_len) for item_len in self.kv_args.kv_item_lens
+        )
+        packed_kv_layer_ids = b"".join(
+            struct.pack("I", layer_id) for layer_id in self.kv_args.kv_layer_ids
+        )
+        packed_aux_data_ptrs = b"".join(
+            struct.pack("Q", ptr) for ptr in self.kv_args.aux_data_ptrs
+        )
+        packed_state_data_ptrs = pack_int_lists(
+            self.kv_args.state_data_ptrs or [], "Q"
+        )
+        packed_state_item_lens = pack_int_lists(
+            self.kv_args.state_item_lens or [], "I"
+        )
+        packed_state_dim_per_tensor = pack_int_lists(
+            self.kv_args.state_dim_per_tensor or [], "I"
+        )
+        packed_state_layer_ids = pack_int_lists(
+            self.kv_args.state_layer_ids, "I"
+        )
+        if self.enable_staging and self._staging_ctx.allocator is not None:
+            allocator = self._staging_ctx.allocator
+            packed_staging_base_ptr = struct.pack("Q", allocator.get_base_ptr())
+            staging_total_size = str(allocator.get_total_size()).encode("ascii")
+        else:
+            packed_staging_base_ptr = b""
+            staging_total_size = b""
+        if len(self.kv_args.kv_item_lens) > 0:
+            dst_kv_item_len = self.kv_args.kv_item_lens[0]
+            dst_num_slots = self.kv_args.kv_data_lens[0] // dst_kv_item_len
+        else:
+            dst_kv_item_len = 0
+            dst_num_slots = 0
+
+        packed_registration_frames = self._packed_decode_registration_frames()
+        if (
+            self.terminal_startup_binding is not None
+            and len(packed_registration_frames) == 0
+        ):
+            raise RuntimeError(
+                "terminal decoder enrollment requires a ready packed controller"
+            )
+        return (
+            GUARD,
+            b"None",
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            self.agent.name.encode("ascii"),
+            self.agent_metadata,
+            packed_kv_data_ptrs,
+            packed_aux_data_ptrs,
+            packed_state_data_ptrs,
+            str(self.kv_args.gpu_id).encode("ascii"),
+            str(self.attn_tp_size).encode("ascii"),
+            str(self.kv_args.engine_rank).encode("ascii"),
+            str(dst_kv_item_len).encode("ascii"),
+            packed_state_item_lens,
+            packed_state_dim_per_tensor,
+            packed_staging_base_ptr,
+            staging_total_size,
+            str(dst_num_slots).encode("ascii"),
+            packed_kv_data_mem_kinds,
+            packed_kv_item_lens,
+            packed_state_layer_ids,
+            packed_kv_layer_ids,
+            self.process_generation.encode("ascii"),
+            *packed_registration_frames,
         )
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
@@ -2622,6 +2940,207 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("NIXL peer process generation is not canonical")
         return value
 
+    def _terminal_prefill_rank_for_route(
+        self,
+        bootstrap_info: dict[str, object],
+    ) -> TerminalStartupRankAdvertisement:
+        """Authenticate one complete source route against the startup matrix.
+
+        :param bootstrap_info: Full source rank route from the bootstrap service.
+        :returns: Exact matrix row proved by the route.
+        :raises RuntimeError: If topology or native identity differs.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        if enrollment.binding.advertisement.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("only a terminal decoder enrolls prefill routes")
+        if bootstrap_info.get("transport_protocol") != NIXL_BOOTSTRAP_PEER_PROTOCOL:
+            raise RuntimeError("terminal prefill route has no native NIXL identity")
+        if bootstrap_info.get("is_dummy", False) is not False:
+            raise RuntimeError(
+                "terminal startup enrollment does not admit dummy routes"
+            )
+
+        normalized_ranks: dict[str, int] = {}
+        for field_name in (
+            "attn_dp_rank",
+            "attn_cp_rank",
+            "attn_tp_rank",
+            "pp_rank",
+            "transfer_source_rank",
+        ):
+            try:
+                normalized_ranks[field_name] = validate_serialized_rank(
+                    bootstrap_info.get(field_name), field_name
+                )
+            except ValueError as error:
+                raise RuntimeError(
+                    f"terminal prefill route has invalid {field_name}"
+                ) from error
+        if (
+            normalized_ranks["attn_dp_rank"] != 0
+            or normalized_ranks["attn_cp_rank"] != 0
+            or normalized_ranks["pp_rank"] != 0
+            or normalized_ranks["transfer_source_rank"]
+            != normalized_ranks["attn_tp_rank"]
+        ):
+            raise RuntimeError("terminal prefill route is not exact DP1/CP1/PP1 TP")
+
+        try:
+            agent_name = validate_nixl_agent_name(
+                bootstrap_info.get("nixl_agent_name")
+            )
+            agent_metadata = decode_nixl_agent_metadata(
+                bootstrap_info.get("nixl_agent_metadata")
+            )
+        except ValueError as error:
+            raise RuntimeError("terminal prefill route identity is invalid") from error
+        advertised_digest = bootstrap_info.get("nixl_agent_metadata_sha256")
+        actual_digest = hashlib.sha256(agent_metadata).hexdigest()
+        if advertised_digest != actual_digest:
+            raise RuntimeError("terminal prefill route metadata digest mismatch")
+
+        matches = tuple(
+            rank
+            for rank in enrollment.expected_remote_ranks
+            if rank.nixl_agent_name == agent_name
+        )
+        if len(matches) != 1:
+            raise RuntimeError("terminal prefill route is absent from sealed matrix")
+        expected_rank = matches[0]
+        return self._terminal_remote_rank(
+            agent_name=agent_name,
+            agent_metadata=agent_metadata,
+            process_generation=self._canonical_process_generation(
+                bootstrap_info.get("process_generation")
+            ),
+            role=TerminalOwnerRole.SOURCE,
+            tensor_parallel_rank=normalized_ranks["attn_tp_rank"],
+            tensor_parallel_size=expected_rank.tensor_parallel_size,
+        )
+
+    def enroll_terminal_prefill_routes(
+        self,
+        bootstrap_addr: str,
+        bootstrap_infos: tuple[dict[str, object], ...],
+    ) -> tuple[_NixlPrefillPeer, ...]:
+        """Load every source peer and send this decoder registration once.
+
+        All routes are authenticated before the first native handle or network
+        send is created. The local source roster freezes only after every full
+        decoder registration has been issued successfully.
+
+        :param bootstrap_addr: Exact source-owned bootstrap service address.
+        :param bootstrap_infos: Canonical full-metadata source rank routes.
+        :returns: Canonically ordered retained source peers.
+        :raises RuntimeError: If membership is incomplete, stale, or already frozen.
+        """
+
+        if type(bootstrap_addr) is not str or len(bootstrap_addr) == 0:
+            raise ValueError("bootstrap_addr must be nonempty")
+        if type(bootstrap_infos) is not tuple or len(bootstrap_infos) == 0:
+            raise ValueError("bootstrap_infos must be a nonempty tuple")
+        if any(type(info) is not dict for info in bootstrap_infos):
+            raise TypeError("bootstrap_infos must contain dictionaries")
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        if enrollment.binding.advertisement.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("only a terminal decoder enrolls prefill routes")
+        with enrollment.lock:
+            if enrollment.frozen:
+                raise RuntimeError("terminal native peer roster is frozen")
+            if len(enrollment.prefill_peers) > 0:
+                raise RuntimeError("terminal prefill routes were already enrolled")
+
+        authenticated = tuple(
+            (self._terminal_prefill_rank_for_route(info), info)
+            for info in bootstrap_infos
+        )
+        authenticated_keys = tuple(rank.key for rank, _ in authenticated)
+        expected_keys = tuple(rank.key for rank in enrollment.expected_remote_ranks)
+        if authenticated_keys != expected_keys:
+            raise RuntimeError(
+                "terminal prefill routes differ from the canonical matrix roster"
+            )
+
+        peers = tuple(
+            self._load_prefill_peer(bootstrap_addr, info)
+            for _, info in authenticated
+        )
+        registration_frames = self._decode_registration_frames()
+        for _, bootstrap_info in authenticated:
+            self._send_terminal_decoder_registration(
+                bootstrap_info,
+                registration_frames,
+            )
+
+        with enrollment.lock:
+            if enrollment.frozen or len(enrollment.prefill_peers) > 0:
+                raise RuntimeError("terminal prefill enrollment changed concurrently")
+            enrollment.prefill_peers.update(
+                (rank.key, peer)
+                for (rank, _), peer in zip(authenticated, peers, strict=True)
+            )
+            enrollment.freeze_if_complete()
+            if not enrollment.frozen:
+                raise RuntimeError("complete terminal prefill roster did not freeze")
+        return peers
+
+    def _send_terminal_decoder_registration(
+        self,
+        bootstrap_info: dict[str, object],
+        frames: tuple[bytes, ...],
+    ) -> None:
+        """Send one immutable decoder registration to one source rank.
+
+        :param bootstrap_info: Already authenticated source rank route.
+        :param frames: Complete guarded registration frames.
+        """
+
+        rank_ip = bootstrap_info.get("rank_ip")
+        rank_port = bootstrap_info.get("rank_port")
+        if type(rank_ip) is not str or len(rank_ip) == 0:
+            raise RuntimeError("terminal prefill route has no rank address")
+        if type(rank_port) is not int or not 1 <= rank_port <= 65535:
+            raise RuntimeError("terminal prefill route has an invalid rank port")
+        address = NetworkAddress(rank_ip, rank_port)
+        with self._packed_control_send_lock:
+            socket = self._connect(address.to_tcp(), is_ipv6=address.is_ipv6)
+            socket.send_multipart(frames)
+
+    def _resolve_terminal_prefill_peer(
+        self,
+        bootstrap_addr: str,
+        bootstrap_info: dict[str, object],
+    ) -> _NixlPrefillPeer:
+        """Resolve one request route without creating any native authority.
+
+        :param bootstrap_addr: Exact enrolled bootstrap service address.
+        :param bootstrap_info: Full source route selected for this request.
+        :returns: Previously retained immutable source peer.
+        :raises RuntimeError: If enrollment is open or route identity drifts.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        rank = self._terminal_prefill_rank_for_route(bootstrap_info)
+        with enrollment.lock:
+            if not enrollment.frozen:
+                raise RuntimeError("terminal native peer roster is not frozen")
+            peer = enrollment.prefill_peers.get(rank.key)
+            if peer is None:
+                raise RuntimeError("terminal prefill peer was not pre-enrolled")
+            if peer.bootstrap_addr != bootstrap_addr:
+                raise RuntimeError("terminal prefill route changed bootstrap authority")
+            if (
+                peer.agent_name != rank.nixl_agent_name
+                or peer.process_generation
+                != str(uuid.UUID(bytes=rank.process_generation))
+                or peer.metadata_sha256 != rank.nixl_agent_metadata_sha256.hex()
+            ):
+                raise RuntimeError("terminal prefill peer differs from frozen roster")
+            if peer.handle in self._quarantined_remote_handles:
+                raise RuntimeError("terminal prefill peer is quarantined")
+            return peer
+
     def _load_prefill_peer(
         self, bootstrap_addr: str, bootstrap_info: dict[str, object]
     ) -> _NixlPrefillPeer:
@@ -3036,6 +3555,61 @@ class NixlKVManager(CommonKVManager):
         return handle
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo) -> None:
+        """Retain one decoder peer under legacy or sealed startup authority.
+
+        :param decode_kv_args: Complete decoder registration.
+        """
+
+        if self.terminal_startup_binding is None:
+            self._retain_decoder_peer(decode_kv_args)
+            return
+        self.enroll_terminal_decoder_peer(decode_kv_args)
+
+    def enroll_terminal_decoder_peer(
+        self,
+        decode_kv_args: KVArgsRegisterInfo,
+    ) -> None:
+        """Authenticate, retain, and roster one startup decoder rank.
+
+        :param decode_kv_args: Complete full-metadata decoder registration.
+        :raises RuntimeError: If the rank is stale, duplicate, or post-freeze.
+        """
+
+        if type(decode_kv_args) is not KVArgsRegisterInfo:
+            raise TypeError("decode_kv_args must be KVArgsRegisterInfo")
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        if enrollment.binding.advertisement.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("only a terminal source enrolls decoder peers")
+        rank = self._terminal_remote_rank(
+            agent_name=decode_kv_args.agent_name,
+            agent_metadata=decode_kv_args.agent_metadata,
+            process_generation=decode_kv_args.process_generation,
+            role=TerminalOwnerRole.DECODE,
+            tensor_parallel_rank=decode_kv_args.decode_tp_rank,
+            tensor_parallel_size=decode_kv_args.decode_tp_size,
+        )
+        with enrollment.lock:
+            if enrollment.frozen:
+                raise RuntimeError("terminal native peer roster is frozen")
+            if rank.key in enrollment.decoder_peers:
+                raise RuntimeError("terminal decoder rank was enrolled more than once")
+
+        self._retain_decoder_peer(decode_kv_args)
+        retained = self.decode_kv_args_table.get(decode_kv_args.agent_name)
+        if retained is None or retained.remote_handle is None:
+            raise RuntimeError("terminal decoder native peer was not retained")
+        with enrollment.lock:
+            if enrollment.frozen or rank.key in enrollment.decoder_peers:
+                raise RuntimeError("terminal decoder enrollment changed concurrently")
+            enrollment.decoder_peers[rank.key] = retained
+            enrollment.freeze_if_complete()
+
+    def _retain_decoder_peer(self, decode_kv_args: KVArgsRegisterInfo) -> None:
+        """Create or resolve one validated decoder native handle.
+
+        :param decode_kv_args: Complete decoder registration.
+        """
+
         try:
             agent_name = validate_nixl_agent_name(decode_kv_args.agent_name)
             agent_metadata = validate_nixl_agent_metadata(decode_kv_args.agent_metadata)
@@ -5244,9 +5818,15 @@ class NixlKVReceiver(CommonKVReceiver):
         source_ranks: set[int] = set()
         with self.kv_mgr._prefill_peer_lock:
             for bootstrap_info in self.bootstrap_infos:
-                peer = self.kv_mgr._load_prefill_peer(
-                    self.bootstrap_addr, bootstrap_info
-                )
+                if self.kv_mgr.terminal_startup_binding is None:
+                    peer = self.kv_mgr._load_prefill_peer(
+                        self.bootstrap_addr, bootstrap_info
+                    )
+                else:
+                    peer = self.kv_mgr._resolve_terminal_prefill_peer(
+                        self.bootstrap_addr,
+                        bootstrap_info,
+                    )
                 if peer.handle in handles:
                     raise RuntimeError("Duplicate native prefill peer in writer cohort")
                 if peer.transfer_source_rank in source_ranks:
@@ -5509,6 +6089,20 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self) -> bool:
+        if self.kv_mgr.terminal_startup_binding is not None:
+            try:
+                self._load_bootstrap_peers()
+            except Exception:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Failed to resolve the frozen NIXL prefill writer cohort:\n"
+                    f"{traceback.format_exc()}",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+            return True
+
         try:
             self._load_bootstrap_peers()
         except Exception:
@@ -5521,93 +6115,18 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return False
 
+        registration_frames = self.kv_mgr._decode_registration_frames()
         for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_kv_data_mem_kinds = _pack_kv_mem_kinds(
-                self.kv_mgr.kv_args.kv_data_mem_kinds
-            )
-            packed_kv_item_lens = b"".join(
-                struct.pack("Q", item_len)
-                for item_len in self.kv_mgr.kv_args.kv_item_lens
-            )
-            packed_kv_layer_ids = b"".join(
-                struct.pack("I", layer_id)
-                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            packed_state_data_ptrs = pack_int_lists(
-                self.kv_mgr.kv_args.state_data_ptrs or [], "Q"
-            )
-            packed_state_item_lens = pack_int_lists(
-                self.kv_mgr.kv_args.state_item_lens or [], "I"
-            )
-            packed_state_dim_per_tensor = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
-            )
-            packed_state_layer_ids = pack_int_lists(
-                self.kv_mgr.kv_args.state_layer_ids, "I"
-            )
-
-            # Include staging allocator metadata if available
-            if (
-                self.kv_mgr.enable_staging
-                and self.kv_mgr._staging_ctx.allocator is not None
-            ):
-                _alloc = self.kv_mgr._staging_ctx.allocator
-                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
-                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
-            else:
-                packed_staging_base_ptr = b""
-                staging_total_size_str = b""
-            if self.kv_mgr.kv_args.kv_item_lens:
-                dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-                dst_num_slots = self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
-            else:
-                dst_kv_item_len = 0
-                dst_num_slots = 0
-
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            packed_registration_frames = (
-                self.kv_mgr._packed_decode_registration_frames()
-            )
             try:
                 with lock:
-                    sock.send_multipart(
-                        [
-                            GUARD,
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.kv_mgr.agent.name.encode("ascii"),
-                            self.kv_mgr.agent_metadata,
-                            packed_kv_data_ptrs,
-                            packed_aux_data_ptrs,
-                            packed_state_data_ptrs,
-                            str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                            str(self.kv_mgr.attn_tp_size).encode("ascii"),
-                            str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                            str(dst_kv_item_len).encode("ascii"),
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
-                            str(dst_num_slots).encode("ascii"),
-                            packed_kv_data_mem_kinds,
-                            packed_kv_item_lens,
-                            packed_state_layer_ids,
-                            packed_kv_layer_ids,
-                            self.kv_mgr.process_generation.encode("ascii"),
-                            *packed_registration_frames,
-                        ]
-                    )
+                    sock.send_multipart(registration_frames)
             except zmq.ZMQError:
+                rank_ip = bootstrap_info.get("rank_ip")
+                rank_port = bootstrap_info.get("rank_port")
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                    f"_register_kv_args to prefill {rank_ip}:{rank_port} failed",
                 )
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
