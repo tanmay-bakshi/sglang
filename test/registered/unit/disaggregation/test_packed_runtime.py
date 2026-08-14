@@ -1949,9 +1949,41 @@ def test_prefill_terminal_failure_keeps_exact_quarantine_inventory() -> None:
         NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         6,
     )
+    settled: list[tuple[str, object, NativeTerminalOwnerAction]] = []
 
-    runtime.quarantine_terminal_owner_request(action, "synthetic ambiguity")
-    runtime.quarantine_terminal_owner_request(action, "duplicate observation")
+    def settle_main(lane: object, exact_action: NativeTerminalOwnerAction) -> None:
+        """Record one exact main-lane failure settlement.
+
+        :param lane: Exact retained main lane.
+        :param exact_action: Matching quarantine authority.
+        """
+
+        settled.append(("main", lane, exact_action))
+
+    def settle_auxiliary(
+        handle: object,
+        exact_action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Record one exact auxiliary-handle failure settlement.
+
+        :param handle: Exact retained canonical auxiliary handle.
+        :param exact_action: Matching quarantine authority.
+        """
+
+        settled.append(("auxiliary", handle, exact_action))
+
+    runtime.quarantine_terminal_owner_request(
+        action,
+        "synthetic ambiguity",
+        settle_main,
+        settle_auxiliary,
+    )
+    runtime.quarantine_terminal_owner_request(
+        action,
+        "duplicate observation",
+        settle_main,
+        settle_auxiliary,
+    )
 
     inventory = runtime.terminal_owner_inventory()
     assert inventory.active_bindings == (identity.local_binding.digest,)
@@ -1959,6 +1991,10 @@ def test_prefill_terminal_failure_keeps_exact_quarantine_inventory() -> None:
     assert inventory.main_handle_bindings == (identity.local_binding.digest,)
     assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
     assert inventory.lane_bindings == (identity.local_binding.digest,)
+    assert settled == [
+        ("main", record.main_lane, action),
+        ("auxiliary", record.auxiliary_handle, action),
+    ]
     assert manager.failures == [(record.chunk_key.room_id, "synthetic ambiguity")]
     with pytest.raises(RuntimeError, match="cannot retire"):
         runtime.retire_terminal_owner_request(
