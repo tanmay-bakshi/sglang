@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import hashlib
 import socket
@@ -5,8 +6,11 @@ import time
 import uuid
 
 import requests
-
 from sglang.srt.disaggregation.nixl.conn import NixlKVBootstrapServer
+from sglang.srt.disaggregation.nixl.startup_source_roster import (
+    TERMINAL_NIXL_SOURCE_ROSTER_ROUTE,
+    fetch_terminal_nixl_source_roster,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
 from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
     TerminalStartupCohortExpectation,
@@ -176,5 +180,90 @@ def test_unconfigured_bootstrap_has_no_terminal_startup_route() -> None:
             timeout=0.2,
         )
         assert response.status_code == 404
+    finally:
+        server.close()
+
+
+def test_decoder_fetches_one_event_driven_complete_source_roster() -> None:
+    """A decoder receives the matrix-bound source route only after publication."""
+
+    expectation = _expectation()
+    registry = TerminalStartupCohortRegistry(expectation, timeout_seconds=2.0)
+    port = _free_port()
+    server = NixlKVBootstrapServer(
+        host="127.0.0.1",
+        port=port,
+        terminal_startup_registry=registry,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    join_endpoint = f"{base_url}{TERMINAL_STARTUP_ROUTE}"
+    roster_endpoint = f"{base_url}{TERMINAL_NIXL_SOURCE_ROSTER_ROUTE}"
+    source = _advertisement(expectation.services[0], 101)
+    decode = _advertisement(expectation.services[1], 102)
+    try:
+        _wait_for_server(base_url)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            source_join = executor.submit(
+                join_terminal_startup_cohort,
+                join_endpoint,
+                source,
+                2.0,
+            )
+            decode_join = executor.submit(
+                join_terminal_startup_cohort,
+                join_endpoint,
+                decode,
+                2.0,
+            )
+            matrix = decode_join.result(timeout=2.0)
+            assert source_join.result(timeout=2.0) == matrix
+
+            roster_future = executor.submit(
+                fetch_terminal_nixl_source_roster,
+                roster_endpoint,
+                decode,
+                matrix,
+                "nixl-peer-handle-v1",
+                2.0,
+            )
+            time.sleep(0.02)
+            assert not roster_future.done()
+            metadata = source.nixl_agent_name.encode("ascii")
+            response = requests.put(
+                f"{base_url}/route",
+                json={
+                    "attn_tp_size": 1,
+                    "attn_tp_rank": 0,
+                    "attn_cp_size": 1,
+                    "attn_cp_rank": 0,
+                    "attn_dp_size": 1,
+                    "attn_dp_rank": 0,
+                    "pp_size": 1,
+                    "pp_rank": 0,
+                    "system_dp_size": 1,
+                    "system_dp_rank": 0,
+                    "rank_ip": "127.0.0.1",
+                    "rank_port": 33000,
+                    "page_size": 64,
+                    "kv_cache_dtype": "fp8_e4m3",
+                    "load_balance_method": "follow_bootstrap_room",
+                    "enable_dsa_cache_layer_split": False,
+                    "prefill_http_port": 32000,
+                    "transport_protocol": "nixl-peer-handle-v1",
+                    "nixl_agent_name": source.nixl_agent_name,
+                    "nixl_agent_metadata": base64.b64encode(metadata).decode("ascii"),
+                    "nixl_agent_metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+                    "process_generation": str(
+                        uuid.UUID(bytes=source.process_generation)
+                    ),
+                    "transfer_source_rank": 0,
+                },
+                timeout=0.5,
+            )
+            assert response.status_code == 200
+            roster = roster_future.result(timeout=2.0)
+        assert len(roster.routes) == 1
+        assert roster.routes[0].nixl_agent_metadata == metadata
+        assert roster.routes[0].bootstrap_info()["attn_tp_rank"] == 0
     finally:
         server.close()

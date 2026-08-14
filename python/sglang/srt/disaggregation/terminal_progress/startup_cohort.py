@@ -566,6 +566,47 @@ class TerminalStartupCohortRegistry:
 
         return self._expectation
 
+    @property
+    def timeout_seconds(self) -> float:
+        """Return the hash-bound startup control deadline.
+
+        :returns: Positive finite timeout in seconds.
+        """
+
+        return self._timeout_seconds
+
+    def sealed_matrix_for(
+        self,
+        advertisement: TerminalStartupRankAdvertisement,
+    ) -> TerminalStartupCohortMatrix:
+        """Authenticate one exact rank against the already sealed matrix.
+
+        This accessor cannot join, replace, or otherwise mutate membership. It
+        lets later startup phases reuse the original generation authority.
+
+        :param advertisement: Exact rank requesting a later startup phase.
+        :returns: Complete immutable observed matrix.
+        :raises TerminalStartupCohortError: If the cohort is unsealed or differs.
+        """
+
+        if type(advertisement) is not TerminalStartupRankAdvertisement:
+            raise TypeError("advertisement must be TerminalStartupRankAdvertisement")
+        with self._condition:
+            if self._disposition is TerminalStartupCohortDisposition.FAILED:
+                self._raise_failure_locked()
+            if (
+                self._disposition is not TerminalStartupCohortDisposition.SEALED
+                or self._matrix is None
+            ):
+                raise TerminalStartupCohortError(
+                    "terminal startup cohort is not sealed"
+                )
+            if self._matrix.rank(*advertisement.key) != advertisement:
+                raise TerminalStartupCohortError(
+                    "startup phase requester differs from the sealed matrix"
+                )
+            return self._matrix
+
     def register_and_wait(
         self,
         advertisement: TerminalStartupRankAdvertisement,

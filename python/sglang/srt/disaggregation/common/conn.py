@@ -364,6 +364,14 @@ class CommonKVManager(BaseKVManager):
 
         del metadata_allocator, consumer_authority
 
+    def activate_terminal_startup(self) -> None:
+        """Complete immutable terminal membership before service readiness.
+
+        Transfer managers without the packed terminal protocol have no second
+        startup phase. The NIXL manager overrides this boundary when a terminal
+        deployment cohort is configured.
+        """
+
     def prepare_packed_decode_request_transaction(
         self,
         *,
@@ -821,8 +829,15 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
-    def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP PUT."""
+    def register_to_bootstrap(self, max_attempts: int = 5) -> None:
+        """Register prefill server info to bootstrap server via HTTP PUT.
+
+        :param max_attempts: Bounded transport attempts. Immutable terminal
+            startup uses one attempt after listener liveness is established.
+        """
+
+        if type(max_attempts) is not int or max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -864,9 +879,9 @@ class CommonKVManager(BaseKVManager):
         }
         payload.update(self._bootstrap_transport_registration())
 
-        max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        initial_delay, max_delay = 1.0, 30.0
         last_failure = "bootstrap registration was not attempted"
-        for attempt in range(max_retries):
+        for attempt in range(max_attempts):
             try:
                 response = requests.put(url, json=payload, timeout=5)
                 if response.status_code == 200:
@@ -876,7 +891,7 @@ class CommonKVManager(BaseKVManager):
                 logger.warning(
                     "Prefill register attempt %d/%d failed: %s",
                     attempt + 1,
-                    max_retries,
+                    max_attempts,
                     last_failure,
                 )
             except requests.RequestException as error:
@@ -884,11 +899,11 @@ class CommonKVManager(BaseKVManager):
                 logger.warning(
                     "Prefill register attempt %d/%d failed: %s",
                     attempt + 1,
-                    max_retries,
+                    max_attempts,
                     last_failure,
                     exc_info=True,
                 )
-            if attempt == max_retries - 1:
+            if attempt == max_attempts - 1:
                 break
             delay = min(initial_delay * (2**attempt), max_delay) * (
                 0.75 + 0.25 * (time.monotonic() % 1)
@@ -896,7 +911,7 @@ class CommonKVManager(BaseKVManager):
             time.sleep(delay)
         raise RuntimeError(
             "Prefill instance failed to register to bootstrap server after "
-            f"{max_retries} attempts: {last_failure}"
+            f"{max_attempts} attempts: {last_failure}"
         )
 
     def _bootstrap_transport_registration(self) -> dict[str, object]:
@@ -1890,16 +1905,20 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self,
         host: str,
         port: int,
-        additional_post_route: BootstrapPostRoute | None = None,
+        additional_post_routes: tuple[BootstrapPostRoute, ...] = (),
     ):
         self.host = host
         self.port = port
-        if (
-            additional_post_route is not None
-            and type(additional_post_route) is not BootstrapPostRoute
+        if type(additional_post_routes) is not tuple or any(
+            type(route) is not BootstrapPostRoute for route in additional_post_routes
         ):
-            raise TypeError("additional_post_route must be BootstrapPostRoute")
-        self.additional_post_route = additional_post_route
+            raise TypeError(
+                "additional_post_routes must contain BootstrapPostRoute values"
+            )
+        route_paths = tuple(route.path for route in additional_post_routes)
+        if len(set(route_paths)) != len(route_paths):
+            raise ValueError("bootstrap POST route paths must be unique")
+        self.additional_post_routes = additional_post_routes
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -1988,10 +2007,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
-        if self.additional_post_route is not None:
+        for additional_post_route in self.additional_post_routes:
             self.app.router.add_post(
-                self.additional_post_route.path,
-                self.additional_post_route.handler,
+                additional_post_route.path,
+                additional_post_route.handler,
             )
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
