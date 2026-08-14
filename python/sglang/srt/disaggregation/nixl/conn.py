@@ -107,6 +107,12 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedDestinationRegistration,
     PackedPeerIdentity,
 )
+from sglang.srt.disaggregation.nixl.source_publication_control import (
+    TERMINAL_SOURCE_PUBLICATION_RECEIPT_TAG,
+    TerminalSourcePublicationControl,
+    TerminalSourcePublicationDelivery,
+    TerminalSourcePublicationRouteRoster,
+)
 from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
     build_terminal_startup_enrollment_ack,
@@ -886,8 +892,6 @@ class NixlTerminalRuntimeInstallation:
         generations and every derived process queue.
     :ivar gateway_endpoint: Canonical source-rank gateway PUSH endpoint.
     :ivar source_work: Source-only actor and transport continuation callbacks.
-    :ivar source_publication_fanout: Source-rank-zero result fan-out to the
-        other source ranks, if the source service has TP greater than one.
     :ivar send_decode_delivery: Decode-only authenticated terminal delivery.
     :ivar bind_source_serving: Source-only scheduler serving installation.
     :ivar bind_decode_serving: Decode-only scheduler and preallocation-queue
@@ -901,7 +905,6 @@ class NixlTerminalRuntimeInstallation:
     physical_capacity: int
     gateway_endpoint: str | None
     source_work: PackedTerminalSourceWork | None
-    source_publication_fanout: Callable[[TerminalGatewayPublicationResult], None] | None
     send_decode_delivery: Callable[[PackedTerminalDecodeWireDelivery], None] | None
     bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None
     bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None
@@ -923,7 +926,6 @@ class NixlTerminalRuntimeInstallation:
         ):
             raise TypeError("source_work must be PackedTerminalSourceWork or None")
         callbacks = (
-            self.source_publication_fanout,
             self.send_decode_delivery,
             self.bind_source_serving,
             self.bind_decode_serving,
@@ -1074,6 +1076,7 @@ class TransferStatus:
 class NixlKVManager(CommonKVManager):
     _terminal_startup_binding: TerminalStartupRankBinding | None = None
     _terminal_startup_peer_enrollment: _TerminalStartupPeerEnrollment | None = None
+    _terminal_source_publication_control: TerminalSourcePublicationControl | None = None
 
     def __init__(
         self,
@@ -1084,6 +1087,7 @@ class NixlKVManager(CommonKVManager):
     ):
         self._terminal_startup_binding = None
         self._terminal_startup_peer_enrollment = None
+        self._terminal_source_publication_control = None
         self._terminal_runtime_activated = threading.Event()
         self._terminal_activation_lock = threading.Lock()
         self._terminal_activation_started = False
@@ -1339,6 +1343,18 @@ class NixlKVManager(CommonKVManager):
         return self._terminal_startup_binding
 
     @property
+    def terminal_source_publication_control(
+        self,
+    ) -> TerminalSourcePublicationControl | None:
+        """Return the direct source-rank publication route owner.
+
+        :returns: Startup-enrolled source control, or ``None`` outside a
+            terminal source deployment.
+        """
+
+        return self._terminal_source_publication_control
+
+    @property
     def terminal_peer_enrollment_frozen(self) -> bool:
         """Return whether every matrix-authorized remote peer is retained.
 
@@ -1389,13 +1405,6 @@ class NixlKVManager(CommonKVManager):
                     raise ValueError(
                         "canonical terminal source requires a gateway endpoint"
                     )
-                if (
-                    local.tensor_parallel_size > 1
-                    and installation.source_publication_fanout is None
-                ):
-                    raise ValueError(
-                        "multi-rank terminal source requires publication fan-out"
-                    )
             elif installation.gateway_endpoint is not None:
                 raise ValueError(
                     "noncanonical terminal source cannot own a gateway endpoint"
@@ -1406,10 +1415,6 @@ class NixlKVManager(CommonKVManager):
             if installation.gateway_endpoint is not None:
                 raise ValueError(
                     "terminal decode installation cannot own a gateway endpoint"
-                )
-            if installation.source_publication_fanout is not None:
-                raise ValueError(
-                    "terminal decode installation cannot own source publication"
                 )
             if installation.send_decode_delivery is None:
                 raise ValueError(
@@ -1518,6 +1523,9 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError(
                 "source request-ready issuer is absent from sealed startup"
             )
+        publication_control = self._terminal_source_publication_control
+        if publication_control is None:
+            raise RuntimeError("source publication control is unavailable")
 
         runtime.bind_terminal_owner(transport, identity)
         importer.register_binding(identity.local_binding)
@@ -1533,6 +1541,14 @@ class NixlKVManager(CommonKVManager):
                     "source serving bind failed after lifecycle commit",
                     traceback.format_exc(),
                 )
+            raise
+        try:
+            publication_control.register_binding(identity.local_binding)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._record_terminal_component_failure(
+                "source publication binding failed after lifecycle commit",
+                traceback.format_exc(),
+            )
             raise
         try:
             runtime.publish_terminal_owner_prepare(transport)
@@ -1814,6 +1830,69 @@ class NixlKVManager(CommonKVManager):
         )
         return roster
 
+    def _enroll_terminal_source_publication_routes(
+        self,
+        deadline: float,
+    ) -> TerminalSourcePublicationControl:
+        """Fetch and freeze direct same-service source control listeners.
+
+        :param deadline: Absolute monotonic startup deadline.
+        :returns: Process-local publication route owner.
+        :raises RuntimeError: If this rank is not a source or any actual
+            listener differs from the sealed startup authority.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        binding = enrollment.binding
+        local = binding.advertisement
+        if local.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("only a terminal source enrolls source control routes")
+        address = self._terminal_bootstrap_address()
+        endpoint = address.to_url() + TERMINAL_NIXL_SOURCE_ROSTER_ROUTE
+        roster = fetch_terminal_nixl_source_roster(
+            endpoint,
+            local,
+            binding.matrix,
+            NIXL_BOOTSTRAP_PEER_PROTOCOL,
+            self._remaining_terminal_startup_seconds(deadline),
+        )
+        route_roster = TerminalSourcePublicationRouteRoster.from_startup_roster(
+            binding,
+            roster,
+            NetworkAddress(self.local_ip, self.rank_port),
+        )
+        return TerminalSourcePublicationControl(
+            route_roster,
+            local.terminal_identity,
+            self._send_terminal_source_publication_frames,
+        )
+
+    def _send_terminal_source_publication_frames(
+        self,
+        endpoint: NetworkAddress,
+        frames: tuple[bytes, ...],
+    ) -> None:
+        """Send one publisher outcome to an enrolled source listener.
+
+        :param endpoint: Exact manager listener from the frozen source roster.
+        :param frames: Closed source-publication control message.
+        """
+
+        if type(endpoint) is not NetworkAddress:
+            raise TypeError("endpoint must be NetworkAddress")
+        if type(frames) is not tuple or any(
+            type(frame) is not bytes for frame in frames
+        ):
+            raise TypeError("frames must be a tuple of bytes")
+        control = self._terminal_source_publication_control
+        if control is None:
+            raise RuntimeError("source publication control is not enrolled")
+        if endpoint not in tuple(route.endpoint for route in control.roster.routes):
+            raise RuntimeError("source publication endpoint is not enrolled")
+        with self._packed_control_send_lock:
+            socket = self._connect(endpoint.to_tcp(), is_ipv6=endpoint.is_ipv6)
+            socket.send_multipart(frames)
+
     @staticmethod
     def _remaining_terminal_startup_seconds(deadline: float) -> float:
         """Return positive time remaining before one startup deadline.
@@ -1983,6 +2062,10 @@ class NixlKVManager(CommonKVManager):
         :param deadline: Absolute monotonic startup deadline.
         """
 
+        if self._terminal_source_publication_control is not None:
+            raise RuntimeError("source publication control is already enrolled")
+        publication_control = self._enroll_terminal_source_publication_routes(deadline)
+        self._terminal_source_publication_control = publication_control
         enrollments = self._receive_terminal_decoder_enrollments(deadline)
         for enrollment in enrollments:
             self._send_terminal_startup_ack(enrollment)
@@ -2108,10 +2191,14 @@ class NixlKVManager(CommonKVManager):
         source_work = installation.source_work
         if actor is None or source_work is None:
             raise RuntimeError("terminal source actor or work boundary is unavailable")
+        publication_control = self._terminal_source_publication_control
+        if publication_control is None:
+            raise RuntimeError("source publication control is unavailable")
         actor.bind_direct_terminal_owner(enrollment.nixl)
         importers = self._source_request_ready_importers(binding)
         self._terminal_source_receipt_importers = importers
         local_identity = binding.advertisement.terminal_identity
+        publication_control.roster.route_for(local_identity)
         publisher: PackedTerminalOutputPublisher | None = None
         if local_identity.tp_rank == 0:
             endpoint = installation.gateway_endpoint
@@ -2119,12 +2206,12 @@ class NixlKVManager(CommonKVManager):
                 raise RuntimeError("canonical source gateway endpoint disappeared")
 
             def result_listener(result: TerminalGatewayPublicationResult) -> None:
-                """Join local publication authority before remote fan-out."""
+                """Fan publisher authority through the sole source route owner.
 
-                self.terminal_source_serving.publisher_result(result)
-                fanout = installation.source_publication_fanout
-                if fanout is not None:
-                    fanout(result)
+                :param result: Immutable gateway publication outcome.
+                """
+
+                publication_control.publish_result(result)
 
             publisher = PackedTerminalOutputPublisher(
                 capacity=installation.physical_capacity,
@@ -2138,6 +2225,14 @@ class NixlKVManager(CommonKVManager):
                 fatal_listener=self._terminal_publisher_failed,
                 clock_ns=time.monotonic_ns,
             )
+        def retire_submission(submission: PackedTerminalSourceSubmission) -> None:
+            """Retire route replay state after native lifecycle retirement.
+
+            :param submission: Successfully retired source submission.
+            """
+
+            publication_control.retire_binding(submission.identity.local_binding)
+
         serving = PackedTerminalSourceServing(
             runtime=enrollment.runtime,
             local_identity=local_identity,
@@ -2148,6 +2243,34 @@ class NixlKVManager(CommonKVManager):
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             work=source_work,
             retire_native_producers=enrollment.retire_native_producers,
+            retire_submission=retire_submission,
+        )
+
+        def deliver_publication(
+            delivery: TerminalSourcePublicationDelivery,
+        ) -> None:
+            """Deliver startup-authenticated publisher authority to serving.
+
+            :param delivery: Imported or locally issued publication authority.
+            """
+
+            serving.publication_receipt(
+                wire_receipt=delivery.wire_receipt,
+                local_receipt=delivery.local_receipt,
+                authenticated_issuer=delivery.authenticated_issuer,
+            )
+
+        def publication_route_failed(reason: str) -> None:
+            """Enter process-fatal ownership after route failure.
+
+            :param reason: Sticky route or authentication failure evidence.
+            """
+
+            self._record_terminal_component_failure(reason, None)
+
+        publication_control.bind_listener(
+            deliver_publication,
+            publication_route_failed,
         )
         return serving, publisher
 
@@ -2691,6 +2814,13 @@ class NixlKVManager(CommonKVManager):
                     if len(frames) == 0:
                         logger.warning("Rejected empty non-terminal runtime traffic")
                         continue
+                    if frames[0] == TERMINAL_SOURCE_PUBLICATION_RECEIPT_TAG:
+                        if binding.advertisement.role is not TerminalOwnerRole.SOURCE:
+                            raise RuntimeError(
+                                "decode control route received source publication"
+                            )
+                        self._handle_terminal_source_publication_receipt(tuple(frames))
+                        continue
                     if frames[0] == PACKED_CONTROL_TAG:
                         if binding.advertisement.role is TerminalOwnerRole.SOURCE:
                             self._dispatch_terminal_source_control(frames)
@@ -2912,6 +3042,16 @@ class NixlKVManager(CommonKVManager):
                     error,
                     traceback.format_exc(),
                 )
+        publication_control = self._terminal_source_publication_control
+        if publication_control is not None and not must_abort:
+            try:
+                publication_control.close_clean()
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal source publication control close failed",
+                    error,
+                    traceback.format_exc(),
+                )
 
         if first_error is not None:
             raise RuntimeError("terminal runtime teardown failed") from first_error
@@ -2940,6 +3080,11 @@ class NixlKVManager(CommonKVManager):
         if not self.terminal_peer_enrollment_frozen:
             raise RuntimeError("terminal native peer roster is not frozen")
         try:
+            if (
+                binding.advertisement.role is TerminalOwnerRole.SOURCE
+                and self._terminal_source_publication_control is None
+            ):
+                raise RuntimeError("terminal source publication routes are not frozen")
             self._compose_terminal_runtime()
         except Exception:  # noqa: BLE001
             self._record_terminal_component_failure(
@@ -7466,6 +7611,20 @@ class NixlKVManager(CommonKVManager):
         self._terminal_bootstrap_thread = thread
         thread.start()
 
+    def _handle_terminal_source_publication_receipt(
+        self,
+        frames: tuple[bytes, ...],
+    ) -> None:
+        """Deliver one direct canonical publication outcome to source serving.
+
+        :param frames: Exact startup-matrix-bound multipart message.
+        """
+
+        control = self._terminal_source_publication_control
+        if control is None:
+            raise RuntimeError("source publication control is unavailable")
+        control.receive_frames(frames)
+
 
 class NixlKVSender(CommonKVSender):
     def __init__(
@@ -7997,7 +8156,7 @@ class NixlKVBootstrapServer(CommonKVBootstrapServer):
         self,
         request: web.Request,
     ) -> web.Response:
-        """Return every matrix-authenticated source route to one decoder.
+        """Return every matrix-authenticated source route to one startup rank.
 
         Route-table readiness waits off the HTTP event loop. The response is
         emitted once from the frozen source topology and cannot select a
@@ -8013,10 +8172,6 @@ class NixlKVBootstrapServer(CommonKVBootstrapServer):
         try:
             requester = decode_terminal_startup_rank_advertisement(await request.read())
             matrix = registry.sealed_matrix_for(requester)
-            if requester.role is not TerminalOwnerRole.DECODE:
-                raise TerminalStartupCohortError(
-                    "only a decoder rank may request source routes"
-                )
             await asyncio.to_thread(
                 self.wait_until_ready,
                 registry.timeout_seconds,

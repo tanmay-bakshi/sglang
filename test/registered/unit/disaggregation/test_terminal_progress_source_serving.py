@@ -300,6 +300,7 @@ def _serving(
         retire_native_producers=lambda: runtime._owner.retire_python_producer(
             _NATIVE_PRODUCER_ID
         ),
+        retire_submission=lambda submission: None,
     )
     return serving, runtime, publisher, work_labels, fatal_inventories
 

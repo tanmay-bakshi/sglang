@@ -752,49 +752,53 @@ class PackedTerminalSourceWiring:
             publication,
             result.source_receipts,
         )
-        action = record.publication_action
-        if action is None:
-            raise RuntimeError("publisher result preceded publication authority")
-        local_receipt = local_issued_receipt.wire_receipt
-        kind = NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED
         reason = None
-        publication_failed = False
         if type(result) is TerminalGatewayPublicationFailure:
-            kind = NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED
             reason = result.reason
-            publication_failed = True
-        producer_id = self._runtime.python_producer_id(
-            NativeTerminalProducerClass.RECEIPT,
-            NativeTerminalProcessIdentity.from_identity(local_receipt.issuer),
+        self._consume_publication_receipt(
+            record=record,
+            wire_receipt=local_issued_receipt.wire_receipt,
+            local_receipt=local_issued_receipt.local_receipt,
+            authenticated_issuer=publication.canonical_binding.owner,
+            reason=reason,
         )
-        native_receipt = NativeTerminalReceipt.from_wire_receipt(local_receipt)
-        try:
-            self._runtime.complete_work_action(
-                producer_id,
-                action,
-                kind,
-                receipt=native_receipt,
-                reason=reason,
-                enqueued_ns=self._clock_ns(),
-            )
-        except Exception as error:
-            self._complete_failed_work(
-                action=action,
-                producer_id=self._local_producer_id,
-                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
-                label="gateway publication result delivery failed",
-                error=error,
-            )
-            self._mark_publication_action_failed(record, action)
-            raise
-        with self._lock:
-            current = self._records.get(local_receipt.binding.digest)
-            if current is not record:
-                raise RuntimeError("source request registry changed during publication")
-            record.publication_action = None
-            record.publication_terminal = True
-            record.publication_failed = publication_failed
-        self._emit_metric_once(local_receipt.binding.digest, kind)
+
+    def publication_receipt(
+        self,
+        *,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Consume a direct same-service publication result.
+
+        The startup-enrolled source route imports remote authority before this
+        call. Canonical rank zero supplies its publisher-issued local authority
+        through the same boundary, so every source owner advances identically.
+
+        :param wire_receipt: Exact canonical publisher receipt.
+        :param local_receipt: Matching process-local import authority.
+        :param authenticated_issuer: Source rank proved by the enrolled route.
+        """
+
+        if type(wire_receipt) is not TerminalWireReceipt:
+            raise TypeError("wire_receipt must be TerminalWireReceipt")
+        if type(local_receipt) is not TerminalReceipt:
+            raise TypeError("local_receipt must be TerminalReceipt")
+        if type(authenticated_issuer) is not TerminalProcessIdentity:
+            raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
+        record = self._record(wire_receipt.binding.digest)
+        self._consume_publication_receipt(
+            record=record,
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+            reason=(
+                "gateway publication failed"
+                if wire_receipt.kind is TerminalReceiptKind.FAILURE
+                else None
+            ),
+        )
 
     def publisher_died(self, binding_digest: bytes, reason: str) -> None:
         """Enter process-fatal source authority after publisher-thread death.
@@ -1090,6 +1094,99 @@ class PackedTerminalSourceWiring:
         if wire_receipt.issuer != identity.publisher_issuer:
             raise RuntimeError("publisher result was signed by another process")
         return record, local_receipt
+
+    def _consume_publication_receipt(
+        self,
+        *,
+        record: _SourceRecord,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        reason: str | None,
+    ) -> None:
+        """Advance one local source owner from enrolled publisher authority.
+
+        :param record: Exact live source side-effect record.
+        :param wire_receipt: Canonical rank-zero publication result.
+        :param local_receipt: Matching local import authority.
+        :param authenticated_issuer: Rank proved by the source control route.
+        :param reason: Stable publication failure reason, when failed.
+        """
+
+        identity = record.submission.identity
+        binding = identity.local_binding
+        if authenticated_issuer != identity.publisher_issuer:
+            raise RuntimeError("publication route authenticated another issuer")
+        if wire_receipt.issuer != authenticated_issuer:
+            raise RuntimeError("publication receipt asserts another issuer")
+        if wire_receipt.binding != binding or local_receipt.binding != binding:
+            raise RuntimeError("publication authority targets another source binding")
+        shared_fields = (
+            local_receipt.kind is wire_receipt.kind,
+            local_receipt.outcome is wire_receipt.outcome,
+            local_receipt.terminal_timestamp_ns == wire_receipt.terminal_timestamp_ns,
+        )
+        if not all(shared_fields):
+            raise RuntimeError("local publication authority differs from wire receipt")
+        publication_failed = wire_receipt.kind is TerminalReceiptKind.FAILURE
+        if publication_failed:
+            if wire_receipt.outcome is not TerminalReceiptOutcome.FAILURE:
+                raise RuntimeError("publication failure requires a failure outcome")
+            if type(reason) is not str or len(reason) == 0:
+                raise RuntimeError("publication failure requires stable evidence")
+            kind = NativeTerminalOwnerEventKind.SOURCE_PUBLICATION_FAILED
+        else:
+            if (
+                wire_receipt.kind is not TerminalReceiptKind.GATEWAY_PUBLISHED
+                or wire_receipt.outcome is not TerminalReceiptOutcome.SUCCESS
+            ):
+                raise RuntimeError("publication receipt has an invalid terminal shape")
+            if reason is not None:
+                raise RuntimeError(
+                    "successful publication cannot carry failure evidence"
+                )
+            kind = NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED
+        action = record.publication_action
+        if action is None:
+            raise RuntimeError("publication result preceded publication authority")
+        if record.request_ready_receipt is None:
+            raise RuntimeError("publication result preceded request readiness")
+        if record.publication_terminal:
+            raise RuntimeError("publication result was delivered twice")
+        if self._local_identity.tp_rank == 0 and not record.publication_submitted:
+            raise RuntimeError("canonical publication result preceded publisher submit")
+
+        producer_id = self._runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            NativeTerminalProcessIdentity.from_identity(authenticated_issuer),
+        )
+        try:
+            self._runtime.complete_work_action(
+                producer_id,
+                action,
+                kind,
+                receipt=NativeTerminalReceipt.from_wire_receipt(wire_receipt),
+                reason=reason,
+                enqueued_ns=self._clock_ns(),
+            )
+        except Exception as error:
+            self._complete_failed_work(
+                action=action,
+                producer_id=self._local_producer_id,
+                followup_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+                label="gateway publication result delivery failed",
+                error=error,
+            )
+            self._mark_publication_action_failed(record, action)
+            raise
+        with self._lock:
+            current = self._records.get(binding.digest)
+            if current is not record:
+                raise RuntimeError("source request registry changed during publication")
+            record.publication_action = None
+            record.publication_terminal = True
+            record.publication_failed = publication_failed
+        self._emit_metric_once(binding.digest, kind)
 
     def _submit_local(
         self,

@@ -266,7 +266,7 @@ def test_canonical_roster_round_trip_and_matrix_binding() -> None:
 def test_roster_rejects_another_matrix_or_requester(
     roster_change: dict[str, object],
 ) -> None:
-    """Roster targeting fields cannot select another matrix or decoder.
+    """Roster targeting fields cannot select another matrix or requester.
 
     :param roster_change: Valid but unbound roster-field replacement.
     """
@@ -276,22 +276,24 @@ def test_roster_rejects_another_matrix_or_requester(
 
     with pytest.raises(
         TerminalStartupCohortError,
-        match="another matrix or decoder",
+        match="another matrix or requester",
     ):
         changed.require_matrix(matrix, requester, _TRANSPORT_PROTOCOL)
 
 
-def test_source_rank_cannot_request_a_decoder_roster() -> None:
-    """The roster authority rejects a matrix-bound source requester."""
+def test_source_rank_receives_its_own_matrix_bound_source_roster() -> None:
+    """A source rank may enroll the same-service control route population."""
 
-    matrix, _, roster = _roster()
+    matrix, _, decoder_roster = _roster()
+    requester = matrix.rank("prefill-a", 0)
+    roster = dataclasses.replace(
+        decoder_roster,
+        requester_service_id=requester.service_id,
+        requester_tensor_parallel_rank=requester.tensor_parallel_rank,
+        requester_process_generation=requester.process_generation,
+    )
 
-    with pytest.raises(TerminalStartupCohortError, match="only a decoder"):
-        roster.require_matrix(
-            matrix,
-            matrix.rank("prefill-a", 0),
-            _TRANSPORT_PROTOCOL,
-        )
+    roster.require_matrix(matrix, requester, _TRANSPORT_PROTOCOL)
 
 
 def test_requester_generation_drift_is_rejected_by_matrix_lookup() -> None:

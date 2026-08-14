@@ -141,6 +141,7 @@ class PackedTerminalSourceServing:
     _scheduler_serving: TerminalSchedulerServing
     _work: PackedTerminalSourceWork
     _retire_native_producers: Callable[[], None]
+    _retire_submission: Callable[[PackedTerminalSourceSubmission], None]
     _owner_dead_marked: bool
     _native_producers_retired: bool
     _started: bool
@@ -159,6 +160,7 @@ class PackedTerminalSourceServing:
         process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None],
         work: PackedTerminalSourceWork,
         retire_native_producers: Callable[[], None],
+        retire_submission: Callable[[PackedTerminalSourceSubmission], None],
     ) -> None:
         """Construct a dormant source serving composition.
 
@@ -171,6 +173,8 @@ class PackedTerminalSourceServing:
         :param process_fatal_handler: Scheduler-affine fail-closed handler.
         :param work: Algorithm-neutral source work callbacks.
         :param retire_native_producers: Native event-channel retirement fence.
+        :param retire_submission: Process-lifetime control-state retirement
+            after native lifecycle retirement succeeds.
         """
 
         if type(runtime) is not NativeTerminalRuntime:
@@ -187,6 +191,8 @@ class PackedTerminalSourceServing:
             raise TypeError("work must be PackedTerminalSourceWork")
         if not callable(retire_native_producers):
             raise TypeError("retire_native_producers must be callable")
+        if not callable(retire_submission):
+            raise TypeError("retire_submission must be callable")
         wiring = PackedTerminalSourceWiring(
             runtime=runtime,
             local_identity=local_identity,
@@ -209,6 +215,7 @@ class PackedTerminalSourceServing:
         self._scheduler_serving = scheduler_serving
         self._work = work
         self._retire_native_producers = retire_native_producers
+        self._retire_submission = retire_submission
         self._owner_dead_marked = False
         self._native_producers_retired = False
         self._started = False
@@ -491,6 +498,27 @@ class PackedTerminalSourceServing:
             reason=reason,
         )
 
+    def publication_receipt(
+        self,
+        *,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Deliver one startup-route-authenticated publisher outcome.
+
+        :param wire_receipt: Exact canonical source publisher receipt.
+        :param local_receipt: Matching local import authority.
+        :param authenticated_issuer: Source rank proved by control enrollment.
+        """
+
+        self._require_open()
+        self._wiring.publication_receipt(
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+        )
+
     def _drain_scheduler_actions(self) -> int:
         """Transfer runtime reclaim actions into the qualified scheduler inbox.
 
@@ -581,7 +609,18 @@ class PackedTerminalSourceServing:
             if self._aborting:
                 self._runtime.acknowledge_aborted_action(action)
                 continue
-            self._wiring.consume_terminal_action(action)
+            try:
+                retired = self._wiring.consume_terminal_action(action)
+                if retired is not None:
+                    self._retire_submission(retired)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                logger.error(
+                    "Source lifecycle retirement failed:\n%s",
+                    traceback.format_exc(),
+                )
+                self._mark_owner_dead()
+                self._runtime.begin_abort()
+                raise
         return len(actions)
 
     @property

@@ -436,6 +436,7 @@ def _manager(
     manager.server_args = SimpleNamespace(pd_terminal_startup_timeout_seconds=1.0)
     manager._terminal_startup_binding = None
     manager._terminal_startup_peer_enrollment = None
+    manager._terminal_source_publication_control = None
     manager._terminal_runtime_activated = threading.Event()
     manager._terminal_activation_lock = threading.Lock()
     manager._terminal_activation_started = False
@@ -639,6 +640,7 @@ def test_runtime_composition_failure_is_sticky_and_starts_no_legacy_workers() ->
     manager = _manager(_binding("prefill-a", 0), {})
     manager._activate_terminal_source = MagicMock()
     manager._terminal_startup_peer_enrollment = SimpleNamespace(frozen=True)
+    manager._terminal_source_publication_control = object()
     manager._compose_terminal_runtime = MagicMock(
         side_effect=RuntimeError("terminal composition failed")
     )
@@ -785,6 +787,7 @@ def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
     reactor = MagicMock()
     serving = MagicMock()
     publisher = MagicMock()
+    publication_control = MagicMock()
     reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
     reactor.close.side_effect = lambda timeout: order.append("reactor-close")
     serving.stop_admission_and_retire_producers.side_effect = lambda: order.append(
@@ -794,12 +797,16 @@ def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
     publisher.stop_admission_and_join.side_effect = lambda: (
         order.append("publisher-close") or True
     )
+    publication_control.close_clean.side_effect = lambda: order.append(
+        "publication-control-close"
+    )
     manager.stop_terminal_control_receiver = lambda timeout: order.append(
         "receiver-close"
     )
     manager._terminal_process_reactor = reactor
     manager._terminal_source_serving = serving
     manager._terminal_output_publisher = publisher
+    manager._terminal_source_publication_control = publication_control
 
     manager.close_terminal_runtime(process_fatal=False)
     manager.close_terminal_runtime(process_fatal=False)
@@ -811,6 +818,7 @@ def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
         "reactor-close",
         "serving-close",
         "publisher-close",
+        "publication-control-close",
     ]
     serving.abort_and_close.assert_not_called()
 
@@ -1054,9 +1062,18 @@ def test_source_retains_exact_decoder_roster_before_runtime_composition() -> Non
     inbox = _InprocInbox()
     manager.server_socket = inbox.pull
     events: list[tuple[str, object]] = []
+    publication_control = object()
+
+    def enroll_publication_routes(deadline: float) -> object:
+        assert deadline > time.monotonic()
+        assert manager.terminal_peer_enrollment_frozen is False
+        assert not manager._terminal_runtime_activated.is_set()
+        events.append(("publication-roster", None))
+        return publication_control
 
     def send_ack(enrollment: _TerminalDecoderEnrollment) -> None:
         assert manager.terminal_peer_enrollment_frozen
+        assert manager.terminal_source_publication_control is publication_control
         assert set(manager.decode_kv_args_table) == {
             "decode-agent-a",
             "decode-agent-b",
@@ -1067,9 +1084,14 @@ def test_source_retains_exact_decoder_roster_before_runtime_composition() -> Non
 
     def compose_runtime() -> None:
         assert not manager._terminal_runtime_activated.is_set()
-        assert [event[0] for event in events] == ["ack", "ack"]
+        assert [event[0] for event in events] == [
+            "publication-roster",
+            "ack",
+            "ack",
+        ]
         events.append(("runtime", None))
 
+    manager._enroll_terminal_source_publication_routes = enroll_publication_routes
     manager._send_terminal_startup_ack = send_ack
     manager._compose_terminal_runtime = compose_runtime
     manager._start_prefill_runtime_workers = MagicMock()
@@ -1082,6 +1104,7 @@ def test_source_retains_exact_decoder_roster_before_runtime_composition() -> Non
         inbox.close()
 
     assert events == [
+        ("publication-roster", None),
         ("ack", ("decode-a", 0)),
         ("ack", ("decode-b", 0)),
         ("runtime", None),
