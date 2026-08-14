@@ -649,6 +649,8 @@ def test_run_batch_handoffs_only_at_model_worker_submission_sites() -> None:
 
     source = inspect.getsource(Scheduler.run_batch)
     assert source.count("self.submit_forward_with_terminal_handoff(") == 6
+    assert "terminal_bind: Callable[[GenerationBatchResult]" in source
+    assert source.count("terminal_bind,") == 4
     assert "launch_batch_with_terminal_handoff" not in source
     assert "lambda: self.model_worker.forward_batch_generation(" in source
     assert "lambda: self.tp_worker.forward_batch_split_prefill(batch)" in source

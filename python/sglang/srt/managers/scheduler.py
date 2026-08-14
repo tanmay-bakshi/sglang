@@ -3783,8 +3783,28 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        terminal_bind: Callable[[GenerationBatchResult], GenerationBatchResult]
+        | None = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch."""
+        """Run one batch and optionally bind its source terminal submission.
+
+        :param batch: Exact scheduler batch submitted to the model worker.
+        :param pp_proxy_tensors: Optional pipeline-parallel proxy tensors.
+        :param terminal_bind: Source-only immutable submission binder executed
+            immediately after the exact model-worker host submission while the
+            launch handoff remains serialized.
+        :returns: Generation or embedding result from the model worker.
+        """
+
+        if terminal_bind is not None:
+            if not callable(terminal_bind):
+                raise TypeError("terminal_bind must be callable or None")
+            if self.disaggregation_mode != DisaggregationMode.PREFILL:
+                raise RuntimeError(
+                    "terminal source binding requires disaggregated prefill"
+                )
+            if not self.is_generation:
+                raise RuntimeError("terminal source binding requires generation")
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -3800,6 +3820,8 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
+            if terminal_bind is not None:
+                raise RuntimeError("prebuilt batches cannot bind terminal source work")
             return self._run_batch_prebuilt(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
@@ -3849,7 +3871,8 @@ class Scheduler(
                             lambda: self.model_worker.forward_batch_generation(
                                 batch,
                                 **fwd_kwargs,
-                            )
+                            ),
+                            terminal_bind,
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -3910,7 +3933,8 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.submit_forward_with_terminal_handoff(
-                    lambda: self.tp_worker.forward_batch_split_prefill(batch)
+                    lambda: self.tp_worker.forward_batch_split_prefill(batch),
+                    terminal_bind,
                 )
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
@@ -3920,7 +3944,8 @@ class Scheduler(
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.submit_forward_with_terminal_handoff(
-                        lambda: self.model_worker.forward_batch_generation(batch)
+                        lambda: self.model_worker.forward_batch_generation(batch),
+                        terminal_bind,
                     )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
@@ -3949,7 +3974,8 @@ class Scheduler(
                     lambda: self.model_worker.forward_batch_generation(
                         batch,
                         **kwargs,
-                    )
+                    ),
+                    terminal_bind,
                 )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
