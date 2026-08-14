@@ -99,7 +99,6 @@ class _Metrics:
     """Non-gating source metric ledger fixture."""
 
     values: list[PackedTerminalSourceMetric]
-    submission_commits: list[NativeTerminalOwnerObservation]
     fail: bool
 
     def __init__(self, *, fail: bool = False) -> None:
@@ -109,7 +108,6 @@ class _Metrics:
         """
 
         self.values = []
-        self.submission_commits = []
         self.fail = fail
 
     def emit(self, metric: PackedTerminalSourceMetric) -> None:
@@ -121,18 +119,6 @@ class _Metrics:
         if self.fail:
             raise RuntimeError("synthetic metric failure")
         self.values.append(metric)
-
-    def emit_submission_commit(
-        self, observation: NativeTerminalOwnerObservation
-    ) -> None:
-        """Record or reject one exact native submission interval.
-
-        :param observation: Evidence-only native commit.
-        """
-
-        if self.fail:
-            raise RuntimeError("synthetic metric failure")
-        self.submission_commits.append(observation)
 
 
 class _Publisher:
@@ -769,7 +755,6 @@ def test_submission_observation_requires_complete_binding_before_one_shot() -> N
 
     valid = _submission_observation(harness)
     harness.wiring.submission_committed(valid)
-    assert harness.metrics.submission_commits == [valid]
     with pytest.raises(RuntimeError, match="observed twice"):
         harness.wiring.submission_committed(valid)
 

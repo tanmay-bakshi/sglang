@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import logging
 import os
 import select
 import sys
@@ -7,6 +8,9 @@ import sys
 import pytest
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    parse_terminal_progress_timing_log_line,
+)
 from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
     GroupedNixlTerminalOwner,
     GroupedNixlTerminalOwnerInventory,
@@ -20,7 +24,6 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
-    NativeTerminalOwnerObservation,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
@@ -99,13 +102,11 @@ class _Metrics:
     """Record non-gating source metrics."""
 
     values: list[PackedTerminalSourceMetric]
-    submission_commits: list[NativeTerminalOwnerObservation]
 
     def __init__(self) -> None:
         """Create an empty metric ledger."""
 
         self.values = []
-        self.submission_commits = []
 
     def emit(self, metric: PackedTerminalSourceMetric) -> None:
         """Record one source metric.
@@ -114,16 +115,6 @@ class _Metrics:
         """
 
         self.values.append(metric)
-
-    def emit_submission_commit(
-        self, observation: NativeTerminalOwnerObservation
-    ) -> None:
-        """Record one exact native submission interval.
-
-        :param observation: Evidence-only native commit.
-        """
-
-        self.submission_commits.append(observation)
 
 
 class _Publisher:
@@ -498,11 +489,17 @@ def test_bind_failure_pairs_unpublished_scheduler_cancellation() -> None:
         serving.abort_and_close()
 
 
-def test_full_source_composition_retires_exactly_once() -> None:
+def test_full_source_composition_retires_exactly_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Pump every source action through runtime, scheduler, and publisher joins."""
 
+    caplog.set_level(
+        logging.INFO,
+        logger="sglang.srt.disaggregation.terminal_progress.source_wiring",
+    )
     identity = _identity()
-    serving, runtime, publisher, metrics, work_labels, _ = _serving(identity)
+    serving, runtime, publisher, _, work_labels, _ = _serving(identity)
     submission = _submission(identity)
     release_calls: list[PackedTerminalSourceSubmission] = []
     serving.start()
@@ -512,14 +509,18 @@ def test_full_source_composition_retires_exactly_once() -> None:
         serving.wiring.producer_completed(digest)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
-        assert len(metrics.submission_commits) == 1
-        commit = metrics.submission_commits[0]
-        assert commit.binding.digest == digest
-        assert commit.event_kind is (
-            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED
+        samples = tuple(
+            sample
+            for record in caplog.records
+            if (sample := parse_terminal_progress_timing_log_line(record.getMessage()))
+            is not None
         )
-        assert commit.enqueued_ns == 1_000
-        assert commit.completed_ns >= commit.enqueued_ns
+        assert len(samples) == 1
+        assert samples[0].binding.digest == digest
+        assert samples[0].sample_key == "source-rank-0"
+        assert samples[0].field.value == "producer_to_owner_handoff_ms"
+        assert samples[0].started_ns == 1_000
+        assert samples[0].completed_ns >= samples[0].started_ns
 
         runtime._owner.submit(
             NativeTerminalOwnerEvent(

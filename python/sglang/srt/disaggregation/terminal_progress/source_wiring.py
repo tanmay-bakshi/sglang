@@ -185,14 +185,6 @@ class PackedTerminalSourceMetricsSink(Protocol):
         :param metric: Source lifecycle event timing.
         """
 
-    def emit_submission_commit(
-        self, observation: NativeTerminalOwnerObservation
-    ) -> None:
-        """Consume one exact producer-to-owner handoff interval.
-
-        :param observation: Actionless authoritative commit evidence.
-        """
-
 
 @runtime_checkable
 class PackedTerminalSourcePublisher(Protocol):
@@ -482,7 +474,6 @@ class PackedTerminalSourceWiring:
             started_ns=observation.enqueued_ns,
             completed_ns=observation.completed_ns,
         )
-        self._metrics_sink.emit_submission_commit(observation)
 
     def lifecycle_published(self, binding_digest: bytes) -> bool:
         """Return whether a lifecycle crossed the native publication boundary.
