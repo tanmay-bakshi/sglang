@@ -733,17 +733,28 @@ class TestNixlPeerLifecycle(CustomTestCase):
     @staticmethod
     def _route(
         *,
-        agent_name,
-        metadata,
-        tp_rank,
-        process_generation="00000000-0000-4000-8000-000000000000",
-    ):
+        agent_name: str,
+        metadata: bytes,
+        tp_rank: int,
+        process_generation: str = "00000000-0000-4000-8000-000000000000",
+    ) -> dict[str, object]:
+        """Build one generation-bound prefill bootstrap route.
+
+        :param agent_name: Authenticated native source agent name.
+        :param metadata: Exact serialized native agent metadata.
+        :param tp_rank: Source tensor-parallel rank.
+        :param process_generation: Source process incarnation.
+        :returns: Complete synthetic peer bootstrap response.
+        """
+
         return {
             "transport_protocol": NIXL_BOOTSTRAP_PEER_PROTOCOL,
             "nixl_agent_name": agent_name,
             "nixl_agent_metadata": base64.b64encode(metadata).decode("ascii"),
             "nixl_agent_metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "process_generation": process_generation,
+            "rank_ip": "127.0.0.1",
+            "rank_port": 31000 + (tp_rank % 4000),
             "attn_dp_rank": 0,
             "attn_cp_rank": 0,
             "attn_tp_rank": tp_rank,
@@ -901,6 +912,19 @@ class TestNixlPeerLifecycle(CustomTestCase):
         manager._load_prefill_peer("prefill:8998", route)
         stale = dict(route)
         stale["process_generation"] = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+        with self.assertRaisesRegex(RuntimeError, "stale prefill"):
+            manager._load_prefill_peer("prefill:8998", stale)
+
+    def test_control_listener_drift_is_rejected(self):
+        """An enrolled source rank cannot change its manager listener."""
+
+        agent = PeerLifecycleFakeAgent({b"metadata": "prefill"})
+        manager = self._manager(agent)
+        route = self._route(agent_name="prefill", metadata=b"metadata", tp_rank=0)
+        manager._load_prefill_peer("prefill:8998", route)
+        stale = dict(route)
+        stale["rank_port"] = 31001
 
         with self.assertRaisesRegex(RuntimeError, "stale prefill"):
             manager._load_prefill_peer("prefill:8998", stale)
