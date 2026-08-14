@@ -109,6 +109,19 @@ class PackedNixlDecodeController:
         return self._runtime.ready
 
     @property
+    def terminal_runtime(self) -> PackedDecodeRuntime:
+        """Return the actor retained by the process-lifetime controller.
+
+        The controller remains the lifetime owner. Terminal serving borrows
+        this exact actor so request registration, control ingress, scatter,
+        and retirement cannot split across parallel runtimes.
+
+        :returns: Sole packed decode actor.
+        """
+
+        return self._runtime
+
+    @property
     def prepared_grant_protocol(self) -> str | None:
         """Return the protocol only after the complete actor is live.
 

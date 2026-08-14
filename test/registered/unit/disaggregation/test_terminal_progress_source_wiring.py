@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceWiring,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
+    IssuedTerminalWireReceipt,
     TerminalWireReceiptIssuer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -528,6 +529,34 @@ def _ready(harness: _Harness) -> None:
     )
 
 
+def _failed(
+    harness: _Harness,
+    *,
+    reason: str = "synthetic request-global failure",
+) -> IssuedTerminalWireReceipt:
+    """Deliver one authenticated request-failure receipt.
+
+    :param harness: Source lifecycle fixture.
+    :param reason: Stable failure evidence.
+    :returns: Exact local and wire authority delivered to the wiring.
+    """
+
+    issued = TerminalWireReceiptIssuer(harness.identity.request_ready_issuer).issue(
+        binding=harness.identity.local_binding,
+        kind=TerminalReceiptKind.FAILURE,
+        outcome=TerminalReceiptOutcome.FAILURE,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    harness.wiring.request_failed(
+        binding_digest=harness.identity.local_binding.digest,
+        wire_receipt=issued.wire_receipt,
+        local_receipt=issued.local_receipt,
+        authenticated_issuer=harness.identity.request_ready_issuer,
+        reason=reason,
+    )
+    return issued
+
+
 def _publication_result(
     harness: _Harness,
     publication: FrozenTerminalGatewayPublication,
@@ -827,6 +856,82 @@ def test_request_ready_rejects_wrong_issuer_before_runtime_submission() -> None:
             authenticated_issuer=wrong_issuer,
         )
     assert len(harness.runtime.operations) == operation_count
+
+
+def test_request_failure_retains_authority_and_submits_native_failure() -> None:
+    """Preserve failure terminality as failure throughout source ingress."""
+
+    harness = _harness()
+    reason = "decode coordinator failed request-global coordination"
+    issued = _failed(harness, reason=reason)
+
+    operation = harness.runtime.operations[-1]
+    assert operation[0] == "import"
+    assert operation[1] == _DECODER_RECEIPT_PRODUCER_ID
+    assert operation[2] == NativeTerminalReceipt.from_wire_receipt(issued.wire_receipt)
+    assert operation[3] is NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED
+    assert operation[4] == reason
+    assert harness.metrics.values[-1].event_kind is (
+        NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED
+    )
+    operation_count = len(harness.runtime.operations)
+    with pytest.raises(RuntimeError, match="terminality was delivered twice"):
+        harness.wiring.request_failed(
+            binding_digest=harness.identity.local_binding.digest,
+            wire_receipt=issued.wire_receipt,
+            local_receipt=issued.local_receipt,
+            authenticated_issuer=harness.identity.request_ready_issuer,
+            reason=reason,
+        )
+    assert len(harness.runtime.operations) == operation_count
+
+
+def test_request_failure_rejects_wrong_route_before_runtime_submission() -> None:
+    """Reject failure authority delivered by another authenticated route."""
+
+    harness = _harness()
+    wrong_issuer = harness.identity.publisher_issuer
+    failure = TerminalWireReceiptIssuer(wrong_issuer).issue(
+        binding=harness.identity.local_binding,
+        kind=TerminalReceiptKind.FAILURE,
+        outcome=TerminalReceiptOutcome.FAILURE,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    operation_count = len(harness.runtime.operations)
+    with pytest.raises(RuntimeError, match="authenticated another issuer"):
+        harness.wiring.request_failed(
+            binding_digest=harness.identity.local_binding.digest,
+            wire_receipt=failure.wire_receipt,
+            local_receipt=failure.local_receipt,
+            authenticated_issuer=wrong_issuer,
+            reason="synthetic remote failure",
+        )
+    assert len(harness.runtime.operations) == operation_count
+
+
+def test_request_failure_rejects_ready_authority_without_poisoning_terminality() -> (
+    None
+):
+    """Validate receipt kind before retaining request-terminal authority."""
+
+    harness = _harness()
+    ready = TerminalWireReceiptIssuer(harness.identity.request_ready_issuer).issue(
+        binding=harness.identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    operation_count = len(harness.runtime.operations)
+    with pytest.raises(RuntimeError, match="another authority"):
+        harness.wiring.request_failed(
+            binding_digest=harness.identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=harness.identity.request_ready_issuer,
+            reason="synthetic remote failure",
+        )
+    assert len(harness.runtime.operations) == operation_count
+    _failed(harness)
 
 
 def test_source_wiring_has_no_raw_owner_or_dynamic_registration() -> None:
