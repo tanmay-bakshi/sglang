@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
 )
 
 TERMINAL_STARTUP_ENROLLMENT_ACK_SCHEMA: str = (
-    "packed-terminal-startup-enrollment-ack-v1"
+    "packed-terminal-startup-enrollment-ack-v2"
 )
 TERMINAL_STARTUP_ENROLLMENT_ACK_TAG: bytes = b"TERMINAL_STARTUP_ENROLLMENT_ACK"
 TERMINAL_STARTUP_ENROLLMENT_ACK_MAX_BYTES: int = 4096
@@ -117,6 +117,8 @@ class TerminalStartupEnrollmentAck:
     :ivar target_decoder_process_generation: Exact decoder process incarnation.
     :ivar decoder_registration_multipart_sha256: Digest of the complete decoder
         registration multipart message retained by the source.
+    :ivar decoder_control_route_table_sha256: Digest of the complete immutable
+        same-service decoder listener table retained by the source.
     """
 
     startup_matrix_sha256: bytes
@@ -129,6 +131,7 @@ class TerminalStartupEnrollmentAck:
     target_decoder_tensor_parallel_rank: int
     target_decoder_process_generation: bytes
     decoder_registration_multipart_sha256: bytes
+    decoder_control_route_table_sha256: bytes
 
     def __post_init__(self) -> None:
         """Validate one structurally complete acknowledgement."""
@@ -165,6 +168,10 @@ class TerminalStartupEnrollmentAck:
         _require_sha256(
             self.decoder_registration_multipart_sha256,
             "decoder_registration_multipart_sha256",
+        )
+        _require_sha256(
+            self.decoder_control_route_table_sha256,
+            "decoder_control_route_table_sha256",
         )
 
     @property
@@ -252,6 +259,7 @@ def build_terminal_startup_enrollment_ack(
     source: TerminalStartupRankAdvertisement,
     target_decoder: TerminalStartupRankAdvertisement,
     decoder_registration_frames: tuple[bytes, ...],
+    decoder_control_route_table_sha256: bytes,
 ) -> TerminalStartupEnrollmentAck:
     """Build one matrix-authenticated source enrollment acknowledgement.
 
@@ -259,6 +267,8 @@ def build_terminal_startup_enrollment_ack(
     :param source: Exact source rank retaining the registration.
     :param target_decoder: Exact decoder rank that issued the registration.
     :param decoder_registration_frames: Complete retained registration message.
+    :param decoder_control_route_table_sha256: Digest of the frozen listener
+        table for the target decoder service.
     :returns: Immutable acknowledgement bound to all three authorities.
     """
 
@@ -268,6 +278,10 @@ def build_terminal_startup_enrollment_ack(
         raise TypeError("source must be TerminalStartupRankAdvertisement")
     if type(target_decoder) is not TerminalStartupRankAdvertisement:
         raise TypeError("target_decoder must be TerminalStartupRankAdvertisement")
+    _require_sha256(
+        decoder_control_route_table_sha256,
+        "decoder_control_route_table_sha256",
+    )
     try:
         matrix_source = matrix.rank(*source.key)
         matrix_decoder = matrix.rank(*target_decoder.key)
@@ -300,6 +314,7 @@ def build_terminal_startup_enrollment_ack(
         decoder_registration_multipart_sha256=(
             terminal_decoder_registration_multipart_sha256(decoder_registration_frames)
         ),
+        decoder_control_route_table_sha256=decoder_control_route_table_sha256,
     )
     acknowledgement.require_matrix(matrix)
     acknowledgement.require_decoder_registration(decoder_registration_frames)
@@ -484,6 +499,9 @@ def encode_terminal_startup_enrollment_ack(
         "decoder_registration_multipart_sha256": (
             acknowledgement.decoder_registration_multipart_sha256.hex()
         ),
+        "decoder_control_route_table_sha256": (
+            acknowledgement.decoder_control_route_table_sha256.hex()
+        ),
     }
     encoded = json.dumps(
         payload,
@@ -514,6 +532,7 @@ def decode_terminal_startup_enrollment_ack(
             "source",
             "target_decoder",
             "decoder_registration_multipart_sha256",
+            "decoder_control_route_table_sha256",
         },
         "startup enrollment acknowledgement",
     )
@@ -574,6 +593,10 @@ def decode_terminal_startup_enrollment_ack(
             decoder_registration_multipart_sha256=_parse_sha256(
                 decoded["decoder_registration_multipart_sha256"],
                 "decoder_registration_multipart_sha256",
+            ),
+            decoder_control_route_table_sha256=_parse_sha256(
+                decoded["decoder_control_route_table_sha256"],
+                "decoder_control_route_table_sha256",
             ),
         )
     except (TypeError, ValueError) as error:
