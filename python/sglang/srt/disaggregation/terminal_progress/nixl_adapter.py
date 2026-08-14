@@ -1620,7 +1620,7 @@ class NixlDirectTerminalOwnerAdapter:
         """Construct from one runtime-registered native producer.
 
         :param agent: Qualified concrete high-level NIXL agent.
-        :param runtime: Running immutable owner runtime.
+        :param runtime: Dormant or running immutable owner runtime.
         :param producer_name: Stable pre-registered native producer name.
         :returns: Bound direct terminal adapter.
         """
