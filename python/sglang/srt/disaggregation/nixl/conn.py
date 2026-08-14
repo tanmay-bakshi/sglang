@@ -113,6 +113,12 @@ from sglang.srt.disaggregation.nixl.source_publication_control import (
     TerminalSourcePublicationDelivery,
     TerminalSourcePublicationRouteRoster,
 )
+from sglang.srt.disaggregation.nixl.startup_decode_routes import (
+    TerminalDecodeControlRouteTable,
+    build_terminal_decode_control_route_table,
+    decode_terminal_decode_control_route_table,
+    encode_terminal_decode_control_route_table,
+)
 from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
     build_terminal_startup_enrollment_ack,
@@ -805,6 +811,7 @@ class _NixlPrefillPeer:
     agent_name: str
     metadata_sha256: str
     process_generation: str
+    control_endpoint: NetworkAddress
     handle: nixl_remote_agent_handle
 
 
@@ -892,7 +899,6 @@ class NixlTerminalRuntimeInstallation:
         generations and every derived process queue.
     :ivar gateway_endpoint: Canonical source-rank gateway PUSH endpoint.
     :ivar source_work: Source-only actor and transport continuation callbacks.
-    :ivar send_decode_delivery: Decode-only authenticated terminal delivery.
     :ivar bind_source_serving: Source-only scheduler serving installation.
     :ivar bind_decode_serving: Decode-only scheduler and preallocation-queue
         serving installation.
@@ -905,7 +911,6 @@ class NixlTerminalRuntimeInstallation:
     physical_capacity: int
     gateway_endpoint: str | None
     source_work: PackedTerminalSourceWork | None
-    send_decode_delivery: Callable[[PackedTerminalDecodeWireDelivery], None] | None
     bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None
     bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None
     scheduler_process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None]
@@ -925,11 +930,7 @@ class NixlTerminalRuntimeInstallation:
             and type(self.source_work) is not PackedTerminalSourceWork
         ):
             raise TypeError("source_work must be PackedTerminalSourceWork or None")
-        callbacks = (
-            self.send_decode_delivery,
-            self.bind_source_serving,
-            self.bind_decode_serving,
-        )
+        callbacks = (self.bind_source_serving, self.bind_decode_serving)
         if any(
             callback is not None and not callable(callback) for callback in callbacks
         ):
@@ -1077,6 +1078,7 @@ class NixlKVManager(CommonKVManager):
     _terminal_startup_binding: TerminalStartupRankBinding | None = None
     _terminal_startup_peer_enrollment: _TerminalStartupPeerEnrollment | None = None
     _terminal_source_publication_control: TerminalSourcePublicationControl | None = None
+    _terminal_decode_control_routes: TerminalDecodeControlRouteTable | None = None
 
     def __init__(
         self,
@@ -1088,6 +1090,7 @@ class NixlKVManager(CommonKVManager):
         self._terminal_startup_binding = None
         self._terminal_startup_peer_enrollment = None
         self._terminal_source_publication_control = None
+        self._terminal_decode_control_routes = None
         self._terminal_runtime_activated = threading.Event()
         self._terminal_activation_lock = threading.Lock()
         self._terminal_activation_started = False
@@ -1388,10 +1391,6 @@ class NixlKVManager(CommonKVManager):
         if local.role is TerminalOwnerRole.SOURCE:
             if installation.source_work is None:
                 raise ValueError("terminal source installation requires source_work")
-            if installation.send_decode_delivery is not None:
-                raise ValueError(
-                    "terminal source installation cannot send decode deliveries"
-                )
             if installation.bind_source_serving is None:
                 raise ValueError(
                     "terminal source installation requires a scheduler binding"
@@ -1415,10 +1414,6 @@ class NixlKVManager(CommonKVManager):
             if installation.gateway_endpoint is not None:
                 raise ValueError(
                     "terminal decode installation cannot own a gateway endpoint"
-                )
-            if installation.send_decode_delivery is None:
-                raise ValueError(
-                    "terminal decode installation requires point-to-point delivery"
                 )
             if installation.bind_decode_serving is None:
                 raise ValueError(
@@ -1977,10 +1972,12 @@ class NixlKVManager(CommonKVManager):
     def _send_terminal_startup_ack(
         self,
         enrollment: _TerminalDecoderEnrollment,
+        route_table: TerminalDecodeControlRouteTable,
     ) -> None:
         """Acknowledge one decoder after the complete source roster freezes.
 
         :param enrollment: Exact retained decoder registration and matrix row.
+        :param route_table: Complete listener table for the target service.
         :raises RuntimeError: If the decoder acknowledgement route is invalid.
         """
 
@@ -1990,6 +1987,7 @@ class NixlKVManager(CommonKVManager):
             binding.advertisement,
             enrollment.rank,
             enrollment.frames,
+            route_table.digest,
         )
         endpoint = enrollment.registration.endpoint
         port = enrollment.registration.dst_port
@@ -1999,19 +1997,88 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("terminal decoder acknowledgement port is invalid")
         address = NetworkAddress(endpoint, port)
         payload = encode_terminal_startup_enrollment_ack(acknowledgement)
+        route_payload = encode_terminal_decode_control_route_table(route_table)
         with self._packed_control_send_lock:
             socket = self._connect(address.to_tcp(), is_ipv6=address.is_ipv6)
-            socket.send_multipart((TERMINAL_STARTUP_ENROLLMENT_ACK_TAG, payload))
+            socket.send_multipart(
+                (TERMINAL_STARTUP_ENROLLMENT_ACK_TAG, payload, route_payload)
+            )
+
+    @staticmethod
+    def _build_terminal_decode_route_tables(
+        binding: TerminalStartupRankBinding,
+        enrollments: tuple[_TerminalDecoderEnrollment, ...],
+    ) -> dict[str, TerminalDecodeControlRouteTable]:
+        """Freeze all source-retained decoder listeners by TP service.
+
+        :param binding: Exact source startup authority.
+        :param enrollments: Complete matrix-ordered decoder registrations.
+        :returns: One immutable route table per decoder service.
+        """
+
+        if type(binding) is not TerminalStartupRankBinding:
+            raise TypeError("binding must be TerminalStartupRankBinding")
+        if binding.advertisement.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("only a source can freeze decoder route tables")
+        if type(enrollments) is not tuple:
+            raise TypeError("enrollments must be a tuple")
+        by_key = {enrollment.rank.key: enrollment for enrollment in enrollments}
+        if len(by_key) != len(enrollments):
+            raise RuntimeError("decoder route enrollment identity was duplicated")
+
+        service_ids = tuple(
+            dict.fromkeys(
+                rank.service_id
+                for rank in binding.matrix.ranks
+                if rank.role is TerminalOwnerRole.DECODE
+            )
+        )
+        tables: dict[str, TerminalDecodeControlRouteTable] = {}
+        for service_id in service_ids:
+            ranks = tuple(
+                rank
+                for rank in binding.matrix.ranks
+                if rank.role is TerminalOwnerRole.DECODE
+                and rank.service_id == service_id
+            )
+            registrations: list[
+                tuple[
+                    TerminalStartupRankAdvertisement,
+                    NetworkAddress,
+                    tuple[bytes, ...],
+                ]
+            ] = []
+            for rank in ranks:
+                enrollment = by_key.get(rank.key)
+                if enrollment is None:
+                    raise RuntimeError("decoder route table is missing a matrix rank")
+                registration = enrollment.registration
+                registrations.append(
+                    (
+                        rank,
+                        NetworkAddress(registration.endpoint, registration.dst_port),
+                        enrollment.frames,
+                    )
+                )
+            tables[service_id] = build_terminal_decode_control_route_table(
+                binding.matrix,
+                service_id,
+                tuple(registrations),
+            )
+        if len(tables) == 0:
+            raise RuntimeError("terminal deployment has no decoder route table")
+        return tables
 
     def _wait_for_terminal_source_acks(
         self,
         registration_frames: tuple[bytes, ...],
         deadline: float,
-    ) -> None:
+    ) -> TerminalDecodeControlRouteTable:
         """Require one exact enrollment acknowledgement from every source rank.
 
         :param registration_frames: Complete registration sent to every source.
         :param deadline: Absolute monotonic startup deadline.
+        :returns: Source-agreed immutable same-service decoder listener table.
         :raises RuntimeError: If any acknowledgement is absent or conflicts.
         """
 
@@ -2023,15 +2090,26 @@ class NixlKVManager(CommonKVManager):
 
         received: set[tuple[str, int]] = set()
         expected = enrollment.expected_keys
+        route_table: TerminalDecodeControlRouteTable | None = None
         while received != expected:
             frames = self._receive_terminal_startup_frames(deadline)
-            if len(frames) != 2 or frames[0] != TERMINAL_STARTUP_ENROLLMENT_ACK_TAG:
+            if len(frames) != 3 or frames[0] != TERMINAL_STARTUP_ENROLLMENT_ACK_TAG:
                 raise RuntimeError(
                     "decoder received runtime traffic before terminal startup commit"
                 )
             acknowledgement = decode_terminal_startup_enrollment_ack(frames[1])
+            received_route_table = decode_terminal_decode_control_route_table(
+                binding.matrix,
+                frames[2],
+            )
             acknowledgement.require_matrix(binding.matrix)
             acknowledgement.require_decoder_registration(registration_frames)
+            if acknowledgement.decoder_control_route_table_sha256 != (
+                received_route_table.digest
+            ):
+                raise RuntimeError(
+                    "terminal enrollment acknowledgement binds another route table"
+                )
             if (
                 acknowledgement.target_decoder_service_id != local_rank.service_id
                 or acknowledgement.target_decoder_tensor_parallel_rank
@@ -2042,6 +2120,11 @@ class NixlKVManager(CommonKVManager):
                 raise RuntimeError(
                     "terminal enrollment acknowledgement targets another decoder"
                 )
+            received_route_table.require_local_registration(
+                binding,
+                NetworkAddress(self.local_ip, self.rank_port),
+                registration_frames,
+            )
             source_key = (
                 acknowledgement.source_service_id,
                 acknowledgement.source_tensor_parallel_rank,
@@ -2055,6 +2138,13 @@ class NixlKVManager(CommonKVManager):
                     "terminal enrollment acknowledgement was received twice"
                 )
             received.add(source_key)
+            if route_table is None:
+                route_table = received_route_table
+            elif received_route_table != route_table:
+                raise RuntimeError("source ranks disagree on decoder control routes")
+        if route_table is None:
+            raise RuntimeError("decoder received no control route table")
+        return route_table
 
     def _activate_terminal_source(self, deadline: float) -> None:
         """Commit source peer authority and hand off to runtime workers.
@@ -2067,8 +2157,15 @@ class NixlKVManager(CommonKVManager):
         publication_control = self._enroll_terminal_source_publication_routes(deadline)
         self._terminal_source_publication_control = publication_control
         enrollments = self._receive_terminal_decoder_enrollments(deadline)
+        route_tables = self._build_terminal_decode_route_tables(
+            self._require_terminal_startup_peer_enrollment().binding,
+            enrollments,
+        )
         for enrollment in enrollments:
-            self._send_terminal_startup_ack(enrollment)
+            self._send_terminal_startup_ack(
+                enrollment,
+                route_tables[enrollment.rank.service_id],
+            )
 
     def _activate_terminal_decoder(self, deadline: float) -> None:
         """Commit decoder peer authority and hand off to runtime workers.
@@ -2085,7 +2182,10 @@ class NixlKVManager(CommonKVManager):
                 route.bootstrap_info(),
                 registration_frames,
             )
-        self._wait_for_terminal_source_acks(registration_frames, deadline)
+        self._terminal_decode_control_routes = self._wait_for_terminal_source_acks(
+            registration_frames,
+            deadline,
+        )
 
     @staticmethod
     def _terminal_rank_runtime_config(
@@ -2290,9 +2390,10 @@ class NixlKVManager(CommonKVManager):
 
         controller = self._require_packed_decode_controller()
         cuda_scatter = enrollment.cuda_scatter
-        send_delivery = installation.send_decode_delivery
-        if cuda_scatter is None or send_delivery is None:
+        if cuda_scatter is None:
             raise RuntimeError("terminal decode native work boundary is unavailable")
+        if self._terminal_decode_control_routes is None:
+            raise RuntimeError("terminal decode control routes are unavailable")
         local_identity = binding.advertisement.terminal_identity
         coordinator_issuer = (
             TerminalWireReceiptIssuer(local_identity)
@@ -2310,7 +2411,7 @@ class NixlKVManager(CommonKVManager):
             physical_capacity=installation.physical_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             work=PackedTerminalDecodeWork(
-                send_delivery=send_delivery,
+                send_delivery=self._send_terminal_decode_delivery,
                 observe_output=self._observe_terminal_output,
             ),
             retire_native_producers=enrollment.retire_native_producers,
@@ -2481,6 +2582,60 @@ class NixlKVManager(CommonKVManager):
         if len(matches) != 1:
             raise RuntimeError("terminal identity is absent from the sealed matrix")
         return matches[0]
+
+    def _send_terminal_decode_delivery(
+        self,
+        delivery: PackedTerminalDecodeWireDelivery,
+    ) -> None:
+        """Send one request terminal receipt directly to its exact owner.
+
+        Same-service decoder listeners come from the source-agreed startup
+        route table. Source listeners come from the already frozen native peer
+        roster. Both paths use the manager's sole serialized control sender and
+        introduce no request-path collective or polling cadence.
+
+        :param delivery: Immutable coordinator fan-in or owner fan-out edge.
+        """
+
+        if type(delivery) is not PackedTerminalDecodeWireDelivery:
+            raise TypeError("delivery must be PackedTerminalDecodeWireDelivery")
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        local = enrollment.binding.advertisement
+        if local.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("only a decoder can send decode terminal delivery")
+        recipient_rank = self._terminal_rank_for_identity(delivery.recipient)
+        if delivery.recipient == local.terminal_identity:
+            raise RuntimeError("local decode delivery must not enter the transport")
+
+        if recipient_rank.role is TerminalOwnerRole.DECODE:
+            routes = self._terminal_decode_control_routes
+            if routes is None:
+                raise RuntimeError("terminal decode control routes are unavailable")
+            endpoint = routes.route_for(delivery.recipient).endpoint
+        else:
+            peer = enrollment.prefill_peers.get(recipient_rank.key)
+            if peer is None:
+                raise RuntimeError("terminal source recipient is not enrolled")
+            with self._prefill_peer_lock:
+                if peer.handle in self._quarantined_remote_handles:
+                    raise RuntimeError("terminal source recipient is quarantined")
+            endpoint = peer.control_endpoint
+
+        receipt = delivery.receipt
+        message = PackedTerminalReceipt(
+            key=receipt.binding.request_key,
+            receipt_payload=receipt.encode(),
+        )
+        frames = tuple(
+            encode_packed_control_frames(
+                self.agent.name,
+                self.process_generation,
+                message,
+            )
+        )
+        with self._packed_control_send_lock:
+            socket = self._connect(endpoint.to_tcp(), is_ipv6=endpoint.is_ipv6)
+            socket.send_multipart(frames)
 
     def receive_terminal_decode_receipt(
         self,
@@ -2697,12 +2852,37 @@ class NixlKVManager(CommonKVManager):
         raise RuntimeError("source terminal receiver rejected another control type")
 
     def _dispatch_terminal_decode_control(self, frames: list[bytes]) -> None:
-        """Authenticate and dispatch one source-to-decode terminal control.
+        """Authenticate and dispatch source or same-service decode control.
 
         :param frames: Exact packed multipart control frames.
         """
 
         agent_name, generation, message = decode_packed_control_frames(frames)
+        routes = self._terminal_decode_control_routes
+        if type(message) is PackedTerminalReceipt and routes is not None:
+            generation_bytes = uuid.UUID(
+                self._canonical_process_generation(generation)
+            ).bytes
+            decoder_matches = tuple(
+                route
+                for route in routes.routes
+                if route.startup_rank.nixl_agent_name == agent_name
+                and route.startup_rank.process_generation == generation_bytes
+            )
+            if len(decoder_matches) == 1:
+                wire_receipt = TerminalWireReceipt.decode(message.receipt_payload)
+                if wire_receipt.binding.request_key != message.key:
+                    raise RuntimeError(
+                        "decode terminal receipt key differs from framing"
+                    )
+                self.receive_terminal_decode_receipt(
+                    wire_receipt,
+                    decoder_matches[0].identity,
+                )
+                return
+            if len(decoder_matches) > 1:
+                raise RuntimeError("decode control route identity is ambiguous")
+
         rank = self._authenticated_terminal_control_rank(
             agent_name,
             generation,
@@ -5026,6 +5206,14 @@ class NixlKVManager(CommonKVManager):
                 raise RuntimeError("terminal prefill peer was not pre-enrolled")
             if peer.bootstrap_addr != bootstrap_addr:
                 raise RuntimeError("terminal prefill route changed bootstrap authority")
+            rank_ip = bootstrap_info.get("rank_ip")
+            rank_port = bootstrap_info.get("rank_port")
+            if (
+                type(rank_ip) is not str
+                or type(rank_port) is not int
+                or peer.control_endpoint != NetworkAddress(rank_ip, rank_port)
+            ):
+                raise RuntimeError("terminal prefill control listener changed")
             if (
                 peer.agent_name != rank.nixl_agent_name
                 or peer.process_generation
@@ -5079,6 +5267,13 @@ class NixlKVManager(CommonKVManager):
         process_generation = self._canonical_process_generation(
             bootstrap_info.get("process_generation")
         )
+        rank_ip = bootstrap_info.get("rank_ip")
+        rank_port = bootstrap_info.get("rank_port")
+        if type(rank_ip) is not str or len(rank_ip) == 0:
+            raise RuntimeError("Missing prefill control listener host")
+        if type(rank_port) is not int or not 1 <= rank_port <= 65535:
+            raise RuntimeError("Invalid prefill control listener port")
+        control_endpoint = NetworkAddress(rank_ip, rank_port)
 
         try:
             metadata = decode_nixl_agent_metadata(encoded_metadata)
@@ -5099,6 +5294,7 @@ class NixlKVManager(CommonKVManager):
             metadata=metadata,
             metadata_sha256=actual_digest,
             process_generation=process_generation,
+            control_endpoint=control_endpoint,
         )
 
     def _retain_prefill_peer(
@@ -5114,6 +5310,7 @@ class NixlKVManager(CommonKVManager):
         metadata: bytes,
         metadata_sha256: str,
         process_generation: str,
+        control_endpoint: NetworkAddress,
     ) -> _NixlPrefillPeer:
         """Atomically resolve or create one native prefill peer record.
 
@@ -5127,6 +5324,7 @@ class NixlKVManager(CommonKVManager):
         :param metadata: Exact native agent metadata.
         :param metadata_sha256: Validated metadata digest.
         :param process_generation: Source process generation.
+        :param control_endpoint: Actual manager-owned source listener.
         :returns: Exact retained native peer record.
         :raises RuntimeError: If an existing route conflicts or native setup fails.
         """
@@ -5138,6 +5336,8 @@ class NixlKVManager(CommonKVManager):
             attn_tp_rank,
             pp_rank,
         )
+        if type(control_endpoint) is not NetworkAddress:
+            raise TypeError("control_endpoint must be NetworkAddress")
         with self._prefill_peer_lock:
             existing = self._prefill_peers.get(route_key)
             if existing is not None:
@@ -5146,6 +5346,7 @@ class NixlKVManager(CommonKVManager):
                     and existing.agent_name == agent_name
                     and existing.metadata_sha256 == metadata_sha256
                     and existing.process_generation == process_generation
+                    and existing.control_endpoint == control_endpoint
                 )
                 if not unchanged:
                     raise RuntimeError(
@@ -5193,6 +5394,7 @@ class NixlKVManager(CommonKVManager):
                 agent_name=agent_name,
                 metadata_sha256=metadata_sha256,
                 process_generation=process_generation,
+                control_endpoint=control_endpoint,
                 handle=handle,
             )
             self._prefill_peers[route_key] = peer

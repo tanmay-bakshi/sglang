@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable
 
 import pytest
+
 from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     TERMINAL_STARTUP_ENROLLMENT_ACK_MAX_BYTES,
     TERMINAL_STARTUP_ENROLLMENT_ACK_SCHEMA,
@@ -26,6 +27,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 _COHORT_SHA256 = bytes.fromhex("11" * 32)
+_ROUTE_TABLE_SHA256 = bytes.fromhex("22" * 32)
 _REGISTRATION_FRAMES = (
     b"NIXL-KV",
     b"None",
@@ -149,6 +151,7 @@ def _acknowledgement() -> TerminalStartupEnrollmentAck:
         matrix.rank("prefill-a", 0),
         matrix.rank("decode-a", 0),
         _REGISTRATION_FRAMES,
+        _ROUTE_TABLE_SHA256,
     )
 
 
@@ -206,6 +209,7 @@ def test_builder_binds_matrix_endpoints_and_exact_registration() -> None:
         source,
         decoder,
         _REGISTRATION_FRAMES,
+        _ROUTE_TABLE_SHA256,
     )
 
     assert acknowledgement.startup_matrix_sha256 == matrix.digest
@@ -224,6 +228,9 @@ def test_builder_binds_matrix_endpoints_and_exact_registration() -> None:
     )
     assert acknowledgement.decoder_registration_multipart_sha256 == (
         terminal_decoder_registration_multipart_sha256(_REGISTRATION_FRAMES)
+    )
+    assert acknowledgement.decoder_control_route_table_sha256 == (
+        _ROUTE_TABLE_SHA256
     )
     acknowledgement.require_matrix(matrix)
     acknowledgement.require_decoder_registration(_REGISTRATION_FRAMES)
@@ -343,6 +350,7 @@ def test_builder_rejects_rows_outside_the_exact_matrix() -> None:
             stale_source,
             decoder,
             _REGISTRATION_FRAMES,
+            _ROUTE_TABLE_SHA256,
         )
     with pytest.raises(TerminalStartupEnrollmentAckError, match="matrix source"):
         build_terminal_startup_enrollment_ack(
@@ -350,6 +358,7 @@ def test_builder_rejects_rows_outside_the_exact_matrix() -> None:
             decoder,
             source,
             _REGISTRATION_FRAMES,
+            _ROUTE_TABLE_SHA256,
         )
 
 

@@ -9,11 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import zmq
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeWriterManifest,
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
+    PackedTerminalReceipt,
 )
 from sglang.srt.disaggregation.nixl.conn import (
     NIXL_BOOTSTRAP_PEER_PROTOCOL,
@@ -24,11 +26,22 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     PACKED_CONTROL_TAG,
     PACKED_PREPARED_GRANT_PROTOCOL,
     PackedRegistrationAdvertisement,
+    decode_packed_control_frames,
+    encode_packed_control_frames,
+)
+from sglang.srt.disaggregation.nixl.startup_decode_routes import (
+    TerminalDecodeControlRouteTable,
+    build_terminal_decode_control_route_table,
+    encode_terminal_decode_control_route_table,
 )
 from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
     build_terminal_startup_enrollment_ack,
     encode_terminal_startup_enrollment_ack,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeDeliveryTarget,
+    PackedTerminalDecodeWireDelivery,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -57,6 +70,7 @@ from sglang.srt.disaggregation.terminal_progress.wire import (
     TerminalWireReceiptIssuer,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.utils.network import NetworkAddress
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -427,8 +441,17 @@ def _manager(
         "prefill-agent-1": b"prefill-metadata-1",
         "decode-agent-a": b"decode-metadata-a",
         "decode-agent-b": b"decode-metadata-b",
+        "prefill-agent-c": b"prefill-metadata-c",
+        "decode-agent-c-0": b"decode-metadata-c-0",
+        "decode-agent-c-1": b"decode-metadata-c-1",
     }[local.nixl_agent_name]
     manager.agent_metadata = local_metadata
+    manager.local_ip = "127.0.0.1"
+    manager.rank_port = (
+        _decode_listener_port(local)
+        if local.role is TerminalOwnerRole.DECODE
+        else 34000 + local.tensor_parallel_rank
+    )
     manager.attn_tp_size = local.tensor_parallel_size
     manager.attn_tp_rank = local.tensor_parallel_rank
     manager.attn_cp_size = 1
@@ -437,6 +460,7 @@ def _manager(
     manager._terminal_startup_binding = None
     manager._terminal_startup_peer_enrollment = None
     manager._terminal_source_publication_control = None
+    manager._terminal_decode_control_routes = None
     manager._terminal_runtime_activated = threading.Event()
     manager._terminal_activation_lock = threading.Lock()
     manager._terminal_activation_started = False
@@ -455,6 +479,7 @@ def _manager(
     manager._terminal_control_stop_requested = False
     manager._terminal_control_ready = threading.Event()
     manager._terminal_control_lock = threading.Lock()
+    manager._packed_control_send_lock = threading.Lock()
     manager._terminal_runtime_close_started = False
     manager._terminal_runtime_closed = False
     manager._terminal_runtime_close_lock = threading.Lock()
@@ -536,7 +561,7 @@ def _decoder_registration_frames(
     manager = object.__new__(NixlKVManager)
     manager._terminal_startup_binding = binding
     manager.local_ip = "127.0.0.1"
-    manager.rank_port = 33000 + (0 if rank.service_id == "decode-a" else 1)
+    manager.rank_port = _decode_listener_port(rank)
     manager.agent = SimpleNamespace(name=rank.nixl_agent_name)
     manager.agent_metadata = (
         b"decode-metadata-a" if rank.service_id == "decode-a" else b"decode-metadata-b"
@@ -573,6 +598,53 @@ def _decoder_registration_frames(
     return manager._decode_registration_frames()
 
 
+def _decode_listener_port(rank: TerminalStartupRankAdvertisement) -> int:
+    """Return one stable synthetic decoder manager listener port.
+
+    :param rank: Exact decoder startup row.
+    :returns: Unique test listener port.
+    """
+
+    service_offset = {
+        "decode-a": 0,
+        "decode-b": 100,
+        "decode-c": 200,
+    }[rank.service_id]
+    return 33000 + service_offset + rank.tensor_parallel_rank
+
+
+def _decode_route_table(
+    binding: TerminalStartupRankBinding,
+    service_id: str,
+    registration_frames: tuple[bytes, ...],
+) -> TerminalDecodeControlRouteTable:
+    """Build one complete synthetic same-service listener table.
+
+    :param binding: Startup matrix authority.
+    :param service_id: Decoder service represented by the table.
+    :param registration_frames: Stable synthetic registration bytes.
+    :returns: Immutable decoder control route table.
+    """
+
+    target_ranks = tuple(
+        rank
+        for rank in binding.matrix.ranks
+        if rank.role is TerminalOwnerRole.DECODE and rank.service_id == service_id
+    )
+    return build_terminal_decode_control_route_table(
+        binding.matrix,
+        service_id,
+        tuple(
+            (
+                rank,
+                NetworkAddress("127.0.0.1", _decode_listener_port(rank)),
+                registration_frames,
+            )
+            for rank in target_ranks
+        ),
+    )
+
+
 def _ack_frames(
     binding: TerminalStartupRankBinding,
     source_rank: TerminalStartupRankAdvertisement,
@@ -595,15 +667,22 @@ def _ack_frames(
         else target_service_id,
         binding.advertisement.tensor_parallel_rank,
     )
+    route_table = _decode_route_table(
+        binding,
+        target.service_id,
+        registration_frames,
+    )
     acknowledgement = build_terminal_startup_enrollment_ack(
         binding.matrix,
         source_rank,
         target,
         registration_frames,
+        route_table.digest,
     )
     return (
         TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
         encode_terminal_startup_enrollment_ack(acknowledgement),
+        encode_terminal_decode_control_route_table(route_table),
     )
 
 
@@ -980,6 +1059,154 @@ def test_decode_peer_accepts_request_ready_only_from_canonical_rank() -> None:
     manager._terminal_decode_serving.coordinator_receipt_received.assert_not_called()
 
 
+def test_decode_delivery_uses_frozen_rank_listener_without_collective_relay() -> None:
+    """LOCAL_DECODE_READY reaches rank zero through the exact startup route."""
+
+    matrix = _decode_tp2_matrix()
+    binding = _binding_for_matrix(matrix, "decode-c", 1)
+    local = binding.advertisement.terminal_identity
+    coordinator = matrix.rank("decode-c", 0).terminal_identity
+    manager = _manager(binding, {})
+    manager._terminal_decode_control_routes = _decode_route_table(
+        binding,
+        "decode-c",
+        (b"guarded-registration",),
+    )
+    socket = MagicMock()
+    manager._connect = MagicMock(return_value=socket)
+    receipt = (
+        TerminalWireReceiptIssuer(local)
+        .issue(
+            binding=_request_binding(local),
+            kind=TerminalReceiptKind.LOCAL_DECODE_READY,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=47,
+        )
+        .wire_receipt
+    )
+
+    manager._send_terminal_decode_delivery(
+        PackedTerminalDecodeWireDelivery(
+            target=PackedTerminalDecodeDeliveryTarget.COORDINATOR,
+            recipient=coordinator,
+            receipt=receipt,
+        )
+    )
+
+    manager._connect.assert_called_once_with("tcp://127.0.0.1:33200", is_ipv6=False)
+    frames = socket.send_multipart.call_args.args[0]
+    agent_name, generation, message = decode_packed_control_frames(list(frames))
+    assert agent_name == binding.advertisement.nixl_agent_name
+    assert generation == str(uuid.UUID(bytes=binding.advertisement.process_generation))
+    assert type(message) is PackedTerminalReceipt
+    assert message.key == receipt.binding.request_key
+    assert message.receipt_payload == receipt.encode()
+
+
+def test_rank_zero_fans_request_ready_to_decode_and_source_owners_directly() -> None:
+    """Request-global terminality uses exact destination and source listeners."""
+
+    matrix = _decode_tp2_matrix()
+    binding = _binding_for_matrix(matrix, "decode-c", 0)
+    coordinator = binding.advertisement.terminal_identity
+    decode_peer = matrix.rank("decode-c", 1).terminal_identity
+    source_rank = matrix.rank("prefill-c", 0)
+    manager = _manager(binding, {})
+    manager._terminal_decode_control_routes = _decode_route_table(
+        binding,
+        "decode-c",
+        (b"guarded-registration",),
+    )
+    source_handle = object()
+    enrollment = manager._terminal_startup_peer_enrollment
+    assert enrollment is not None
+    enrollment.prefill_peers[source_rank.key] = SimpleNamespace(
+        handle=source_handle,
+        control_endpoint=NetworkAddress("127.0.0.1", 31000),
+    )
+    sockets: dict[str, MagicMock] = {}
+
+    def connect(endpoint: str, *, is_ipv6: bool) -> MagicMock:
+        """Return one endpoint-specific fake PUSH socket.
+
+        :param endpoint: Exact target URL.
+        :param is_ipv6: Address-family discriminator.
+        :returns: Stable synthetic socket.
+        """
+
+        assert not is_ipv6
+        return sockets.setdefault(endpoint, MagicMock())
+
+    manager._connect = connect
+    for owner in (decode_peer, source_rank.terminal_identity):
+        receipt = (
+            TerminalWireReceiptIssuer(coordinator)
+            .issue(
+                binding=_request_binding(owner),
+                kind=TerminalReceiptKind.REQUEST_READY,
+                outcome=TerminalReceiptOutcome.SUCCESS,
+                terminal_timestamp_ns=53,
+            )
+            .wire_receipt
+        )
+        manager._send_terminal_decode_delivery(
+            PackedTerminalDecodeWireDelivery(
+                target=PackedTerminalDecodeDeliveryTarget.OWNER,
+                recipient=owner,
+                receipt=receipt,
+            )
+        )
+
+    assert set(sockets) == {
+        "tcp://127.0.0.1:31000",
+        "tcp://127.0.0.1:33201",
+    }
+    assert all(socket.send_multipart.call_count == 1 for socket in sockets.values())
+
+
+def test_decode_control_ingress_authenticates_same_service_rank_receipt() -> None:
+    """The blocking manager owner joins wire claims with its frozen route table."""
+
+    matrix = _decode_tp2_matrix()
+    binding = _binding_for_matrix(matrix, "decode-c", 0)
+    remote_rank = matrix.rank("decode-c", 1)
+    remote = remote_rank.terminal_identity
+    manager = _manager(binding, {})
+    manager._terminal_decode_control_routes = _decode_route_table(
+        binding,
+        "decode-c",
+        (b"guarded-registration",),
+    )
+    manager._terminal_decode_serving = MagicMock()
+    manager._terminal_process_reactor = MagicMock()
+    receipt = (
+        TerminalWireReceiptIssuer(remote)
+        .issue(
+            binding=_request_binding(remote),
+            kind=TerminalReceiptKind.LOCAL_DECODE_READY,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=59,
+        )
+        .wire_receipt
+    )
+    frames = encode_packed_control_frames(
+        remote_rank.nixl_agent_name,
+        str(uuid.UUID(bytes=remote_rank.process_generation)),
+        PackedTerminalReceipt(
+            key=receipt.binding.request_key,
+            receipt_payload=receipt.encode(),
+        ),
+    )
+
+    manager._dispatch_terminal_decode_control(frames)
+
+    manager._terminal_decode_serving.coordinator_receipt_received.assert_called_once_with(
+        receipt,
+        remote,
+    )
+    manager._terminal_process_reactor.notify_coordinator_deadline_changed.assert_called_once_with()
+
+
 def test_source_routes_authenticated_failure_to_failure_ingress() -> None:
     """Keep decode failure terminality distinct from request readiness."""
 
@@ -1071,9 +1298,25 @@ def test_source_retains_exact_decoder_roster_before_runtime_composition() -> Non
         events.append(("publication-roster", None))
         return publication_control
 
-    def send_ack(enrollment: _TerminalDecoderEnrollment) -> None:
+    def send_ack(
+        enrollment: _TerminalDecoderEnrollment,
+        route_table: TerminalDecodeControlRouteTable,
+    ) -> None:
+        """Record one source acknowledgement after route-table freeze.
+
+        :param enrollment: Exact target decoder registration.
+        :param route_table: Complete target-service listener table.
+        """
+
         assert manager.terminal_peer_enrollment_frozen
         assert manager.terminal_source_publication_control is publication_control
+        assert route_table.decoder_service_id == enrollment.rank.service_id
+        assert route_table.route_for(enrollment.rank.terminal_identity).endpoint == (
+            NetworkAddress(
+                enrollment.registration.endpoint,
+                enrollment.registration.dst_port,
+            )
+        )
         assert set(manager.decode_kv_args_table) == {
             "decode-agent-a",
             "decode-agent-b",
