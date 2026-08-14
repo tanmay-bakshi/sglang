@@ -6,7 +6,6 @@ import select
 import sys
 
 import pytest
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.evidence import (
     parse_terminal_progress_timing_log_line,
