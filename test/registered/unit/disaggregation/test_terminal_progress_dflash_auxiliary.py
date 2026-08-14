@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
     PackedAuxiliaryDestinationSegment,
     PackedAuxiliaryPlan,
+    PackedDFlashBoundaryCounters,
     PackedDFlashBoundaryMetadata,
     PackedDFlashBoundaryOutcome,
     PackedRequestKey,
@@ -29,6 +30,7 @@ from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryRowAllocator,
     DFlashBoundaryRowLease,
     DFlashBoundaryRowLeaseState,
+    DFlashBoundaryPrefillSource,
     DFlashBoundarySourceTransfer,
     DFlashBoundarySourceTransportOwner,
     DFlashBoundaryTransportAccounting,
@@ -553,6 +555,24 @@ def _metadata(boundary_token_id: int = 17) -> PackedDFlashBoundaryMetadata:
     )
 
 
+def _counters() -> PackedDFlashBoundaryCounters:
+    """Build deterministic pre-launch DFlash scalar state.
+
+    :returns: Complete immutable counter projection.
+    """
+
+    metadata = _metadata()
+    return PackedDFlashBoundaryCounters(
+        cached_tokens=metadata.cached_tokens,
+        cached_tokens_device=metadata.cached_tokens_device,
+        cached_tokens_host=metadata.cached_tokens_host,
+        cached_tokens_storage=metadata.cached_tokens_storage,
+        image_tokens=metadata.image_tokens,
+        audio_tokens=metadata.audio_tokens,
+        video_tokens=metadata.video_tokens,
+    )
+
+
 def _registered_row(
     allocator: DFlashBoundaryRowAllocator,
     owner: object,
@@ -996,6 +1016,53 @@ def test_scalar_metadata_requires_exact_uint64_values(value: int) -> None:
 
     with pytest.raises(ValueError, match="must be a uint64"):
         dataclasses.replace(_metadata(), cached_tokens=value)
+
+
+@pytest.mark.parametrize("value", [-1, 1 << 64, True])
+def test_boundary_counters_require_exact_uint64_values(value: int) -> None:
+    """Pre-launch scalar state rejects invalid unsigned counters."""
+
+    with pytest.raises(ValueError, match="must be a uint64"):
+        dataclasses.replace(_counters(), cached_tokens=value)
+
+
+def test_boundary_counters_join_only_the_completed_token() -> None:
+    """The sampled token is the sole post-launch DFlash metadata field."""
+
+    counters = _counters()
+
+    assert counters.metadata(23) == dataclasses.replace(
+        _metadata(),
+        boundary_token_id=23,
+    )
+    with pytest.raises(ValueError, match="must be a uint64"):
+        counters.metadata(-1)
+
+
+def test_prefill_source_joins_active_row_with_completed_result_slot() -> None:
+    """Terminal source state retains its row until result completion."""
+
+    _, allocator = _allocator(row_capacity=1)
+    pool = _pool_without_cuda(allocator)
+    authority = object()
+    lease = pool.lease_row(authority)
+    source = DFlashBoundaryPrefillSource(lease=lease, counters=_counters())
+
+    assert source.lease is lease
+    assert source.metadata_from_result_slot(_GatewaySlot([])) == _metadata()
+
+
+def test_prefill_source_rejects_non_active_row() -> None:
+    """Released or quarantined rows cannot enter a launch plan."""
+
+    _, allocator = _allocator(row_capacity=1)
+    pool = _pool_without_cuda(allocator)
+    authority = object()
+    lease = pool.lease_row(authority)
+    lease.release(authority)
+
+    with pytest.raises(ValueError, match="must be active"):
+        DFlashBoundaryPrefillSource(lease=lease, counters=_counters())
 
 
 def test_boundary_outcome_wire_round_trip_is_exact() -> None:
