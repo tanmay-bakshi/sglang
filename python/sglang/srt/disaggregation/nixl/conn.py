@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -60,6 +61,9 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryPlan,
+    PackedReady,
+    PackedRequestTeardown,
+    PackedTerminalReceipt,
 )
 from sglang.srt.disaggregation.common.packed_staging_wire import (
     PackedWireMessage,
@@ -122,6 +126,15 @@ from sglang.srt.disaggregation.runtime_capabilities import (
 from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
     build_terminal_startup_cohort_expectation,
 )
+from sglang.srt.disaggregation.terminal_progress.deadlines import (
+    TerminalDeadlineKind,
+    terminal_deadline_spec,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeServing,
+    PackedTerminalDecodeWireDelivery,
+    PackedTerminalDecodeWork,
+)
 from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentCohort,
     TerminalDeploymentLocalService,
@@ -129,7 +142,24 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
+    TerminalProcessIdentity,
     TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerActionKind,
+    NativeTerminalOwnerEventKind,
+)
+from sglang.srt.disaggregation.terminal_progress.output_projection import (
+    PrefillTerminalGatewayPayloadEncoder,
+)
+from sglang.srt.disaggregation.terminal_progress.publisher import (
+    PackedTerminalOutputPublisher,
+    TerminalGatewayPublicationResult,
+    ZmqTerminalGatewaySinkFactory,
+)
+from sglang.srt.disaggregation.terminal_progress.receipts import (
+    TerminalReceiptKind,
+    TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.request_registration import (
     PackedTerminalDecodeRequestAuthority,
@@ -138,10 +168,31 @@ from sglang.srt.disaggregation.terminal_progress.request_registration import (
     project_packed_terminal_source_authority,
     require_source_plan_request_key,
 )
+from sglang.srt.disaggregation.terminal_progress.runtime_enrollment import (
+    TerminalRankRuntimeConfig,
+    TerminalRankRuntimeEnrollment,
+    TerminalRankRuntimeEnrollmentFactory,
+)
+from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
+    SchedulerReceiptInboxInventory,
+)
+from sglang.srt.disaggregation.terminal_progress.serving_reactor import (
+    PackedTerminalProcessReactor,
+    PackedTerminalProcessReactorFailure,
+)
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
     PackedTerminalSourcePlan,
     decode_packed_terminal_source_plan,
+)
+from sglang.srt.disaggregation.terminal_progress.source_serving import (
+    PackedTerminalSourceServing,
+    PackedTerminalSourceWork,
+)
+from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceMetric,
+    PackedTerminalSourceMetricsSink,
+    PackedTerminalSourceSubmission,
 )
 from sglang.srt.disaggregation.terminal_progress.startup_binding import (
     TerminalStartupRankBinding,
@@ -156,6 +207,11 @@ from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
 from sglang.srt.disaggregation.terminal_progress.startup_http import (
     TERMINAL_STARTUP_ROUTE,
     handle_terminal_startup_join,
+)
+from sglang.srt.disaggregation.terminal_progress.wire import (
+    TerminalWireReceipt,
+    TerminalWireReceiptImportNamespace,
+    TerminalWireReceiptIssuer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -822,6 +878,85 @@ class _TerminalDecoderEnrollment:
     frames: tuple[bytes, ...]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class NixlTerminalRuntimeInstallation:
+    """Scheduler-owned dependencies required before terminal activation.
+
+    :ivar physical_capacity: Exact metadata-row capacity governing live request
+        generations and every derived process queue.
+    :ivar gateway_endpoint: Canonical source-rank gateway PUSH endpoint.
+    :ivar source_work: Source-only actor and transport continuation callbacks.
+    :ivar source_publication_fanout: Source-rank-zero result fan-out to the
+        other source ranks, if the source service has TP greater than one.
+    :ivar send_decode_delivery: Decode-only authenticated terminal delivery.
+    :ivar bind_source_serving: Source-only scheduler serving installation.
+    :ivar bind_decode_serving: Decode-only scheduler and preallocation-queue
+        serving installation.
+    :ivar scheduler_process_fatal_handler: Scheduler-thread fatal inventory
+        consumer.
+    :ivar owner_dead_handler: Thread-safe wake that makes scheduler admission
+        fail closed after a publisher, reactor, or control-owner death.
+    """
+
+    physical_capacity: int
+    gateway_endpoint: str | None
+    source_work: PackedTerminalSourceWork | None
+    source_publication_fanout: Callable[[TerminalGatewayPublicationResult], None] | None
+    send_decode_delivery: Callable[[PackedTerminalDecodeWireDelivery], None] | None
+    bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None
+    bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None
+    scheduler_process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None]
+    owner_dead_handler: Callable[[], None]
+
+    def __post_init__(self) -> None:
+        """Validate the role-neutral installation boundary."""
+
+        if type(self.physical_capacity) is not int or self.physical_capacity <= 0:
+            raise ValueError("physical_capacity must be a positive integer")
+        if self.gateway_endpoint is not None and (
+            type(self.gateway_endpoint) is not str or len(self.gateway_endpoint) == 0
+        ):
+            raise ValueError("gateway_endpoint must be None or a non-empty string")
+        if (
+            self.source_work is not None
+            and type(self.source_work) is not PackedTerminalSourceWork
+        ):
+            raise TypeError("source_work must be PackedTerminalSourceWork or None")
+        callbacks = (
+            self.source_publication_fanout,
+            self.send_decode_delivery,
+            self.bind_source_serving,
+            self.bind_decode_serving,
+        )
+        if any(
+            callback is not None and not callable(callback) for callback in callbacks
+        ):
+            raise TypeError("optional terminal installation callbacks must be callable")
+        if not callable(self.scheduler_process_fatal_handler):
+            raise TypeError("scheduler_process_fatal_handler must be callable")
+        if not callable(self.owner_dead_handler):
+            raise TypeError("owner_dead_handler must be callable")
+
+
+class _NixlTerminalSourceMetrics(PackedTerminalSourceMetricsSink):
+    """Project non-gating source metrics into the existing process logger."""
+
+    def emit(self, metric: PackedTerminalSourceMetric) -> None:
+        """Emit one source lifecycle point without affecting admission.
+
+        :param metric: Exactly-once source lifecycle timing point.
+        """
+
+        if type(metric) is not PackedTerminalSourceMetric:
+            raise TypeError("metric must be PackedTerminalSourceMetric")
+        logger.debug(
+            "terminal source event=%s binding=%s timestamp_ns=%d",
+            metric.event_kind.name,
+            metric.binding_digest.hex(),
+            metric.timestamp_ns,
+        )
+
+
 def expand_page_indices_for_slice(
     page_indices: npt.NDArray[np.int32],
     num_ptr_pairs: int,
@@ -954,6 +1089,29 @@ class NixlKVManager(CommonKVManager):
         self._terminal_activation_started = False
         self._terminal_bootstrap_thread: threading.Thread | None = None
         self._runtime_workers_started = False
+        self._terminal_runtime_installation: NixlTerminalRuntimeInstallation | None = (
+            None
+        )
+        self._terminal_runtime_enrollment: TerminalRankRuntimeEnrollment | None = None
+        self._terminal_source_serving: PackedTerminalSourceServing | None = None
+        self._terminal_decode_serving: PackedTerminalDecodeServing | None = None
+        self._terminal_process_reactor: PackedTerminalProcessReactor | None = None
+        self._terminal_output_publisher: PackedTerminalOutputPublisher | None = None
+        self._terminal_source_receipt_importers: dict[
+            TerminalProcessIdentity, TerminalWireReceiptImportNamespace
+        ] = {}
+        self._terminal_control_thread: threading.Thread | None = None
+        self._terminal_control_read_fd: int | None = None
+        self._terminal_control_write_fd: int | None = None
+        self._terminal_control_stop_requested = False
+        self._terminal_control_ready = threading.Event()
+        self._terminal_control_lock = threading.Lock()
+        self._terminal_runtime_close_started = False
+        self._terminal_runtime_closed = False
+        self._terminal_runtime_close_lock = threading.Lock()
+        self._terminal_process_fatal_reason: str | None = None
+        self._terminal_process_fatal_traceback: str | None = None
+        self._terminal_process_fatal_lock = threading.Lock()
         super().__init__(
             args,
             disaggregation_mode,
@@ -1189,6 +1347,201 @@ class NixlKVManager(CommonKVManager):
 
         enrollment = self._terminal_startup_peer_enrollment
         return enrollment is not None and enrollment.frozen
+
+    def install_terminal_runtime(
+        self,
+        installation: NixlTerminalRuntimeInstallation,
+    ) -> None:
+        """Install scheduler and route dependencies before startup activation.
+
+        :param installation: Exact role-specific runtime dependencies.
+        :raises RuntimeError: If installation repeats or activation has begun.
+        """
+
+        if type(installation) is not NixlTerminalRuntimeInstallation:
+            raise TypeError("installation must be NixlTerminalRuntimeInstallation")
+        binding = self.terminal_startup_binding
+        if binding is None:
+            raise RuntimeError("terminal startup binding is not configured")
+        if self._terminal_activation_started:
+            raise RuntimeError("terminal runtime installation is too late")
+        if self._terminal_runtime_installation is not None:
+            raise RuntimeError("terminal runtime is already installed")
+
+        local = binding.advertisement
+        if local.role is TerminalOwnerRole.SOURCE:
+            if installation.source_work is None:
+                raise ValueError("terminal source installation requires source_work")
+            if installation.send_decode_delivery is not None:
+                raise ValueError(
+                    "terminal source installation cannot send decode deliveries"
+                )
+            if installation.bind_source_serving is None:
+                raise ValueError(
+                    "terminal source installation requires a scheduler binding"
+                )
+            if installation.bind_decode_serving is not None:
+                raise ValueError(
+                    "terminal source installation cannot bind decode serving"
+                )
+            if local.tensor_parallel_rank == 0:
+                if installation.gateway_endpoint is None:
+                    raise ValueError(
+                        "canonical terminal source requires a gateway endpoint"
+                    )
+                if (
+                    local.tensor_parallel_size > 1
+                    and installation.source_publication_fanout is None
+                ):
+                    raise ValueError(
+                        "multi-rank terminal source requires publication fan-out"
+                    )
+            elif installation.gateway_endpoint is not None:
+                raise ValueError(
+                    "noncanonical terminal source cannot own a gateway endpoint"
+                )
+        else:
+            if installation.source_work is not None:
+                raise ValueError("terminal decode installation cannot own source_work")
+            if installation.gateway_endpoint is not None:
+                raise ValueError(
+                    "terminal decode installation cannot own a gateway endpoint"
+                )
+            if installation.source_publication_fanout is not None:
+                raise ValueError(
+                    "terminal decode installation cannot own source publication"
+                )
+            if installation.send_decode_delivery is None:
+                raise ValueError(
+                    "terminal decode installation requires point-to-point delivery"
+                )
+            if installation.bind_decode_serving is None:
+                raise ValueError(
+                    "terminal decode installation requires a scheduler binding"
+                )
+            if installation.bind_source_serving is not None:
+                raise ValueError(
+                    "terminal decode installation cannot bind source serving"
+                )
+        self._terminal_runtime_installation = installation
+
+    @property
+    def terminal_runtime_enrollment(self) -> TerminalRankRuntimeEnrollment:
+        """Return the sole active terminal runtime enrollment.
+
+        :returns: Process-lifetime runtime and native producer ownership.
+        """
+
+        enrollment = self._terminal_runtime_enrollment
+        if enrollment is None:
+            raise RuntimeError("terminal runtime enrollment is unavailable")
+        return enrollment
+
+    @property
+    def terminal_source_serving(self) -> PackedTerminalSourceServing:
+        """Return the active source serving composition.
+
+        :returns: Sole source serving owner for this process.
+        """
+
+        binding = self.terminal_startup_binding
+        if (
+            binding is None
+            or binding.advertisement.role is not TerminalOwnerRole.SOURCE
+        ):
+            raise RuntimeError("terminal source serving requires a source manager")
+        serving = self._terminal_source_serving
+        if serving is None:
+            raise RuntimeError("terminal source serving is unavailable")
+        return serving
+
+    @property
+    def terminal_decode_serving(self) -> PackedTerminalDecodeServing:
+        """Return the active decode serving composition.
+
+        :returns: Sole decode serving owner for this process.
+        """
+
+        binding = self.terminal_startup_binding
+        if (
+            binding is None
+            or binding.advertisement.role is not TerminalOwnerRole.DECODE
+        ):
+            raise RuntimeError("terminal decode serving requires a decode manager")
+        serving = self._terminal_decode_serving
+        if serving is None:
+            raise RuntimeError("terminal decode serving is unavailable")
+        return serving
+
+    @property
+    def terminal_process_reactor(self) -> PackedTerminalProcessReactor:
+        """Return the active off-forward process reactor.
+
+        :returns: Sole role-specific terminal reactor.
+        """
+
+        reactor = self._terminal_process_reactor
+        if reactor is None:
+            raise RuntimeError("terminal process reactor is unavailable")
+        return reactor
+
+    def bind_terminal_source_submission(
+        self,
+        submission: PackedTerminalSourceSubmission,
+        release_resources: Callable[[PackedTerminalSourceSubmission], None],
+    ) -> None:
+        """Bind actor, scheduler, receipt, and native ownership before PREPARE.
+
+        :param submission: Exact immutable post-model-return handoff.
+        :param release_resources: Scheduler-affine one-shot resource release.
+        """
+
+        if type(submission) is not PackedTerminalSourceSubmission:
+            raise TypeError("submission must be PackedTerminalSourceSubmission")
+        if not callable(release_resources):
+            raise TypeError("release_resources must be callable")
+        self.terminal_process_reactor.require_admission_open()
+        serving = self.terminal_source_serving
+        runtime = self._packed_prefill_runtime
+        if runtime is None:
+            raise RuntimeError("packed source actor is unavailable")
+        transport = submission.transport_submission
+        if type(transport) is not PackedPrefillSubmission:
+            raise TypeError(
+                "source transport_submission must be PackedPrefillSubmission"
+            )
+        identity = submission.identity
+        importer = self._terminal_source_receipt_importers.get(
+            identity.request_ready_issuer
+        )
+        if importer is None:
+            raise RuntimeError(
+                "source request-ready issuer is absent from sealed startup"
+            )
+
+        runtime.bind_terminal_owner(transport, identity)
+        importer.register_binding(identity.local_binding)
+        try:
+            serving.bind_submission(submission, release_resources)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            active = serving.inventory().wiring.active_binding_digests
+            if identity.local_binding.digest not in active:
+                importer.retire_binding(identity.local_binding)
+                runtime.cancel_terminal_owner_unpublished(transport)
+            else:
+                self._record_terminal_component_failure(
+                    "source serving bind failed after lifecycle commit",
+                    traceback.format_exc(),
+                )
+            raise
+        try:
+            runtime.publish_terminal_owner_prepare(transport)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._record_terminal_component_failure(
+                "source PREPARE publication failed after lifecycle commit",
+                traceback.format_exc(),
+            )
+            raise
 
     def install_terminal_startup_binding(
         self,
@@ -1651,6 +2004,920 @@ class NixlKVManager(CommonKVManager):
             )
         self._wait_for_terminal_source_acks(registration_frames, deadline)
 
+    @staticmethod
+    def _terminal_rank_runtime_config(
+        physical_capacity: int,
+    ) -> TerminalRankRuntimeConfig:
+        """Derive every native queue from one physical request authority.
+
+        Each live request can emit every event at most once. Routed action
+        queues use their exact applicable action populations, while scheduler,
+        coordinator, decode-work, and publication queues admit at most one
+        simultaneous action per live generation.
+
+        :param physical_capacity: Exact metadata-row request capacity.
+        :returns: Complete role-neutral runtime queue configuration.
+        """
+
+        if type(physical_capacity) is not int or physical_capacity <= 0:
+            raise ValueError("physical_capacity must be a positive integer")
+        event_population = len(NativeTerminalOwnerEventKind)
+        action_population = len(NativeTerminalOwnerActionKind)
+        return TerminalRankRuntimeConfig(
+            input_capacity=physical_capacity * event_population,
+            output_capacity=physical_capacity * action_population,
+            maximum_live_lifecycles=physical_capacity,
+            scheduler_capacity=physical_capacity,
+            coordinator_capacity=physical_capacity,
+            lifecycle_capacity=physical_capacity * 2,
+            source_work_capacity=physical_capacity * 3,
+            decode_work_capacity=physical_capacity,
+            publisher_capacity=physical_capacity,
+            observation_capacity=physical_capacity * event_population,
+            native_producer_retirement_timeout_seconds=terminal_deadline_spec(
+                TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
+            ).seconds,
+        )
+
+    def _source_request_ready_importers(
+        self,
+        binding: TerminalStartupRankBinding,
+    ) -> dict[TerminalProcessIdentity, TerminalWireReceiptImportNamespace]:
+        """Build one exact importer for every eligible decode coordinator.
+
+        :param binding: Local source startup authority.
+        :returns: Decode-rank-zero importer map keyed by authenticated identity.
+        """
+
+        importers: dict[
+            TerminalProcessIdentity, TerminalWireReceiptImportNamespace
+        ] = {}
+        for rank in binding.matrix.ranks:
+            if rank.role is not TerminalOwnerRole.DECODE:
+                continue
+            if rank.tensor_parallel_rank != 0:
+                continue
+            identity = rank.terminal_identity
+            importers[identity] = TerminalWireReceiptImportNamespace(identity)
+        if len(importers) == 0:
+            raise RuntimeError("terminal source has no decode coordinator importer")
+        return importers
+
+    @staticmethod
+    def _decode_coordinator_importers(
+        binding: TerminalStartupRankBinding,
+    ) -> tuple[TerminalWireReceiptImportNamespace, ...]:
+        """Build canonical same-service decode importers for rank zero.
+
+        :param binding: Local decode startup authority.
+        :returns: Complete TP-rank importer roster, or empty off rank zero.
+        """
+
+        local = binding.advertisement
+        if local.tensor_parallel_rank != 0:
+            return ()
+        ranks = tuple(
+            rank
+            for rank in binding.matrix.ranks
+            if rank.role is TerminalOwnerRole.DECODE
+            and rank.service_id == local.service_id
+        )
+        if tuple(rank.tensor_parallel_rank for rank in ranks) != tuple(
+            range(local.tensor_parallel_size)
+        ):
+            raise RuntimeError("decode coordinator roster is not a complete TP group")
+        return tuple(
+            TerminalWireReceiptImportNamespace(rank.terminal_identity) for rank in ranks
+        )
+
+    def _compose_terminal_source(
+        self,
+        binding: TerminalStartupRankBinding,
+        enrollment: TerminalRankRuntimeEnrollment,
+        installation: NixlTerminalRuntimeInstallation,
+    ) -> tuple[PackedTerminalSourceServing, PackedTerminalOutputPublisher | None]:
+        """Construct dormant source serving around the enrolled runtime.
+
+        :param binding: Exact local startup authority.
+        :param enrollment: Sole rank runtime and native NIXL producer.
+        :param installation: Scheduler and route-owned dependencies.
+        :returns: Source serving and optional canonical publisher.
+        """
+
+        actor = self._packed_prefill_runtime
+        source_work = installation.source_work
+        if actor is None or source_work is None:
+            raise RuntimeError("terminal source actor or work boundary is unavailable")
+        actor.bind_direct_terminal_owner(enrollment.nixl)
+        importers = self._source_request_ready_importers(binding)
+        self._terminal_source_receipt_importers = importers
+        local_identity = binding.advertisement.terminal_identity
+        publisher: PackedTerminalOutputPublisher | None = None
+        if local_identity.tp_rank == 0:
+            endpoint = installation.gateway_endpoint
+            if endpoint is None:
+                raise RuntimeError("canonical source gateway endpoint disappeared")
+
+            def result_listener(result: TerminalGatewayPublicationResult) -> None:
+                """Join local publication authority before remote fan-out."""
+
+                self.terminal_source_serving.publisher_result(result)
+                fanout = installation.source_publication_fanout
+                if fanout is not None:
+                    fanout(result)
+
+            publisher = PackedTerminalOutputPublisher(
+                capacity=installation.physical_capacity,
+                sink_factory=ZmqTerminalGatewaySinkFactory(endpoint),
+                payload_encoder=PrefillTerminalGatewayPayloadEncoder(),
+                wire_issuer=TerminalWireReceiptIssuer(local_identity),
+                request_ready_authorities=frozenset(
+                    importer.authority for importer in importers.values()
+                ),
+                result_listener=result_listener,
+                fatal_listener=self._terminal_publisher_failed,
+                clock_ns=time.monotonic_ns,
+            )
+        serving = PackedTerminalSourceServing(
+            runtime=enrollment.runtime,
+            local_identity=local_identity,
+            publisher=publisher,
+            metrics_sink=_NixlTerminalSourceMetrics(),
+            clock_ns=time.monotonic_ns,
+            physical_capacity=installation.physical_capacity,
+            process_fatal_handler=(installation.scheduler_process_fatal_handler),
+            work=source_work,
+            retire_native_producers=enrollment.retire_native_producers,
+        )
+        return serving, publisher
+
+    def _compose_terminal_decode(
+        self,
+        binding: TerminalStartupRankBinding,
+        enrollment: TerminalRankRuntimeEnrollment,
+        installation: NixlTerminalRuntimeInstallation,
+    ) -> PackedTerminalDecodeServing:
+        """Construct dormant decode serving around the enrolled runtime.
+
+        :param binding: Exact local startup authority.
+        :param enrollment: Sole rank runtime and native producers.
+        :param installation: Scheduler and route-owned dependencies.
+        :returns: Full decode serving composition.
+        """
+
+        controller = self._require_packed_decode_controller()
+        cuda_scatter = enrollment.cuda_scatter
+        send_delivery = installation.send_decode_delivery
+        if cuda_scatter is None or send_delivery is None:
+            raise RuntimeError("terminal decode native work boundary is unavailable")
+        local_identity = binding.advertisement.terminal_identity
+        coordinator_issuer = (
+            TerminalWireReceiptIssuer(local_identity)
+            if local_identity.tp_rank == 0
+            else None
+        )
+        return PackedTerminalDecodeServing(
+            actor=controller.terminal_runtime,
+            runtime=enrollment.runtime,
+            cuda_completion=cuda_scatter,
+            local_identity=local_identity,
+            coordinator_issuer=coordinator_issuer,
+            coordinator_importers=self._decode_coordinator_importers(binding),
+            clock_ns=time.monotonic_ns,
+            physical_capacity=installation.physical_capacity,
+            process_fatal_handler=(installation.scheduler_process_fatal_handler),
+            work=PackedTerminalDecodeWork(
+                send_delivery=send_delivery,
+                observe_output=self._observe_terminal_output,
+            ),
+            retire_native_producers=enrollment.retire_native_producers,
+        )
+
+    def _compose_terminal_runtime(self) -> None:
+        """Construct, bind, and start the complete role-specific runtime."""
+
+        binding = self._require_terminal_startup_peer_enrollment().binding
+        installation = self._terminal_runtime_installation
+        if installation is None:
+            raise RuntimeError("terminal runtime dependencies are not installed")
+        config = self._terminal_rank_runtime_config(installation.physical_capacity)
+        enrollment = TerminalRankRuntimeEnrollmentFactory(binding, config).create(
+            self.agent
+        )
+        local_role = binding.advertisement.role
+        source_serving: PackedTerminalSourceServing | None = None
+        decode_serving: PackedTerminalDecodeServing | None = None
+        publisher: PackedTerminalOutputPublisher | None = None
+        if local_role is TerminalOwnerRole.SOURCE:
+            source_serving, publisher = self._compose_terminal_source(
+                binding,
+                enrollment,
+                installation,
+            )
+            reactor = PackedTerminalProcessReactor.for_source(
+                source_serving,
+                self._terminal_reactor_failed,
+            )
+        else:
+            decode_serving = self._compose_terminal_decode(
+                binding,
+                enrollment,
+                installation,
+            )
+            reactor = PackedTerminalProcessReactor.for_decode(
+                decode_serving,
+                time.monotonic_ns,
+                self._terminal_reactor_failed,
+            )
+
+        self._terminal_runtime_enrollment = enrollment
+        self._terminal_source_serving = source_serving
+        self._terminal_decode_serving = decode_serving
+        self._terminal_process_reactor = reactor
+        self._terminal_output_publisher = publisher
+        if source_serving is not None:
+            bind_source = installation.bind_source_serving
+            if bind_source is None:
+                raise RuntimeError("source serving binder disappeared")
+            bind_source(source_serving)
+        else:
+            bind_decode = installation.bind_decode_serving
+            if bind_decode is None or decode_serving is None:
+                raise RuntimeError("decode serving binder disappeared")
+            bind_decode(decode_serving)
+
+        if publisher is not None:
+            publisher.start()
+        if source_serving is not None:
+            source_serving.start()
+        elif decode_serving is not None:
+            decode_serving.start()
+        else:
+            raise RuntimeError("terminal serving composition disappeared")
+        reactor.start(self._terminal_startup_timeout_seconds())
+        self._start_terminal_control_receiver()
+
+    def _observe_terminal_output(self, output: object) -> None:
+        """Project non-gating native output into the process logger.
+
+        :param output: Immutable native runtime observation.
+        """
+
+        logger.debug("terminal runtime observation: %r", output)
+
+    def _terminal_publisher_failed(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Record publisher death and wake scheduler fail-closed handling.
+
+        :param reason: Stable publisher failure boundary.
+        :param formatted_traceback: Complete originating traceback, if any.
+        """
+
+        self._record_terminal_component_failure(reason, formatted_traceback)
+
+    def _terminal_reactor_failed(
+        self,
+        failure: PackedTerminalProcessReactorFailure,
+    ) -> None:
+        """Record reactor death and wake scheduler fail-closed handling.
+
+        :param failure: Complete process-reactor failure evidence.
+        """
+
+        if type(failure) is not PackedTerminalProcessReactorFailure:
+            raise TypeError("failure must be PackedTerminalProcessReactorFailure")
+        self._record_terminal_component_failure(
+            str(failure),
+            failure.formatted_traceback,
+        )
+
+    def _record_terminal_component_failure(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Retain the first component death and wake scheduler admission once.
+
+        :param reason: Stable process-fatal component boundary.
+        :param formatted_traceback: Complete originating traceback, if any.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        if formatted_traceback is not None and type(formatted_traceback) is not str:
+            raise TypeError("formatted_traceback must be str or None")
+        with self._terminal_process_fatal_lock:
+            if self._terminal_process_fatal_reason is not None:
+                return
+            self._terminal_process_fatal_reason = reason
+            self._terminal_process_fatal_traceback = formatted_traceback
+        reactor = self._terminal_process_reactor
+        if reactor is not None:
+            try:
+                inventory = reactor.inventory()
+                if inventory.started and inventory.admission_open:
+                    reactor.stop_admission()
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Terminal reactor admission stop failed after component death:\n%s",
+                    traceback.format_exc(),
+                )
+        installation = self._terminal_runtime_installation
+        if installation is None:
+            logger.error(
+                "Terminal component failed before runtime installation: %s", reason
+            )
+            return
+        try:
+            installation.owner_dead_handler()
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "Terminal owner-death wake failed:\n%s",
+                traceback.format_exc(),
+            )
+
+    def _terminal_rank_for_identity(
+        self,
+        identity: TerminalProcessIdentity,
+    ) -> TerminalStartupRankAdvertisement:
+        """Resolve one route-authenticated identity through the sealed matrix.
+
+        :param identity: Exact process identity proved by its transport route.
+        :returns: Sole matching startup rank.
+        """
+
+        if type(identity) is not TerminalProcessIdentity:
+            raise TypeError("identity must be TerminalProcessIdentity")
+        binding = self._require_terminal_startup_peer_enrollment().binding
+        matches = tuple(
+            rank for rank in binding.matrix.ranks if rank.terminal_identity == identity
+        )
+        if len(matches) != 1:
+            raise RuntimeError("terminal identity is absent from the sealed matrix")
+        return matches[0]
+
+    def receive_terminal_decode_receipt(
+        self,
+        wire_receipt: TerminalWireReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Deliver one same-service decode receipt through terminal serving.
+
+        This is the narrow receive seam used by matrix-bound same-role routes.
+        Cross-role packed controls join the same path after route authentication.
+
+        :param wire_receipt: Canonical terminal wire authority.
+        :param authenticated_issuer: Exact identity proved by the route.
+        """
+
+        if type(wire_receipt) is not TerminalWireReceipt:
+            raise TypeError("wire_receipt must be TerminalWireReceipt")
+        issuer_rank = self._terminal_rank_for_identity(authenticated_issuer)
+        local = self._require_terminal_startup_peer_enrollment().binding.advertisement
+        if (
+            issuer_rank.role is not TerminalOwnerRole.DECODE
+            or local.role is not TerminalOwnerRole.DECODE
+            or issuer_rank.service_id != local.service_id
+        ):
+            raise RuntimeError("decode receipt route crosses serving identities")
+        if wire_receipt.issuer != authenticated_issuer:
+            raise RuntimeError("decode receipt asserts another route issuer")
+        serving = self.terminal_decode_serving
+        if wire_receipt.kind is TerminalReceiptKind.LOCAL_DECODE_READY or (
+            wire_receipt.kind is TerminalReceiptKind.FAILURE
+            and wire_receipt.issuer == wire_receipt.binding.owner
+        ):
+            if local.tensor_parallel_rank != 0:
+                raise RuntimeError(
+                    "decode coordinator receipt targets a noncanonical rank"
+                )
+            if wire_receipt.binding.owner != authenticated_issuer:
+                raise RuntimeError(
+                    "decode coordinator receipt asserts another rank binding"
+                )
+            serving.coordinator_receipt_received(
+                wire_receipt,
+                authenticated_issuer,
+            )
+            self.terminal_process_reactor.notify_coordinator_deadline_changed()
+            return
+        if wire_receipt.kind in (
+            TerminalReceiptKind.REQUEST_READY,
+            TerminalReceiptKind.FAILURE,
+        ):
+            if issuer_rank.tensor_parallel_rank != 0:
+                raise RuntimeError("decode owner receipt did not come from rank zero")
+            if wire_receipt.binding.owner != local.terminal_identity:
+                raise RuntimeError("decode owner receipt targets another process")
+            serving.request_terminal_received(
+                wire_receipt,
+                authenticated_issuer,
+            )
+            return
+        raise RuntimeError("decode terminal route carried another receipt kind")
+
+    def receive_terminal_source_receipt(
+        self,
+        wire_receipt: TerminalWireReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Import one decode coordinator receipt into source serving.
+
+        :param wire_receipt: Request-ready or failure authority.
+        :param authenticated_issuer: Exact decode coordinator route identity.
+        """
+
+        if type(wire_receipt) is not TerminalWireReceipt:
+            raise TypeError("wire_receipt must be TerminalWireReceipt")
+        issuer_rank = self._terminal_rank_for_identity(authenticated_issuer)
+        local = self._require_terminal_startup_peer_enrollment().binding.advertisement
+        if (
+            issuer_rank.role is not TerminalOwnerRole.DECODE
+            or issuer_rank.tensor_parallel_rank != 0
+            or local.role is not TerminalOwnerRole.SOURCE
+        ):
+            raise RuntimeError("source receipt route has another owner role")
+        if wire_receipt.issuer != authenticated_issuer:
+            raise RuntimeError("source receipt asserts another route issuer")
+        if wire_receipt.binding.owner != local.terminal_identity:
+            raise RuntimeError("source receipt targets another process")
+        is_ready = (
+            wire_receipt.kind is TerminalReceiptKind.REQUEST_READY
+            and wire_receipt.outcome is TerminalReceiptOutcome.SUCCESS
+        )
+        is_failure = (
+            wire_receipt.kind is TerminalReceiptKind.FAILURE
+            and wire_receipt.outcome is TerminalReceiptOutcome.FAILURE
+        )
+        if not is_ready and not is_failure:
+            raise RuntimeError("source route carried another receipt kind")
+        importer = self._terminal_source_receipt_importers.get(authenticated_issuer)
+        if importer is None:
+            raise RuntimeError("source receipt issuer has no import namespace")
+        local_receipt = importer.import_receipt(
+            wire_receipt,
+            authenticated_issuer,
+        )
+        serving = self.terminal_source_serving
+        if is_ready:
+            serving.request_ready(
+                binding_digest=wire_receipt.binding.digest,
+                wire_receipt=wire_receipt,
+                local_receipt=local_receipt,
+                authenticated_issuer=authenticated_issuer,
+            )
+        else:
+            serving.request_failed(
+                binding_digest=wire_receipt.binding.digest,
+                wire_receipt=wire_receipt,
+                local_receipt=local_receipt,
+                authenticated_issuer=authenticated_issuer,
+                reason="request-global coordination failed",
+            )
+        importer.retire_binding(wire_receipt.binding)
+
+    def _authenticated_terminal_control_rank(
+        self,
+        agent_name: str,
+        process_generation: str,
+        role: TerminalOwnerRole,
+    ) -> TerminalStartupRankAdvertisement:
+        """Authenticate claimed packed-control identity through enrolled peers.
+
+        :param agent_name: NIXL agent encoded by the packed control route.
+        :param process_generation: Canonical process generation string.
+        :param role: Required remote owner role.
+        :returns: Exact enrolled startup rank.
+        """
+
+        generation = self._canonical_process_generation(process_generation)
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        matches = tuple(
+            rank
+            for rank in enrollment.expected_remote_ranks
+            if rank.role is role
+            and rank.nixl_agent_name == agent_name
+            and rank.process_generation == uuid.UUID(generation).bytes
+        )
+        if len(matches) != 1:
+            raise RuntimeError("packed control identity is not an enrolled peer")
+        rank = matches[0]
+        if role is TerminalOwnerRole.DECODE:
+            registration = enrollment.decoder_peers.get(rank.key)
+            if (
+                registration is None
+                or registration.remote_handle is None
+                or registration.process_generation != generation
+                or registration.agent_name != agent_name
+            ):
+                raise RuntimeError("packed control decoder peer is not live")
+            with self._prefill_peer_lock:
+                if registration.remote_handle in self._quarantined_remote_handles:
+                    raise RuntimeError("packed control decoder peer is quarantined")
+        else:
+            peer = enrollment.prefill_peers.get(rank.key)
+            if (
+                peer is None
+                or peer.process_generation != generation
+                or peer.agent_name != agent_name
+            ):
+                raise RuntimeError("packed control source peer is not live")
+            with self._prefill_peer_lock:
+                if peer.handle in self._quarantined_remote_handles:
+                    raise RuntimeError("packed control source peer is quarantined")
+        return rank
+
+    def _dispatch_terminal_source_control(self, frames: list[bytes]) -> None:
+        """Authenticate and dispatch one decoder-to-source terminal control.
+
+        :param frames: Exact packed multipart control frames.
+        """
+
+        agent_name, generation, message = decode_packed_control_frames(frames)
+        rank = self._authenticated_terminal_control_rank(
+            agent_name,
+            generation,
+            TerminalOwnerRole.DECODE,
+        )
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        registration = enrollment.decoder_peers[rank.key]
+        peer = PackedPeerIdentity(
+            agent_name=registration.agent_name,
+            agent_generation=rank.process_generation,
+        )
+        actor = self._packed_prefill_runtime
+        if actor is None:
+            raise RuntimeError("packed source actor is unavailable")
+        if type(message) is PackedReady:
+            actor.deliver_terminal_owner_ready(peer, message)
+            return
+        if type(message) is PackedRequestTeardown:
+            binding = actor.deliver_terminal_owner_teardown(peer, message)
+            if binding is not None:
+                self.terminal_source_serving.wiring.teardown_received(
+                    binding.digest,
+                    rank.terminal_identity,
+                )
+            return
+        if type(message) is PackedTerminalReceipt:
+            wire_receipt = TerminalWireReceipt.decode(message.receipt_payload)
+            if wire_receipt.binding.request_key != message.key:
+                raise RuntimeError("source terminal receipt key differs from framing")
+            self.receive_terminal_source_receipt(
+                wire_receipt,
+                rank.terminal_identity,
+            )
+            return
+        raise RuntimeError("source terminal receiver rejected another control type")
+
+    def _dispatch_terminal_decode_control(self, frames: list[bytes]) -> None:
+        """Authenticate and dispatch one source-to-decode terminal control.
+
+        :param frames: Exact packed multipart control frames.
+        """
+
+        agent_name, generation, message = decode_packed_control_frames(frames)
+        rank = self._authenticated_terminal_control_rank(
+            agent_name,
+            generation,
+            TerminalOwnerRole.SOURCE,
+        )
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        peer = enrollment.prefill_peers[rank.key]
+        writer_id = StagingWriterId(
+            transfer_source_rank=peer.transfer_source_rank,
+            source_attn_tp_rank=peer.attn_tp_rank,
+            source_pp_rank=peer.pp_rank,
+            source_cp_rank=peer.attn_cp_rank,
+        )
+        if type(message) is PackedTerminalReceipt:
+            wire_receipt = TerminalWireReceipt.decode(message.receipt_payload)
+            if wire_receipt.binding.request_key != message.key:
+                raise RuntimeError("decode terminal receipt key differs from framing")
+            self.receive_terminal_decode_receipt(
+                wire_receipt,
+                rank.terminal_identity,
+            )
+            return
+        self.terminal_decode_serving.control_received(writer_id, message)
+
+    def _handle_terminal_source_metadata(self, frames: list[bytes]) -> None:
+        """Retain exact terminal request metadata without a transfer worker.
+
+        :param frames: Existing guarded request metadata frames.
+        """
+
+        if len(frames) < 2 or frames[0] != GUARD:
+            raise RuntimeError("terminal source metadata framing is invalid")
+        payload = frames[1:]
+        if payload[0] == b"None":
+            raise RuntimeError("terminal source peer registration is already frozen")
+        room = int(payload[0].decode("ascii"))
+        transfer_info = TransferInfo.from_zmq(payload)
+        if transfer_info.room != room:
+            raise RuntimeError("terminal source metadata room changed in transit")
+        if transfer_info.packed_plan is None:
+            raise RuntimeError("terminal source metadata omitted its packed plan")
+        self.terminal_source_identity_plan(transfer_info)
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        rank = self._authenticated_terminal_control_rank(
+            transfer_info.agent_name,
+            transfer_info.process_generation,
+            TerminalOwnerRole.DECODE,
+        )
+        registration = enrollment.decoder_peers[rank.key]
+        if (
+            transfer_info.endpoint != registration.endpoint
+            or transfer_info.dst_port != registration.dst_port
+        ):
+            raise RuntimeError("terminal source metadata changed its control route")
+        room_infos = self.transfer_infos.setdefault(room, {})
+        if transfer_info.agent_name in room_infos:
+            raise RuntimeError("terminal source metadata was delivered twice")
+        room_infos[transfer_info.agent_name] = transfer_info
+        if len(room_infos) > transfer_info.required_dst_info_num:
+            raise RuntimeError("terminal source metadata exceeds its destination count")
+        if len(room_infos) != transfer_info.required_dst_info_num:
+            return
+        self.resolve_kv_replica_factor(room_infos)
+        self.req_to_decode_prefix_len[room] = transfer_info.decode_prefix_len or 0
+        self.update_status(room, KVPoll.WaitingForInput)
+
+    def _start_terminal_control_receiver(self) -> None:
+        """Start the sole blocking terminal runtime socket owner.
+
+        The receiver blocks on the transport socket and a dedicated pipe. The
+        pipe is an explicit teardown wake, not a completion cadence, so normal
+        shutdown never depends on closing a ZeroMQ socket from another thread.
+        """
+
+        with self._terminal_control_lock:
+            if self._terminal_control_thread is not None:
+                raise RuntimeError("terminal control receiver is already started")
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(read_fd, False)
+            os.set_blocking(write_fd, False)
+            self._terminal_control_read_fd = read_fd
+            self._terminal_control_write_fd = write_fd
+            self._terminal_control_stop_requested = False
+            self._terminal_control_ready.clear()
+        binding = self._require_terminal_startup_peer_enrollment().binding
+
+        def receive() -> None:
+            """Own the manager PULL socket for the process lifetime."""
+
+            poller = zmq.Poller()
+            try:
+                poller.register(self.server_socket, zmq.POLLIN)
+                poller.register(read_fd, zmq.POLLIN)
+                self._terminal_control_ready.set()
+                while True:
+                    events = dict(poller.poll())
+                    if read_fd in events:
+                        os.read(read_fd, 4096)
+                        with self._terminal_control_lock:
+                            stopping = self._terminal_control_stop_requested
+                        if not stopping:
+                            raise RuntimeError(
+                                "terminal control receiver woke without a stop request"
+                            )
+                        return
+                    if self.server_socket not in events:
+                        continue
+                    frames = list(self.server_socket.recv_multipart())
+                    if len(frames) == 0:
+                        logger.warning("Rejected empty non-terminal runtime traffic")
+                        continue
+                    if frames[0] == PACKED_CONTROL_TAG:
+                        if binding.advertisement.role is TerminalOwnerRole.SOURCE:
+                            self._dispatch_terminal_source_control(frames)
+                        else:
+                            self._dispatch_terminal_decode_control(frames)
+                        continue
+                    if (
+                        binding.advertisement.role is TerminalOwnerRole.SOURCE
+                        and frames[0] == GUARD
+                    ):
+                        if len(frames) >= 2 and frames[1] == b"None":
+                            logger.warning(
+                                "Rejected late terminal peer-registration traffic"
+                            )
+                            continue
+                        self._handle_terminal_source_metadata(frames)
+                        continue
+                    logger.warning("Rejected structurally unrelated runtime traffic")
+            except BaseException:  # noqa: BLE001
+                self._record_terminal_component_failure(
+                    "terminal control receiver died",
+                    traceback.format_exc(),
+                )
+            finally:
+                self._terminal_control_ready.set()
+                try:
+                    poller.unregister(self.server_socket)
+                except KeyError:
+                    pass
+                try:
+                    poller.unregister(read_fd)
+                except KeyError:
+                    pass
+
+        thread = threading.Thread(
+            target=receive,
+            name="nixl-terminal-control",
+            daemon=True,
+        )
+        with self._terminal_control_lock:
+            self._terminal_control_thread = thread
+        thread.start()
+        timeout_seconds = self._terminal_startup_timeout_seconds()
+        if not self._terminal_control_ready.wait(timeout_seconds):
+            self._record_terminal_component_failure(
+                "terminal control receiver did not start within its bound",
+                None,
+            )
+            raise TimeoutError("terminal control receiver startup timed out")
+        if not thread.is_alive():
+            raise RuntimeError("terminal control receiver failed during startup")
+
+    def stop_terminal_control_receiver(self, timeout_seconds: float) -> None:
+        """Wake and join the terminal socket owner within one explicit bound.
+
+        :param timeout_seconds: Positive receiver join bound.
+        :raises TimeoutError: If the receiver does not stop within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        with self._terminal_control_lock:
+            thread = self._terminal_control_thread
+            write_fd = self._terminal_control_write_fd
+            if thread is None:
+                return
+            if threading.current_thread() is thread:
+                raise RuntimeError("terminal control receiver cannot join itself")
+            should_wake = not self._terminal_control_stop_requested
+            self._terminal_control_stop_requested = True
+        if should_wake and write_fd is not None and thread.is_alive():
+            try:
+                os.write(write_fd, b"\x01")
+            except BlockingIOError:
+                pass
+            except OSError:
+                self._record_terminal_component_failure(
+                    "terminal control receiver stop wake failed",
+                    traceback.format_exc(),
+                )
+                raise
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive():
+            self._record_terminal_component_failure(
+                "terminal control receiver did not stop within its bound",
+                None,
+            )
+            raise TimeoutError("terminal control receiver stop timed out")
+        self._close_terminal_control_fds()
+
+    def _close_terminal_control_fds(self) -> None:
+        """Close teardown-only receiver descriptors exactly once."""
+
+        with self._terminal_control_lock:
+            descriptors = (
+                self._terminal_control_read_fd,
+                self._terminal_control_write_fd,
+            )
+            self._terminal_control_read_fd = None
+            self._terminal_control_write_fd = None
+        close_traceback: str | None = None
+        for descriptor in descriptors:
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                close_traceback = traceback.format_exc()
+        if close_traceback is not None:
+            self._record_terminal_component_failure(
+                "terminal control receiver descriptor close failed",
+                close_traceback,
+            )
+            raise OSError("terminal control receiver descriptor close failed")
+
+    def close_terminal_runtime(self, *, process_fatal: bool) -> None:
+        """Close every terminal owner in dependency-reverse order.
+
+        Admission closes before the control receiver, then native producers
+        retire while the reactor can still drain their final actions. The
+        reactor closes before serving descriptors, and the canonical gateway
+        publisher drains last because serving may still earn publication work
+        during its terminal drain.
+
+        :param process_fatal: Whether retained authority must be quarantined.
+        """
+
+        if type(process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
+        with self._terminal_runtime_close_lock:
+            if self._terminal_runtime_closed:
+                return
+            if self._terminal_runtime_close_started:
+                raise RuntimeError("terminal runtime close cannot retry")
+            self._terminal_runtime_close_started = True
+
+        reactor = self._terminal_process_reactor
+        serving: PackedTerminalSourceServing | PackedTerminalDecodeServing | None = (
+            self._terminal_source_serving
+        )
+        if serving is None:
+            serving = self._terminal_decode_serving
+        publisher = self._terminal_output_publisher
+        if reactor is None or serving is None:
+            raise RuntimeError("terminal runtime composition is incomplete")
+        timeout_seconds = terminal_deadline_spec(
+            TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
+        ).seconds
+        first_error: Exception | None = None
+
+        def retain_failure(
+            reason: str,
+            error: Exception,
+            formatted_traceback: str,
+        ) -> None:
+            """Retain the first teardown error without skipping later owners."""
+
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+            self._record_terminal_component_failure(reason, formatted_traceback)
+
+        try:
+            reactor.stop_admission()
+        except Exception as error:  # noqa: BLE001
+            retain_failure(
+                "terminal reactor admission stop failed",
+                error,
+                traceback.format_exc(),
+            )
+        try:
+            self.stop_terminal_control_receiver(timeout_seconds)
+        except Exception as error:  # noqa: BLE001
+            retain_failure(
+                "terminal control receiver close failed",
+                error,
+                traceback.format_exc(),
+            )
+        try:
+            serving.stop_admission_and_retire_producers()
+        except Exception as error:  # noqa: BLE001
+            retain_failure(
+                "terminal native producer retirement failed",
+                error,
+                traceback.format_exc(),
+            )
+        try:
+            reactor.close(timeout_seconds)
+        except Exception as error:  # noqa: BLE001
+            retain_failure(
+                "terminal process reactor close failed",
+                error,
+                traceback.format_exc(),
+            )
+
+        must_abort = (
+            process_fatal
+            or first_error is not None
+            or self._terminal_process_fatal_reason is not None
+        )
+        try:
+            if must_abort:
+                serving.abort_and_close()
+            else:
+                serving.close_clean(timeout_seconds)
+        except Exception as error:  # noqa: BLE001
+            retain_failure(
+                "terminal serving close failed",
+                error,
+                traceback.format_exc(),
+            )
+        if publisher is not None:
+            try:
+                if not publisher.stop_admission_and_join():
+                    raise RuntimeError("terminal gateway publisher close timed out")
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal gateway publisher close failed",
+                    error,
+                    traceback.format_exc(),
+                )
+
+        if first_error is not None:
+            raise RuntimeError("terminal runtime teardown failed") from first_error
+        with self._terminal_runtime_close_lock:
+            self._terminal_runtime_closed = True
+
     def activate_terminal_startup(self) -> None:
         """Commit immutable cross-role peers before exposing service readiness.
 
@@ -1672,12 +2939,15 @@ class NixlKVManager(CommonKVManager):
             self._activate_terminal_decoder(deadline)
         if not self.terminal_peer_enrollment_frozen:
             raise RuntimeError("terminal native peer roster is not frozen")
-
+        try:
+            self._compose_terminal_runtime()
+        except Exception:  # noqa: BLE001
+            self._record_terminal_component_failure(
+                "terminal runtime composition failed",
+                traceback.format_exc(),
+            )
+            raise
         self._terminal_runtime_activated.set()
-        if binding.advertisement.role is TerminalOwnerRole.SOURCE:
-            self._start_prefill_runtime_workers()
-        else:
-            self._start_decode_runtime_workers()
 
     def _bootstrap_transport_registration(self) -> dict[str, object]:
         """Publish this prefill rank's exact native NIXL identity.

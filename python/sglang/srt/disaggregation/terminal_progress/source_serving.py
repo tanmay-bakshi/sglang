@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     TerminalGatewayPublicationResult,
 )
+from sglang.srt.disaggregation.terminal_progress.receipts import TerminalReceipt
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
@@ -46,6 +47,7 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceSubmission,
     PackedTerminalSourceWiring,
 )
+from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +232,15 @@ class PackedTerminalSourceServing:
         """
 
         return self._scheduler_serving.fileno()
+
+    @property
+    def scheduler_serving(self) -> TerminalSchedulerServing:
+        """Return the qualified source scheduler binding surface.
+
+        :returns: Process-lifetime source scheduler serving adapter.
+        """
+
+        return self._scheduler_serving
 
     @property
     def runtime_filenos(self) -> tuple[int, ...]:
@@ -428,6 +439,57 @@ class PackedTerminalSourceServing:
 
         self._require_open()
         self._wiring.publisher_result(result)
+
+    def request_ready(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Deliver authenticated request readiness into source authority.
+
+        :param binding_digest: Exact accepted source binding.
+        :param wire_receipt: Transport readiness authority.
+        :param local_receipt: Matching process-local authority.
+        :param authenticated_issuer: Decode coordinator proved by routing.
+        """
+
+        self._require_open()
+        self._wiring.request_ready(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+        )
+
+    def request_failed(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        reason: str,
+    ) -> None:
+        """Deliver authenticated request failure into source authority.
+
+        :param binding_digest: Exact accepted source binding.
+        :param wire_receipt: Transport failure authority.
+        :param local_receipt: Matching process-local authority.
+        :param authenticated_issuer: Decode coordinator proved by routing.
+        :param reason: Stable request-global failure evidence.
+        """
+
+        self._require_open()
+        self._wiring.request_failed(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+            reason=reason,
+        )
 
     def _drain_scheduler_actions(self) -> int:
         """Transfer runtime reclaim actions into the qualified scheduler inbox.

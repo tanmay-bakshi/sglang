@@ -293,6 +293,7 @@ class _SourceRecord:
     submission: PackedTerminalSourceSubmission
     lifecycle_published: bool = False
     request_ready_receipt: TerminalReceipt | None = None
+    request_failure_receipt: TerminalReceipt | None = None
     publication_action: NativeTerminalOwnerAction | None = None
     publication_submitted: bool = False
     reclaim_consumed: bool = False
@@ -570,48 +571,42 @@ class PackedTerminalSourceWiring:
         :param authenticated_issuer: Process identity proved by control routing.
         """
 
-        if type(wire_receipt) is not TerminalWireReceipt:
-            raise TypeError("wire_receipt must be TerminalWireReceipt")
-        if type(local_receipt) is not TerminalReceipt:
-            raise TypeError("local_receipt must be TerminalReceipt")
-        record = self._record(binding_digest)
-        identity = record.submission.identity
-        binding = identity.local_binding
-        if authenticated_issuer != identity.request_ready_issuer:
-            raise RuntimeError("request-ready route authenticated another issuer")
-        if wire_receipt.issuer != authenticated_issuer:
-            raise RuntimeError("request-ready receipt asserts another issuer")
-        if wire_receipt.binding != binding or local_receipt.binding != binding:
-            raise RuntimeError("request-ready authority targets another binding")
-        shared_fields = (
-            local_receipt.kind is wire_receipt.kind,
-            local_receipt.outcome is wire_receipt.outcome,
-            local_receipt.terminal_timestamp_ns == wire_receipt.terminal_timestamp_ns,
+        self._submit_request_terminal_receipt(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+            event_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
+            reason=None,
         )
-        if not all(shared_fields):
-            raise RuntimeError(
-                "local request-ready authority differs from wire receipt"
-            )
-        with self._lock:
-            current = self._records.get(binding_digest)
-            if current is not record:
-                raise RuntimeError("source request registry changed during readiness")
-            if current.request_ready_receipt is not None:
-                raise RuntimeError("request-ready authority was delivered twice")
-            current.request_ready_receipt = local_receipt
-        producer_id = self._runtime.python_producer_id(
-            NativeTerminalProducerClass.RECEIPT,
-            NativeTerminalProcessIdentity.from_identity(authenticated_issuer),
-        )
-        self._runtime.submit_imported_receipt(
-            producer_id,
-            NativeTerminalReceipt.from_wire_receipt(wire_receipt),
-            NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
-            enqueued_ns=self._clock_ns(),
-        )
-        self._emit_metric_once(
-            binding_digest,
-            NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
+
+    def request_failed(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        reason: str,
+    ) -> None:
+        """Store authenticated request failure and submit it to native state.
+
+        :param binding_digest: Exact accepted source binding.
+        :param wire_receipt: Transport failure authority submitted to native state.
+        :param local_receipt: Matching process-local failure authority.
+        :param authenticated_issuer: Process identity proved by control routing.
+        :param reason: Stable request-global failure evidence.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        self._submit_request_terminal_receipt(
+            binding_digest=binding_digest,
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+            event_kind=NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+            reason=reason,
         )
 
     def consume_reclaim_authorized(
@@ -890,6 +885,90 @@ class PackedTerminalSourceWiring:
             quarantined_binding_digests=quarantined,
             pending_publication_action_count=pending_publication_count,
         )
+
+    def _submit_request_terminal_receipt(
+        self,
+        *,
+        binding_digest: bytes,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+        event_kind: NativeTerminalOwnerEventKind,
+        reason: str | None,
+    ) -> None:
+        """Join route authentication with one request-terminal authority.
+
+        :param binding_digest: Exact accepted source binding.
+        :param wire_receipt: Transport authority submitted to native state.
+        :param local_receipt: Matching process-local authority retained by wiring.
+        :param authenticated_issuer: Process identity proved by control routing.
+        :param event_kind: Native ready or failed transition.
+        :param reason: Stable failure evidence, otherwise ``None``.
+        """
+
+        if type(wire_receipt) is not TerminalWireReceipt:
+            raise TypeError("wire_receipt must be TerminalWireReceipt")
+        if type(local_receipt) is not TerminalReceipt:
+            raise TypeError("local_receipt must be TerminalReceipt")
+        if type(authenticated_issuer) is not TerminalProcessIdentity:
+            raise TypeError("authenticated_issuer must be TerminalProcessIdentity")
+        if event_kind is NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY:
+            expected_kind = TerminalReceiptKind.REQUEST_READY
+            expected_outcome = TerminalReceiptOutcome.SUCCESS
+            if reason is not None:
+                raise ValueError("request readiness cannot carry a failure reason")
+        elif event_kind is NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED:
+            expected_kind = TerminalReceiptKind.FAILURE
+            expected_outcome = TerminalReceiptOutcome.FAILURE
+            if type(reason) is not str or len(reason) == 0:
+                raise ValueError("request failure requires a non-empty reason")
+        else:
+            raise ValueError("source terminal ingress requires ready or failed event")
+        if (
+            wire_receipt.kind is not expected_kind
+            or wire_receipt.outcome is not expected_outcome
+            or local_receipt.kind is not expected_kind
+            or local_receipt.outcome is not expected_outcome
+        ):
+            raise RuntimeError("source terminal ingress received another authority")
+        record = self._record(binding_digest)
+        identity = record.submission.identity
+        binding = identity.local_binding
+        if authenticated_issuer != identity.request_ready_issuer:
+            raise RuntimeError("request-terminal route authenticated another issuer")
+        if wire_receipt.issuer != authenticated_issuer:
+            raise RuntimeError("request-terminal receipt asserts another issuer")
+        if wire_receipt.binding != binding or local_receipt.binding != binding:
+            raise RuntimeError("request-terminal authority targets another binding")
+        if local_receipt.terminal_timestamp_ns != wire_receipt.terminal_timestamp_ns:
+            raise RuntimeError(
+                "local request-terminal authority differs from wire receipt"
+            )
+        with self._lock:
+            current = self._records.get(binding_digest)
+            if current is not record:
+                raise RuntimeError("source request registry changed during terminality")
+            if (
+                current.request_ready_receipt is not None
+                or current.request_failure_receipt is not None
+            ):
+                raise RuntimeError("request terminality was delivered twice")
+            if event_kind is NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY:
+                current.request_ready_receipt = local_receipt
+            else:
+                current.request_failure_receipt = local_receipt
+        producer_id = self._runtime.python_producer_id(
+            NativeTerminalProducerClass.RECEIPT,
+            NativeTerminalProcessIdentity.from_identity(authenticated_issuer),
+        )
+        self._runtime.submit_imported_receipt(
+            producer_id,
+            NativeTerminalReceipt.from_wire_receipt(wire_receipt),
+            event_kind,
+            reason=reason,
+            enqueued_ns=self._clock_ns(),
+        )
+        self._emit_metric_once(binding_digest, event_kind)
 
     def _consume_followup_action(
         self,

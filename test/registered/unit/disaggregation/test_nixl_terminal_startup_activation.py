@@ -5,12 +5,15 @@ import time
 import uuid
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import zmq
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeWriterManifest,
+)
+from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedRequestKey,
 )
 from sglang.srt.disaggregation.nixl.conn import (
     NIXL_BOOTSTRAP_PEER_PROTOCOL,
@@ -18,6 +21,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     _TerminalDecoderEnrollment,
 )
 from sglang.srt.disaggregation.nixl.packed_runtime import (
+    PACKED_CONTROL_TAG,
     PACKED_PREPARED_GRANT_PROTOCOL,
     PackedRegistrationAdvertisement,
 )
@@ -26,7 +30,19 @@ from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     build_terminal_startup_enrollment_ack,
     encode_terminal_startup_enrollment_ack,
 )
-from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
+    TerminalProcessIdentity,
+    TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.receipts import (
+    TerminalReceiptKind,
+    TerminalReceiptOutcome,
+)
+from sglang.srt.disaggregation.terminal_progress.serving_reactor import (
+    PackedTerminalProcessReactorFailure,
+    PackedTerminalProcessReactorFailureCause,
+)
 from sglang.srt.disaggregation.terminal_progress.startup_binding import (
     TerminalStartupRankBinding,
 )
@@ -36,6 +52,9 @@ from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
 )
 from sglang.srt.disaggregation.terminal_progress.startup_producers import (
     build_terminal_startup_python_producer_plan,
+)
+from sglang.srt.disaggregation.terminal_progress.wire import (
+    TerminalWireReceiptIssuer,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -271,6 +290,96 @@ def _matrix() -> TerminalStartupCohortMatrix:
     )
 
 
+def _decode_tp2_matrix() -> TerminalStartupCohortMatrix:
+    """Build a source service and one TP2 decode service.
+
+    :returns: Complete same-decode-service receipt-routing matrix.
+    """
+
+    return TerminalStartupCohortMatrix(
+        group_id="group-a",
+        cohort_sha256=_COHORT_DIGEST,
+        ranks=(
+            _rank(
+                service_id="prefill-c",
+                role=TerminalOwnerRole.SOURCE,
+                tp_rank=0,
+                tp_size=1,
+                generation=301,
+                agent_name="prefill-agent-c",
+                metadata=b"prefill-metadata-c",
+                launch_instance=4,
+                port=32004,
+            ),
+            _rank(
+                service_id="decode-c",
+                role=TerminalOwnerRole.DECODE,
+                tp_rank=0,
+                tp_size=2,
+                generation=401,
+                agent_name="decode-agent-c-0",
+                metadata=b"decode-metadata-c-0",
+                launch_instance=5,
+                port=32005,
+            ),
+            _rank(
+                service_id="decode-c",
+                role=TerminalOwnerRole.DECODE,
+                tp_rank=1,
+                tp_size=2,
+                generation=402,
+                agent_name="decode-agent-c-1",
+                metadata=b"decode-metadata-c-1",
+                launch_instance=5,
+                port=32005,
+            ),
+        ),
+    )
+
+
+def _binding_for_matrix(
+    matrix: TerminalStartupCohortMatrix,
+    service_id: str,
+    tp_rank: int,
+) -> TerminalStartupRankBinding:
+    """Bind one rank from an explicit startup matrix.
+
+    :param matrix: Complete immutable deployment matrix.
+    :param service_id: Exact local service.
+    :param tp_rank: Exact local tensor-parallel rank.
+    :returns: Rank binding and least-authority producer plan.
+    """
+
+    return TerminalStartupRankBinding(
+        advertisement=matrix.rank(service_id, tp_rank),
+        matrix=matrix,
+        python_producers=build_terminal_startup_python_producer_plan(
+            matrix,
+            local_service_id=service_id,
+            local_tensor_parallel_rank=tp_rank,
+            first_producer_id=0,
+        ),
+    )
+
+
+def _request_binding(owner: TerminalProcessIdentity) -> TerminalRequestBinding:
+    """Build one stable request binding for a decode routing test.
+
+    :param owner: Exact destination-rank lifecycle owner.
+    :returns: Complete immutable request binding.
+    """
+
+    return TerminalRequestBinding(
+        request_key=PackedRequestKey(
+            room_id=47,
+            request_generation=bytes((19,)) * 16,
+        ),
+        owner=owner,
+        rank_manifest_digest=bytes((23,)) * 32,
+        allocation_digest=bytes((29,)) * 32,
+    )
+
+
 def _binding(service_id: str, tp_rank: int) -> TerminalStartupRankBinding:
     """Build one local binding over the shared fixture matrix.
 
@@ -332,6 +441,25 @@ def _manager(
     manager._terminal_activation_started = False
     manager._terminal_bootstrap_thread = None
     manager._runtime_workers_started = False
+    manager._terminal_runtime_installation = None
+    manager._terminal_runtime_enrollment = None
+    manager._terminal_source_serving = None
+    manager._terminal_decode_serving = None
+    manager._terminal_process_reactor = None
+    manager._terminal_output_publisher = None
+    manager._terminal_source_receipt_importers = {}
+    manager._terminal_control_thread = None
+    manager._terminal_control_read_fd = None
+    manager._terminal_control_write_fd = None
+    manager._terminal_control_stop_requested = False
+    manager._terminal_control_ready = threading.Event()
+    manager._terminal_control_lock = threading.Lock()
+    manager._terminal_runtime_close_started = False
+    manager._terminal_runtime_closed = False
+    manager._terminal_runtime_close_lock = threading.Lock()
+    manager._terminal_process_fatal_reason = None
+    manager._terminal_process_fatal_traceback = None
+    manager._terminal_process_fatal_lock = threading.Lock()
     manager._prefill_peers = {}
     manager._prefill_peer_keys_by_addr = defaultdict(set)
     manager._prefill_peers_by_agent_name = {}
@@ -479,12 +607,13 @@ def _ack_frames(
 
 
 def test_activation_is_one_shot_and_precommit_failure_starts_no_workers() -> None:
-    """A failed first activation permanently fails closed before worker launch."""
+    """A failed first activation cannot compose either runtime implementation."""
 
     manager = _manager(_binding("prefill-a", 0), {})
     manager._activate_terminal_source = MagicMock(
         side_effect=RuntimeError("precommit enrollment failed")
     )
+    manager._compose_terminal_runtime = MagicMock()
     manager._start_prefill_runtime_workers = MagicMock()
 
     with pytest.raises(RuntimeError, match="precommit enrollment failed"):
@@ -493,17 +622,417 @@ def test_activation_is_one_shot_and_precommit_failure_starts_no_workers() -> Non
     assert manager._terminal_activation_started
     assert not manager._terminal_runtime_activated.is_set()
     assert not manager._runtime_workers_started
+    manager._compose_terminal_runtime.assert_not_called()
     manager._start_prefill_runtime_workers.assert_not_called()
 
     manager._activate_terminal_source = MagicMock()
     with pytest.raises(RuntimeError, match="cannot repeat"):
         manager.activate_terminal_startup()
     manager._activate_terminal_source.assert_not_called()
+    manager._compose_terminal_runtime.assert_not_called()
     manager._start_prefill_runtime_workers.assert_not_called()
 
 
-def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
-    """Source activation freezes all decoders before any ACK or worker starts."""
+def test_runtime_composition_failure_is_sticky_and_starts_no_legacy_workers() -> None:
+    """A post-enrollment composition failure cannot retry or fall back."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    manager._activate_terminal_source = MagicMock()
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(frozen=True)
+    manager._compose_terminal_runtime = MagicMock(
+        side_effect=RuntimeError("terminal composition failed")
+    )
+    manager._start_prefill_runtime_workers = MagicMock()
+
+    with pytest.raises(RuntimeError, match="terminal composition failed"):
+        manager.activate_terminal_startup()
+
+    assert manager._terminal_activation_started
+    assert not manager._terminal_runtime_activated.is_set()
+    assert manager._terminal_process_fatal_reason == (
+        "terminal runtime composition failed"
+    )
+    manager._start_prefill_runtime_workers.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="cannot repeat"):
+        manager.activate_terminal_startup()
+    assert manager._compose_terminal_runtime.call_count == 1
+
+
+def test_source_runtime_composition_binds_before_starting_exactly_one_stack() -> None:
+    """One enrollment, serving owner, reactor, and receiver start in order."""
+
+    binding = _binding("prefill-a", 0)
+    manager = _manager(binding, {})
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=binding)
+    order: list[str] = []
+    enrollment = SimpleNamespace()
+    serving = MagicMock()
+    publisher = MagicMock()
+    reactor = MagicMock()
+    serving.start.side_effect = lambda: order.append("serving-start")
+    publisher.start.side_effect = lambda: order.append("publisher-start")
+    reactor.start.side_effect = lambda timeout: order.append("reactor-start")
+    manager._start_terminal_control_receiver = MagicMock(
+        side_effect=lambda: order.append("receiver-start")
+    )
+    manager._compose_terminal_source = MagicMock(return_value=(serving, publisher))
+    manager._terminal_runtime_installation = SimpleNamespace(
+        physical_capacity=7,
+        bind_source_serving=lambda value: order.append("scheduler-bind"),
+    )
+    manager._start_prefill_runtime_workers = MagicMock()
+    manager._start_decode_runtime_workers = MagicMock()
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.nixl.conn.TerminalRankRuntimeEnrollmentFactory"
+        ) as enrollment_factory,
+        patch(
+            "sglang.srt.disaggregation.nixl.conn."
+            "PackedTerminalProcessReactor.for_source",
+            return_value=reactor,
+        ) as reactor_factory,
+    ):
+        enrollment_factory.return_value.create.return_value = enrollment
+        manager._compose_terminal_runtime()
+
+    assert order == [
+        "scheduler-bind",
+        "publisher-start",
+        "serving-start",
+        "reactor-start",
+        "receiver-start",
+    ]
+    enrollment_factory.assert_called_once()
+    enrollment_factory.return_value.create.assert_called_once_with(manager.agent)
+    manager._compose_terminal_source.assert_called_once_with(
+        binding,
+        enrollment,
+        manager._terminal_runtime_installation,
+    )
+    reactor_factory.assert_called_once_with(
+        serving,
+        manager._terminal_reactor_failed,
+    )
+    assert manager._terminal_runtime_enrollment is enrollment
+    assert manager._terminal_source_serving is serving
+    assert manager._terminal_decode_serving is None
+    assert manager._terminal_process_reactor is reactor
+    assert manager._terminal_output_publisher is publisher
+    manager._start_prefill_runtime_workers.assert_not_called()
+    manager._start_decode_runtime_workers.assert_not_called()
+
+
+def test_publisher_death_is_sticky_and_wakes_scheduler_once() -> None:
+    """Publisher thread death becomes one process-lifetime fatal wake."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    wake_scheduler = MagicMock()
+    manager._terminal_runtime_installation = SimpleNamespace(
+        owner_dead_handler=wake_scheduler
+    )
+    reactor = MagicMock()
+    reactor.inventory.return_value = SimpleNamespace(
+        started=True,
+        admission_open=True,
+    )
+    manager._terminal_process_reactor = reactor
+
+    manager._terminal_publisher_failed("publisher died", "publisher traceback")
+    manager._terminal_publisher_failed("later publisher error", None)
+
+    assert manager._terminal_process_fatal_reason == "publisher died"
+    assert manager._terminal_process_fatal_traceback == "publisher traceback"
+    reactor.stop_admission.assert_called_once_with()
+    wake_scheduler.assert_called_once_with()
+
+
+def test_reactor_death_is_sticky_and_wakes_scheduler_once() -> None:
+    """Reactor thread death becomes one process-lifetime fatal wake."""
+
+    manager = _manager(_binding("decode-a", 0), {})
+    wake_scheduler = MagicMock()
+    manager._terminal_runtime_installation = SimpleNamespace(
+        owner_dead_handler=wake_scheduler
+    )
+    reactor = MagicMock()
+    reactor.inventory.return_value = SimpleNamespace(
+        started=True,
+        admission_open=False,
+    )
+    manager._terminal_process_reactor = reactor
+    failure = PackedTerminalProcessReactorFailure(
+        cause=PackedTerminalProcessReactorFailureCause.SELECTOR_FAILURE,
+        reason="selector died",
+        formatted_traceback="reactor traceback",
+        occurred_ns=17,
+    )
+
+    manager._terminal_reactor_failed(failure)
+
+    assert manager._terminal_process_fatal_reason == str(failure)
+    assert manager._terminal_process_fatal_traceback == "reactor traceback"
+    reactor.stop_admission.assert_not_called()
+    wake_scheduler.assert_called_once_with()
+
+
+def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
+    """Teardown keeps downstream consumers alive until their producers drain."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    publisher = MagicMock()
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.stop_admission_and_retire_producers.side_effect = lambda: order.append(
+        "producer-retirement"
+    )
+    serving.close_clean.side_effect = lambda timeout: order.append("serving-close")
+    publisher.stop_admission_and_join.side_effect = lambda: (
+        order.append("publisher-close") or True
+    )
+    manager.stop_terminal_control_receiver = lambda timeout: order.append(
+        "receiver-close"
+    )
+    manager._terminal_process_reactor = reactor
+    manager._terminal_source_serving = serving
+    manager._terminal_output_publisher = publisher
+
+    manager.close_terminal_runtime(process_fatal=False)
+    manager.close_terminal_runtime(process_fatal=False)
+
+    assert order == [
+        "reactor-admission",
+        "receiver-close",
+        "producer-retirement",
+        "reactor-close",
+        "serving-close",
+        "publisher-close",
+    ]
+    serving.abort_and_close.assert_not_called()
+
+
+def test_terminal_control_receiver_stops_without_component_failure() -> None:
+    """The dedicated wake joins a blocked receiver as an intentional stop."""
+
+    binding = _binding("prefill-a", 0)
+    manager = _manager(binding, {})
+    inbox = _InprocInbox()
+    manager.server_socket = inbox.pull
+    manager._require_terminal_startup_peer_enrollment = MagicMock(
+        return_value=SimpleNamespace(binding=binding)
+    )
+    manager._record_terminal_component_failure = MagicMock()
+
+    try:
+        manager._start_terminal_control_receiver()
+        manager.stop_terminal_control_receiver(1.0)
+    finally:
+        inbox.close()
+
+    thread = manager._terminal_control_thread
+    assert thread is not None
+    assert not thread.is_alive()
+    assert manager._terminal_control_read_fd is None
+    assert manager._terminal_control_write_fd is None
+    manager._record_terminal_component_failure.assert_not_called()
+
+
+def test_terminal_control_receiver_rejects_unrelated_traffic_and_continues() -> None:
+    """Foreign pre-request framing cannot kill the terminal socket owner."""
+
+    binding = _binding("prefill-a", 0)
+    manager = _manager(binding, {})
+    inbox = _InprocInbox()
+    manager.server_socket = inbox.pull
+    manager._require_terminal_startup_peer_enrollment = MagicMock(
+        return_value=SimpleNamespace(binding=binding)
+    )
+    manager._record_terminal_component_failure = MagicMock()
+    dispatched = threading.Event()
+    manager._dispatch_terminal_source_control = MagicMock(
+        side_effect=lambda frames: dispatched.set()
+    )
+
+    try:
+        manager._start_terminal_control_receiver()
+        inbox.send((b"legacy-runtime",))
+        inbox.send((PACKED_CONTROL_TAG, b"opaque-terminal-payload"))
+        assert dispatched.wait(1.0)
+        manager.stop_terminal_control_receiver(1.0)
+    finally:
+        inbox.close()
+
+    manager._dispatch_terminal_source_control.assert_called_once()
+    manager._record_terminal_component_failure.assert_not_called()
+
+
+def test_terminal_control_dispatch_failure_kills_receiver_fail_closed() -> None:
+    """A structurally terminal lifecycle failure is process-fatal."""
+
+    binding = _binding("prefill-a", 0)
+    manager = _manager(binding, {})
+    inbox = _InprocInbox()
+    manager.server_socket = inbox.pull
+    manager._require_terminal_startup_peer_enrollment = MagicMock(
+        return_value=SimpleNamespace(binding=binding)
+    )
+    failed = threading.Event()
+    failures: list[tuple[str, str | None]] = []
+
+    def record_failure(reason: str, formatted_traceback: str | None) -> None:
+        failures.append((reason, formatted_traceback))
+        failed.set()
+
+    manager._record_terminal_component_failure = record_failure
+    manager._dispatch_terminal_source_control = MagicMock(
+        side_effect=RuntimeError("authenticated lifecycle was invalid")
+    )
+
+    try:
+        manager._start_terminal_control_receiver()
+        inbox.send((PACKED_CONTROL_TAG, b"opaque-terminal-payload"))
+        assert failed.wait(1.0)
+        manager.stop_terminal_control_receiver(1.0)
+    finally:
+        inbox.close()
+
+    thread = manager._terminal_control_thread
+    assert thread is not None
+    assert not thread.is_alive()
+    assert len(failures) == 1
+    assert failures[0][0] == "terminal control receiver died"
+    assert failures[0][1] is not None
+    assert "authenticated lifecycle was invalid" in failures[0][1]
+
+
+def test_decode_rank_zero_accepts_authenticated_local_ready_from_peer_rank() -> None:
+    """Coordinator fan-in preserves the remote rank's binding identity."""
+
+    matrix = _decode_tp2_matrix()
+    local_binding = _binding_for_matrix(matrix, "decode-c", 0)
+    remote = matrix.rank("decode-c", 1).terminal_identity
+    manager = _manager(_binding("decode-a", 0), {})
+    manager._terminal_startup_binding = local_binding
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=local_binding)
+    manager._terminal_decode_serving = MagicMock()
+    manager._terminal_process_reactor = MagicMock()
+    receipt = (
+        TerminalWireReceiptIssuer(remote)
+        .issue(
+            binding=_request_binding(remote),
+            kind=TerminalReceiptKind.LOCAL_DECODE_READY,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=31,
+        )
+        .wire_receipt
+    )
+
+    manager.receive_terminal_decode_receipt(receipt, remote)
+
+    manager._terminal_decode_serving.coordinator_receipt_received.assert_called_once_with(
+        receipt,
+        remote,
+    )
+    manager._terminal_process_reactor.notify_coordinator_deadline_changed.assert_called_once_with()
+    manager._terminal_decode_serving.request_terminal_received.assert_not_called()
+
+
+def test_decode_peer_accepts_request_ready_only_from_canonical_rank() -> None:
+    """Coordinator fan-out targets the local owner under rank-zero authority."""
+
+    matrix = _decode_tp2_matrix()
+    local_binding = _binding_for_matrix(matrix, "decode-c", 1)
+    coordinator = matrix.rank("decode-c", 0).terminal_identity
+    local = local_binding.advertisement.terminal_identity
+    manager = _manager(_binding("decode-a", 0), {})
+    manager._terminal_startup_binding = local_binding
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=local_binding)
+    manager._terminal_decode_serving = MagicMock()
+    receipt = (
+        TerminalWireReceiptIssuer(coordinator)
+        .issue(
+            binding=_request_binding(local),
+            kind=TerminalReceiptKind.REQUEST_READY,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=37,
+        )
+        .wire_receipt
+    )
+
+    manager.receive_terminal_decode_receipt(receipt, coordinator)
+
+    manager._terminal_decode_serving.request_terminal_received.assert_called_once_with(
+        receipt,
+        coordinator,
+    )
+    manager._terminal_decode_serving.coordinator_receipt_received.assert_not_called()
+
+
+def test_source_routes_authenticated_failure_to_failure_ingress() -> None:
+    """Keep decode failure terminality distinct from request readiness."""
+
+    local_binding = _binding("prefill-a", 0)
+    local = local_binding.advertisement.terminal_identity
+    decoder = local_binding.matrix.rank("decode-a", 0).terminal_identity
+    manager = _manager(local_binding, {})
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=local_binding)
+    manager._terminal_source_serving = MagicMock()
+    importer = MagicMock()
+    manager._terminal_source_receipt_importers = {decoder: importer}
+    issued = TerminalWireReceiptIssuer(decoder).issue(
+        binding=_request_binding(local),
+        kind=TerminalReceiptKind.FAILURE,
+        outcome=TerminalReceiptOutcome.FAILURE,
+        terminal_timestamp_ns=41,
+    )
+    importer.import_receipt.return_value = issued.local_receipt
+
+    manager.receive_terminal_source_receipt(issued.wire_receipt, decoder)
+
+    manager._terminal_source_serving.request_failed.assert_called_once_with(
+        binding_digest=issued.wire_receipt.binding.digest,
+        wire_receipt=issued.wire_receipt,
+        local_receipt=issued.local_receipt,
+        authenticated_issuer=decoder,
+        reason="request-global coordination failed",
+    )
+    manager._terminal_source_serving.request_ready.assert_not_called()
+    importer.retire_binding.assert_called_once_with(issued.wire_receipt.binding)
+
+
+def test_source_rejects_mismatched_failure_outcome_before_import() -> None:
+    """Reject malformed terminality before consuming importer authority."""
+
+    local_binding = _binding("prefill-a", 0)
+    local = local_binding.advertisement.terminal_identity
+    decoder = local_binding.matrix.rank("decode-a", 0).terminal_identity
+    manager = _manager(local_binding, {})
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=local_binding)
+    importer = MagicMock()
+    manager._terminal_source_receipt_importers = {decoder: importer}
+    receipt = (
+        TerminalWireReceiptIssuer(decoder)
+        .issue(
+            binding=_request_binding(local),
+            kind=TerminalReceiptKind.FAILURE,
+            outcome=TerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=43,
+        )
+        .wire_receipt
+    )
+
+    with pytest.raises(RuntimeError, match="another receipt kind"):
+        manager.receive_terminal_source_receipt(receipt, decoder)
+
+    importer.import_receipt.assert_not_called()
+
+
+def test_source_retains_exact_decoder_roster_before_runtime_composition() -> None:
+    """Source activation freezes all decoders before terminal composition."""
 
     binding = _binding("prefill-a", 0)
     manager = _manager(
@@ -536,14 +1065,14 @@ def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
         assert not manager._runtime_workers_started
         events.append(("ack", enrollment.rank.key))
 
-    def start_workers() -> None:
-        assert manager._terminal_runtime_activated.is_set()
+    def compose_runtime() -> None:
+        assert not manager._terminal_runtime_activated.is_set()
         assert [event[0] for event in events] == ["ack", "ack"]
-        manager._runtime_workers_started = True
-        events.append(("workers", None))
+        events.append(("runtime", None))
 
     manager._send_terminal_startup_ack = send_ack
-    manager._start_prefill_runtime_workers = start_workers
+    manager._compose_terminal_runtime = compose_runtime
+    manager._start_prefill_runtime_workers = MagicMock()
 
     try:
         for rank in reversed(decoder_ranks):
@@ -555,14 +1084,15 @@ def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
     assert events == [
         ("ack", ("decode-a", 0)),
         ("ack", ("decode-b", 0)),
-        ("workers", None),
+        ("runtime", None),
     ]
     assert manager.agent.add_calls == [
         b"decode-metadata-b",
         b"decode-metadata-a",
     ]
     assert manager._terminal_runtime_activated.is_set()
-    assert manager._runtime_workers_started
+    assert not manager._runtime_workers_started
+    manager._start_prefill_runtime_workers.assert_not_called()
 
 
 def test_decoder_freezes_sources_before_registration_and_requires_all_acks() -> None:
@@ -611,15 +1141,15 @@ def test_decoder_freezes_sources_before_registration_and_requires_all_acks() -> 
         assert frames == registration_frames
         events.append(("registration", route["nixl_agent_name"]))
 
-    def start_workers() -> None:
-        assert manager._terminal_runtime_activated.is_set()
-        manager._runtime_workers_started = True
-        events.append(("workers", None))
+    def compose_runtime() -> None:
+        assert not manager._terminal_runtime_activated.is_set()
+        events.append(("runtime", None))
 
     manager._enroll_terminal_source_routes = enroll_sources
     manager._decode_registration_frames = registration_image
     manager._send_terminal_decoder_registration = send_registration
-    manager._start_decode_runtime_workers = start_workers
+    manager._compose_terminal_runtime = compose_runtime
+    manager._start_decode_runtime_workers = MagicMock()
 
     try:
         for source_rank in reversed(source_ranks):
@@ -633,14 +1163,15 @@ def test_decoder_freezes_sources_before_registration_and_requires_all_acks() -> 
         ("registration-image", None),
         ("registration", "prefill-agent-0"),
         ("registration", "prefill-agent-1"),
-        ("workers", None),
+        ("runtime", None),
     ]
     assert manager.agent.add_calls == [
         b"prefill-metadata-0",
         b"prefill-metadata-1",
     ]
     assert manager._terminal_runtime_activated.is_set()
-    assert manager._runtime_workers_started
+    assert not manager._runtime_workers_started
+    manager._start_decode_runtime_workers.assert_not_called()
 
 
 def test_decoder_rejects_duplicate_source_ack() -> None:
