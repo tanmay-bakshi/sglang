@@ -235,12 +235,12 @@ class TerminalNixlSourceRoute:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class TerminalNixlSourceRoster:
-    """Canonical complete source route roster for one decoder rank.
+    """Canonical complete source route roster for one startup rank.
 
     :ivar matrix_sha256: Exact observed startup matrix digest.
-    :ivar requester_service_id: Decoder service receiving the roster.
-    :ivar requester_tensor_parallel_rank: Decoder rank receiving the roster.
-    :ivar requester_process_generation: Exact decoder process incarnation.
+    :ivar requester_service_id: Service receiving the roster.
+    :ivar requester_tensor_parallel_rank: Rank receiving the roster.
+    :ivar requester_process_generation: Exact requester process incarnation.
     :ivar routes: Complete source-first matrix-ordered native routes.
     """
 
@@ -277,6 +277,9 @@ class TerminalNixlSourceRoster:
         )
         if len(set(keys)) != len(keys):
             raise ValueError("source route keys must be unique")
+        endpoints = tuple((route.rank_ip, route.rank_port) for route in self.routes)
+        if len(set(endpoints)) != len(endpoints):
+            raise ValueError("source route endpoints must be unique")
 
     def require_matrix(
         self,
@@ -284,10 +287,10 @@ class TerminalNixlSourceRoster:
         requester: TerminalStartupRankAdvertisement,
         transport_protocol: str,
     ) -> None:
-        """Authenticate the complete roster against one decoder binding.
+        """Authenticate the complete roster against one startup binding.
 
         :param matrix: Complete sealed startup matrix.
-        :param requester: Exact local decoder row.
+        :param requester: Exact local startup row.
         :param transport_protocol: Required native transport protocol.
         :raises TerminalStartupCohortError: If identity or topology drifts.
         """
@@ -296,10 +299,6 @@ class TerminalNixlSourceRoster:
             raise TypeError("matrix must be TerminalStartupCohortMatrix")
         if type(requester) is not TerminalStartupRankAdvertisement:
             raise TypeError("requester must be TerminalStartupRankAdvertisement")
-        if requester.role is not TerminalOwnerRole.DECODE:
-            raise TerminalStartupCohortError(
-                "only a decoder rank may receive the source roster"
-            )
         if matrix.rank(*requester.key) != requester:
             raise TerminalStartupCohortError(
                 "source roster requester differs from the sealed matrix"
@@ -311,7 +310,7 @@ class TerminalNixlSourceRoster:
             or self.requester_process_generation != requester.process_generation
         ):
             raise TerminalStartupCohortError(
-                "source roster belongs to another matrix or decoder"
+                "source roster belongs to another matrix or requester"
             )
         source_ranks = tuple(
             rank for rank in matrix.ranks if rank.role is TerminalOwnerRole.SOURCE
@@ -525,7 +524,7 @@ def fetch_terminal_nixl_source_roster(
     discovery condition.
 
     :param endpoint: Exact source-owned roster route.
-    :param requester: Local decoder startup row.
+    :param requester: Local sealed startup row.
     :param matrix: Complete sealed startup matrix.
     :param transport_protocol: Required native transport protocol.
     :param timeout_seconds: Hash-bound startup control deadline.

@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     TerminalGatewayPublicationResult,
 )
+from sglang.srt.disaggregation.terminal_progress.receipts import TerminalReceipt
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
@@ -46,6 +47,7 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceSubmission,
     PackedTerminalSourceWiring,
 )
+from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +430,27 @@ class PackedTerminalSourceServing:
 
         self._require_open()
         self._wiring.publisher_result(result)
+
+    def publication_receipt(
+        self,
+        *,
+        wire_receipt: TerminalWireReceipt,
+        local_receipt: TerminalReceipt,
+        authenticated_issuer: TerminalProcessIdentity,
+    ) -> None:
+        """Deliver one startup-route-authenticated publisher outcome.
+
+        :param wire_receipt: Exact canonical source publisher receipt.
+        :param local_receipt: Matching local import authority.
+        :param authenticated_issuer: Source rank proved by control enrollment.
+        """
+
+        self._require_open()
+        self._wiring.publication_receipt(
+            wire_receipt=wire_receipt,
+            local_receipt=local_receipt,
+            authenticated_issuer=authenticated_issuer,
+        )
 
     def _drain_scheduler_actions(self) -> int:
         """Transfer runtime reclaim actions into the qualified scheduler inbox.

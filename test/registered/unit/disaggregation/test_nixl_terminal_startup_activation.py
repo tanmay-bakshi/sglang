@@ -327,6 +327,7 @@ def _manager(
     manager.server_args = SimpleNamespace(pd_terminal_startup_timeout_seconds=1.0)
     manager._terminal_startup_binding = None
     manager._terminal_startup_peer_enrollment = None
+    manager._terminal_source_publication_control = None
     manager._terminal_runtime_activated = threading.Event()
     manager._terminal_activation_lock = threading.Lock()
     manager._terminal_activation_started = False
@@ -525,9 +526,18 @@ def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
     inbox = _InprocInbox()
     manager.server_socket = inbox.pull
     events: list[tuple[str, object]] = []
+    publication_control = object()
+
+    def enroll_publication_routes(deadline: float) -> object:
+        assert deadline > time.monotonic()
+        assert manager.terminal_peer_enrollment_frozen is False
+        assert not manager._terminal_runtime_activated.is_set()
+        events.append(("publication-roster", None))
+        return publication_control
 
     def send_ack(enrollment: _TerminalDecoderEnrollment) -> None:
         assert manager.terminal_peer_enrollment_frozen
+        assert manager.terminal_source_publication_control is publication_control
         assert set(manager.decode_kv_args_table) == {
             "decode-agent-a",
             "decode-agent-b",
@@ -538,10 +548,15 @@ def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
 
     def start_workers() -> None:
         assert manager._terminal_runtime_activated.is_set()
-        assert [event[0] for event in events] == ["ack", "ack"]
+        assert [event[0] for event in events] == [
+            "publication-roster",
+            "ack",
+            "ack",
+        ]
         manager._runtime_workers_started = True
         events.append(("workers", None))
 
+    manager._enroll_terminal_source_publication_routes = enroll_publication_routes
     manager._send_terminal_startup_ack = send_ack
     manager._start_prefill_runtime_workers = start_workers
 
@@ -553,6 +568,7 @@ def test_source_retains_exact_decoder_roster_before_acks_and_workers() -> None:
         inbox.close()
 
     assert events == [
+        ("publication-roster", None),
         ("ack", ("decode-a", 0)),
         ("ack", ("decode-b", 0)),
         ("workers", None),

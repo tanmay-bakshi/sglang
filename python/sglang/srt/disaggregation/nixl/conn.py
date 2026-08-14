@@ -103,6 +103,11 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedDestinationRegistration,
     PackedPeerIdentity,
 )
+from sglang.srt.disaggregation.nixl.source_publication_control import (
+    TERMINAL_SOURCE_PUBLICATION_RECEIPT_TAG,
+    TerminalSourcePublicationControl,
+    TerminalSourcePublicationRouteRoster,
+)
 from sglang.srt.disaggregation.nixl.startup_enrollment_ack import (
     TERMINAL_STARTUP_ENROLLMENT_ACK_TAG,
     build_terminal_startup_enrollment_ack,
@@ -939,6 +944,7 @@ class TransferStatus:
 class NixlKVManager(CommonKVManager):
     _terminal_startup_binding: TerminalStartupRankBinding | None = None
     _terminal_startup_peer_enrollment: _TerminalStartupPeerEnrollment | None = None
+    _terminal_source_publication_control: TerminalSourcePublicationControl | None = None
 
     def __init__(
         self,
@@ -949,6 +955,7 @@ class NixlKVManager(CommonKVManager):
     ):
         self._terminal_startup_binding = None
         self._terminal_startup_peer_enrollment = None
+        self._terminal_source_publication_control = None
         self._terminal_runtime_activated = threading.Event()
         self._terminal_activation_lock = threading.Lock()
         self._terminal_activation_started = False
@@ -1179,6 +1186,18 @@ class NixlKVManager(CommonKVManager):
         """
 
         return self._terminal_startup_binding
+
+    @property
+    def terminal_source_publication_control(
+        self,
+    ) -> TerminalSourcePublicationControl | None:
+        """Return the direct source-rank publication route owner.
+
+        :returns: Startup-enrolled source control, or ``None`` outside a
+            terminal source deployment.
+        """
+
+        return self._terminal_source_publication_control
 
     @property
     def terminal_peer_enrollment_frozen(self) -> bool:
@@ -1461,6 +1480,69 @@ class NixlKVManager(CommonKVManager):
         )
         return roster
 
+    def _enroll_terminal_source_publication_routes(
+        self,
+        deadline: float,
+    ) -> TerminalSourcePublicationControl:
+        """Fetch and freeze direct same-service source control listeners.
+
+        :param deadline: Absolute monotonic startup deadline.
+        :returns: Process-local publication route owner.
+        :raises RuntimeError: If this rank is not a source or any actual
+            listener differs from the sealed startup authority.
+        """
+
+        enrollment = self._require_terminal_startup_peer_enrollment()
+        binding = enrollment.binding
+        local = binding.advertisement
+        if local.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("only a terminal source enrolls source control routes")
+        address = self._terminal_bootstrap_address()
+        endpoint = address.to_url() + TERMINAL_NIXL_SOURCE_ROSTER_ROUTE
+        roster = fetch_terminal_nixl_source_roster(
+            endpoint,
+            local,
+            binding.matrix,
+            NIXL_BOOTSTRAP_PEER_PROTOCOL,
+            self._remaining_terminal_startup_seconds(deadline),
+        )
+        route_roster = TerminalSourcePublicationRouteRoster.from_startup_roster(
+            binding,
+            roster,
+            NetworkAddress(self.local_ip, self.rank_port),
+        )
+        return TerminalSourcePublicationControl(
+            route_roster,
+            local.terminal_identity,
+            self._send_terminal_source_publication_frames,
+        )
+
+    def _send_terminal_source_publication_frames(
+        self,
+        endpoint: NetworkAddress,
+        frames: tuple[bytes, ...],
+    ) -> None:
+        """Send one publisher outcome to an enrolled source listener.
+
+        :param endpoint: Exact manager listener from the frozen source roster.
+        :param frames: Closed source-publication control message.
+        """
+
+        if type(endpoint) is not NetworkAddress:
+            raise TypeError("endpoint must be NetworkAddress")
+        if type(frames) is not tuple or any(
+            type(frame) is not bytes for frame in frames
+        ):
+            raise TypeError("frames must be a tuple of bytes")
+        control = self._terminal_source_publication_control
+        if control is None:
+            raise RuntimeError("source publication control is not enrolled")
+        if endpoint not in tuple(route.endpoint for route in control.roster.routes):
+            raise RuntimeError("source publication endpoint is not enrolled")
+        with self._packed_control_send_lock:
+            socket = self._connect(endpoint.to_tcp(), is_ipv6=endpoint.is_ipv6)
+            socket.send_multipart(frames)
+
     @staticmethod
     def _remaining_terminal_startup_seconds(deadline: float) -> float:
         """Return positive time remaining before one startup deadline.
@@ -1630,6 +1712,10 @@ class NixlKVManager(CommonKVManager):
         :param deadline: Absolute monotonic startup deadline.
         """
 
+        if self._terminal_source_publication_control is not None:
+            raise RuntimeError("source publication control is already enrolled")
+        publication_control = self._enroll_terminal_source_publication_routes(deadline)
+        self._terminal_source_publication_control = publication_control
         enrollments = self._receive_terminal_decoder_enrollments(deadline)
         for enrollment in enrollments:
             self._send_terminal_startup_ack(enrollment)
@@ -1672,6 +1758,11 @@ class NixlKVManager(CommonKVManager):
             self._activate_terminal_decoder(deadline)
         if not self.terminal_peer_enrollment_frozen:
             raise RuntimeError("terminal native peer roster is not frozen")
+        if (
+            binding.advertisement.role is TerminalOwnerRole.SOURCE
+            and self._terminal_source_publication_control is None
+        ):
+            raise RuntimeError("terminal source publication routes are not frozen")
 
         self._terminal_runtime_activated.set()
         if binding.advertisement.role is TerminalOwnerRole.SOURCE:
@@ -6085,6 +6176,12 @@ class NixlKVManager(CommonKVManager):
                     self._handle_packed_prefill_control(waiting_req_bytes)
                     continue
 
+                if waiting_req_bytes[0] == TERMINAL_SOURCE_PUBLICATION_RECEIPT_TAG:
+                    self._handle_terminal_source_publication_receipt(
+                        tuple(waiting_req_bytes)
+                    )
+                    continue
+
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
@@ -6195,6 +6292,20 @@ class NixlKVManager(CommonKVManager):
         )
         self._terminal_bootstrap_thread = thread
         thread.start()
+
+    def _handle_terminal_source_publication_receipt(
+        self,
+        frames: tuple[bytes, ...],
+    ) -> None:
+        """Deliver one direct canonical publication outcome to source serving.
+
+        :param frames: Exact startup-matrix-bound multipart message.
+        """
+
+        control = self._terminal_source_publication_control
+        if control is None:
+            raise RuntimeError("source publication control is unavailable")
+        control.receive_frames(frames)
 
 
 class NixlKVSender(CommonKVSender):
@@ -6727,7 +6838,7 @@ class NixlKVBootstrapServer(CommonKVBootstrapServer):
         self,
         request: web.Request,
     ) -> web.Response:
-        """Return every matrix-authenticated source route to one decoder.
+        """Return every matrix-authenticated source route to one startup rank.
 
         Route-table readiness waits off the HTTP event loop. The response is
         emitted once from the frozen source topology and cannot select a
@@ -6743,10 +6854,6 @@ class NixlKVBootstrapServer(CommonKVBootstrapServer):
         try:
             requester = decode_terminal_startup_rank_advertisement(await request.read())
             matrix = registry.sealed_matrix_for(requester)
-            if requester.role is not TerminalOwnerRole.DECODE:
-                raise TerminalStartupCohortError(
-                    "only a decoder rank may request source routes"
-                )
             await asyncio.to_thread(
                 self.wait_until_ready,
                 registry.timeout_seconds,
