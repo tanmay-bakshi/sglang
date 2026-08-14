@@ -28,14 +28,6 @@ from sglang.srt.disaggregation.terminal_progress.coordinator import (
     TerminalRequestCoordinatorManifest,
     TerminalRequestCoordinationTiming,
 )
-from sglang.srt.disaggregation.terminal_progress.deadlines import (
-    TerminalDeadlineKind,
-    terminal_deadline_spec,
-)
-from sglang.srt.disaggregation.terminal_progress.evidence import (
-    TerminalProgressTimingRecorder,
-    terminal_progress_timing_recorder,
-)
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerInventory,
     PackedTerminalDecodeSchedulerRegistration,
@@ -43,6 +35,14 @@ from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer impor
 )
 from sglang.srt.disaggregation.terminal_progress.decode_wiring import (
     PackedTerminalDecodeWiring,
+)
+from sglang.srt.disaggregation.terminal_progress.deadlines import (
+    TerminalDeadlineKind,
+    terminal_deadline_spec,
+)
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    TerminalProgressTimingRecorder,
+    terminal_progress_timing_recorder,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,

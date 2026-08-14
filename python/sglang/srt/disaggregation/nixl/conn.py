@@ -140,10 +140,10 @@ from sglang.srt.disaggregation.nixl.startup_source_roster import (
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
+from sglang.srt.disaggregation.terminal_progress.clock import SystemTerminalOwnerClock
 from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
     build_terminal_startup_cohort_expectation,
 )
-from sglang.srt.disaggregation.terminal_progress.clock import SystemTerminalOwnerClock
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
