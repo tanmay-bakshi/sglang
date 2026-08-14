@@ -127,6 +127,9 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentLocalService,
     TerminalDeploymentRole,
 )
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryDeviceRowPool,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalRequestBinding,
@@ -939,6 +942,7 @@ class TransferStatus:
 class NixlKVManager(CommonKVManager):
     _terminal_startup_binding: TerminalStartupRankBinding | None = None
     _terminal_startup_peer_enrollment: _TerminalStartupPeerEnrollment | None = None
+    _terminal_dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None = None
 
     def __init__(
         self,
@@ -949,6 +953,7 @@ class NixlKVManager(CommonKVManager):
     ):
         self._terminal_startup_binding = None
         self._terminal_startup_peer_enrollment = None
+        self._terminal_dflash_boundary_pool = None
         self._terminal_runtime_activated = threading.Event()
         self._terminal_activation_lock = threading.Lock()
         self._terminal_activation_started = False
@@ -1025,6 +1030,17 @@ class NixlKVManager(CommonKVManager):
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
 
         self.register_buffer_to_engine()
+        if self._requires_terminal_dflash_boundary_pool():
+            row_capacity = self.kv_args.terminal_dflash_boundary_row_capacity
+            if type(row_capacity) is not int or row_capacity <= 0:
+                raise ValueError(
+                    "terminal DFlash boundary row capacity must be positive"
+                )
+            self._terminal_dflash_boundary_pool = DFlashBoundaryDeviceRowPool(
+                self.agent,
+                row_capacity=row_capacity,
+                device=torch.device("cuda", self.kv_args.gpu_id),
+            )
         self._prefill_peers: dict[tuple[str, int, int, int, int], _NixlPrefillPeer] = {}
         self._prefill_peer_keys_by_addr: Dict[
             str, set[tuple[str, int, int, int, int]]
@@ -1099,6 +1115,7 @@ class NixlKVManager(CommonKVManager):
                     self,
                     staging_allocator.buffer.buffer,
                     staging_registration,
+                    self._terminal_dflash_boundary_pool,
                 )
         elif (
             self.enable_staging
@@ -1130,6 +1147,28 @@ class NixlKVManager(CommonKVManager):
                 self._start_prefill_runtime_workers()
         elif terminal_binding is None:
             self._start_decode_runtime_workers()
+
+    def _requires_terminal_dflash_boundary_pool(self) -> bool:
+        """Return whether this manager must advertise registered boundary rows.
+
+        :returns: Whether the local role is a terminal DFlash decoder.
+        """
+
+        return (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.pd_terminal_deployment_cohort is not None
+            and self.server_args.speculative_algorithm == "DFLASH"
+        )
+
+    def terminal_dflash_boundary_pool(
+        self,
+    ) -> DFlashBoundaryDeviceRowPool | None:
+        """Return the process-lifetime destination row owner.
+
+        :returns: Registered DFlash rows, or ``None`` outside terminal DFlash.
+        """
+
+        return self._terminal_dflash_boundary_pool
 
     def _start_prefill_runtime_workers(self) -> None:
         """Start source transfer workers after peer authority is immutable."""
@@ -1758,7 +1797,7 @@ class NixlKVManager(CommonKVManager):
         *,
         room_id: int,
         request_owner: object,
-        metadata_buffer_index: int,
+        metadata_buffer_index: int | None,
         allocation_lease: DecodeAllocationLease,
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
@@ -1768,7 +1807,8 @@ class NixlKVManager(CommonKVManager):
 
         :param room_id: Decoder-minted non-recycled bootstrap room.
         :param request_owner: Exact retained decode request.
-        :param metadata_buffer_index: Exact reserved auxiliary metadata slot.
+        :param metadata_buffer_index: Legacy reserved auxiliary slot, or
+            ``None`` for terminal DFlash registered VRAM.
         :param allocation_lease: Prepared decode allocation lease.
         :param allocation_authority: Exact allocation lease authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.

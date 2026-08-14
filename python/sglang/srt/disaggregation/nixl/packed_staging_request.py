@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.packed_auxiliary_allocation import (
     PackedAuxiliaryAllocationLeaseAuthority,
     PackedAuxiliaryAllocationLeaseSnapshot,
     PackedAuxiliaryAllocationState,
+    PackedAuxiliarySlotReservationSnapshot,
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_TEARDOWN_GENERATION_BYTES,
@@ -27,6 +28,8 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryPlan,
     PackedChunkKey,
     PackedDecodeProtocol,
+    PackedDFlashBoundaryMetadata,
+    PackedDFlashBoundaryOutcome,
     PackedLayoutSpec,
     PackedPrepare,
     PackedProtocolError,
@@ -58,6 +61,10 @@ logger = logging.getLogger(__name__)
 
 _SCATTER_CONSTRUCTION_SEAL = object()
 _COMMIT_CONSTRUCTION_SEAL = object()
+
+PackedTerminalAuxiliaryOutcome = (
+    PackedAuxiliaryOutcome | PackedDFlashBoundaryOutcome
+)
 
 
 class PackedRequestTransactionError(RuntimeError):
@@ -258,8 +265,47 @@ class PackedRequestTransactionSnapshot:
     scatter_started: tuple[int, ...]
     scatter_terminal: tuple[int, ...]
     teardown_acks: tuple[StagingWriterId, ...]
-    auxiliary_outcome: PackedAuxiliaryOutcome | None
+    auxiliary_outcome: PackedTerminalAuxiliaryOutcome | None
     auxiliary_teardown_acknowledged: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedDFlashBoundaryDecodeAdoption:
+    """Authenticated destination row and scalar state for scheduler adoption.
+
+    :ivar metadata: Source-authored DFlash boundary and request counters.
+    :ivar lease: Exact committed destination VRAM row generation and state.
+    :ivar outcome_digest: Identity of the authenticated native transfer outcome.
+    """
+
+    metadata: PackedDFlashBoundaryMetadata
+    lease: PackedAuxiliaryAllocationLeaseSnapshot
+    outcome_digest: bytes
+
+    def __post_init__(self) -> None:
+        """Validate immutable scheduler adoption authority."""
+
+        if type(self.metadata) is not PackedDFlashBoundaryMetadata:
+            raise TypeError("metadata must be PackedDFlashBoundaryMetadata")
+        if type(self.lease) is not PackedAuxiliaryAllocationLeaseSnapshot:
+            raise TypeError("lease must be PackedAuxiliaryAllocationLeaseSnapshot")
+        if self.lease.state is not PackedAuxiliaryAllocationState.COMMITTED_TO_REQUEST:
+            raise ValueError("DFlash boundary row is not committed to its request")
+        if type(self.outcome_digest) is not bytes or len(self.outcome_digest) != 32:
+            raise ValueError("outcome_digest must contain 32 bytes")
+
+    @property
+    def slot(self) -> PackedAuxiliarySlotReservationSnapshot:
+        """Project the committed lease to its live pool reservation geometry.
+
+        :returns: Exact row index, generation, and registered segment.
+        """
+
+        return PackedAuxiliarySlotReservationSnapshot(
+            metadata_buffer_index=self.lease.metadata_buffer_index,
+            metadata_slot_generation=self.lease.metadata_slot_generation,
+            destination_segments=self.lease.destination_segments,
+        )
 
 
 @dataclasses.dataclass
@@ -278,13 +324,14 @@ class PackedDecodeRequestTransaction:
 
     _auxiliary_allocation_authority: PackedAuxiliaryAllocationLeaseAuthority
     _auxiliary_allocation_lease: PackedAuxiliaryAllocationLease
-    _auxiliary_outcome: PackedAuxiliaryOutcome | None
+    _auxiliary_outcome: PackedTerminalAuxiliaryOutcome | None
     _auxiliary_plan: PackedAuxiliaryPlan
     _auxiliary_committed_to_request: bool
     _auxiliary_released: bool
     _auxiliary_retired: bool
     _auxiliary_submission_recorded: bool
     _auxiliary_teardown_recorded: bool
+    _dflash_boundary_adoption: PackedDFlashBoundaryDecodeAdoption | None
     _allocation_authority: DecodeAllocationLeaseAuthority
     _allocation_committed: bool
     _allocation_lease: DecodeAllocationLease
@@ -421,6 +468,7 @@ class PackedDecodeRequestTransaction:
         self._auxiliary_retired = False
         self._auxiliary_submission_recorded = False
         self._auxiliary_teardown_recorded = False
+        self._dflash_boundary_adoption = None
         self._allocation_authority = allocation_authority
         self._allocation_committed = False
         self._allocation_lease = allocation_lease
@@ -701,6 +749,42 @@ class PackedDecodeRequestTransaction:
 
         if type(message) is not PackedAuxiliaryOutcome:
             raise TypeError("message must be PackedAuxiliaryOutcome")
+        return self._handle_terminal_auxiliary_outcome(
+            message,
+            authenticated_writer_id,
+        )
+
+    def handle_dflash_boundary_outcome(
+        self,
+        message: PackedDFlashBoundaryOutcome,
+        authenticated_writer_id: StagingWriterId,
+    ) -> bool:
+        """Bind one authenticated all-VRAM DFlash boundary outcome.
+
+        :param message: Untrusted terminal DFlash boundary outcome.
+        :param authenticated_writer_id: Writer bound to the transport peer.
+        :returns: Whether this exact outcome was newly accepted.
+        """
+
+        if type(message) is not PackedDFlashBoundaryOutcome:
+            raise TypeError("message must be PackedDFlashBoundaryOutcome")
+        return self._handle_terminal_auxiliary_outcome(
+            message,
+            authenticated_writer_id,
+        )
+
+    def _handle_terminal_auxiliary_outcome(
+        self,
+        message: PackedTerminalAuxiliaryOutcome,
+        authenticated_writer_id: StagingWriterId,
+    ) -> bool:
+        """Apply shared authenticated auxiliary lifecycle transitions.
+
+        :param message: Validated legacy or DFlash terminal outcome.
+        :param authenticated_writer_id: Writer bound to the transport peer.
+        :returns: Whether this exact outcome was newly accepted.
+        """
+
         if type(authenticated_writer_id) is not StagingWriterId:
             raise TypeError("authenticated_writer_id must be StagingWriterId")
         with self._lock:
@@ -873,7 +957,7 @@ class PackedDecodeRequestTransaction:
                     allocation_digest=snapshot.allocation_digest,
                     teardown_generation=generation,
                     auxiliary_handle_generation=(
-                        outcome.native_dram_handle_generation
+                        self._terminal_auxiliary_handle_generation(outcome)
                         if writer_id == self._auxiliary_plan.canonical_writer_id
                         else None
                     ),
@@ -957,7 +1041,7 @@ class PackedDecodeRequestTransaction:
                             self._auxiliary_plan.metadata_slot_generation
                         ),
                         native_dram_handle_generation=(
-                            outcome.native_dram_handle_generation
+                            self._terminal_auxiliary_handle_generation(outcome)
                         ),
                         descriptor_digest=outcome.descriptor_digest,
                         evidence_digest=outcome.evidence_digest,
@@ -1050,13 +1134,56 @@ class PackedDecodeRequestTransaction:
             self._state = PackedRequestTransactionState.DESTINATION_CONSUMPTION_WAITING
             return self._request_owner
 
+    def begin_dflash_boundary_adoption_on_scheduler_thread(
+        self,
+    ) -> PackedDFlashBoundaryDecodeAdoption:
+        """Issue the authenticated DFlash row generation for one D2D adoption.
+
+        This operation does not release the destination row. The scheduler must
+        enqueue a request-owned device copy and hand its completion authority to
+        the terminal owner before metadata consumption can release the row.
+
+        :returns: Exact committed row and authenticated scalar metadata.
+        """
+
+        self._require_scheduler_thread()
+        with self._lock:
+            if (
+                self._state
+                is not PackedRequestTransactionState.DESTINATION_CONSUMPTION_WAITING
+            ):
+                raise PackedRequestTransactionError(
+                    "DFlash boundary adoption is invalid in state "
+                    f"{self._state.value}"
+                )
+            if self._dflash_boundary_adoption is not None:
+                raise PackedRequestTransactionError(
+                    "DFlash boundary adoption authority was already issued"
+                )
+            outcome = self._auxiliary_outcome
+            if type(outcome) is not PackedDFlashBoundaryOutcome:
+                raise PackedRequestTransactionError(
+                    "terminal request has no authenticated DFlash boundary outcome"
+                )
+            slot = self._validate_auxiliary_request_commit_snapshot_locked()
+            adoption = PackedDFlashBoundaryDecodeAdoption(
+                metadata=outcome.metadata,
+                lease=slot,
+                outcome_digest=outcome.outcome_digest,
+            )
+            self._dflash_boundary_adoption = adoption
+            return adoption
+
     def complete_auxiliary_consumption_on_scheduler_thread(
         self,
         consumer_authority: object,
+        dflash_adoption: PackedDFlashBoundaryDecodeAdoption | None = None,
     ) -> None:
         """Release the exact metadata row after scheduler copy completes.
 
         :param consumer_authority: Exact configured scheduler metadata consumer.
+        :param dflash_adoption: Exact issued DFlash adoption after its device
+            copy completion became terminal.
         """
 
         self._require_scheduler_thread()
@@ -1068,6 +1195,21 @@ class PackedDecodeRequestTransaction:
                 raise PackedRequestTransactionError(
                     "metadata consumption completion is invalid in state "
                     f"{self._state.value}"
+                )
+            if type(self._auxiliary_outcome) is PackedDFlashBoundaryOutcome:
+                if dflash_adoption is not self._dflash_boundary_adoption:
+                    self._quarantine_locked(
+                        "DFlash metadata consumption lacks exact adoption authority"
+                    )
+                    raise PackedRequestTransactionError(
+                        "DFlash metadata consumption lacks exact adoption authority"
+                    )
+            elif dflash_adoption is not None:
+                self._quarantine_locked(
+                    "legacy metadata consumption received DFlash authority"
+                )
+                raise PackedRequestTransactionError(
+                    "legacy metadata consumption received DFlash authority"
                 )
             self._validate_auxiliary_request_commit_snapshot_locked()
             try:
@@ -1087,6 +1229,7 @@ class PackedDecodeRequestTransaction:
                 raise PackedRequestTransactionError(
                     "metadata consumption release failed"
                 ) from error
+            self._dflash_boundary_adoption = None
             self._state = PackedRequestTransactionState.COMMITTED
 
     def quarantine(self, reason: str) -> None:
@@ -1131,6 +1274,22 @@ class PackedDecodeRequestTransaction:
                     self._auxiliary_plan.canonical_writer_id in self._teardown_acks
                 ),
             )
+
+    @staticmethod
+    def _terminal_auxiliary_handle_generation(
+        outcome: PackedTerminalAuxiliaryOutcome,
+    ) -> int:
+        """Return the native handle generation from either auxiliary schema.
+
+        :param outcome: Authenticated legacy or DFlash terminal outcome.
+        :returns: Exact native handle generation.
+        """
+
+        if type(outcome) is PackedAuxiliaryOutcome:
+            return outcome.native_dram_handle_generation
+        if type(outcome) is PackedDFlashBoundaryOutcome:
+            return outcome.native_handle_generation
+        raise TypeError("unsupported terminal auxiliary outcome")
 
     @staticmethod
     def _teardown_ack(request: PackedRequestTeardown) -> PackedRequestTeardownAck:
@@ -1187,7 +1346,7 @@ class PackedDecodeRequestTransaction:
             failure_reason = "auxiliary allocation has not reached teardown completion"
         elif outcome is not None and (
             snapshot.native_dram_handle_generation
-            != outcome.native_dram_handle_generation
+            != self._terminal_auxiliary_handle_generation(outcome)
             or snapshot.descriptor_digest != outcome.descriptor_digest
             or snapshot.evidence_digest != outcome.evidence_digest
         ):

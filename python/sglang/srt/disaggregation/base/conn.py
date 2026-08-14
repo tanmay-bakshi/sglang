@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
+
 from sglang.srt.disaggregation.runtime_capabilities import KvTransferProtocol
 
 if TYPE_CHECKING:
     import torch
+
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.server_args import ServerArgs
 
@@ -84,6 +86,10 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Maximum decoder requests which can simultaneously retain a terminal
+    # DFlash boundary row. Backends that do not implement the terminal packed
+    # protocol ignore this field.
+    terminal_dflash_boundary_row_capacity: int
 
 
 class KVPoll:

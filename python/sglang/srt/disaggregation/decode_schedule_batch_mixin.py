@@ -138,9 +138,47 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        last_tokens_tensor = torch.tensor(
-            last_tokens, dtype=torch.int64, device=self.device
+        terminal_boundary_tokens = tuple(
+            req.pd_dflash_boundary_token_id for req in self.reqs
         )
+        terminal_boundary_events = tuple(
+            req.pd_dflash_boundary_completion_event for req in self.reqs
+        )
+        terminal_token_count = sum(
+            token is not None for token in terminal_boundary_tokens
+        )
+        if terminal_token_count > 0:
+            if terminal_token_count != len(self.reqs):
+                raise RuntimeError(
+                    "a prebuilt DFlash batch cannot mix terminal and legacy tokens"
+                )
+            if not self.spec_algorithm.is_dflash():
+                raise RuntimeError(
+                    "request-owned terminal boundary tokens require DFlash"
+                )
+            if any(event is None for event in terminal_boundary_events):
+                raise RuntimeError(
+                    "terminal DFlash boundary token lost its completion event"
+                )
+            current_stream = torch.get_device_module(self.device).current_stream()
+            for token, event in zip(
+                terminal_boundary_tokens,
+                terminal_boundary_events,
+                strict=True,
+            ):
+                assert token is not None
+                assert event is not None
+                current_stream.wait_event(event)
+                token.record_stream(current_stream)
+            last_tokens_tensor = torch.cat(terminal_boundary_tokens, dim=0)
+        else:
+            if any(event is not None for event in terminal_boundary_events):
+                raise RuntimeError(
+                    "terminal DFlash completion event lost its device token"
+                )
+            last_tokens_tensor = torch.tensor(
+                last_tokens, dtype=torch.int64, device=self.device
+            )
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
@@ -157,3 +195,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
             )
             self.input_ids = None
+
+        if terminal_token_count > 0:
+            for req in self.reqs:
+                req.pd_dflash_boundary_token_id = None
+                req.pd_dflash_boundary_completion_event = None

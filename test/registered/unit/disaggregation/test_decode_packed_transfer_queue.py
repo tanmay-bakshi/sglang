@@ -1,13 +1,32 @@
+import contextlib
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.packed_auxiliary_allocation import (
+    PackedAuxiliaryAllocationLeaseSnapshot,
+    PackedAuxiliaryAllocationState,
+)
+from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedAuxiliaryDestinationSegment,
+    PackedDFlashBoundaryMetadata,
+)
 from sglang.srt.disaggregation.decode import (
     DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    TerminalDFlashDecodeAdoption,
+)
+from sglang.srt.disaggregation.nixl.packed_staging_request import (
+    PackedDFlashBoundaryDecodeAdoption,
+)
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryAdoptedValue,
+    DFlashBoundaryDeviceRowPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -115,6 +134,16 @@ class TestDecodePackedTransferQueue(CustomTestCase):
             return_logprob=False,
             return_sampling_mask=False,
             output_ids=[],
+            cached_tokens=0,
+            already_computed=0,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            mm_image_tokens=0,
+            mm_audio_tokens=0,
+            mm_video_tokens=0,
+            pd_dflash_boundary_token_id=None,
+            pd_dflash_boundary_completion_event=None,
             finished_reason=None,
             pd_rebootstrap_forced_output_id=None,
             time_stats=MagicMock(),
@@ -165,10 +194,12 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         queue.tree_cache = MagicMock()
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
+        queue.spec_algorithm.is_dflash.return_value = False
         queue.enable_staging = True
         queue.staging_handler = MagicMock()
         queue.allocation_lease_authority = allocation_lease_authority
         queue.allocation_lifecycle_authority = lifecycle_authority
+        queue.terminal_dflash_boundary_pool = None
         queue._clean_hicache_prefetch_resources = MagicMock()
         queue._commit_hicache_local_restore_to_req = MagicMock()
         queue._poll_with_staging = MagicMock(
@@ -291,7 +322,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
     def test_terminal_adoption_keeps_metadata_pinned_until_finalization(
         self,
     ) -> None:
-        """Split copy from runnable visibility around actor row consumption."""
+        """Retain the device token while the owner holds row-release authority."""
 
         room_id = 47
         metadata_buffer_index = 1
@@ -302,6 +333,11 @@ class TestDecodePackedTransferQueue(CustomTestCase):
             size=4,
             room_id=room_id,
             row_index=metadata_buffer_index,
+        )
+        metadata_buffers.get_buf = MagicMock(
+            side_effect=AssertionError(
+                "terminal DFlash adoption must not read legacy metadata"
+            )
         )
         metadata_allocator = MagicMock()
         decode_req = self._request(
@@ -320,11 +356,78 @@ class TestDecodePackedTransferQueue(CustomTestCase):
             allocation_lease_authority=MagicMock(),
         )
         queue.scheduler.waiting_queue = []
+        queue.spec_algorithm.is_dflash.return_value = True
+        boundary_pool = object.__new__(DFlashBoundaryDeviceRowPool)
+        queue.terminal_dflash_boundary_pool = boundary_pool
+        metadata = PackedDFlashBoundaryMetadata(
+            boundary_token_id=17,
+            cached_tokens=4,
+            cached_tokens_device=3,
+            cached_tokens_host=2,
+            cached_tokens_storage=1,
+            image_tokens=7,
+            audio_tokens=8,
+            video_tokens=9,
+        )
+        transaction_adoption = PackedDFlashBoundaryDecodeAdoption(
+            metadata=metadata,
+            lease=PackedAuxiliaryAllocationLeaseSnapshot(
+                metadata_buffer_index=metadata_buffer_index,
+                metadata_slot_generation=b"g" * 16,
+                destination_segments=(
+                    PackedAuxiliaryDestinationSegment(
+                        address=0xA00000,
+                        item_length=8,
+                    ),
+                ),
+                state=PackedAuxiliaryAllocationState.COMMITTED_TO_REQUEST,
+                native_dram_handle_generation=29,
+                descriptor_digest=b"d" * 32,
+                evidence_digest=b"e" * 32,
+                failure_reason=None,
+            ),
+            outcome_digest=b"o" * 32,
+        )
+        transaction.begin_dflash_boundary_adoption_on_scheduler_thread = MagicMock(
+            return_value=transaction_adoption
+        )
+        device_value = object.__new__(DFlashBoundaryAdoptedValue)
+        boundary_token = torch.tensor([17], dtype=torch.int64)
+        completion_event = object()
+        object.__setattr__(device_value, "boundary_token_id", boundary_token)
+        object.__setattr__(device_value, "completion_event", completion_event)
 
-        queue.adopt_terminal_request(decode_req, transaction)
+        with patch.object(
+            DFlashBoundaryDeviceRowPool,
+            "enqueue_destination_adoption",
+            return_value=device_value,
+        ) as enqueue_adoption:
+            receipt = queue.adopt_terminal_request(decode_req, transaction)
 
+        self.assertIsInstance(receipt, TerminalDFlashDecodeAdoption)
+        self.assertIs(receipt.transaction_adoption, transaction_adoption)
+        self.assertIs(receipt.device_value, device_value)
+        enqueue_adoption.assert_called_once_with(
+            transaction_adoption.slot,
+            stream=queue.scheduler.schedule_stream,
+        )
         self.assertEqual(decode_req.req.output_ids, [17])
-        self.assertEqual(metadata_buffers.bootstrap_room[metadata_buffer_index], 0)
+        self.assertEqual(decode_req.req.cached_tokens, 4)
+        self.assertEqual(decode_req.req.cached_tokens_device, 3)
+        self.assertEqual(decode_req.req.cached_tokens_host, 2)
+        self.assertEqual(decode_req.req.cached_tokens_storage, 1)
+        self.assertEqual(decode_req.req.mm_image_tokens, 7)
+        self.assertEqual(decode_req.req.mm_audio_tokens, 8)
+        self.assertEqual(decode_req.req.mm_video_tokens, 9)
+        self.assertIs(decode_req.req.pd_dflash_boundary_token_id, boundary_token)
+        self.assertIs(
+            decode_req.req.pd_dflash_boundary_completion_event,
+            completion_event,
+        )
+        self.assertEqual(
+            metadata_buffers.bootstrap_room[metadata_buffer_index],
+            room_id,
+        )
         self.assertEqual(queue.queue, [decode_req])
         self.assertEqual(queue.scheduler.waiting_queue, [])
         self.assertIs(decode_req.allocation_lease, allocation_lease)
@@ -332,6 +435,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         self.assertEqual(decode_req.metadata_buffer_index, metadata_buffer_index)
         self.assertEqual(receiver.clear_count, 0)
         metadata_allocator.free.assert_not_called()
+        metadata_buffers.get_buf.assert_not_called()
 
         queue.finalize_terminal_request(decode_req, transaction)
 
@@ -343,6 +447,127 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         self.assertEqual(receiver.clear_count, 1)
         metadata_allocator.free.assert_not_called()
+
+    def test_terminal_rebootstrap_replaces_device_token_after_clone_completion(
+        self,
+    ) -> None:
+        """Order a forced boundary replacement after the row-to-request clone."""
+
+        room_id = 53
+        metadata_buffer_index = 2
+        forced_output_id = 29
+        receiver = _RecordingReceiver()
+        metadata_buffers = _FakeMetadataBuffers(
+            size=4,
+            room_id=room_id,
+            row_index=metadata_buffer_index,
+        )
+        decode_req = self._request(
+            room_id=room_id,
+            metadata_buffer_index=metadata_buffer_index,
+            receiver=receiver,
+            allocation_lease=object(),
+            packed_transaction=object(),
+        )
+        decode_req.is_rebootstrap = True
+        decode_req.req.pd_rebootstrap_forced_output_id = forced_output_id
+        queue = self._queue(
+            decode_req=decode_req,
+            metadata_buffers=metadata_buffers,
+            metadata_allocator=MagicMock(),
+            lifecycle_authority=MagicMock(),
+            allocation_lease_authority=MagicMock(),
+        )
+        timeline: list[str] = []
+        clone_completion_event = object()
+        schedule_stream = MagicMock()
+        schedule_stream.wait_event.side_effect = lambda event: timeline.append(
+            f"wait:{id(event)}"
+        )
+        queue.scheduler.schedule_stream = schedule_stream
+        boundary_token = MagicMock()
+        boundary_token.fill_.side_effect = lambda token_id: timeline.append(
+            f"fill:{token_id}"
+        )
+        replacement_event = MagicMock()
+        replacement_event.record.side_effect = lambda stream: timeline.append(
+            f"record:{id(stream)}"
+        )
+        metadata = PackedDFlashBoundaryMetadata(
+            boundary_token_id=17,
+            cached_tokens=4,
+            cached_tokens_device=3,
+            cached_tokens_host=2,
+            cached_tokens_storage=1,
+            image_tokens=7,
+            audio_tokens=8,
+            video_tokens=9,
+        )
+        adoption = MagicMock(metadata=metadata)
+        device_value = MagicMock(
+            boundary_token_id=boundary_token,
+            completion_event=clone_completion_event,
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.torch.cuda.stream",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.torch.cuda.Event",
+                return_value=replacement_event,
+            ) as event_factory,
+        ):
+            queue._commit_terminal_dflash_metadata_to_req(
+                decode_req,
+                adoption,
+                device_value,
+            )
+
+        self.assertEqual(
+            timeline,
+            [
+                f"wait:{id(clone_completion_event)}",
+                f"fill:{forced_output_id}",
+                f"record:{id(schedule_stream)}",
+            ],
+        )
+        event_factory.assert_called_once_with(
+            enable_timing=False,
+            blocking=False,
+            interprocess=False,
+        )
+        self.assertEqual(decode_req.req.output_ids, [forced_output_id])
+        self.assertIsNone(decode_req.req.pd_rebootstrap_forced_output_id)
+        self.assertIs(decode_req.req.pd_dflash_boundary_token_id, boundary_token)
+        self.assertIs(
+            decode_req.req.pd_dflash_boundary_completion_event,
+            replacement_event,
+        )
+
+    def test_terminal_decode_path_forbids_legacy_and_host_scalar_access(self) -> None:
+        """Keep the terminal scheduler adoption path device-only and event-driven."""
+
+        methods = (
+            DecodeTransferQueue.adopt_terminal_request,
+            DecodeTransferQueue._commit_terminal_dflash_metadata_to_req,
+            DecodeTransferQueue.finalize_terminal_request,
+        )
+        source = "\n".join(inspect.getsource(method) for method in methods)
+        forbidden_fragments = (
+            "MetadataBuffers",
+            "get_buf(",
+            ".cpu(",
+            ".item(",
+            "time.sleep(",
+            "output_topk_p",
+            "output_topk_index",
+            "output_hidden_states",
+        )
+
+        for fragment in forbidden_fragments:
+            self.assertNotIn(fragment, source)
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")

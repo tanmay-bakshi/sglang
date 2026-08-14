@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from torch.distributed import ProcessGroup
+
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -66,6 +68,7 @@ from sglang.srt.disaggregation.decode_reservations import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
+    PackedDFlashBoundaryDecodeAdoption,
     PackedRequestPublication,
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
@@ -73,6 +76,10 @@ from sglang.srt.disaggregation.runtime_capabilities import (
 )
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
+)
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryAdoptedValue,
+    DFlashBoundaryDeviceRowPool,
 )
 from sglang.srt.disaggregation.terminal_progress.request_registration import (
     register_packed_terminal_decode_request,
@@ -133,7 +140,6 @@ from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +367,28 @@ class DecodeRequest:
         return self.req.priority
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalDFlashDecodeAdoption:
+    """Pending device-copy authority returned to the terminal owner.
+
+    :ivar transaction_adoption: Exact actor-issued row generation and metadata.
+    :ivar device_value: Request-owned token and completion event for row release.
+    """
+
+    transaction_adoption: PackedDFlashBoundaryDecodeAdoption
+    device_value: DFlashBoundaryAdoptedValue
+
+    def __post_init__(self) -> None:
+        """Validate exact cross-layer adoption authority."""
+
+        if type(self.transaction_adoption) is not PackedDFlashBoundaryDecodeAdoption:
+            raise TypeError(
+                "transaction_adoption must be PackedDFlashBoundaryDecodeAdoption"
+            )
+        if type(self.device_value) is not DFlashBoundaryAdoptedValue:
+            raise TypeError("device_value must be DFlashBoundaryAdoptedValue")
+
+
 class DecodePreparedAllocationCohort:
     """Opaque queue-owned handle for one exact prepared request cohort."""
 
@@ -493,6 +521,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     _preparing_request_ids: set[str]
     _seen_bootstrap_rooms: set[int]
     _terminal_decode_serving: PackedTerminalDecodeServing | None
+    _terminal_dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None
     allocation_lease_authority: DecodeAllocationLeaseAuthority
     allocation_lifecycle_authority: CommonKVManager
     tp1_poll_progress_policy: SingletonPollProgressPolicy
@@ -552,6 +581,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._preparing_request_ids: set[str] = set()
         self._seen_bootstrap_rooms = set()
         self._terminal_decode_serving = None
+        self._terminal_dflash_boundary_pool = None
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -582,6 +612,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_queue.allocation_lifecycle_authority = (
             self.allocation_lifecycle_authority
         )
+        terminal_dflash_boundary_pool = (
+            self.kv_manager.terminal_dflash_boundary_pool()
+        )
+        if terminal_dflash_boundary_pool is not None:
+            if not self.scheduler.spec_algorithm.is_dflash():
+                raise RuntimeError(
+                    "registered terminal DFlash rows require the DFlash algorithm"
+                )
+            self.transfer_queue.install_terminal_dflash_boundary_pool(
+                terminal_dflash_boundary_pool
+            )
+            self._terminal_dflash_boundary_pool = terminal_dflash_boundary_pool
         self.kv_manager.attach_packed_decode_scheduler(
             self.req_to_metadata_buffer_idx_allocator,
             self.transfer_queue,
@@ -720,6 +762,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.terminal_dflash_boundary_row_capacity = self.req_to_token_pool.size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -870,13 +913,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_matches,
                 strict=True,
             ):
-                metadata_index = self.req_to_metadata_buffer_idx_allocator.alloc()
-                if metadata_index is None:
-                    raise DecodeReservationAdmissionRefused(
-                        "decode_metadata_capacity",
-                        DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+                metadata_index: int | None = None
+                if self._terminal_dflash_boundary_pool is None:
+                    metadata_index = (
+                        self.req_to_metadata_buffer_idx_allocator.alloc()
                     )
-                decode_req.metadata_buffer_index = metadata_index
+                    if metadata_index is None:
+                        raise DecodeReservationAdmissionRefused(
+                            "decode_metadata_capacity",
+                            DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+                        )
+                    decode_req.metadata_buffer_index = metadata_index
                 migration_end = self._rebootstrap_prefill_len(req)
                 prefix_len = 0 if prefix_match is None else prefix_match.l1_prefix_len
                 total_prefix_len = (
@@ -917,6 +964,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "request transaction"
                     )
                 prepared_packed_transactions.append(packed_transaction)
+                if self._terminal_dflash_boundary_pool is not None:
+                    boundary_row_index = (
+                        packed_transaction.prepared_publication()
+                        .auxiliary_plan.metadata_buffer_index
+                    )
+                    decode_req.metadata_buffer_index = boundary_row_index
                 slot_generation = uuid.UUID(bytes=snapshot.lease_id)
                 allocations.append(
                     DecodeReservationAllocation(
@@ -1112,13 +1165,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req: DecodeRequest,
         transaction: PackedDecodeRequestTransaction,
         owner: object,
-    ) -> None:
+    ) -> TerminalDFlashDecodeAdoption:
         """Copy terminal metadata while its actor-owned row remains pinned.
 
         :param record: Exact prepared cohort retaining the request.
         :param decode_req: Exact mutable decode request.
         :param transaction: Exact terminal-owned packed transaction.
         :param owner: Candidate owner returned by allocation adoption.
+        :returns: Exact D2D completion authority for owner-side row release.
         """
 
         self._require_terminal_callback_owner(
@@ -1136,7 +1190,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 raise DecodeAllocationLeaseError(
                     "terminal adoption preceded packed metadata publication"
                 )
-            self.transfer_queue.adopt_terminal_request(decode_req, transaction)
+            return self.transfer_queue.adopt_terminal_request(
+                decode_req,
+                transaction,
+            )
 
     def _finalize_terminal_decode_request(
         self,
@@ -1546,9 +1603,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "decode_request_slot_capacity",
                 DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
             )
-        if self.req_to_metadata_buffer_idx_allocator.available_size() < request_count:
+        boundary_pool = self._terminal_dflash_boundary_pool
+        if boundary_pool is None:
+            if (
+                self.req_to_metadata_buffer_idx_allocator.available_size()
+                < request_count
+            ):
+                raise DecodeReservationAdmissionRefused(
+                    "decode_metadata_capacity",
+                    DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
+                )
+        elif boundary_pool.inventory()[0] < request_count:
             raise DecodeReservationAdmissionRefused(
-                "decode_metadata_capacity",
+                "decode_dflash_boundary_capacity",
                 DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
             )
         for req in requests:
@@ -3893,6 +3960,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.staging_handler = None
         self.allocation_lease_authority: DecodeAllocationLeaseAuthority | None = None
         self.allocation_lifecycle_authority: CommonKVManager | None = None
+        self.terminal_dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None = None
+
+    def install_terminal_dflash_boundary_pool(
+        self,
+        pool: DFlashBoundaryDeviceRowPool,
+    ) -> None:
+        """Install the process-lifetime destination boundary-row owner once.
+
+        :param pool: Registered decoder VRAM row pool used by terminal requests.
+        """
+
+        if type(pool) is not DFlashBoundaryDeviceRowPool:
+            raise TypeError("pool must be DFlashBoundaryDeviceRowPool")
+        if self.terminal_dflash_boundary_pool is not None:
+            if self.terminal_dflash_boundary_pool is pool:
+                return
+            raise RuntimeError("terminal DFlash boundary pool ownership changed")
+        self.terminal_dflash_boundary_pool = pool
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -3986,31 +4071,48 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         decode_req: DecodeRequest,
         transaction: PackedDecodeRequestTransaction,
-    ) -> None:
-        """Copy metadata without releasing its actor-owned auxiliary row.
+    ) -> TerminalDFlashDecodeAdoption:
+        """Adopt authenticated DFlash state without releasing its VRAM row.
 
         :param decode_req: Exact transfer-queue request.
         :param transaction: Exact terminal-owned packed transaction.
+        :returns: Device-copy completion authority retained by the owner.
         """
 
         self._require_terminal_transfer_request(decode_req, transaction)
-        metadata_index = decode_req.metadata_buffer_index
-        if metadata_index < 0:
+        if not self.spec_algorithm.is_dflash():
             raise DecodeAllocationLeaseError(
-                "terminal adoption lost its auxiliary metadata row"
+                "terminal boundary adoption requires the DFlash algorithm"
             )
         if decode_req.allocation_lease is None:
             raise DecodeAllocationLeaseError(
                 "terminal adoption lost its allocation lease field"
             )
-        if not self._copy_transfer_metadata_to_req(decode_req):
+        if decode_req.req.pd_dflash_boundary_token_id is not None:
             raise DecodeAllocationLeaseError(
-                "terminal adoption rejected transferred metadata"
+                "terminal request already owns a DFlash boundary token"
             )
-        # The row remains actor-pinned until the callback returns. Resetting its
-        # readiness marker here prevents a later generation from observing
-        # stale metadata once the actor releases the exact reservation.
-        self.metadata_buffers.bootstrap_room[metadata_index] = 0
+        pool = self.terminal_dflash_boundary_pool
+        if pool is None:
+            raise DecodeAllocationLeaseError(
+                "terminal DFlash boundary pool is not installed"
+            )
+        transaction_adoption = (
+            transaction.begin_dflash_boundary_adoption_on_scheduler_thread()
+        )
+        device_value = pool.enqueue_destination_adoption(
+            transaction_adoption.slot,
+            stream=self.scheduler.schedule_stream,
+        )
+        self._commit_terminal_dflash_metadata_to_req(
+            decode_req,
+            transaction_adoption,
+            device_value,
+        )
+        return TerminalDFlashDecodeAdoption(
+            transaction_adoption=transaction_adoption,
+            device_value=device_value,
+        )
 
     def finalize_terminal_request(
         self,
@@ -4024,18 +4126,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         """
 
         self._require_terminal_transfer_request(decode_req, transaction)
-        metadata_index = decode_req.metadata_buffer_index
-        if metadata_index < 0:
-            raise DecodeAllocationLeaseError(
-                "terminal finalization lost its consumed metadata identity"
-            )
-        if self.metadata_buffers.bootstrap_room[metadata_index] != 0:
-            raise DecodeAllocationLeaseError(
-                "terminal finalization preceded scheduler metadata consumption"
-            )
         if decode_req.allocation_lease is None:
             raise DecodeAllocationLeaseError(
                 "terminal finalization lost its adopted allocation identity"
+            )
+        if (
+            decode_req.req.pd_dflash_boundary_token_id is None
+            or decode_req.req.pd_dflash_boundary_completion_event is None
+        ):
+            raise DecodeAllocationLeaseError(
+                "terminal finalization lost request-owned DFlash boundary state"
             )
         if any(entry is decode_req.req for entry in self.scheduler.waiting_queue):
             raise DecodeAllocationLeaseError(
@@ -4047,9 +4147,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "terminal finalization lost its transfer receiver"
             )
 
-        # Actor adoption already committed pages to Req, and actor metadata
-        # consumption already returned the auxiliary row. Only transaction-local
-        # scheduler fields may be cleared before runnable visibility is granted.
+        # The terminal owner releases the exact VRAM row only after the D2D
+        # completion event. The cloned token remains request-owned until DFlash
+        # consumes it while constructing the first decode batch.
         decode_req.metadata_buffer_index = -1
         decode_req.allocation_lease = None
         decode_req.packed_transaction = None
@@ -4112,6 +4212,60 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "terminal transfer callback lacks singular queue ownership"
             )
+
+    def _commit_terminal_dflash_metadata_to_req(
+        self,
+        decode_req: DecodeRequest,
+        adoption: PackedDFlashBoundaryDecodeAdoption,
+        device_value: DFlashBoundaryAdoptedValue,
+    ) -> None:
+        """Commit authenticated scalar state and retain the device token.
+
+        :param decode_req: Exact terminal request becoming scheduler-owned.
+        :param adoption: Actor-authenticated row and scalar state.
+        :param device_value: Request-owned D2D result and row-release event.
+        """
+
+        metadata = adoption.metadata
+        self._commit_hicache_local_restore_to_req(decode_req)
+
+        replayed_boundary = (
+            decode_req.is_rebootstrap
+            and decode_req.req.pd_rebootstrap_forced_output_id is not None
+        )
+        request_completion_event = device_value.completion_event
+        if replayed_boundary:
+            committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
+            if committed_output_id is None:
+                raise DecodeAllocationLeaseError(
+                    "rebootstrap boundary disappeared during terminal adoption"
+                )
+            stream = self.scheduler.schedule_stream
+            stream.wait_event(device_value.completion_event)
+            with torch.cuda.stream(stream):
+                device_value.boundary_token_id.fill_(committed_output_id)
+                request_completion_event = torch.cuda.Event(
+                    enable_timing=False,
+                    blocking=False,
+                    interprocess=False,
+                )
+                request_completion_event.record(stream)
+            decode_req.req.pd_rebootstrap_forced_output_id = None
+        else:
+            committed_output_id = metadata.boundary_token_id
+
+        req = decode_req.req
+        req.output_ids.append(committed_output_id)
+        req.cached_tokens = metadata.cached_tokens
+        req.already_computed = metadata.cached_tokens
+        req.cached_tokens_device = metadata.cached_tokens_device
+        req.cached_tokens_host = metadata.cached_tokens_host
+        req.cached_tokens_storage = metadata.cached_tokens_storage
+        req.mm_image_tokens = metadata.image_tokens
+        req.mm_audio_tokens = metadata.audio_tokens
+        req.mm_video_tokens = metadata.video_tokens
+        req.pd_dflash_boundary_token_id = device_value.boundary_token_id
+        req.pd_dflash_boundary_completion_event = request_completion_event
 
     def _reconcile_failed_allocation(
         self,

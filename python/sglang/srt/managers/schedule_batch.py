@@ -1047,6 +1047,8 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        self.pd_dflash_boundary_token_id: torch.Tensor | None = None
+        self.pd_dflash_boundary_completion_event: torch.cuda.Event | None = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
