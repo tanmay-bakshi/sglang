@@ -1,4 +1,5 @@
 import dataclasses
+import inspect
 import logging
 import uuid
 from unittest.mock import Mock
@@ -1663,6 +1664,42 @@ def test_prefill_terminal_binding_publishes_prepare_without_blocking(
         runtime._post_auxiliary_transfer(record)
 
 
+def test_prefill_terminal_unpublished_binding_cancels_exactly() -> None:
+    """Remove local PREPARE state only before external publication."""
+
+    runtime, _, _, _, submission, identity, record = _terminal_prefill_actor_fixture()
+    record.terminal_prepare_sent = False
+    retired: list[tuple[PackedChunkKey, PackedPeerIdentity]] = []
+    runtime._ready.retire_pending = lambda key, peer: retired.append((key, peer))
+
+    runtime.cancel_terminal_owner_unpublished(submission)
+
+    assert retired == [(record.chunk_key, submission.control.peer)]
+    assert runtime.terminal_owner_inventory().active_bindings == ()
+    assert identity.local_binding.request_key not in runtime._records
+
+
+def test_prefill_terminal_actor_surface_contains_no_polling_or_collective() -> None:
+    """Keep every terminal actor continuation event and action driven."""
+
+    methods = (
+        PackedPrefillRuntime.bind_terminal_owner,
+        PackedPrefillRuntime.publish_terminal_owner_prepare,
+        PackedPrefillRuntime.deliver_terminal_owner_ready,
+        PackedPrefillRuntime.begin_terminal_owner_transfer,
+        PackedPrefillRuntime.send_terminal_owner_outcomes,
+        PackedPrefillRuntime.deliver_terminal_owner_teardown,
+        PackedPrefillRuntime.settle_terminal_owner_teardown,
+        PackedPrefillRuntime.retire_terminal_owner_request,
+    )
+    source = "\n".join(inspect.getsource(method) for method in methods)
+
+    assert "time.sleep(" not in source
+    assert "condition.wait(" not in source
+    assert "take_xfer_completion_receipt(" not in source
+    assert "poll_and_all_reduce" not in source
+
+
 def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1750,7 +1787,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
     runtime, manager, peer, sent, submission, identity, record = (
         _terminal_prefill_actor_fixture()
     )
-    record.source_transfer = Mock()
+    record.source_transfer = Mock(layout=Mock(digest=b"d" * 32), lease_id=9)
     record.terminal_gather_started = True
     record.terminal_gather_posted = True
     record.main_transport_started_at = runtime_module.time.perf_counter()

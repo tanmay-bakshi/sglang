@@ -1489,9 +1489,14 @@ class PackedPrefillRuntime:
 
         if type(outcome) is not PackedWriterOutcome:
             raise TypeError("main settlement must return PackedWriterOutcome")
+        transfer = record.source_transfer
+        if transfer is None:
+            raise RuntimeError("main settlement lost authenticated READY ownership")
         if (
             outcome.key != record.chunk_key
             or outcome.writer_id != self._writer_id
+            or outcome.digest != transfer.layout.digest
+            or outcome.lease_id != transfer.lease_id
             or outcome.status is not PackedWriterOutcomeStatus.DONE
         ):
             raise RuntimeError("main settlement outcome differs from actor ownership")
