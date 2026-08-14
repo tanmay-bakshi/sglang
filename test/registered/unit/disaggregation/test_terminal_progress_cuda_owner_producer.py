@@ -303,7 +303,11 @@ def _wait_for_source_phase(
     deadline = time.monotonic() + _WAIT_SECONDS
     snapshot = None
     while time.monotonic() < deadline:
-        snapshot = owner.lifecycle_snapshot_for_testing(binding_digest)
+        try:
+            snapshot = owner.lifecycle_snapshot_for_testing(binding_digest)
+        except KeyError:
+            time.sleep(0.001)
+            continue
         if snapshot.phase == int(phase):
             return
         time.sleep(0.001)
