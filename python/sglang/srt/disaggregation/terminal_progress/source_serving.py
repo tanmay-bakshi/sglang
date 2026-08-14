@@ -201,7 +201,7 @@ class PackedTerminalSourceServing:
             raise ValueError("physical_capacity must be a positive integer")
         if not callable(process_fatal_handler):
             raise TypeError("process_fatal_handler must be callable")
-        if type(grouped_nixl) is not GroupedNixlTerminalOwner:
+        if not isinstance(grouped_nixl, GroupedNixlTerminalOwner):
             raise TypeError("grouped_nixl must be GroupedNixlTerminalOwner")
         if type(work) is not PackedTerminalSourceWork:
             raise TypeError("work must be PackedTerminalSourceWork")
