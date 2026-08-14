@@ -7,6 +7,7 @@ from sglang.srt.disaggregation.terminal_progress.evidence import (
     TERMINAL_PROGRESS_TIMING_LOG_PREFIX,
     TerminalProgressTimingEmitter,
     TerminalProgressTimingLogger,
+    TerminalProgressTimingRecorder,
     TerminalProgressTimingSample,
     parse_terminal_progress_timing_log_line,
     summarize_terminal_progress_request,
@@ -38,6 +39,25 @@ class _RejectingSink:
         if type(sample) is not TerminalProgressTimingSample:
             raise TypeError("sample must be TerminalProgressTimingSample")
         raise RuntimeError("synthetic timing sink failure")
+
+
+class _CollectingSink:
+    """Timing sink fixture retaining every accepted sample."""
+
+    samples: list[TerminalProgressTimingSample]
+
+    def __init__(self) -> None:
+        """Create an empty sample ledger."""
+
+        self.samples = []
+
+    def emit(self, sample: TerminalProgressTimingSample) -> None:
+        """Retain one exact timing sample.
+
+        :param sample: Exact sample presented to the fixture.
+        """
+
+        self.samples.append(sample)
 
 
 def _binding(
@@ -150,6 +170,53 @@ def test_timing_emitter_keeps_evidence_failure_off_lifecycle_path() -> None:
     assert "synthetic timing sink failure" in stream.getvalue()
 
 
+def test_timing_recorder_pairs_raw_anchors_and_discards_incomplete_state() -> None:
+    stream = io.StringIO()
+    logger = logging.Logger("terminal-progress-recorder-test")
+    logger.addHandler(logging.StreamHandler(stream))
+    sink = _CollectingSink()
+    clock_values = iter((10, 20, 30))
+    recorder = TerminalProgressTimingRecorder(
+        emitter=TerminalProgressTimingEmitter(sink, logger),
+        clock_ns=lambda: next(clock_values),
+        failure_logger=logger,
+    )
+    binding = _binding(TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY)
+
+    assert recorder.capture(
+        binding=binding,
+        field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+        sample_key="decode-rank-0",
+    )
+    assert recorder.complete(
+        binding=binding,
+        field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+        sample_key="decode-rank-0",
+    )
+    assert sink.samples == [
+        _sample(
+            TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+            sample_key="decode-rank-0",
+            started_ns=10,
+            completed_ns=20,
+        )
+    ]
+
+    assert recorder.capture(
+        binding=binding,
+        field=TerminalOwnerTimingField.METADATA_CONSUMPTION,
+        sample_key="decode-rank-0",
+    )
+    assert recorder.discard_binding(binding.digest) == 1
+    assert recorder.complete(
+        binding=binding,
+        field=TerminalOwnerTimingField.METADATA_CONSUMPTION,
+        sample_key="decode-rank-0",
+        completed_ns=40,
+    ) is False
+    assert "anchor is absent" in stream.getvalue()
+
+
 def test_parser_rejects_identity_and_duration_tampering() -> None:
     sample = _sample(TerminalOwnerTimingField.SCATTER_CALLBACK_DELIVERY)
     payload = sample.to_payload()
@@ -210,6 +277,67 @@ def test_request_summary_preserves_cardinality_and_uses_local_maximum() -> None:
             TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF.value
         ]
         == 2
+    )
+
+
+def test_tp2_dflash_smoke_summary_requires_exact_eleven_sample_shape() -> None:
+    """The frozen TP2-to-TP1 smoke retains its exact raw timing cardinality."""
+
+    samples = [
+        _sample(
+            TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF,
+            sample_key=f"source-rank-{rank}",
+            tp_rank=rank,
+        )
+        for rank in (0, 1)
+    ]
+    samples.extend(
+        _sample(
+            TerminalOwnerTimingField.NATIVE_TERMINAL_DELIVERY,
+            sample_key=f"main:writer-{rank}",
+            tp_rank=rank,
+        )
+        for rank in (0, 1)
+    )
+    samples.append(
+        _sample(
+            TerminalOwnerTimingField.NATIVE_TERMINAL_DELIVERY,
+            sample_key="boundary:writer-0",
+        )
+    )
+    samples.extend(
+        _sample(field, sample_key="decode-rank-0")
+        for field in (
+            TerminalOwnerTimingField.SCATTER_CALLBACK_DELIVERY,
+            TerminalOwnerTimingField.ACK_AGGREGATION,
+            TerminalOwnerTimingField.REQUEST_GLOBAL_COORDINATION,
+            TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+            TerminalOwnerTimingField.METADATA_CONSUMPTION,
+        )
+    )
+    samples.append(
+        _sample(
+            TerminalOwnerTimingField.GATEWAY_PUBLICATION,
+            sample_key="canonical-source-publisher",
+        )
+    )
+
+    summary = summarize_terminal_progress_request(samples)
+    sample_counts = dict(summary.sample_counts)
+
+    assert len(samples) == 11
+    assert sample_counts[TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF] == 2
+    assert sample_counts[TerminalOwnerTimingField.NATIVE_TERMINAL_DELIVERY] == 3
+    assert all(
+        sample_counts[field] == 1
+        for field in (
+            TerminalOwnerTimingField.SCATTER_CALLBACK_DELIVERY,
+            TerminalOwnerTimingField.ACK_AGGREGATION,
+            TerminalOwnerTimingField.REQUEST_GLOBAL_COORDINATION,
+            TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+            TerminalOwnerTimingField.METADATA_CONSUMPTION,
+            TerminalOwnerTimingField.GATEWAY_PUBLICATION,
+        )
     )
 
 

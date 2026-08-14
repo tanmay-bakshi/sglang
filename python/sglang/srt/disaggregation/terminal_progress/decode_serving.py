@@ -26,10 +26,15 @@ from sglang.srt.disaggregation.terminal_progress.coordinator import (
     TerminalRequestCoordinatorEmission,
     TerminalRequestCoordinatorError,
     TerminalRequestCoordinatorManifest,
+    TerminalRequestCoordinationTiming,
 )
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
+)
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    TerminalProgressTimingRecorder,
+    terminal_progress_timing_recorder,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerInventory,
@@ -48,6 +53,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerOutput,
+)
+from sglang.srt.disaggregation.terminal_progress.owner_events import (
+    TerminalOwnerTimingField,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptKind,
@@ -266,6 +274,7 @@ class PackedTerminalDecodeServing:
     _coordinator_issuer: TerminalWireReceiptIssuer | None
     _coordinator_importers: tuple[TerminalWireReceiptImportNamespace, ...]
     _clock_ns: Callable[[], int]
+    _timing: TerminalProgressTimingRecorder
     _work: PackedTerminalDecodeWork
     _retire_native_producers: Callable[[], None]
     _requests: dict[bytes, _DecodeServingRequest]
@@ -341,6 +350,7 @@ class PackedTerminalDecodeServing:
             runtime=runtime,
             cuda_completion=cuda_completion,
             local_identity=local_identity,
+            clock_ns=clock_ns,
         )
         decode_composition = PackedTerminalDecodeServingComposition(
             wiring=wiring,
@@ -356,6 +366,7 @@ class PackedTerminalDecodeServing:
         self._coordinator_issuer = coordinator_issuer
         self._coordinator_importers = coordinator_importers
         self._clock_ns = clock_ns
+        self._timing = terminal_progress_timing_recorder(logger, clock_ns)
         self._work = work
         self._retire_native_producers = retire_native_producers
         self._requests = {}
@@ -660,6 +671,7 @@ class PackedTerminalDecodeServing:
                 result = record.coordinator.expire(now_ns)
                 if not result.newly_terminal:
                     continue
+                self._emit_coordination_timing(record, result.timing)
                 self._deliver_coordinator_emissions(record, result.emissions)
                 terminal_count += 1
         except Exception:
@@ -790,6 +802,14 @@ class PackedTerminalDecodeServing:
         self._require_open()
         observations = self._runtime.observations.drain()
         for output in observations:
+            try:
+                self._wiring.observe_native_output(output)
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Decode terminal timing observation failed without gating "
+                    "progress:\n%s",
+                    traceback.format_exc(),
+                )
             try:
                 self._work.observe_output(output)
             except Exception:  # noqa: BLE001
@@ -1009,7 +1029,44 @@ class PackedTerminalDecodeServing:
             self._deliver_coordinator_emissions(record, emissions)
             return
         if result.newly_terminal:
+            self._emit_coordination_timing(record, result.timing)
             self._deliver_coordinator_emissions(record, result.emissions)
+
+    def _emit_coordination_timing(
+        self,
+        record: _DecodeCoordinatorRecord,
+        timing: TerminalRequestCoordinationTiming | None,
+    ) -> None:
+        """Project one newly terminal request-global coordination interval.
+
+        :param record: Exact canonical coordinator and immutable manifest.
+        :param timing: Same-process first-receipt-to-terminal interval.
+        """
+
+        try:
+            if type(timing) is not TerminalRequestCoordinationTiming:
+                raise RuntimeError("terminal coordinator timing is absent")
+            local_bindings = tuple(
+                binding
+                for binding in record.manifest.destination_bindings
+                if binding.owner == self._local_identity
+            )
+            if len(local_bindings) != 1:
+                raise RuntimeError("coordinator timing has no unique local binding")
+            binding = local_bindings[0]
+            self._timing.emit_interval(
+                binding=binding,
+                field=TerminalOwnerTimingField.REQUEST_GLOBAL_COORDINATION,
+                sample_key=f"decode-rank-{binding.owner.tp_rank}",
+                started_ns=timing.first_local_ready_received_ns,
+                completed_ns=timing.terminal_emitted_ns,
+            )
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "Decode coordination timing projection failed without gating "
+                "progress:\n%s",
+                traceback.format_exc(),
+            )
 
     def _deliver_coordinator_emissions(
         self,

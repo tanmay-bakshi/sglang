@@ -7,6 +7,11 @@ from collections.abc import Callable
 from typing import Protocol, TypeVar, runtime_checkable
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
+from sglang.srt.disaggregation.terminal_progress.clock import SystemTerminalOwnerClock
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    TerminalProgressTimingRecorder,
+    terminal_progress_timing_recorder,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalRequestBinding,
@@ -17,6 +22,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
     NativeTerminalReceipt,
     NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.owner_events import (
+    TerminalOwnerTimingField,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxFatalError,
@@ -176,6 +184,7 @@ class TerminalSchedulerServing:
     _source_consumer: TerminalSourceSchedulerConsumer | None
     _decode_consumer: TerminalDecodeSchedulerConsumer | None
     _inbox: TerminalReceiptInbox
+    _timing: TerminalProgressTimingRecorder
     _actions_by_receipt: dict[bytes, NativeTerminalOwnerAction]
     _receipt_by_request: dict[PackedRequestKey, bytes]
     _fatal_delivered: bool
@@ -217,6 +226,10 @@ class TerminalSchedulerServing:
         self._source_consumer = source_consumer
         self._decode_consumer = decode_consumer
         self._inbox = TerminalReceiptInbox(physical_capacity=physical_capacity)
+        self._timing = terminal_progress_timing_recorder(
+            logger,
+            SystemTerminalOwnerClock().now_ns,
+        )
         self._actions_by_receipt = {}
         self._receipt_by_request = {}
         self._fatal_delivered = False
@@ -336,12 +349,19 @@ class TerminalSchedulerServing:
                     self._receipt_by_request[request_key] = encoded
                     inserted = True
 
+        if self._role is TerminalSchedulerServingRole.DECODE:
+            self._timing.capture(
+                binding=wire_receipt.binding,
+                field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+                sample_key=f"decode-rank-{wire_receipt.binding.owner.tp_rank}",
+            )
         try:
             return self._inbox.publish_after_retention(
                 wire_receipt,
                 retain_action,
             )
         except SchedulerReceiptInboxFatalError as error:
+            self._timing.discard_binding(wire_receipt.binding.digest)
             self._discard_unpublished_action(
                 encoded=encoded,
                 action=action,
@@ -351,6 +371,7 @@ class TerminalSchedulerServing:
             )
             raise
         except SchedulerInboxError as error:
+            self._timing.discard_binding(wire_receipt.binding.digest)
             self._discard_unpublished_action(
                 encoded=encoded,
                 action=action,
@@ -529,6 +550,12 @@ class TerminalSchedulerServing:
             action = self._actions_by_receipt.get(encoded)
         if action is None:
             raise RuntimeError("scheduler receipt has no retained native action")
+        if self._role is TerminalSchedulerServingRole.DECODE:
+            self._timing.complete(
+                binding=receipt.binding,
+                field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+                sample_key=f"decode-rank-{receipt.binding.owner.tp_rank}",
+            )
         if self._role is TerminalSchedulerServingRole.SOURCE:
             consumer = self._source_consumer
             if consumer is None:

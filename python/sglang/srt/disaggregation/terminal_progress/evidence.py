@@ -2,8 +2,9 @@ import dataclasses
 import json
 import logging
 import math
+import threading
 import traceback
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Protocol, runtime_checkable
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
@@ -310,6 +311,211 @@ class TerminalProgressTimingEmitter:
             )
             return False
         return True
+
+
+class TerminalProgressTimingRecorder:
+    """Retain process-local anchors without acquiring lifecycle authority."""
+
+    _emitter: TerminalProgressTimingEmitter
+    _clock_ns: Callable[[], int]
+    _failure_logger: logging.Logger
+    _anchors: dict[
+        tuple[bytes, TerminalOwnerTimingField, str],
+        tuple[TerminalRequestBinding, int],
+    ]
+    _lock: threading.Lock
+
+    def __init__(
+        self,
+        *,
+        emitter: TerminalProgressTimingEmitter,
+        clock_ns: Callable[[], int],
+        failure_logger: logging.Logger,
+    ) -> None:
+        """Construct one non-authoritative interval recorder.
+
+        :param emitter: Non-gating evidence projection boundary.
+        :param clock_ns: Process-local ``CLOCK_MONOTONIC_RAW`` clock.
+        :param failure_logger: Logger receiving full recorder failures.
+        """
+
+        if type(emitter) is not TerminalProgressTimingEmitter:
+            raise TypeError("emitter must be TerminalProgressTimingEmitter")
+        if not callable(clock_ns):
+            raise TypeError("clock_ns must be callable")
+        if not isinstance(failure_logger, logging.Logger):
+            raise TypeError("failure_logger must be logging.Logger")
+        self._emitter = emitter
+        self._clock_ns = clock_ns
+        self._failure_logger = failure_logger
+        self._anchors = {}
+        self._lock = threading.Lock()
+
+    def capture(
+        self,
+        *,
+        binding: TerminalRequestBinding,
+        field: TerminalOwnerTimingField,
+        sample_key: str,
+        started_ns: int | None = None,
+    ) -> bool:
+        """Retain one interval start without affecting request progress.
+
+        :param binding: Exact local request generation.
+        :param field: Frozen interval field.
+        :param sample_key: Stable rank, writer, or handle identity.
+        :param started_ns: Explicit start, otherwise the bound raw clock.
+        :returns: Whether a new timing anchor was retained.
+        """
+
+        try:
+            if type(binding) is not TerminalRequestBinding:
+                raise TypeError("binding must be TerminalRequestBinding")
+            if type(field) is not TerminalOwnerTimingField:
+                raise TypeError("field must be TerminalOwnerTimingField")
+            if type(sample_key) is not str or len(sample_key) == 0:
+                raise ValueError("sample_key must be a non-empty string")
+            timestamp_ns = self._clock_ns() if started_ns is None else started_ns
+            if type(timestamp_ns) is not int or timestamp_ns < 0:
+                raise ValueError("started_ns must be a non-negative integer")
+            key = (binding.digest, field, sample_key)
+            with self._lock:
+                if key in self._anchors:
+                    raise RuntimeError("terminal timing anchor was captured twice")
+                self._anchors[key] = (binding, timestamp_ns)
+        except Exception:  # noqa: BLE001
+            self._log_failure("capture")
+            return False
+        return True
+
+    def complete(
+        self,
+        *,
+        binding: TerminalRequestBinding,
+        field: TerminalOwnerTimingField,
+        sample_key: str,
+        completed_ns: int | None = None,
+    ) -> bool:
+        """Complete and project one retained interval without gating progress.
+
+        :param binding: Exact local request generation.
+        :param field: Frozen interval field.
+        :param sample_key: Stable rank, writer, or handle identity.
+        :param completed_ns: Explicit end, otherwise the bound raw clock.
+        :returns: Whether the complete sample reached the evidence sink.
+        """
+
+        try:
+            if type(binding) is not TerminalRequestBinding:
+                raise TypeError("binding must be TerminalRequestBinding")
+            if type(field) is not TerminalOwnerTimingField:
+                raise TypeError("field must be TerminalOwnerTimingField")
+            if type(sample_key) is not str or len(sample_key) == 0:
+                raise ValueError("sample_key must be a non-empty string")
+            timestamp_ns = self._clock_ns() if completed_ns is None else completed_ns
+            if type(timestamp_ns) is not int or timestamp_ns < 0:
+                raise ValueError("completed_ns must be a non-negative integer")
+            key = (binding.digest, field, sample_key)
+            with self._lock:
+                anchor = self._anchors.pop(key, None)
+            if anchor is None:
+                raise RuntimeError("terminal timing anchor is absent")
+            anchored_binding, started_ns = anchor
+            if anchored_binding != binding:
+                raise RuntimeError("terminal timing binding changed before completion")
+            return self._emitter.emit(
+                binding=binding,
+                field=field,
+                sample_key=sample_key,
+                started_ns=started_ns,
+                completed_ns=timestamp_ns,
+            )
+        except Exception:  # noqa: BLE001
+            self._log_failure("completion")
+            return False
+
+    def emit_interval(
+        self,
+        *,
+        binding: TerminalRequestBinding,
+        field: TerminalOwnerTimingField,
+        sample_key: str,
+        started_ns: int,
+        completed_ns: int,
+    ) -> bool:
+        """Project one already-complete interval without retaining an anchor.
+
+        :param binding: Exact local request generation.
+        :param field: Frozen interval field.
+        :param sample_key: Stable rank, writer, or handle identity.
+        :param started_ns: Process-local interval start.
+        :param completed_ns: Process-local interval end.
+        :returns: Whether the complete sample reached the evidence sink.
+        """
+
+        return self._emitter.emit(
+            binding=binding,
+            field=field,
+            sample_key=sample_key,
+            started_ns=started_ns,
+            completed_ns=completed_ns,
+        )
+
+    def discard_binding(self, binding_digest: bytes) -> int:
+        """Discard incomplete evidence state when functional ownership retires.
+
+        :param binding_digest: Exact retired or quarantined binding digest.
+        :returns: Number of incomplete anchors discarded.
+        """
+
+        try:
+            if type(binding_digest) is not bytes or len(binding_digest) != 32:
+                raise ValueError("binding_digest must contain 32 bytes")
+            with self._lock:
+                keys = tuple(
+                    key for key in self._anchors if key[0] == binding_digest
+                )
+                for key in keys:
+                    del self._anchors[key]
+            return len(keys)
+        except Exception:  # noqa: BLE001
+            self._log_failure("discard")
+            return 0
+
+    def _log_failure(self, operation: str) -> None:
+        """Log one recorder failure with its complete stack trace.
+
+        :param operation: Stable failed-operation label.
+        """
+
+        self._failure_logger.error(
+            "Terminal timing evidence %s failed without gating progress:\n%s",
+            operation,
+            traceback.format_exc(),
+        )
+
+
+def terminal_progress_timing_recorder(
+    logger: logging.Logger,
+    clock_ns: Callable[[], int],
+) -> TerminalProgressTimingRecorder:
+    """Build one production log-backed non-gating timing recorder.
+
+    :param logger: Process-local serving logger.
+    :param clock_ns: Process-local ``CLOCK_MONOTONIC_RAW`` clock.
+    :returns: Recorder projecting parser-stable production log lines.
+    """
+
+    if not isinstance(logger, logging.Logger):
+        raise TypeError("logger must be logging.Logger")
+    return TerminalProgressTimingRecorder(
+        emitter=TerminalProgressTimingEmitter(
+            TerminalProgressTimingLogger(logger),
+            logger,
+        ),
+        clock_ns=clock_ns,
+        failure_logger=logger,
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

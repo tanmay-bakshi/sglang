@@ -1,5 +1,6 @@
 import dataclasses
 import inspect
+import logging
 import select
 import sys
 import threading
@@ -33,6 +34,9 @@ from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
     PackedTerminalDecodeWireDelivery,
     PackedTerminalDecodeWork,
+)
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    parse_terminal_progress_timing_log_line,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -680,7 +684,9 @@ def _drive_to_adoption(
     _pump(serving)
 
 
-def test_tp1_full_success_retires_every_authority_exactly_once() -> None:
+def test_tp1_full_success_retires_every_authority_exactly_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Registration through local fan-out reaches an exact-zero clean close."""
 
     (
@@ -694,57 +700,80 @@ def test_tp1_full_success_retires_every_authority_exactly_once() -> None:
         scheduler_events,
         _,
     ) = _serving(1)
-    serving.start()
-    try:
-        serving.register_request(registration, manifest)
-        registered = serving.inventory()
-        assert registered.runtime.scheduler_live_count == 1
-        assert registered.actor.active_bindings == (registration.binding.digest,)
-        assert registered.scheduler_consumer.active_binding_digests == (
-            registration.binding.digest,
-        )
-        assert registered.scheduler_serving.inbox.live_bindings == (
-            registration.binding,
-        )
-        _drive_to_adoption(serving, registration)
-        serving.drain_scheduler_at_loop_entry()
-        _pump(serving)
-        _pump(serving)
+    with caplog.at_level(logging.INFO):
+        serving.start()
+        try:
+            serving.register_request(registration, manifest)
+            registered = serving.inventory()
+            assert registered.runtime.scheduler_live_count == 1
+            assert registered.actor.active_bindings == (registration.binding.digest,)
+            assert registered.scheduler_consumer.active_binding_digests == (
+                registration.binding.digest,
+            )
+            assert registered.scheduler_serving.inbox.live_bindings == (
+                registration.binding,
+            )
+            _drive_to_adoption(serving, registration)
+            serving.drain_scheduler_at_loop_entry()
+            _pump(serving)
+            _pump(serving)
 
-        inventory = serving.inventory()
-        assert inventory.active_binding_digests == ()
-        assert inventory.active_coordinator_manifest_digests == ()
-        assert inventory.actor.active_bindings == ()
-        assert inventory.scheduler_consumer.active_binding_digests == ()
-        assert inventory.scheduler_serving.inbox.live_count == 0
-        assert inventory.ready_coordinator_count == 1
-        assert completion.armed == [registration.binding.digest]
-        assert completion.submitted == [(17, registration.binding.digest)]
-        assert scheduler_events == ["adopt", "finalize"]
-        assert actor_state.events == [
-            "bound",
-            "published",
-            "DECODE_WRITER_AGGREGATION_STARTED",
-            "DECODE_WRITER_MANIFEST_COMPLETED",
-            "scatter",
-            "callback",
-            "scatter_complete",
-            "teardown",
-            "DECODE_ACK_AGGREGATION_STARTED",
-            "DECODE_ACK_MANIFEST_COMPLETED",
-            "adopt",
-            "metadata",
-            "retired",
-        ]
-        assert len(deliveries) == 1
-        assert deliveries[0].target is PackedTerminalDecodeDeliveryTarget.OWNER
-        assert deliveries[0].recipient.role is TerminalOwnerRole.SOURCE
+            inventory = serving.inventory()
+            assert inventory.active_binding_digests == ()
+            assert inventory.active_coordinator_manifest_digests == ()
+            assert inventory.actor.active_bindings == ()
+            assert inventory.scheduler_consumer.active_binding_digests == ()
+            assert inventory.scheduler_serving.inbox.live_count == 0
+            assert inventory.ready_coordinator_count == 1
+            assert completion.armed == [registration.binding.digest]
+            assert completion.submitted == [(17, registration.binding.digest)]
+            assert scheduler_events == ["adopt", "finalize"]
+            assert actor_state.events == [
+                "bound",
+                "published",
+                "DECODE_WRITER_AGGREGATION_STARTED",
+                "DECODE_WRITER_MANIFEST_COMPLETED",
+                "scatter",
+                "callback",
+                "scatter_complete",
+                "teardown",
+                "DECODE_ACK_AGGREGATION_STARTED",
+                "DECODE_ACK_MANIFEST_COMPLETED",
+                "adopt",
+                "metadata",
+                "retired",
+            ]
+            assert len(deliveries) == 1
+            assert deliveries[0].target is PackedTerminalDecodeDeliveryTarget.OWNER
+            assert deliveries[0].recipient.role is TerminalOwnerRole.SOURCE
 
-        serving.stop_admission_and_retire_producers()
-        serving.close_clean(_WAIT_SECONDS)
-    finally:
-        if runtime.disposition.value != "stopped":
-            serving.abort_and_close()
+            timing_samples = tuple(
+                sample
+                for record in caplog.records
+                if (
+                    sample := parse_terminal_progress_timing_log_line(
+                        record.getMessage()
+                    )
+                )
+                is not None
+            )
+            assert len(timing_samples) == 5
+            assert {sample.field.value for sample in timing_samples} == {
+                "scatter_callback_delivery_ms",
+                "ack_aggregation_ms",
+                "request_global_coordination_ms",
+                "scheduler_inbox_delay_ms",
+                "metadata_consumption_ms",
+            }
+            assert {sample.sample_key for sample in timing_samples} == {
+                "decode-rank-0"
+            }
+
+            serving.stop_admission_and_retire_producers()
+            serving.close_clean(_WAIT_SECONDS)
+        finally:
+            if runtime.disposition.value != "stopped":
+                serving.abort_and_close()
 
 
 def test_runtime_fds_and_launch_binding_are_stable() -> None:

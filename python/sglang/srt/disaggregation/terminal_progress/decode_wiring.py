@@ -17,6 +17,10 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestPublication,
 )
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    TerminalProgressTimingRecorder,
+    terminal_progress_timing_recorder,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -27,10 +31,14 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerOutput,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalReceipt,
     NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.owner_events import (
+    TerminalOwnerTimingField,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptKind,
@@ -202,6 +210,7 @@ class PackedTerminalDecodeWiring:
     _actor: PackedDecodeRuntime
     _runtime: NativeTerminalDecodeRuntime
     _cuda_completion: PackedDecodeScatterCompletionProducer
+    _timing: TerminalProgressTimingRecorder
     _local_producer_id: int
     _local_receipt_producer_id: int
 
@@ -212,6 +221,7 @@ class PackedTerminalDecodeWiring:
         runtime: NativeTerminalDecodeRuntime,
         cuda_completion: PackedDecodeScatterCompletionProducer,
         local_identity: TerminalProcessIdentity,
+        clock_ns: Callable[[], int],
     ) -> None:
         """Construct decode orchestration around process-lifetime owners.
 
@@ -219,6 +229,7 @@ class PackedTerminalDecodeWiring:
         :param runtime: Sole authoritative native lifecycle runtime.
         :param cuda_completion: Direct CUDA callback-to-owner producer.
         :param local_identity: Exact decode process owned by this wiring.
+        :param clock_ns: Process-local ``CLOCK_MONOTONIC_RAW`` clock.
         """
 
         if type(actor) is not PackedDecodeRuntime:
@@ -236,9 +247,12 @@ class PackedTerminalDecodeWiring:
             raise TypeError("local_identity must be TerminalProcessIdentity")
         if local_identity.role is not TerminalOwnerRole.DECODE:
             raise ValueError("local_identity must belong to decode")
+        if not callable(clock_ns):
+            raise TypeError("clock_ns must be callable")
         self._actor = actor
         self._runtime = runtime
         self._cuda_completion = cuda_completion
+        self._timing = terminal_progress_timing_recorder(logger, clock_ns)
         self._local_producer_id = runtime.python_producer_id(
             NativeTerminalProducerClass.LOCAL
         )
@@ -345,6 +359,11 @@ class PackedTerminalDecodeWiring:
         transaction = self._actor.terminal_owner_transaction(action.binding.digest)
         try:
             batch = self._actor.begin_terminal_owner_scatter(transaction)
+            self._timing.capture(
+                binding=action.binding.to_binding(),
+                field=TerminalOwnerTimingField.SCATTER_CALLBACK_DELIVERY,
+                sample_key=f"decode-rank-{action.binding.owner.tp_rank}",
+            )
         except (OSError, RuntimeError, TypeError, ValueError):
             self._complete_failed_work(action, "decode scatter submission failed")
             raise
@@ -362,6 +381,7 @@ class PackedTerminalDecodeWiring:
                 transaction,
                 "decode scatter callback attachment failed",
             )
+            self._timing.discard_binding(action.binding.digest)
             self._submit_local_failure(
                 batch.binding_digest,
                 "decode scatter callback attachment failed",
@@ -386,12 +406,18 @@ class PackedTerminalDecodeWiring:
         try:
             self._actor.complete_terminal_owner_scatter(transaction)
             self._actor.begin_terminal_owner_teardown(transaction)
+            self._timing.capture(
+                binding=action.binding.to_binding(),
+                field=TerminalOwnerTimingField.ACK_AGGREGATION,
+                sample_key=f"decode-rank-{action.binding.owner.tp_rank}",
+            )
             self._runtime.complete_work_action(
                 self._local_producer_id,
                 action,
                 NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
             )
         except (OSError, RuntimeError, TypeError, ValueError):
+            self._timing.discard_binding(action.binding.digest)
             self._complete_failed_work(action, "decode teardown dispatch failed")
             raise
 
@@ -427,6 +453,11 @@ class PackedTerminalDecodeWiring:
         transaction = self._actor.terminal_owner_transaction(action.binding.digest)
         scheduler_action_completed = False
         try:
+            self._timing.capture(
+                binding=action.binding.to_binding(),
+                field=TerminalOwnerTimingField.METADATA_CONSUMPTION,
+                sample_key=f"decode-rank-{action.binding.owner.tp_rank}",
+            )
             owner = self._actor.consume_terminal_owner_adoption(transaction)
             self._runtime.complete_scheduler_action(
                 self._local_receipt_producer_id,
@@ -447,10 +478,16 @@ class PackedTerminalDecodeWiring:
                 action.binding.digest,
                 NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
             )
+            self._timing.complete(
+                binding=action.binding.to_binding(),
+                field=TerminalOwnerTimingField.METADATA_CONSUMPTION,
+                sample_key=f"decode-rank-{action.binding.owner.tp_rank}",
+            )
             return owner
         except Exception:
             reason = "decode scheduler adoption failed"
             formatted_traceback = traceback.format_exc()
+            self._timing.discard_binding(action.binding.digest)
             try:
                 self._actor.quarantine(transaction, reason)
             except Exception:  # noqa: BLE001
@@ -612,6 +649,36 @@ class PackedTerminalDecodeWiring:
         transaction = self._actor.terminal_owner_transaction(action.binding.digest)
         self._actor.retire_terminal_owner_request(transaction)
         self._runtime.acknowledge_consumed_action(action)
+        self._timing.discard_binding(action.binding.digest)
+
+    def observe_native_output(self, output: NativeTerminalOwnerOutput) -> None:
+        """Complete decode timing anchors from non-gating native evidence.
+
+        :param output: One action-bearing native owner commit observation.
+        """
+
+        if type(output) is not NativeTerminalOwnerOutput:
+            raise TypeError("output must be NativeTerminalOwnerOutput")
+        binding = output.binding.to_binding()
+        sample_key = f"decode-rank-{binding.owner.tp_rank}"
+        if output.event_kind is NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL:
+            self._timing.complete(
+                binding=binding,
+                field=TerminalOwnerTimingField.SCATTER_CALLBACK_DELIVERY,
+                sample_key=sample_key,
+                completed_ns=output.completed_ns,
+            )
+            return
+        if (
+            output.event_kind
+            is NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED
+        ):
+            self._timing.complete(
+                binding=binding,
+                field=TerminalOwnerTimingField.ACK_AGGREGATION,
+                sample_key=sample_key,
+                completed_ns=output.completed_ns,
+            )
 
     def cancel_unpublished(
         self,

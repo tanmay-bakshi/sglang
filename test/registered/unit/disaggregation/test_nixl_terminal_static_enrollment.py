@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import inspect
 import threading
 import uuid
 from collections import defaultdict
@@ -34,6 +35,20 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 _COHORT_DIGEST = bytes.fromhex("11" * 32)
+
+
+def test_terminal_production_composition_uses_monotonic_raw_clock() -> None:
+    """Every timing-bearing production composition uses the canonical raw clock."""
+
+    methods = (
+        NixlKVManager._compose_terminal_source,
+        NixlKVManager._compose_terminal_decode,
+        NixlKVManager._compose_terminal_runtime,
+    )
+    sources = tuple(inspect.getsource(method) for method in methods)
+
+    assert all("time.monotonic_ns" not in source for source in sources)
+    assert sum(source.count("SystemTerminalOwnerClock") for source in sources) == 3
 
 
 class _FakeRemoteHandle:
