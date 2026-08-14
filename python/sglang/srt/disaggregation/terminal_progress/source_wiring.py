@@ -5,12 +5,18 @@ import traceback
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    TerminalProgressTimingRecorder,
+    terminal_progress_timing_recorder,
+)
 from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlTransferMember,
     GroupedNixlTerminalResult,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
+    TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalLifecycleRegistration,
@@ -22,6 +28,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalPublicationIdentity,
     NativeTerminalReceipt,
     NativeTerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.owner_events import (
+    TerminalOwnerTimingField,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
@@ -322,6 +331,7 @@ class PackedTerminalSourceWiring:
     _publisher: PackedTerminalSourcePublisher | None
     _metrics_sink: PackedTerminalSourceMetricsSink
     _clock_ns: Callable[[], int]
+    _timing: TerminalProgressTimingRecorder
     _records: dict[bytes, _SourceRecord]
     _emitted_metrics: set[tuple[bytes, NativeTerminalOwnerEventKind]]
     _lock: threading.Lock
@@ -377,6 +387,7 @@ class PackedTerminalSourceWiring:
         self._publisher = publisher
         self._metrics_sink = metrics_sink
         self._clock_ns = clock_ns
+        self._timing = terminal_progress_timing_recorder(logger, clock_ns)
         self._records = {}
         self._emitted_metrics = set()
         self._lock = threading.Lock()
@@ -426,6 +437,31 @@ class PackedTerminalSourceWiring:
         self._emit_metric_once(
             digest,
             NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        )
+
+    def submission_committed(
+        self,
+        binding: TerminalRequestBinding,
+        enqueued_ns: int,
+        completed_ns: int,
+    ) -> None:
+        """Project an exact native source-submission commit observation.
+
+        The native owner supplies this observation through its dedicated,
+        droppable evidence channel. It carries no action authority and this
+        projection cannot affect lifecycle progress.
+
+        :param binding: Exact source-rank request generation.
+        :param enqueued_ns: Native producer enqueue timestamp.
+        :param completed_ns: Native post-commit timestamp.
+        """
+
+        self._timing.emit_interval(
+            binding=binding,
+            field=TerminalOwnerTimingField.PRODUCER_TO_OWNER_HANDOFF,
+            sample_key=f"source-rank-{binding.owner.tp_rank}",
+            started_ns=enqueued_ns,
+            completed_ns=completed_ns,
         )
 
     def lifecycle_published(self, binding_digest: bytes) -> bool:
@@ -494,6 +530,18 @@ class PackedTerminalSourceWiring:
             reason=reason,
             enqueued_ns=result.native_timestamp_ns,
         )
+        binding = self._record(result.binding_digest).submission.identity.local_binding
+        for timing in result.member_timings:
+            sample_key = f"main:writer-{binding.owner.tp_rank}"
+            if timing.member is GroupedNixlTransferMember.DFLASH_BOUNDARY:
+                sample_key = "boundary:writer-0"
+            self._timing.emit_interval(
+                binding=binding,
+                field=TerminalOwnerTimingField.NATIVE_TERMINAL_DELIVERY,
+                sample_key=sample_key,
+                started_ns=timing.post_started_ns,
+                completed_ns=timing.native_terminal_ns,
+            )
         self._emit_metric_once(result.binding_digest, kind)
 
     def consume_gather_ready(
@@ -794,6 +842,14 @@ class PackedTerminalSourceWiring:
             authenticated_issuer=publication.canonical_binding.owner,
             reason=reason,
         )
+        if type(result) is TerminalGatewayPublicationSuccess:
+            self._timing.emit_interval(
+                binding=publication.canonical_binding,
+                field=TerminalOwnerTimingField.GATEWAY_PUBLICATION,
+                sample_key="canonical-source-publisher",
+                started_ns=publication.enqueued_ns,
+                completed_ns=result.completed_ns,
+            )
 
     def publication_receipt(
         self,

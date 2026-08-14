@@ -143,6 +143,7 @@ from sglang.srt.disaggregation.runtime_capabilities import (
 from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
     build_terminal_startup_cohort_expectation,
 )
+from sglang.srt.disaggregation.terminal_progress.clock import SystemTerminalOwnerClock
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
@@ -2585,6 +2586,7 @@ class NixlKVManager(CommonKVManager):
         self._terminal_source_receipt_importers = importers
         local_identity = binding.advertisement.terminal_identity
         publication_control.roster.route_for(local_identity)
+        terminal_clock_ns = SystemTerminalOwnerClock().now_ns
         publisher: PackedTerminalOutputPublisher | None = None
         if local_identity.tp_rank == 0:
             endpoint = installation.gateway_endpoint
@@ -2609,7 +2611,7 @@ class NixlKVManager(CommonKVManager):
                 ),
                 result_listener=result_listener,
                 fatal_listener=self._terminal_publisher_failed,
-                clock_ns=time.monotonic_ns,
+                clock_ns=terminal_clock_ns,
             )
 
         def retire_submission(submission: PackedTerminalSourceSubmission) -> None:
@@ -2625,7 +2627,7 @@ class NixlKVManager(CommonKVManager):
             local_identity=local_identity,
             publisher=publisher,
             metrics_sink=_NixlTerminalSourceMetrics(),
-            clock_ns=time.monotonic_ns,
+            clock_ns=terminal_clock_ns,
             physical_capacity=installation.physical_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             grouped_nixl=grouped_nixl,
@@ -2688,6 +2690,7 @@ class NixlKVManager(CommonKVManager):
             if local_identity.tp_rank == 0
             else None
         )
+        terminal_clock_ns = SystemTerminalOwnerClock().now_ns
         return PackedTerminalDecodeServing(
             actor=controller.terminal_runtime,
             runtime=enrollment.runtime,
@@ -2695,7 +2698,7 @@ class NixlKVManager(CommonKVManager):
             local_identity=local_identity,
             coordinator_issuer=coordinator_issuer,
             coordinator_importers=self._decode_coordinator_importers(binding),
-            clock_ns=time.monotonic_ns,
+            clock_ns=terminal_clock_ns,
             physical_capacity=installation.physical_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             work=PackedTerminalDecodeWork(
@@ -2736,7 +2739,7 @@ class NixlKVManager(CommonKVManager):
             )
             reactor = PackedTerminalProcessReactor.for_decode(
                 decode_serving,
-                time.monotonic_ns,
+                SystemTerminalOwnerClock().now_ns,
                 self._terminal_reactor_failed,
             )
 

@@ -1,9 +1,18 @@
 import dataclasses
 import hashlib
 import inspect
+import logging
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
+from sglang.srt.disaggregation.terminal_progress.evidence import (
+    parse_terminal_progress_timing_log_line,
+)
+from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlMemberTiming,
+    GroupedNixlTerminalResult,
+    GroupedNixlTransferMember,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -617,6 +626,69 @@ def test_runtime_registration_precedes_first_source_event() -> None:
     assert harness.wiring.lifecycle_published(harness.identity.local_binding.digest)
 
 
+def test_source_timing_projects_two_main_members_and_one_dflash_boundary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """TP2 DFlash timing retains exactly three native transfer samples."""
+
+    harnesses = (_harness(local_rank=0), _harness(local_rank=1))
+    with caplog.at_level(
+        logging.INFO,
+        logger="sglang.srt.disaggregation.terminal_progress.source_wiring",
+    ):
+        for rank, harness in enumerate(harnesses):
+            binding = harness.identity.local_binding
+            harness.wiring.submission_committed(binding, 100 + rank, 110 + rank)
+            timings = [
+                GroupedNixlMemberTiming(
+                    member=GroupedNixlTransferMember.MAIN,
+                    owner_cookie=10 + rank,
+                    post_started_ns=200 + rank,
+                    native_terminal_ns=220 + rank,
+                )
+            ]
+            if rank == 0:
+                timings.append(
+                    GroupedNixlMemberTiming(
+                        member=GroupedNixlTransferMember.DFLASH_BOUNDARY,
+                        owner_cookie=20,
+                        post_started_ns=201,
+                        native_terminal_ns=225,
+                    )
+                )
+            result = GroupedNixlTerminalResult(
+                binding_digest=binding.digest,
+                successful=True,
+                transfer_count=len(timings),
+                native_timestamp_ns=max(
+                    timing.native_terminal_ns for timing in timings
+                ),
+                reason=None,
+                member_timings=tuple(timings),
+            )
+            harness.wiring.grouped_native_terminal(result)
+
+    samples = tuple(
+        sample
+        for record in caplog.records
+        if (sample := parse_terminal_progress_timing_log_line(record.getMessage()))
+        is not None
+    )
+    native_samples = tuple(
+        sample
+        for sample in samples
+        if sample.field.value == "native_terminal_delivery_ms"
+    )
+
+    assert len(samples) == 5
+    assert len(native_samples) == 3
+    assert {sample.sample_key for sample in native_samples} == {
+        "main:writer-0",
+        "main:writer-1",
+        "boundary:writer-0",
+    }
+
+
 def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
     """Permit paired scheduler rollback only before native publication."""
 
@@ -638,9 +710,15 @@ def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
     assert wiring.inventory().active_binding_digests == ()
 
 
-def test_full_source_success_uses_runtime_completion_surfaces() -> None:
+def test_full_source_success_uses_runtime_completion_surfaces(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Join reclaim and publication before exact runtime retirement."""
 
+    caplog.set_level(
+        logging.INFO,
+        logger="sglang.srt.disaggregation.terminal_progress.source_wiring",
+    )
     harness = _harness()
     digest = harness.identity.local_binding.digest
     harness.wiring.producer_completed(digest)
@@ -688,6 +766,15 @@ def test_full_source_success_uses_runtime_completion_surfaces() -> None:
     assert any(operation[0] == "scheduler" for operation in harness.runtime.operations)
     assert any(operation[0] == "work" for operation in harness.runtime.operations)
     assert harness.runtime.operations[-1] == ("ack", retired)
+    samples = tuple(
+        sample
+        for record in caplog.records
+        if (sample := parse_terminal_progress_timing_log_line(record.getMessage()))
+        is not None
+    )
+    assert len(samples) == 1
+    assert samples[0].field.value == "gateway_publication_ms"
+    assert samples[0].sample_key == "canonical-source-publisher"
 
 
 def test_reclaim_failure_enters_explicit_runtime_fatal_boundary() -> None:
