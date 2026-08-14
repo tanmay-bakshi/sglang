@@ -143,6 +143,8 @@ class PackedRequestPublication:
     :ivar allocation_digest: Exact destination allocation identity.
     :ivar auxiliary_plan: Exact authority-derived metadata transfer plan.
     :ivar chunk_specs: Decoder-prescribed fixed chunk boundaries.
+    :ivar terminal_source_plan: Exact encoded terminal source authority, when
+        terminal serving owns this request.
     """
 
     key: PackedRequestKey
@@ -151,6 +153,7 @@ class PackedRequestPublication:
     allocation_digest: bytes
     auxiliary_plan: PackedAuxiliaryPlan
     chunk_specs: tuple[PackedLayoutSpec, ...]
+    terminal_source_plan: bytes | None = None
 
     def __post_init__(self) -> None:
         """Own and validate externally visible request metadata."""
@@ -166,6 +169,11 @@ class PackedRequestPublication:
                 "publication auxiliary slot generation differs from request"
             )
         object.__setattr__(self, "chunk_specs", tuple(self.chunk_specs))
+        if self.terminal_source_plan is not None:
+            if type(self.terminal_source_plan) is not bytes:
+                raise TypeError("terminal source plan must be bytes")
+            if len(self.terminal_source_plan) == 0:
+                raise ValueError("terminal source plan must not be empty")
 
 
 class PackedRequestScatter:
@@ -297,6 +305,7 @@ class PackedDecodeRequestTransaction:
     _submission_recorded: bool
     _teardown_acks: set[StagingWriterId]
     _teardown_requests: tuple[PackedRequestTeardown, ...]
+    _terminal_binding_digest: bytes | None
     _transaction_nonce: object
     _writer_completion_recorded: bool
 
@@ -439,6 +448,7 @@ class PackedDecodeRequestTransaction:
         self._submission_recorded = False
         self._teardown_acks = set()
         self._teardown_requests = ()
+        self._terminal_binding_digest = None
         self._transaction_nonce = object()
         self._writer_completion_recorded = False
         self._register_chunks()
@@ -471,6 +481,60 @@ class PackedDecodeRequestTransaction:
         with self._lock:
             return self._state
 
+    def prepared_publication(self) -> PackedRequestPublication:
+        """Return immutable metadata while publication remains reversible.
+
+        :returns: Exact decoder-authored metadata before wire visibility.
+        """
+
+        self._require_scheduler_thread()
+        with self._lock:
+            if self._state is not PackedRequestTransactionState.PREPARED:
+                raise PackedRequestTransactionError(
+                    "prepared publication is available only before publication"
+                )
+            return self._publication
+
+    def bind_terminal_owner_authority(
+        self,
+        encoded_source_plan: bytes,
+        binding_digest: bytes,
+    ) -> None:
+        """Bind exact wire authority to a registered terminal owner.
+
+        The packed actor calls this only after validating the source plan and
+        reserving the rank-local terminal binding. Keeping the payload and the
+        owner marker in the transaction makes publication itself enforce the
+        ordering boundary instead of relying on caller discipline.
+
+        :param encoded_source_plan: Canonical source-plan codec output.
+        :param binding_digest: Exact rank-local terminal binding digest.
+        """
+
+        self._require_scheduler_thread()
+        if type(encoded_source_plan) is not bytes or len(encoded_source_plan) == 0:
+            raise ValueError("encoded_source_plan must be nonempty bytes")
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        with self._lock:
+            if self._state is not PackedRequestTransactionState.PREPARED:
+                raise PackedRequestTransactionError(
+                    "terminal owner authority must bind before publication"
+                )
+            if self._terminal_binding_digest is not None:
+                raise PackedRequestTransactionError(
+                    "terminal owner authority was already bound"
+                )
+            if self._publication.terminal_source_plan is not None:
+                raise PackedRequestTransactionError(
+                    "terminal source plan was already bound"
+                )
+            self._publication = dataclasses.replace(
+                self._publication,
+                terminal_source_plan=encoded_source_plan,
+            )
+            self._terminal_binding_digest = binding_digest
+
     def publish(self) -> PackedRequestPublication:
         """Make the exact allocation generation irreversible before wire I/O.
 
@@ -482,6 +546,12 @@ class PackedDecodeRequestTransaction:
             if self._state is not PackedRequestTransactionState.PREPARED:
                 raise PackedRequestTransactionError(
                     f"publication is invalid in state {self._state.value}"
+                )
+            terminal_payload = self._publication.terminal_source_plan
+            terminal_binding = self._terminal_binding_digest
+            if (terminal_payload is None) != (terminal_binding is None):
+                raise PackedRequestTransactionError(
+                    "terminal source plan and owner registration are incomplete"
                 )
             try:
                 self._auxiliary_allocation_authority.record_publication(

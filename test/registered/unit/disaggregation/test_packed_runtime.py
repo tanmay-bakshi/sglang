@@ -423,6 +423,8 @@ class _DecodeLifecycleTransaction:
     defer_scatter_completion_until_auxiliary: bool
     scatter_complete: bool
     auxiliary_allocation: "_AuxiliaryAllocation | None"
+    terminal_source_plan: bytes | None
+    terminal_binding_digest: bytes | None
 
     def __init__(
         self,
@@ -459,6 +461,26 @@ class _DecodeLifecycleTransaction:
         )
         self.scatter_complete = False
         self.auxiliary_allocation = auxiliary_allocation
+        self.terminal_source_plan = None
+        self.terminal_binding_digest = None
+
+    def bind_terminal_owner_authority(
+        self,
+        encoded_source_plan: bytes,
+        binding_digest: bytes,
+    ) -> None:
+        """Record the production actor's prepublication authority handoff.
+
+        :param encoded_source_plan: Exact source plan bytes.
+        :param binding_digest: Exact local terminal binding digest.
+        """
+
+        if self.state is not PackedRequestTransactionState.PREPARED:
+            raise RuntimeError("terminal authority requires a prepared transaction")
+        if self.terminal_source_plan is not None:
+            raise RuntimeError("terminal authority was already bound")
+        self.terminal_source_plan = encoded_source_plan
+        self.terminal_binding_digest = binding_digest
 
     def snapshot(self) -> _DecodeLifecycleSnapshot:
         """Return current actor-facing transaction state.
