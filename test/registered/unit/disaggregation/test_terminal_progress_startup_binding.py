@@ -5,7 +5,7 @@ import time
 import uuid
 
 import requests
-from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+from sglang.srt.disaggregation.nixl.conn import NixlKVBootstrapServer
 from sglang.srt.disaggregation.terminal_progress.cohort_expectation import (
     build_terminal_startup_cohort_expectation,
 )
@@ -150,7 +150,7 @@ def test_complete_http_join_returns_one_matrix_and_frozen_producer_plans() -> No
     source, decode = _members(cohort)
     expectation = build_terminal_startup_cohort_expectation(cohort, source)
     registry = TerminalStartupCohortRegistry(expectation, timeout_seconds=2.0)
-    server = CommonKVBootstrapServer(
+    server = NixlKVBootstrapServer(
         host="127.0.0.1",
         port=port,
         terminal_startup_registry=registry,
