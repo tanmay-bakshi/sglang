@@ -288,6 +288,62 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         queue._poll_with_staging.assert_not_called()
         queue._poll_with_metadata_gate.assert_not_called()
 
+    def test_terminal_adoption_keeps_metadata_pinned_until_finalization(
+        self,
+    ) -> None:
+        """Split copy from runnable visibility around actor row consumption."""
+
+        room_id = 47
+        metadata_buffer_index = 1
+        allocation_lease = object()
+        transaction = SimpleNamespace(request_owner=None)
+        receiver = _RecordingReceiver()
+        metadata_buffers = _FakeMetadataBuffers(
+            size=4,
+            room_id=room_id,
+            row_index=metadata_buffer_index,
+        )
+        metadata_allocator = MagicMock()
+        decode_req = self._request(
+            room_id=room_id,
+            metadata_buffer_index=metadata_buffer_index,
+            receiver=receiver,
+            allocation_lease=allocation_lease,
+            packed_transaction=transaction,
+        )
+        transaction.request_owner = decode_req
+        queue = self._queue(
+            decode_req=decode_req,
+            metadata_buffers=metadata_buffers,
+            metadata_allocator=metadata_allocator,
+            lifecycle_authority=MagicMock(),
+            allocation_lease_authority=MagicMock(),
+        )
+        queue.scheduler.waiting_queue = []
+
+        queue.adopt_terminal_request(decode_req, transaction)
+
+        self.assertEqual(decode_req.req.output_ids, [17])
+        self.assertEqual(metadata_buffers.bootstrap_room[metadata_buffer_index], 0)
+        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(queue.scheduler.waiting_queue, [])
+        self.assertIs(decode_req.allocation_lease, allocation_lease)
+        self.assertIs(decode_req.packed_transaction, transaction)
+        self.assertEqual(decode_req.metadata_buffer_index, metadata_buffer_index)
+        self.assertEqual(receiver.clear_count, 0)
+        metadata_allocator.free.assert_not_called()
+
+        queue.finalize_terminal_request(decode_req, transaction)
+
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.scheduler.waiting_queue, [decode_req.req])
+        self.assertIsNone(decode_req.allocation_lease)
+        self.assertIsNone(decode_req.packed_transaction)
+        self.assertEqual(decode_req.metadata_buffer_index, -1)
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertEqual(receiver.clear_count, 1)
+        metadata_allocator.free.assert_not_called()
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     def test_terminal_actor_failure_quarantines_without_legacy_cleanup(

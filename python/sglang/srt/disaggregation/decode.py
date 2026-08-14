@@ -28,13 +28,12 @@ import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -71,6 +70,12 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeServing,
+)
+from sglang.srt.disaggregation.terminal_progress.request_registration import (
+    register_packed_terminal_decode_request,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -128,6 +133,7 @@ from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +492,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     _preparing_grant_ids: set[uuid.UUID]
     _preparing_request_ids: set[str]
     _seen_bootstrap_rooms: set[int]
+    _terminal_decode_serving: PackedTerminalDecodeServing | None
     allocation_lease_authority: DecodeAllocationLeaseAuthority
     allocation_lifecycle_authority: CommonKVManager
     tp1_poll_progress_policy: SingletonPollProgressPolicy
@@ -544,6 +551,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._preparing_grant_ids: set[uuid.UUID] = set()
         self._preparing_request_ids: set[str] = set()
         self._seen_bootstrap_rooms = set()
+        self._terminal_decode_serving = None
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -591,6 +599,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def bind_terminal_decode_serving(
+        self,
+        serving: PackedTerminalDecodeServing,
+    ) -> None:
+        """Bind the process-lifetime terminal owner before request promotion.
+
+        :param serving: Exact full decode serving composition.
+        """
+
+        if type(serving) is not PackedTerminalDecodeServing:
+            raise TypeError("serving must be PackedTerminalDecodeServing")
+        if self._terminal_decode_serving is not None:
+            raise RuntimeError("terminal decode serving is already bound")
+        self._terminal_decode_serving = serving
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -1021,7 +1044,53 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             publications: list[PackedRequestPublication] = []
             try:
-                for transaction in record.packed_transactions:
+                terminal_startup = self.kv_manager.terminal_startup_binding
+                terminal_serving = self._terminal_decode_serving
+                if terminal_startup is not None and terminal_serving is None:
+                    raise RuntimeError(
+                        "terminal decode promotion requires the full serving owner"
+                    )
+                if terminal_startup is None:
+                    terminal_serving = None
+                for decode_req, transaction in zip(
+                    record.decode_reqs,
+                    record.packed_transactions,
+                    strict=True,
+                ):
+                    if terminal_serving is not None:
+                        authority = (
+                            self.kv_manager.build_terminal_decode_request_authority(
+                                transaction=transaction,
+                                adopt_request=partial(
+                                    self._adopt_terminal_decode_request,
+                                    record,
+                                    decode_req,
+                                    transaction,
+                                ),
+                                finalize_request=partial(
+                                    self._finalize_terminal_decode_request,
+                                    record,
+                                    decode_req,
+                                    transaction,
+                                ),
+                                cancel_request=partial(
+                                    self._cancel_terminal_decode_request,
+                                    record,
+                                    decode_req,
+                                    transaction,
+                                ),
+                                quarantine_request=partial(
+                                    self._quarantine_terminal_decode_request,
+                                    record,
+                                    decode_req,
+                                    transaction,
+                                ),
+                            )
+                        )
+                        register_packed_terminal_decode_request(
+                            terminal_serving,
+                            authority,
+                        )
                     publications.append(transaction.publish())
             except Exception:  # noqa: BLE001
                 promotion_traceback = traceback.format_exc()
@@ -1036,6 +1105,165 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 raise
             record.packed_publications = tuple(publications)
             record.state = _DecodePreparedCohortState.PROMOTED
+
+    def _adopt_terminal_decode_request(
+        self,
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        owner: object,
+    ) -> None:
+        """Copy terminal metadata while its actor-owned row remains pinned.
+
+        :param record: Exact prepared cohort retaining the request.
+        :param decode_req: Exact mutable decode request.
+        :param transaction: Exact terminal-owned packed transaction.
+        :param owner: Candidate owner returned by allocation adoption.
+        """
+
+        self._require_terminal_callback_owner(
+            record,
+            decode_req,
+            transaction,
+            owner,
+        )
+        with self._prepared_cohort_lock:
+            if record.state is not _DecodePreparedCohortState.ATTACHED:
+                raise DecodeAllocationLeaseError(
+                    "terminal adoption requires an attached prepared cohort"
+                )
+            if not record.metadata_published:
+                raise DecodeAllocationLeaseError(
+                    "terminal adoption preceded packed metadata publication"
+                )
+            self.transfer_queue.adopt_terminal_request(decode_req, transaction)
+
+    def _finalize_terminal_decode_request(
+        self,
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        owner: object,
+    ) -> None:
+        """Publish one adopted request only after actor metadata release.
+
+        :param record: Exact prepared cohort retaining the request.
+        :param decode_req: Exact mutable decode request.
+        :param transaction: Exact terminal-owned packed transaction.
+        :param owner: Candidate owner returned by allocation adoption.
+        """
+
+        self._require_terminal_callback_owner(
+            record,
+            decode_req,
+            transaction,
+            owner,
+        )
+        with self._prepared_cohort_lock:
+            if record.state is not _DecodePreparedCohortState.ATTACHED:
+                raise DecodeAllocationLeaseError(
+                    "terminal finalization requires an attached prepared cohort"
+                )
+            self.transfer_queue.finalize_terminal_request(decode_req, transaction)
+
+    def _cancel_terminal_decode_request(
+        self,
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        owner: object,
+    ) -> None:
+        """Release scheduler resources after actor-authorized cancellation.
+
+        :param record: Exact prepared cohort retaining the request.
+        :param decode_req: Exact mutable decode request.
+        :param transaction: Exact safely cancelled packed transaction.
+        :param owner: Candidate owner returned by cancellation.
+        """
+
+        self._require_terminal_callback_owner(
+            record,
+            decode_req,
+            transaction,
+            owner,
+        )
+        with self._prepared_cohort_lock:
+            if record.state is not _DecodePreparedCohortState.PREPARED:
+                raise DecodeAllocationLeaseError(
+                    "terminal cancellation requires an unpublished prepared cohort"
+                )
+            self._release_cancelled_preallocated_decode_req(decode_req)
+
+    def _quarantine_terminal_decode_request(
+        self,
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        owner: object,
+        reason: str,
+    ) -> None:
+        """Remove active queue visibility while retaining ambiguous resources.
+
+        :param record: Exact prepared cohort retaining the request.
+        :param decode_req: Exact mutable decode request.
+        :param transaction: Exact quarantined packed transaction.
+        :param owner: Candidate retained scheduler owner.
+        :param reason: Stable first ambiguity evidence.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        self._require_terminal_callback_owner(
+            record,
+            decode_req,
+            transaction,
+            owner,
+        )
+        with self._prepared_cohort_lock:
+            self.transfer_queue.quarantine_terminal_request(decode_req, transaction)
+            self._quarantine_preallocated_record_locked(record, reason)
+
+    def _require_terminal_callback_owner(
+        self,
+        record: _DecodePreparedCohortRecord,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        owner: object,
+    ) -> None:
+        """Require one callback to retain the exact prepared child graph.
+
+        :param record: Candidate live cohort record.
+        :param decode_req: Candidate cohort child.
+        :param transaction: Candidate child transaction.
+        :param owner: Candidate callback owner.
+        """
+
+        if owner is not decode_req:
+            raise DecodeAllocationLeaseError(
+                "terminal decode callback returned another request owner"
+            )
+        with self._prepared_cohort_lock:
+            if self._prepared_cohorts.get(record.handle._token) is not record:
+                raise DecodeAllocationLeaseError(
+                    "terminal decode callback lost its prepared cohort"
+                )
+            matching_children = tuple(
+                (owned_req, owned_transaction)
+                for owned_req, owned_transaction in zip(
+                    record.decode_reqs,
+                    record.packed_transactions,
+                    strict=True,
+                )
+                if owned_req is decode_req and owned_transaction is transaction
+            )
+            if len(matching_children) != 1:
+                raise DecodeAllocationLeaseError(
+                    "terminal decode callback differs from its prepared child"
+                )
+            if transaction.request_owner is not decode_req:
+                raise DecodeAllocationLeaseError(
+                    "terminal transaction retained another decode request"
+                )
 
     def attach_preallocated(
         self,
@@ -1564,6 +1792,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "packed cancellation returned another decode request"
                 )
             decode_req.allocation_lease = None
+            # The packed auxiliary authority returned this row as part of the
+            # same cancellation. Keeping the stale index would double-release
+            # a generation which may already have been reissued.
+            decode_req.metadata_buffer_index = -1
             lease = None
         elif lease is not None:
             snapshot = self.allocation_lease_authority.snapshot(lease)
@@ -1572,6 +1804,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "reserved child rollback requires a prepared allocation lease"
                 )
             self.allocation_lease_authority.rollback_to_request(lease)
+
+        self._release_preallocated_scheduler_resources(decode_req)
+
+        if lease is not None:
+            self.allocation_lease_authority.retire_terminal(lease)
+            decode_req.allocation_lease = None
+
+    def _release_cancelled_preallocated_decode_req(
+        self,
+        decode_req: DecodeRequest,
+    ) -> None:
+        """Release scheduler resources after packed authorities retired.
+
+        :param decode_req: Exact request returned by terminal cancellation.
+        """
+
+        if decode_req.allocation_lease is None:
+            raise DecodeAllocationLeaseError(
+                "terminal cancellation lost its prepared allocation lease"
+            )
+        if decode_req.packed_transaction is not None:
+            raise DecodeAllocationLeaseError(
+                "unpublished terminal cancellation found attached ownership"
+            )
+        decode_req.allocation_lease = None
+        # Native cancellation already released the adopted auxiliary row.
+        decode_req.metadata_buffer_index = -1
+        self._release_preallocated_scheduler_resources(decode_req)
+
+    def _release_preallocated_scheduler_resources(
+        self,
+        decode_req: DecodeRequest,
+    ) -> None:
+        """Release request, prefix, row, and receiver ownership still present.
+
+        :param decode_req: Exact unpublished child being reconciled.
+        """
 
         self._abort_preallocated_hicache_prefetch(decode_req)
         try:
@@ -1604,10 +1873,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if decode_req.kv_receiver is not None:
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
-
-        if lease is not None:
-            self.allocation_lease_authority.retire_terminal(lease)
-            decode_req.allocation_lease = None
 
     def _release_unallocated_preallocated_prefix_lock(
         self,
@@ -3717,6 +3982,137 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         return True
 
+    def adopt_terminal_request(
+        self,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Copy metadata without releasing its actor-owned auxiliary row.
+
+        :param decode_req: Exact transfer-queue request.
+        :param transaction: Exact terminal-owned packed transaction.
+        """
+
+        self._require_terminal_transfer_request(decode_req, transaction)
+        metadata_index = decode_req.metadata_buffer_index
+        if metadata_index < 0:
+            raise DecodeAllocationLeaseError(
+                "terminal adoption lost its auxiliary metadata row"
+            )
+        if decode_req.allocation_lease is None:
+            raise DecodeAllocationLeaseError(
+                "terminal adoption lost its allocation lease field"
+            )
+        if not self._copy_transfer_metadata_to_req(decode_req):
+            raise DecodeAllocationLeaseError(
+                "terminal adoption rejected transferred metadata"
+            )
+        # The row remains actor-pinned until the callback returns. Resetting its
+        # readiness marker here prevents a later generation from observing
+        # stale metadata once the actor releases the exact reservation.
+        self.metadata_buffers.bootstrap_room[metadata_index] = 0
+
+    def finalize_terminal_request(
+        self,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Make one request runnable after actor-authorized metadata release.
+
+        :param decode_req: Exact adopted transfer-queue request.
+        :param transaction: Exact terminal-owned packed transaction.
+        """
+
+        self._require_terminal_transfer_request(decode_req, transaction)
+        metadata_index = decode_req.metadata_buffer_index
+        if metadata_index < 0:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization lost its consumed metadata identity"
+            )
+        if self.metadata_buffers.bootstrap_room[metadata_index] != 0:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization preceded scheduler metadata consumption"
+            )
+        if decode_req.allocation_lease is None:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization lost its adopted allocation identity"
+            )
+        if any(entry is decode_req.req for entry in self.scheduler.waiting_queue):
+            raise DecodeAllocationLeaseError(
+                "terminal request is already visible in the waiting queue"
+            )
+        receiver = decode_req.kv_receiver
+        if receiver is None:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization lost its transfer receiver"
+            )
+
+        # Actor adoption already committed pages to Req, and actor metadata
+        # consumption already returned the auxiliary row. Only transaction-local
+        # scheduler fields may be cleared before runnable visibility is granted.
+        decode_req.metadata_buffer_index = -1
+        decode_req.allocation_lease = None
+        decode_req.packed_transaction = None
+        receiver.clear()
+        decode_req.kv_receiver = None
+        decode_req.req.time_stats.set_wait_queue_entry_time()
+        self.queue = [entry for entry in self.queue if entry is not decode_req]
+        if len(self.queue) == 0:
+            self.tp1_poll_progress_policy.mark_idle()
+        self.scheduler.waiting_queue.append(decode_req.req)
+
+    def quarantine_terminal_request(
+        self,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Remove an ambiguous terminal request from active transfer polling.
+
+        The prepared cohort remains its process-lifetime retention owner.
+
+        :param decode_req: Exact ambiguous decode request.
+        :param transaction: Exact quarantined packed transaction.
+        """
+
+        matches = sum(entry is decode_req for entry in self.queue)
+        if matches > 1:
+            raise DecodeAllocationLeaseError(
+                "terminal request appears more than once in the transfer queue"
+            )
+        if matches == 0:
+            return
+        if decode_req.packed_transaction is not transaction:
+            raise DecodeAllocationLeaseError(
+                "terminal transfer queue retains another packed transaction"
+            )
+        self.queue = [entry for entry in self.queue if entry is not decode_req]
+        if len(self.queue) == 0:
+            self.tp1_poll_progress_policy.mark_idle()
+
+    def _require_terminal_transfer_request(
+        self,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+    ) -> None:
+        """Require exact singular transfer-queue ownership.
+
+        :param decode_req: Candidate terminal request.
+        :param transaction: Candidate request transaction.
+        """
+
+        if decode_req.packed_transaction is not transaction:
+            raise DecodeAllocationLeaseError(
+                "terminal transfer callback carries another packed transaction"
+            )
+        if transaction.request_owner is not decode_req:
+            raise DecodeAllocationLeaseError(
+                "terminal transfer transaction retains another request owner"
+            )
+        if sum(entry is decode_req for entry in self.queue) != 1:
+            raise DecodeAllocationLeaseError(
+                "terminal transfer callback lacks singular queue ownership"
+            )
+
     def _reconcile_failed_allocation(
         self,
         decode_req: DecodeRequest,
@@ -3799,7 +4195,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.allocation_lease = None
         return True
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+    def _copy_transfer_metadata_to_req(self, decode_req: DecodeRequest) -> bool:
+        """Copy one validated auxiliary row into its exact request.
+
+        :param decode_req: Exact transfer request retaining the metadata row.
+        :returns: Whether the row was valid and completely copied.
+        """
+
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -3850,7 +4252,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if not retained:
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
-            return
+            return False
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
             # Abort the request and remove from the queue
@@ -3874,7 +4276,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if not retained:
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
-            return
+            return False
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
@@ -3957,6 +4359,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req.output_token_sampling_logprobs.append(
                     float(output_token_sampling_logprobs[0].item())
                 )
+
+        return True
+
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        """Complete the legacy polled transfer path after metadata copy.
+
+        :param decode_req: Exact transfer request becoming scheduler-owned.
+        """
+
+        if not self._copy_transfer_metadata_to_req(decode_req):
+            return
 
         try:
             self._complete_packed_metadata_consumption(decode_req)
