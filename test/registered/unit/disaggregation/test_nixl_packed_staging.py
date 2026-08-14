@@ -1932,6 +1932,20 @@ def test_terminal_lane_settles_callback_before_post_returns() -> None:
 
     assert len(outcomes) == 1
     assert outcomes[0].status is PackedWriterOutcomeStatus.DONE
+    assert owner.calls == ["arm", "post", "settle_success"]
+    assert lane.state is PackedTransferLaneState.IN_FLIGHT
+    assert lane._active_transfer is not None
+    assert lane._transport_handle is handle
+    assert lane._terminal_transfer is not None
+    assert lane._terminal_binding_digest == digest
+
+    lane.release_terminal_transfer(
+        _terminal_owner_action(
+            digest,
+            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+    )
+
     assert owner.calls == ["arm", "post", "settle_success", "release"]
     assert lane.state is PackedTransferLaneState.IDLE
 
@@ -1945,10 +1959,27 @@ def test_terminal_lane_async_completion_is_one_shot() -> None:
     outcome = lane.settle_terminal_completion(_terminal_owner_action(digest))
 
     assert outcome.status is PackedWriterOutcomeStatus.DONE
-    assert owner.calls == ["arm", "post", "settle_success", "release"]
-    with pytest.raises(RuntimeError, match="settlement requires"):
+    assert owner.calls == ["arm", "post", "settle_success"]
+    with pytest.raises(RuntimeError, match="already settled"):
         lane.settle_terminal_completion(_terminal_owner_action(digest))
     assert owner.calls.count("settle_success") == 1
+    assert owner.calls.count("release") == 0
+
+    lane.release_terminal_transfer(
+        _terminal_owner_action(
+            digest,
+            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+    )
+
+    assert owner.calls.count("release") == 1
+    with pytest.raises(RuntimeError, match="settlement requires"):
+        lane.release_terminal_transfer(
+            _terminal_owner_action(
+                digest,
+                NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            )
+        )
     assert owner.calls.count("release") == 1
 
 
@@ -1971,8 +2002,19 @@ def test_terminal_lane_post_failure_remains_poisoned_until_owner_failure() -> No
             NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         )
     )
-    assert owner.calls == ["arm", "post", "settle_failure", "release"]
+    assert owner.calls == ["arm", "post", "settle_failure"]
     assert lane.state is PackedTransferLaneState.POISONED
+    assert lane._active_transfer is not None
+    assert lane._transport_handle is not None
+    assert lane._terminal_transfer is not None
+    with pytest.raises(RuntimeError, match="already settled"):
+        lane.settle_terminal_failure(
+            _terminal_owner_action(
+                digest,
+                NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            )
+        )
+    assert "release" not in owner.calls
 
 
 def test_terminal_lane_cancellation_retains_until_matching_failure() -> None:
@@ -1991,7 +2033,68 @@ def test_terminal_lane_cancellation_retains_until_matching_failure() -> None:
             NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         )
     )
-    assert owner.calls == ["arm", "post", "cancel", "settle_failure", "release"]
+    assert owner.calls == ["arm", "post", "cancel", "settle_failure"]
+    assert lane._active_transfer is not None
+    assert lane._transport_handle is not None
+    assert lane._terminal_transfer is not None
+    assert "release" not in owner.calls
+
+
+def test_terminal_lane_rejects_release_before_ack_authority() -> None:
+    """Only a matching ACK action can release a successful DMA cohort."""
+
+    lane, _, _, owner, handle, digest = _direct_terminal_lane()
+    lane.post_submission(lambda exact_handle: exact_handle)
+
+    with pytest.raises(RuntimeError, match="preceded successful completion"):
+        lane.release_terminal_transfer(
+            _terminal_owner_action(
+                digest,
+                NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            )
+        )
+
+    lane.settle_terminal_completion(_terminal_owner_action(digest))
+    with pytest.raises(ValueError, match="requires SOURCE_ACK_READY"):
+        lane.release_terminal_transfer(_terminal_owner_action(digest))
+    with pytest.raises(RuntimeError, match="another binding"):
+        lane.release_terminal_transfer(
+            _terminal_owner_action(
+                b"x" * 32,
+                NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            )
+        )
+
+    assert owner.calls == ["arm", "post", "settle_success"]
+    assert lane._transport_handle is handle
+    lane.release_terminal_transfer(
+        _terminal_owner_action(
+            digest,
+            NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+    )
+    assert owner.calls == ["arm", "post", "settle_success", "release"]
+
+
+def test_terminal_lane_invalid_receipt_quarantines_without_release() -> None:
+    """Full receipt validation precedes every handle release or lane reuse."""
+
+    lane, _, _, owner, handle, digest = _direct_terminal_lane()
+    receipt = owner.receipt
+    if receipt is None:
+        raise AssertionError("direct terminal fixture lost its planned receipt")
+    owner.receipt = dataclasses.replace(receipt, remoteAgent="another-decode")
+    lane.post_submission(lambda exact_handle: exact_handle)
+
+    with pytest.raises(ValueError, match="another remote agent"):
+        lane.settle_terminal_completion(_terminal_owner_action(digest))
+
+    assert lane.state is PackedTransferLaneState.POISONED
+    assert lane._active_transfer is not None
+    assert lane._transport_handle is handle
+    assert lane._terminal_transfer is not None
+    assert owner.calls == ["arm", "post", "settle_success"]
+    assert "release" not in owner.calls
 
 
 def test_terminal_lane_has_no_polling_completion_path() -> None:
