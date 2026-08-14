@@ -785,8 +785,11 @@ def test_source_runtime_composition_binds_before_starting_exactly_one_stack() ->
         "reactor-start",
         "receiver-start",
     ]
-    enrollment_factory.assert_called_once()
-    enrollment_factory.return_value.create.assert_called_once_with(manager.agent)
+    enrollment_factory.assert_called_once_with(
+        binding,
+        manager._terminal_rank_runtime_config(7),
+    )
+    enrollment_factory.return_value.create.assert_called_once_with()
     manager._compose_terminal_source.assert_called_once_with(
         binding,
         enrollment,
