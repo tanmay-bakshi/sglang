@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 import torch
+
 from sglang.srt.disaggregation.common.packed_auxiliary_allocation import (
     PackedAuxiliarySlotReservationSnapshot,
 )
@@ -24,6 +25,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
 from sglang.srt.disaggregation.common.staging_layout import StagingWriterId
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
 )
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     TerminalGatewayResultSlot,
@@ -854,6 +856,15 @@ class DFlashBoundaryDeviceRowPool:
 
         return self._registration.receipt
 
+    @property
+    def row_capacity(self) -> int:
+        """Return the exact physical request capacity.
+
+        :returns: Number of independently leased boundary rows.
+        """
+
+        return self._registration.receipt.row_capacity
+
     def lease_row(self, lifecycle_authority: object) -> "DFlashBoundaryRowLease":
         """Lease one row to an exact process-level lifecycle authority.
 
@@ -1544,17 +1555,26 @@ class DFlashBoundarySourceTransportOwner:
             record.state = DFlashBoundarySourceTransferState.SETTLED
         return outcome
 
-    def release(self, transfer: DFlashBoundarySourceTransfer) -> None:
-        """Release native handle and source row under actor ACK authority.
+    def release(
+        self,
+        transfer: DFlashBoundarySourceTransfer,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Release native handle and source row under exact ACK authority.
 
         :param transfer: Exact successfully settled source transfer.
+        :param action: Matching one-shot source ACK action.
         """
 
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
+            raise ValueError("DFlash boundary release requires SOURCE_ACK_READY")
         record = self._require_record(transfer)
         with self._lock:
             if record.state is not DFlashBoundarySourceTransferState.SETTLED:
                 raise RuntimeError("DFlash boundary release requires settlement")
-        self._direct_owner.release_transfer(record.native_transfer)
+        self._direct_owner.release_transfer(record.native_transfer, action)
         record.source_lease.release(self._lifecycle_authority)
         with self._lock:
             current = self._records.get(transfer._token)

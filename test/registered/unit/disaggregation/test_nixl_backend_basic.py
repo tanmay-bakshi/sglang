@@ -49,6 +49,8 @@ from sglang.srt.disaggregation.nixl.conn import (
 from sglang.srt.disaggregation.nixl.packed_runtime import (
     PACKED_KV_TRANSFER_PROTOCOL,
     PACKED_PREPARED_GRANT_PROTOCOL,
+    PackedLegacyAuxiliarySource,
+    PackedPrefillLaunchPlan,
     PackedRegistrationAdvertisement,
     encode_packed_control_frames,
 )
@@ -1114,6 +1116,33 @@ class TestNixlCapabilityAdmission(CustomTestCase):
                 "test transfer capability admission timed out after 5.000s",
             ):
                 manager._post_transfer_when_ready(object(), "test transfer")
+
+    def test_terminal_post_never_retries_static_capability_failure(self):
+        """A terminal cohort contradiction fails on its first native result."""
+
+        manager = object.__new__(NixlKVManager)
+        manager.agent = SimpleNamespace(transfer=MagicMock(return_value="NOT_READY"))
+        handle = object()
+
+        with patch("sglang.srt.disaggregation.nixl.conn.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "one-shot post"):
+                manager._post_terminal_transfer_once(handle, "terminal transfer")
+
+        manager.agent.transfer.assert_called_once_with(handle)
+        sleep.assert_not_called()
+
+    def test_terminal_post_accepts_only_native_terminal_states(self):
+        """Return the exact handle after a successful one-shot post."""
+
+        manager = object.__new__(NixlKVManager)
+        manager.agent = SimpleNamespace(transfer=MagicMock(return_value="PROC"))
+        handle = object()
+
+        self.assertIs(
+            manager._post_terminal_transfer_once(handle, "terminal transfer"),
+            handle,
+        )
+        manager.agent.transfer.assert_called_once_with(handle)
 
 
 class TestNixlTransferStatusCompletion(CustomTestCase):
@@ -3544,9 +3573,7 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
 
         manager = object.__new__(NixlKVManager)
         manager.attn_tp_size = 2
-        manager._packed_prefill_runtime = SimpleNamespace(
-            writer_id=_packed_writer(1)
-        )
+        manager._packed_prefill_runtime = SimpleNamespace(writer_id=_packed_writer(1))
 
         manifest = manager._packed_destination_manifest(
             SimpleNamespace(decode_tp_size=2, decode_tp_rank=1)
@@ -3605,6 +3632,9 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
         destination = object()
         runtime.build_destination_capability.return_value = destination
         manager = object.__new__(NixlKVManager)
+        manager.attn_cp_rank = 0
+        manager.attn_tp_rank = 0
+        manager.pp_rank = 0
         manager._packed_prefill_runtime = runtime
         manager.kv_args = SimpleNamespace(state_types=[])
         manager.agent = SimpleNamespace(name="prefill-agent")
@@ -3612,11 +3642,13 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
         manager._send_packed_control_frames = MagicMock()
         producer_event = object()
         submission = object()
+        launch_plan = MagicMock(spec=PackedPrefillLaunchPlan)
+        launch_plan.bind_producer_event.return_value = submission
 
         with patch(
-            "sglang.srt.disaggregation.nixl.conn.PackedPrefillSubmission",
-            return_value=submission,
-        ) as submission_factory:
+            "sglang.srt.disaggregation.nixl.conn.PackedPrefillLaunchPlan",
+            return_value=launch_plan,
+        ) as launch_plan_factory:
             manager._execute_packed_source_request(
                 transfer_info=transfer_info,
                 registration=registration,
@@ -3635,11 +3667,14 @@ class TestNixlPackedSourceIntegration(CustomTestCase):
             request_generation=plan.key.request_generation,
         )
         runtime.execute.assert_called_once_with(submission)
-        submission_kwargs = submission_factory.call_args.kwargs
+        launch_plan.bind_producer_event.assert_called_once_with(producer_event)
+        submission_kwargs = launch_plan_factory.call_args.kwargs
         self.assertIs(submission_kwargs["plan"], plan)
         self.assertIs(submission_kwargs["destination"], destination)
-        self.assertIs(submission_kwargs["producer_event"], producer_event)
-        self.assertEqual(submission_kwargs["auxiliary_source_index"], 7)
+        self.assertEqual(
+            submission_kwargs["auxiliary_source"],
+            PackedLegacyAuxiliarySource(row_index=7),
+        )
         self.assertEqual(
             submission_kwargs["destination_registration"].main_item_lens,
             (256,),

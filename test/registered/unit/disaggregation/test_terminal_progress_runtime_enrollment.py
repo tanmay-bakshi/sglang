@@ -3,6 +3,7 @@ import hashlib
 import uuid
 
 import pytest
+
 from sglang.srt.disaggregation.terminal_progress import (
     runtime_enrollment as enrollment_module,
 )
@@ -16,7 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.runtime import (
 )
 from sglang.srt.disaggregation.terminal_progress.runtime_enrollment import (
     TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME,
-    TERMINAL_NATIVE_NIXL_PRODUCER_NAME,
+    TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME,
     TerminalRankNativeProducerDisposition,
     TerminalRankRuntimeConfig,
     TerminalRankRuntimeEnrollmentError,
@@ -180,14 +181,12 @@ class _Construction:
     """Captured fake runtime and producer population.
 
     :ivar runtimes: Every constructed runtime.
-    :ivar nixl: Bound NIXL producers.
     :ivar cuda: Bound CUDA producers.
     :ivar calls: Shared producer lifecycle call log.
-    :ivar cuda_testing: Decode CUDA construction modes.
+    :ivar cuda_testing: Role-specific CUDA construction modes.
     """
 
     runtimes: list[_FakeRuntime] = dataclasses.field(default_factory=list)
-    nixl: list[_FakeNativeProducer] = dataclasses.field(default_factory=list)
     cuda: list[_FakeNativeProducer] = dataclasses.field(default_factory=list)
     calls: list[str] = dataclasses.field(default_factory=list)
     cuda_testing: list[bool] = dataclasses.field(default_factory=list)
@@ -337,29 +336,13 @@ def _install_construction(
             super().__init__(*args, **kwargs)
             construction.runtimes.append(self)
 
-    def bind_nixl(agent: object, runtime: _FakeRuntime) -> _FakeNativeProducer:
-        """Bind one captured NIXL producer.
-
-        :param agent: Unused initialized-agent sentinel.
-        :param runtime: Captured rank runtime.
-        :returns: Fake direct NIXL producer.
-        """
-
-        del agent
-        producer = _FakeNativeProducer(
-            runtime.producer_id(TERMINAL_NATIVE_NIXL_PRODUCER_NAME),
-            "nixl",
-            construction.calls,
-        )
-        construction.nixl.append(producer)
-        return producer
-
     def bind_cuda(
         runtime: _FakeRuntime,
         *,
         testing: bool,
+        producer_name: str,
     ) -> _FakeNativeProducer:
-        """Bind one captured decode CUDA producer.
+        """Bind one captured role-specific CUDA producer.
 
         :param runtime: Captured rank runtime.
         :param testing: Prospective native test mode.
@@ -368,7 +351,7 @@ def _install_construction(
 
         construction.cuda_testing.append(testing)
         producer = _FakeNativeProducer(
-            runtime.producer_id(TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME),
+            runtime.producer_id(producer_name),
             "cuda",
             construction.calls,
         )
@@ -376,11 +359,23 @@ def _install_construction(
         return producer
 
     monkeypatch.setattr(enrollment_module, "NativeTerminalRuntime", _CapturingRuntime)
-    monkeypatch.setattr(enrollment_module, "_bind_nixl_producer", bind_nixl)
+    monkeypatch.setattr(
+        enrollment_module,
+        "_bind_cuda_source_producer",
+        lambda runtime, *, testing: bind_cuda(
+            runtime,
+            testing=testing,
+            producer_name=TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME,
+        ),
+    )
     monkeypatch.setattr(
         enrollment_module,
         "_bind_cuda_scatter_producer",
-        bind_cuda,
+        lambda runtime, *, testing: bind_cuda(
+            runtime,
+            testing=testing,
+            producer_name=TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME,
+        ),
     )
     return construction
 
@@ -391,21 +386,20 @@ def test_native_producer_numbering_is_a_role_specific_contiguous_suffix() -> Non
     source_binding = _binding("prefill-a", 0)
     source = build_terminal_rank_native_producer_plan(source_binding)
     assert source_binding.python_producers.next_producer_id == 12
-    assert source.nixl_producer_id == 12
+    assert source.cuda_source_producer_id == 12
     assert source.cuda_scatter_producer_id is None
     assert source.next_producer_id == 13
     assert tuple(spec.registration.name for spec in source.specs) == (
-        TERMINAL_NATIVE_NIXL_PRODUCER_NAME,
+        TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME,
     )
 
     decode_binding = _binding("decode-a", 0)
     decode = build_terminal_rank_native_producer_plan(decode_binding)
     assert decode_binding.python_producers.next_producer_id == 13
-    assert decode.nixl_producer_id == 13
-    assert decode.cuda_scatter_producer_id == 14
-    assert decode.next_producer_id == 15
+    assert decode.cuda_source_producer_id is None
+    assert decode.cuda_scatter_producer_id == 13
+    assert decode.next_producer_id == 14
     assert tuple(spec.registration.name for spec in decode.specs) == (
-        TERMINAL_NATIVE_NIXL_PRODUCER_NAME,
         TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME,
     )
 
@@ -426,10 +420,10 @@ def test_factory_rejects_a_python_plan_from_another_matrix_rank() -> None:
 
 
 @pytest.mark.parametrize(
-    ("service_id", "rank", "expected_native_ids", "has_cuda"),
+    ("service_id", "rank", "expected_native_ids"),
     (
-        ("prefill-a", 1, (12,), False),
-        ("decode-a", 0, (13, 14), True),
+        ("prefill-a", 1, (12,)),
+        ("decode-a", 0, (13,)),
     ),
 )
 def test_factory_constructs_one_dormant_role_exact_runtime(
@@ -437,7 +431,6 @@ def test_factory_constructs_one_dormant_role_exact_runtime(
     service_id: str,
     rank: int,
     expected_native_ids: tuple[int, ...],
-    has_cuda: bool,
 ) -> None:
     """Construction freezes exact identity and never crosses activation.
 
@@ -445,13 +438,12 @@ def test_factory_constructs_one_dormant_role_exact_runtime(
     :param service_id: Local matrix service.
     :param rank: Local service rank.
     :param expected_native_ids: Role-specific native suffix.
-    :param has_cuda: Whether decode CUDA ownership is required.
     """
 
     construction = _install_construction(monkeypatch)
     binding = _binding(service_id, rank)
     factory = TerminalRankRuntimeEnrollmentFactory(binding, _config())
-    enrollment = factory.create(object(), cuda_testing=True)
+    enrollment = factory.create(cuda_testing=True)
 
     assert factory.enrollment is enrollment
     assert len(construction.runtimes) == 1
@@ -470,13 +462,14 @@ def test_factory_constructs_one_dormant_role_exact_runtime(
     assert runtime.capacities == tuple(range(101, 111))
     assert runtime.disposition is NativeTerminalRuntimeDisposition.CREATED
     assert runtime.start_calls == 0
-    assert enrollment.nixl is construction.nixl[0]
-    assert (enrollment.cuda_scatter is not None) is has_cuda
-    assert len(construction.cuda) == int(has_cuda)
-    assert construction.cuda_testing == ([True] if has_cuda else [])
+    has_source_cuda = binding.advertisement.role is TerminalOwnerRole.SOURCE
+    assert (enrollment.cuda_source is not None) is has_source_cuda
+    assert (enrollment.cuda_scatter is not None) is (not has_source_cuda)
+    assert len(construction.cuda) == 1
+    assert construction.cuda_testing == [True]
 
     with pytest.raises(TerminalRankRuntimeEnrollmentError, match="one-shot"):
-        factory.create(object(), cuda_testing=True)
+        factory.create(cuda_testing=True)
     assert len(construction.runtimes) == 1
 
 
@@ -492,7 +485,7 @@ def test_decode_native_retirement_is_ordered_and_idempotent(
     enrollment = TerminalRankRuntimeEnrollmentFactory(
         _binding("decode-a", 0),
         _config(),
-    ).create(object())
+    ).create()
     runtime = construction.runtimes[0]
     runtime.disposition = NativeTerminalRuntimeDisposition.DRAINING
 
@@ -500,11 +493,8 @@ def test_decode_native_retirement_is_ordered_and_idempotent(
     enrollment.retire_native_producers()
 
     assert construction.calls == [
-        "nixl:stop",
         "cuda:stop",
-        "nixl:join",
         "cuda:join",
-        "nixl:close",
         "cuda:close",
     ]
     assert (
@@ -527,10 +517,10 @@ def test_retirement_timeout_is_sticky_and_enters_runtime_abort(
     enrollment = TerminalRankRuntimeEnrollmentFactory(
         _binding("prefill-a", 0),
         _config(),
-    ).create(object())
+    ).create()
     runtime = construction.runtimes[0]
     runtime.disposition = NativeTerminalRuntimeDisposition.DRAINING
-    construction.nixl[0].join_result = False
+    construction.cuda[0].join_result = False
 
     with pytest.raises(
         TerminalRankRuntimeEnrollmentError,
@@ -551,7 +541,7 @@ def test_retirement_timeout_is_sticky_and_enters_runtime_abort(
     ):
         enrollment.retire_native_producers()
     assert runtime.begin_abort_calls == 1
-    assert construction.calls == ["nixl:stop", "nixl:join"]
+    assert construction.calls == ["cuda:stop", "cuda:join"]
 
 
 def test_runtime_config_is_frozen_and_rejects_implicit_capacity() -> None:

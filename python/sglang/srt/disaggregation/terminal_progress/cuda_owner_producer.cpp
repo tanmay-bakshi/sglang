@@ -14,8 +14,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <time.h>
 #include <thread>
+#include <time.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -27,7 +27,16 @@ namespace py = pybind11;
 namespace {
 
 constexpr std::size_t kDigestBytes = 32;
+constexpr std::uint16_t kSourceProducerCompletedEvent = 11;
 constexpr std::uint16_t kDecodeScatterTerminalEvent = 44;
+
+std::uint16_t require_event_kind(std::uint16_t event_kind) {
+  if (event_kind != kSourceProducerCompletedEvent &&
+      event_kind != kDecodeScatterTerminalEvent) {
+    throw std::invalid_argument("unsupported CUDA terminal event kind");
+  }
+  return event_kind;
+}
 
 using Digest = std::array<std::uint8_t, kDigestBytes>;
 
@@ -120,9 +129,9 @@ std::uint64_t monotonic_raw_ns() noexcept {
 
 class ProducerState {
 public:
-  ProducerState(const sglang_terminal_owner_producer_api_v1 *api,
-                void *context)
-      : api_(api), context_(context) {}
+  ProducerState(const sglang_terminal_owner_producer_api_v1 *api, void *context,
+                std::uint16_t event_kind)
+      : api_(api), context_(context), event_kind_(event_kind) {}
 
   void arm(const Digest &binding) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -349,9 +358,8 @@ public:
     std::vector<std::thread> producers;
     producers.reserve(bindings.size());
     for (const Digest &binding : bindings) {
-      producers.emplace_back([this, binding]() {
-        publish_from_callback(make_event(binding));
-      });
+      producers.emplace_back(
+          [this, binding]() { publish_from_callback(make_event(binding)); });
     }
     for (std::thread &producer : producers) {
       producer.join();
@@ -360,20 +368,20 @@ public:
 #endif
 
 private:
-  static Digest event_binding(
-      const sglang_terminal_owner_producer_event_v1 &event) noexcept {
+  static Digest
+  event_binding(const sglang_terminal_owner_producer_event_v1 &event) noexcept {
     Digest binding{};
     std::memcpy(binding.data(), event.binding_digest, binding.size());
     return binding;
   }
 
-  static sglang_terminal_owner_producer_event_v1
-  make_event(const Digest &binding) noexcept {
+  sglang_terminal_owner_producer_event_v1
+  make_event(const Digest &binding) const noexcept {
     sglang_terminal_owner_producer_event_v1 event{};
     event.abi_version = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION;
     event.struct_size = sizeof(event);
     std::memcpy(event.binding_digest, binding.data(), binding.size());
-    event.event_kind = kDecodeScatterTerminalEvent;
+    event.event_kind = event_kind_;
     return event;
   }
 
@@ -410,6 +418,7 @@ private:
 
   const sglang_terminal_owner_producer_api_v1 *api_;
   void *context_;
+  std::uint16_t event_kind_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   std::unordered_map<Digest, BindingPhase, DigestHash> bindings_;
@@ -445,12 +454,16 @@ std::vector<std::pair<PyObject *, PyObject *>> abandoned_capsules;
 class NativeCudaTerminalProducer {
 public:
   NativeCudaTerminalProducer(const py::capsule &api_capsule,
-                             const py::capsule &context_capsule)
+                             const py::capsule &context_capsule,
+                             std::uint16_t event_kind)
       : api_capsule_(api_capsule.ptr()),
-        context_capsule_(context_capsule.ptr()) {
-    const auto *api = static_cast<const sglang_terminal_owner_producer_api_v1 *>(
-        PyCapsule_GetPointer(api_capsule.ptr(),
-                             SGLANG_TERMINAL_OWNER_PRODUCER_API_CAPSULE_NAME));
+        context_capsule_(context_capsule.ptr()),
+        event_kind_(require_event_kind(event_kind)) {
+    const auto *api =
+        static_cast<const sglang_terminal_owner_producer_api_v1 *>(
+            PyCapsule_GetPointer(
+                api_capsule.ptr(),
+                SGLANG_TERMINAL_OWNER_PRODUCER_API_CAPSULE_NAME));
     if (api == nullptr) {
       throw py::error_already_set();
     }
@@ -466,10 +479,11 @@ public:
             sizeof(sglang_terminal_owner_producer_event_v1) ||
         (api->flags & SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS) !=
             SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS ||
-        api->submit == nullptr || api->retire == nullptr || api->join == nullptr) {
+        api->submit == nullptr || api->retire == nullptr ||
+        api->join == nullptr) {
       throw std::invalid_argument("terminal owner producer ABI mismatch");
     }
-    state_ = std::make_shared<ProducerState>(api, context);
+    state_ = std::make_shared<ProducerState>(api, context, event_kind_);
     Py_INCREF(api_capsule_);
     Py_INCREF(context_capsule_);
   }
@@ -531,8 +545,7 @@ public:
 
 #ifdef SGLANG_CUDA_COMPLETION_BRIDGE_TESTING
   void complete_synchronously_for_test(const py::bytes &binding_digest) {
-    state_->complete_synchronously_for_test(
-        digest_from_python(binding_digest));
+    state_->complete_synchronously_for_test(digest_from_python(binding_digest));
   }
 
   void begin_held_callback_for_test(const py::bytes &binding_digest) {
@@ -554,19 +567,20 @@ public:
 #endif
 
 private:
-  static sglang_terminal_owner_producer_event_v1
-  make_event(const Digest &binding) noexcept {
+  sglang_terminal_owner_producer_event_v1
+  make_event(const Digest &binding) const noexcept {
     sglang_terminal_owner_producer_event_v1 event{};
     event.abi_version = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION;
     event.struct_size = sizeof(event);
     std::memcpy(event.binding_digest, binding.data(), binding.size());
-    event.event_kind = kDecodeScatterTerminalEvent;
+    event.event_kind = event_kind_;
     return event;
   }
 
   std::shared_ptr<ProducerState> state_;
   PyObject *api_capsule_{nullptr};
   PyObject *context_capsule_{nullptr};
+  std::uint16_t event_kind_;
 };
 
 py::dict compiled_abi() {
@@ -581,15 +595,14 @@ py::dict compiled_abi() {
       offsetof(sglang_terminal_owner_producer_event_v1, event_kind);
   offsets["enqueued_ns"] =
       offsetof(sglang_terminal_owner_producer_event_v1, enqueued_ns);
-  offsets["receipt_binding_digest"] = offsetof(
-      sglang_terminal_owner_producer_event_v1, receipt_binding_digest);
+  offsets["receipt_binding_digest"] =
+      offsetof(sglang_terminal_owner_producer_event_v1, receipt_binding_digest);
   offsets["receipt_nonce"] =
       offsetof(sglang_terminal_owner_producer_event_v1, receipt_nonce);
   py::dict result;
   result["abi_version"] = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION;
   result["api_struct_size"] = sizeof(sglang_terminal_owner_producer_api_v1);
-  result["event_struct_size"] =
-      sizeof(sglang_terminal_owner_producer_event_v1);
+  result["event_struct_size"] = sizeof(sglang_terminal_owner_producer_event_v1);
   result["required_flags"] = SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS;
   result["event_offsets"] = std::move(offsets);
   return result;
@@ -599,10 +612,10 @@ py::dict compiled_abi() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   py::class_<NativeCudaTerminalProducer>(module, "CudaTerminalProducer")
-      .def(py::init<const py::capsule &, const py::capsule &>(),
-           py::arg("producer_api"), py::arg("producer_context"))
-      .def("arm", &NativeCudaTerminalProducer::arm,
-           py::arg("binding_digest"))
+      .def(py::init<const py::capsule &, const py::capsule &, std::uint16_t>(),
+           py::arg("producer_api"), py::arg("producer_context"),
+           py::arg("event_kind"))
+      .def("arm", &NativeCudaTerminalProducer::arm, py::arg("binding_digest"))
       .def("submit", &NativeCudaTerminalProducer::submit,
            py::arg("stream_handle"), py::arg("binding_digest"))
       .def("stop_admission", &NativeCudaTerminalProducer::stop_admission)

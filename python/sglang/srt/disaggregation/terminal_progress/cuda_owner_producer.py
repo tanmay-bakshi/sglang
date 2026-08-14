@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import hashlib
 import os
 import sys
@@ -7,11 +8,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Protocol, cast
 
+from torch.utils.cpp_extension import CUDA_HOME, load
+
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalNativeProducerBinding,
     NativeTerminalRuntime,
 )
-from torch.utils.cpp_extension import CUDA_HOME, load
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -90,6 +92,13 @@ class CudaTerminalProducerInventory:
         """
 
         return self.armed_count + self.submitted_count
+
+
+class CudaTerminalEventKind(enum.IntEnum):
+    """Native lifecycle transition emitted by one CUDA callback owner."""
+
+    SOURCE_PRODUCER_COMPLETED = 11
+    DECODE_SCATTER_TERMINAL = 44
 
 
 class _NativeCudaTerminalProducer(Protocol):
@@ -251,17 +260,21 @@ class CudaTerminalProducer:
     def __init__(
         self,
         binding: NativeTerminalNativeProducerBinding,
+        event_kind: CudaTerminalEventKind,
         *,
         testing: bool = False,
     ) -> None:
         """Bind one registered producer namespace to CUDA callbacks.
 
         :param binding: Runtime-owned API and producer-context capsules.
+        :param event_kind: Exact lifecycle transition emitted on completion.
         :param testing: Whether native test controls are required.
         """
 
         if type(binding) is not NativeTerminalNativeProducerBinding:
             raise TypeError("binding must be NativeTerminalNativeProducerBinding")
+        if type(event_kind) is not CudaTerminalEventKind:
+            raise TypeError("event_kind must be CudaTerminalEventKind")
         if type(testing) is not bool:
             raise TypeError("testing must be bool")
         module = _load_native_cuda_terminal_producer(testing=testing)
@@ -270,6 +283,7 @@ class CudaTerminalProducer:
             module.CudaTerminalProducer(
                 binding.producer_api,
                 binding.producer_context,
+                int(event_kind),
             ),
         )
         self._binding = binding
@@ -280,6 +294,7 @@ class CudaTerminalProducer:
         cls,
         runtime: NativeTerminalRuntime,
         producer_name: str,
+        event_kind: CudaTerminalEventKind,
         *,
         testing: bool = False,
     ) -> "CudaTerminalProducer":
@@ -287,6 +302,7 @@ class CudaTerminalProducer:
 
         :param runtime: Dormant or running immutable owner runtime.
         :param producer_name: Stable pre-registered native producer name.
+        :param event_kind: Exact lifecycle transition emitted on completion.
         :param testing: Whether native test controls are required.
         :returns: Bound direct CUDA terminal producer.
         """
@@ -295,6 +311,7 @@ class CudaTerminalProducer:
             raise TypeError("runtime must be NativeTerminalRuntime")
         return cls(
             runtime.native_producer_binding(producer_name),
+            event_kind,
             testing=testing,
         )
 

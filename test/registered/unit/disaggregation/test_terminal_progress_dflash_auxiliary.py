@@ -4,6 +4,7 @@ import inspect
 from unittest.mock import Mock
 
 import pytest
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
     PackedAuxiliaryDestinationSegment,
@@ -23,6 +24,7 @@ from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFLASH_BOUNDARY_ROW_BYTES,
     DFlashBoundaryDeviceRowPool,
     DFlashBoundaryNixlRegistration,
+    DFlashBoundaryPrefillSource,
     DFlashBoundaryRegisteredRow,
     DFlashBoundaryRegistration,
     DFlashBoundaryRemoteRow,
@@ -34,12 +36,53 @@ from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryTransportAccounting,
     build_dflash_boundary_nixl_descriptors,
 )
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
+    NativeTerminalOwnerRole,
+    NativeTerminalProcessIdentity,
+    NativeTerminalRequestBinding,
+)
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     TerminalGatewayResultSlot,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def _source_action(
+    kind: NativeTerminalOwnerActionKind,
+    action_id: int,
+) -> NativeTerminalOwnerAction:
+    """Build exact source transport authority.
+
+    :param kind: Outcome or ACK action kind.
+    :param action_id: One-shot native action identity.
+    :returns: Immutable native owner action.
+    """
+
+    owner = NativeTerminalProcessIdentity(
+        process_generation=b"g" * 16,
+        role=NativeTerminalOwnerRole.SOURCE,
+        tp_rank=0,
+        tp_size=1,
+        digest=b"o" * 32,
+    )
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=kind,
+        binding=NativeTerminalRequestBinding(
+            room_id=9,
+            request_generation=b"r" * 16,
+            owner=owner,
+            rank_manifest_digest=b"m" * 32,
+            allocation_digest=b"a" * 32,
+            digest=b"b" * 32,
+        ),
+        commit_timestamp_ns=19,
+        receipt=None,
+    )
 
 
 class _RecordingAgent:
@@ -418,10 +461,15 @@ class _DirectOwner:
 
         self.calls.append("failure")
 
-    def release_transfer(self, _transfer: _DirectTransfer) -> None:
+    def release_transfer(
+        self,
+        _transfer: _DirectTransfer,
+        _action: object,
+    ) -> None:
         """Record exact handle release.
 
         :param _transfer: Exact settled transfer.
+        :param _action: Matching source ACK authority.
         """
 
         self.calls.append("release")
@@ -1028,7 +1076,11 @@ def test_source_owner_retains_row_and_handle_until_ack_release() -> None:
 
     pool, owner, direct_owner, source_lease, transfer = _posted_transport()
 
-    outcome = owner.settle(transfer, Mock(), _metadata())
+    outcome = owner.settle(
+        transfer,
+        _source_action(NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY, 11),
+        _metadata(),
+    )
 
     assert type(outcome) is PackedDFlashBoundaryOutcome
     assert outcome.metadata == _metadata()
@@ -1038,7 +1090,10 @@ def test_source_owner_retains_row_and_handle_until_ack_release() -> None:
     assert owner.inventory().settled_count == 1
     assert direct_owner.calls == ["arm", "post", "settle"]
 
-    owner.release(transfer)
+    owner.release(
+        transfer,
+        _source_action(NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 12),
+    )
 
     assert source_lease.state is DFlashBoundaryRowLeaseState.RELEASED
     assert pool.inventory() == (1, 0, 0)

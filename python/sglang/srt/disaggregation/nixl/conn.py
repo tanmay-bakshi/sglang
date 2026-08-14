@@ -93,9 +93,14 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     PACKED_PREPARED_GRANT_PROTOCOL,
     PackedControlSender,
     PackedDecodeControlSender,
+    PackedLegacyAuxiliarySource,
+    PackedNoncanonicalAuxiliarySource,
+    PackedPrefillAuxiliarySource,
+    PackedPrefillLaunchPlan,
     PackedPrefillRuntime,
     PackedPrefillSubmission,
     PackedRegistrationAdvertisement,
+    PackedTerminalDFlashAuxiliarySource,
     build_same_host_visibility_policy,
     decode_packed_control_frames,
     encode_packed_control_frames,
@@ -148,6 +153,13 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
 )
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryDeviceRowPool,
+    DFlashBoundaryPrefillSource,
+    DFlashBoundarySourceTransfer,
+    DFlashBoundarySourceTransportOwner,
+)
+from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
+    GroupedNixlTerminalOwner,
+    grouped_nixl_source_members,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -155,10 +167,12 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
 )
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
+    PrefillTerminalGatewayOutputProjection,
     PrefillTerminalGatewayPayloadEncoder,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
@@ -894,7 +908,6 @@ class NixlTerminalRuntimeInstallation:
     :ivar physical_capacity: Exact metadata-row capacity governing live request
         generations and every derived process queue.
     :ivar gateway_endpoint: Canonical source-rank gateway PUSH endpoint.
-    :ivar source_work: Source-only actor and transport continuation callbacks.
     :ivar send_decode_delivery: Decode-only authenticated terminal delivery.
     :ivar bind_source_serving: Source-only scheduler serving installation.
     :ivar bind_decode_serving: Decode-only scheduler and preallocation-queue
@@ -907,7 +920,6 @@ class NixlTerminalRuntimeInstallation:
 
     physical_capacity: int
     gateway_endpoint: str | None
-    source_work: PackedTerminalSourceWork | None
     send_decode_delivery: Callable[[PackedTerminalDecodeWireDelivery], None] | None
     bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None
     bind_decode_serving: Callable[[PackedTerminalDecodeServing], None] | None
@@ -923,11 +935,6 @@ class NixlTerminalRuntimeInstallation:
             type(self.gateway_endpoint) is not str or len(self.gateway_endpoint) == 0
         ):
             raise ValueError("gateway_endpoint must be None or a non-empty string")
-        if (
-            self.source_work is not None
-            and type(self.source_work) is not PackedTerminalSourceWork
-        ):
-            raise TypeError("source_work must be PackedTerminalSourceWork or None")
         callbacks = (
             self.send_decode_delivery,
             self.bind_source_serving,
@@ -1102,6 +1109,11 @@ class NixlKVManager(CommonKVManager):
             None
         )
         self._terminal_runtime_enrollment: TerminalRankRuntimeEnrollment | None = None
+        self._terminal_dflash_source_pool: DFlashBoundaryDeviceRowPool | None = None
+        self._terminal_dflash_source_owner: (
+            DFlashBoundarySourceTransportOwner | None
+        ) = None
+        self._terminal_grouped_nixl_owner: GroupedNixlTerminalOwner | None = None
         self._terminal_source_serving: PackedTerminalSourceServing | None = None
         self._terminal_decode_serving: PackedTerminalDecodeServing | None = None
         self._terminal_process_reactor: PackedTerminalProcessReactor | None = None
@@ -1293,6 +1305,8 @@ class NixlKVManager(CommonKVManager):
                 build_same_host_visibility_policy(runtime_artifacts),
             )
 
+        self._initialize_terminal_dflash_source_pool()
+
         # NIXL metadata is a snapshot of every registered memory section. No
         # transport identity may leave this manager until all long-lived
         # payload and staging regions are represented in that snapshot.
@@ -1331,6 +1345,32 @@ class NixlKVManager(CommonKVManager):
         """
 
         return self._terminal_dflash_boundary_pool
+
+    def _initialize_terminal_dflash_source_pool(self) -> None:
+        """Register canonical source boundary rows before metadata freezes."""
+
+        if self.server_args.pd_terminal_deployment_cohort is None:
+            return
+        if self.disaggregation_mode is not DisaggregationMode.PREFILL:
+            return
+        if not self._is_canonical_aux_writer():
+            return
+        if self.server_args.speculative_algorithm != "DFLASH":
+            raise ValueError(
+                "terminal DFlash boundary transport requires DFLASH speculation"
+            )
+        capacity = self.kv_args.terminal_request_capacity
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError(
+                "terminal source requires a positive scheduler request capacity"
+            )
+        if self._terminal_dflash_source_pool is not None:
+            raise RuntimeError("terminal DFlash source pool is already initialized")
+        self._terminal_dflash_source_pool = DFlashBoundaryDeviceRowPool(
+            self.agent,
+            row_capacity=capacity,
+            device=torch.device("cuda", self.kv_args.gpu_id),
+        )
 
     def _start_prefill_runtime_workers(self) -> None:
         """Start source transfer workers after peer authority is immutable."""
@@ -1425,8 +1465,6 @@ class NixlKVManager(CommonKVManager):
 
         local = binding.advertisement
         if local.role is TerminalOwnerRole.SOURCE:
-            if installation.source_work is None:
-                raise ValueError("terminal source installation requires source_work")
             if installation.send_decode_delivery is not None:
                 raise ValueError(
                     "terminal source installation cannot send decode deliveries"
@@ -1449,8 +1487,6 @@ class NixlKVManager(CommonKVManager):
                     "noncanonical terminal source cannot own a gateway endpoint"
                 )
         else:
-            if installation.source_work is not None:
-                raise ValueError("terminal decode installation cannot own source_work")
             if installation.gateway_endpoint is not None:
                 raise ValueError(
                     "terminal decode installation cannot own a gateway endpoint"
@@ -2171,9 +2207,9 @@ class NixlKVManager(CommonKVManager):
         :returns: Decode-rank-zero importer map keyed by authenticated identity.
         """
 
-        importers: dict[
-            TerminalProcessIdentity, TerminalWireReceiptImportNamespace
-        ] = {}
+        importers: dict[TerminalProcessIdentity, TerminalWireReceiptImportNamespace] = (
+            {}
+        )
         for rank in binding.matrix.ranks:
             if rank.role is not TerminalOwnerRole.DECODE:
                 continue
@@ -2184,6 +2220,202 @@ class NixlKVManager(CommonKVManager):
         if len(importers) == 0:
             raise RuntimeError("terminal source has no decode coordinator importer")
         return importers
+
+    def _compose_terminal_dflash_source_owner(
+        self,
+        actor: PackedPrefillRuntime,
+        grouped_nixl: GroupedNixlTerminalOwner,
+    ) -> DFlashBoundarySourceTransportOwner | None:
+        """Bind canonical DFlash boundary transport to enrolled native ownership.
+
+        :param actor: Exact rank-local packed source actor.
+        :param grouped_nixl: Sole request-level native completion owner.
+        :returns: Canonical DFlash owner, otherwise ``None`` off the writer rank.
+        """
+
+        canonical = self._is_canonical_aux_writer()
+        pool = self._terminal_dflash_source_pool
+        if not canonical:
+            if pool is not None:
+                raise RuntimeError("noncanonical source retained a DFlash row pool")
+            return None
+        if pool is None:
+            raise RuntimeError("canonical source has no registered DFlash row pool")
+        if self._terminal_dflash_source_owner is not None:
+            raise RuntimeError("terminal DFlash source owner is already composed")
+
+        owner = DFlashBoundarySourceTransportOwner(
+            pool=pool,
+            agent=self.agent,
+            direct_owner=grouped_nixl.dflash_endpoint,
+            writer_id=actor.writer_id,
+            post=lambda handle: self._post_terminal_transfer_once(
+                handle,
+                "terminal DFlash boundary transfer",
+            ),
+        )
+        self._terminal_dflash_source_owner = owner
+        return owner
+
+    def _compose_terminal_source_work(
+        self,
+        actor: PackedPrefillRuntime,
+        grouped_nixl: GroupedNixlTerminalOwner,
+        dflash_owner: DFlashBoundarySourceTransportOwner | None,
+    ) -> PackedTerminalSourceWork:
+        """Compose owner-earned source work over typed transport ownership.
+
+        :param actor: Sole packed source request registry.
+        :param grouped_nixl: Sole main and DFlash completion group owner.
+        :param dflash_owner: Canonical device-row transport owner, if local.
+        :returns: Complete forward-independent source work callbacks.
+        """
+
+        canonical = self._is_canonical_aux_writer()
+        if canonical != (dflash_owner is not None):
+            raise RuntimeError("DFlash owner presence differs from canonical rank")
+
+        def transport_submission(
+            submission: PackedTerminalSourceSubmission,
+        ) -> PackedPrefillSubmission:
+            transport = submission.transport_submission
+            if type(transport) is not PackedPrefillSubmission:
+                raise TypeError("terminal source transport has another schema")
+            return transport
+
+        def dflash_source(
+            transport: PackedPrefillSubmission,
+        ) -> DFlashBoundaryPrefillSource:
+            auxiliary = transport.auxiliary_source
+            if type(auxiliary) is not PackedTerminalDFlashAuxiliarySource:
+                raise TypeError("canonical terminal source lacks DFlash ownership")
+            return auxiliary.prefill_source
+
+        def post_gather(
+            submission: PackedTerminalSourceSubmission,
+            action: NativeTerminalOwnerAction,
+        ) -> None:
+            transport = transport_submission(submission)
+            expected_members = grouped_nixl_source_members(canonical)
+            grouped_nixl.begin_group(action.binding.digest, expected_members)
+            post_auxiliary: Callable[[PackedPrefillSubmission], object] | None = None
+            if dflash_owner is not None:
+                source = dflash_source(transport)
+
+                def post_auxiliary(
+                    exact_transport: PackedPrefillSubmission,
+                ) -> object:
+                    if exact_transport is not transport:
+                        raise RuntimeError("source actor changed transport identity")
+                    return dflash_owner.post(
+                        plan=transport.plan,
+                        source_lease=source.lease,
+                        destination_device_index=(
+                            transport.destination.route.destination_gpu_id
+                        ),
+                        remote_handle=transport.control.remote_handle,
+                        remote_agent_name=transport.control.peer.agent_name,
+                        binding_digest=action.binding.digest,
+                    )
+
+            try:
+                actor.begin_terminal_owner_transfer(action, post_auxiliary)
+                grouped_nixl.seal_group(action.binding.digest)
+            except Exception:
+                logger.error(
+                    "Terminal grouped source post failed:\n%s",
+                    traceback.format_exc(),
+                )
+                grouped_nixl.quarantine_group(
+                    action.binding.digest,
+                    "terminal source gather or transfer post became ambiguous",
+                )
+                raise
+
+        def send_outcomes(
+            submission: PackedTerminalSourceSubmission,
+            action: NativeTerminalOwnerAction,
+        ) -> None:
+            transport = transport_submission(submission)
+            settle_auxiliary: (
+                Callable[[object, NativeTerminalOwnerAction], object] | None
+            ) = None
+            if dflash_owner is not None:
+                source = dflash_source(transport)
+                projection = submission.output_projection
+                if type(projection) is not PrefillTerminalGatewayOutputProjection:
+                    raise TypeError("terminal source output has another schema")
+
+                def settle_auxiliary(
+                    transfer: object,
+                    exact_action: NativeTerminalOwnerAction,
+                ) -> object:
+                    if type(transfer) is not DFlashBoundarySourceTransfer:
+                        raise TypeError("source actor retained another aux transfer")
+                    metadata = source.metadata_from_result_slot(projection.result_slot)
+                    return dflash_owner.settle(
+                        transfer,
+                        exact_action,
+                        metadata,
+                    )
+
+            actor.send_terminal_owner_outcomes(
+                action,
+                lambda lane, exact_action: lane.settle_terminal_completion(
+                    exact_action
+                ),
+                settle_auxiliary,
+            )
+
+        def send_ack(
+            submission: PackedTerminalSourceSubmission,
+            action: NativeTerminalOwnerAction,
+        ) -> None:
+            transport = transport_submission(submission)
+            release_auxiliary: (
+                Callable[[object, NativeTerminalOwnerAction], None] | None
+            ) = None
+            if dflash_owner is not None:
+                dflash_source(transport)
+
+                def release_auxiliary(
+                    transfer: object,
+                    exact_action: NativeTerminalOwnerAction,
+                ) -> None:
+                    if type(transfer) is not DFlashBoundarySourceTransfer:
+                        raise TypeError("source actor retained another aux transfer")
+                    if exact_action is not action:
+                        raise RuntimeError("source actor changed ACK authority")
+                    dflash_owner.release(transfer, exact_action)
+
+            actor.settle_terminal_owner_teardown(
+                action,
+                lambda lane, exact_action: lane.release_terminal_transfer(exact_action),
+                release_auxiliary,
+            )
+
+        def quarantine(action: NativeTerminalOwnerAction) -> None:
+            actor.quarantine_terminal_owner_request(
+                action,
+                "native source lifecycle quarantined terminal transport",
+                lambda lane, exact_action: lane.settle_terminal_failure(exact_action),
+                (
+                    None
+                    if dflash_owner is None
+                    else lambda transfer, exact_action: dflash_owner.settle_failure(
+                        transfer,
+                        exact_action,
+                    )
+                ),
+            )
+
+        return PackedTerminalSourceWork(
+            post_gather=post_gather,
+            send_outcomes=send_outcomes,
+            send_ack=send_ack,
+            quarantine=quarantine,
+            observe_output=self._observe_terminal_output,
+        )
 
     @staticmethod
     def _decode_coordinator_importers(
@@ -2227,13 +2459,28 @@ class NixlKVManager(CommonKVManager):
         """
 
         actor = self._packed_prefill_runtime
-        source_work = installation.source_work
-        if actor is None or source_work is None:
-            raise RuntimeError("terminal source actor or work boundary is unavailable")
+        if actor is None:
+            raise RuntimeError("terminal source actor is unavailable")
         publication_control = self._terminal_source_publication_control
         if publication_control is None:
             raise RuntimeError("source publication control is unavailable")
-        actor.bind_direct_terminal_owner(enrollment.nixl)
+        if self._terminal_grouped_nixl_owner is not None:
+            raise RuntimeError("terminal grouped NIXL owner is already composed")
+        grouped_nixl = GroupedNixlTerminalOwner(
+            self.agent,
+            channel_capacity=installation.physical_capacity * 2,
+        )
+        self._terminal_grouped_nixl_owner = grouped_nixl
+        actor.bind_direct_terminal_owner(grouped_nixl.main_endpoint)
+        dflash_owner = self._compose_terminal_dflash_source_owner(
+            actor,
+            grouped_nixl,
+        )
+        source_work = self._compose_terminal_source_work(
+            actor,
+            grouped_nixl,
+            dflash_owner,
+        )
         importers = self._source_request_ready_importers(binding)
         self._terminal_source_receipt_importers = importers
         local_identity = binding.advertisement.terminal_identity
@@ -2264,6 +2511,7 @@ class NixlKVManager(CommonKVManager):
                 fatal_listener=self._terminal_publisher_failed,
                 clock_ns=time.monotonic_ns,
             )
+
         def retire_submission(submission: PackedTerminalSourceSubmission) -> None:
             """Retire route replay state after native lifecycle retirement.
 
@@ -2280,6 +2528,7 @@ class NixlKVManager(CommonKVManager):
             clock_ns=time.monotonic_ns,
             physical_capacity=installation.physical_capacity,
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
+            grouped_nixl=grouped_nixl,
             work=source_work,
             retire_native_producers=enrollment.retire_native_producers,
             retire_submission=retire_submission,
@@ -2363,9 +2612,7 @@ class NixlKVManager(CommonKVManager):
         if installation is None:
             raise RuntimeError("terminal runtime dependencies are not installed")
         config = self._terminal_rank_runtime_config(installation.physical_capacity)
-        enrollment = TerminalRankRuntimeEnrollmentFactory(binding, config).create(
-            self.agent
-        )
+        enrollment = TerminalRankRuntimeEnrollmentFactory(binding, config).create()
         local_role = binding.advertisement.role
         source_serving: PackedTerminalSourceServing | None = None
         decode_serving: PackedTerminalDecodeServing | None = None
@@ -4269,9 +4516,7 @@ class NixlKVManager(CommonKVManager):
             startup_binding=startup_binding,
             source_plan=source_plan,
             local_writer_id=runtime.writer_id,
-            destination_process_generation=(
-                packed_plan.destination_process_generation
-            ),
+            destination_process_generation=(packed_plan.destination_process_generation),
         )
 
     def _packed_destination_manifest(
@@ -4378,24 +4623,23 @@ class NixlKVManager(CommonKVManager):
             )
         return tuple(components)
 
-    def _execute_packed_source_request(
+    def _build_packed_source_launch_plan(
         self,
         *,
         transfer_info: TransferInfo,
         registration: KVArgsRegisterInfo,
         source_main_pages: npt.NDArray[np.int32],
-        auxiliary_source_index: int,
+        auxiliary_source: PackedPrefillAuxiliarySource,
         state_indices: Optional[List],
-        producer_event: torch.cuda.Event,
-    ) -> None:
-        """Execute one complete source request through the packed actor.
+    ) -> PackedPrefillLaunchPlan:
+        """Freeze one complete packed source request before model submission.
 
         :param transfer_info: Exact request metadata from the decoder.
         :param registration: Generation-bound decoder registration.
         :param source_main_pages: Complete source KV page projection.
-        :param auxiliary_source_index: Source auxiliary metadata row.
+        :param auxiliary_source: Explicit rank-local auxiliary ownership.
         :param state_indices: Complete final source state page arrays.
-        :param producer_event: Event recorded after the exact source cache writes.
+        :returns: Immutable route, pages, control, and auxiliary ownership.
         """
 
         runtime = self._packed_prefill_runtime
@@ -4447,21 +4691,104 @@ class NixlKVManager(CommonKVManager):
             ),
             page_size=advertisement.page_size,
         )
-        runtime.execute(
-            PackedPrefillSubmission(
-                plan=plan,
-                destination=destination,
-                destination_registration=destination_registration,
-                control=control,
-                components=self._packed_source_components(
-                    source_main_pages,
-                    transfer_info,
-                    state_indices,
-                ),
-                auxiliary_source_index=auxiliary_source_index,
-                producer_event=producer_event,
-            )
+        return PackedPrefillLaunchPlan(
+            plan=plan,
+            destination=destination,
+            destination_registration=destination_registration,
+            control=control,
+            components=self._packed_source_components(
+                source_main_pages,
+                transfer_info,
+                state_indices,
+            ),
+            auxiliary_source=auxiliary_source,
         )
+
+    def build_terminal_source_launch_plan(
+        self,
+        *,
+        room: int,
+        source_main_pages: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+        dflash_source: DFlashBoundaryPrefillSource | None,
+    ) -> tuple[PackedTerminalSourceIdentityPlan, PackedPrefillLaunchPlan]:
+        """Freeze terminal identity and transport ownership before launch.
+
+        :param room: Exact decoder-minted bootstrap room.
+        :param source_main_pages: Complete migration-owned source KV pages.
+        :param state_indices: Complete final source state-window pages.
+        :param dflash_source: Canonical-rank device row and frozen counters.
+        :returns: Exact terminal identity and immutable pre-launch transport.
+        """
+
+        if type(room) is not int or room < 0:
+            raise ValueError("terminal source room must be non-negative")
+        route = self._packed_source_route(room)
+        if route is None:
+            raise RuntimeError("terminal source requires a packed destination route")
+        transfer_info, registration = route
+        identity = self.terminal_source_identity_plan(transfer_info)
+        if identity is None:
+            raise RuntimeError("terminal source identity is unavailable")
+        auxiliary_source: PackedPrefillAuxiliarySource
+        if self._is_canonical_aux_writer():
+            if type(dflash_source) is not DFlashBoundaryPrefillSource:
+                raise TypeError(
+                    "canonical terminal source requires a DFlash device row"
+                )
+            auxiliary_source = PackedTerminalDFlashAuxiliarySource(dflash_source)
+        else:
+            if dflash_source is not None:
+                raise ValueError(
+                    "noncanonical terminal source cannot own DFlash transport"
+                )
+            auxiliary_source = PackedNoncanonicalAuxiliarySource()
+        return identity, self._build_packed_source_launch_plan(
+            transfer_info=transfer_info,
+            registration=registration,
+            source_main_pages=source_main_pages,
+            auxiliary_source=auxiliary_source,
+            state_indices=state_indices,
+        )
+
+    def _execute_packed_source_request(
+        self,
+        *,
+        transfer_info: TransferInfo,
+        registration: KVArgsRegisterInfo,
+        source_main_pages: npt.NDArray[np.int32],
+        auxiliary_source_index: int,
+        state_indices: Optional[List],
+        producer_event: torch.cuda.Event,
+    ) -> None:
+        """Execute one legacy packed request through the blocking actor.
+
+        :param transfer_info: Exact request metadata from the decoder.
+        :param registration: Generation-bound decoder registration.
+        :param source_main_pages: Complete source KV page projection.
+        :param auxiliary_source_index: Source auxiliary metadata row.
+        :param state_indices: Complete final source state page arrays.
+        :param producer_event: Event recorded after exact source cache writes.
+        """
+
+        runtime = self._packed_prefill_runtime
+        if runtime is None:
+            raise RuntimeError("packed source runtime ownership is incomplete")
+        auxiliary_source: PackedPrefillAuxiliarySource
+        if self._is_canonical_aux_writer():
+            auxiliary_source = PackedLegacyAuxiliarySource(
+                row_index=auxiliary_source_index
+            )
+        else:
+            auxiliary_source = PackedNoncanonicalAuxiliarySource()
+        launch_plan = self._build_packed_source_launch_plan(
+            transfer_info=transfer_info,
+            registration=registration,
+            source_main_pages=source_main_pages,
+            auxiliary_source=auxiliary_source,
+            state_indices=state_indices,
+        )
+        runtime.execute(launch_plan.bind_producer_event(producer_event))
 
     def _retire_successful_source_room(self, room: int) -> None:
         """Drop source-side request metadata after terminal submission.
@@ -5488,6 +5815,32 @@ class NixlKVManager(CommonKVManager):
             raise error
         if state not in ("DONE", "PROC"):
             raise RuntimeError(f"{context} returned unexpected state {state!r}")
+        return handle
+
+    def _post_terminal_transfer_once(self, handle: Any, context: str) -> Any:
+        """Post one statically enrolled terminal transfer without polling.
+
+        Terminal startup freezes both endpoint authority and registered memory
+        before request admission. A ``NOT_READY`` result therefore contradicts
+        the serving cohort and must fail closed under the native owner instead
+        of borrowing progress from a retry loop.
+
+        :param handle: Exact native-owner-armed NIXL transfer handle.
+        :param context: Operation label used in failure diagnostics.
+        :returns: The posted transfer handle.
+        """
+
+        try:
+            state = self.agent.transfer(handle)
+        except _NIXL_TRANSPORT_ERRORS:
+            logger.error(
+                "%s terminal post raised before terminality:\n%s",
+                context,
+                traceback.format_exc(),
+            )
+            raise
+        if state not in ("DONE", "PROC"):
+            raise RuntimeError(f"{context} terminal one-shot post returned {state!r}")
         return handle
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo) -> None:
@@ -7543,9 +7896,9 @@ class NixlKVManager(CommonKVManager):
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
-                assert waiting_req_bytes[0] == GUARD, (
-                    f"First message should be {GUARD}. Foreign traffic?"
-                )
+                assert (
+                    waiting_req_bytes[0] == GUARD
+                ), f"First message should be {GUARD}. Foreign traffic?"
                 waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
                 if room == "None":

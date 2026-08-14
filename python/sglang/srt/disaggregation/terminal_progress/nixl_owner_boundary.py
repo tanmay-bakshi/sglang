@@ -75,10 +75,15 @@ class NixlTerminalOwnerBoundary(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def release_transfer(self, transfer: object) -> None:
-        """Release one exact handle after terminal settlement.
+    def release_transfer(
+        self,
+        transfer: object,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Release one exact handle under teardown-ACK authority.
 
         :param transfer: Settled exact-generation transfer authority.
+        :param action: Matching one-shot source ACK action.
         """
 
         raise NotImplementedError

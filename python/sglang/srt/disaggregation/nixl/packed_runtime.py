@@ -100,7 +100,9 @@ from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFLASH_BOUNDARY_ROW_BYTES,
     DFlashBoundaryDeviceRowPool,
+    DFlashBoundaryPrefillSource,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -166,6 +168,14 @@ class PackedRuntimeManager(Protocol):
         :returns: Posted native handle.
         """
 
+    def _post_terminal_transfer_once(self, handle: object, context: str) -> object:
+        """Post one terminal handle after static peer enrollment.
+
+        :param handle: Exact native-owner-armed handle.
+        :param context: Stable diagnostic context.
+        :returns: Posted native handle.
+        """
+
     def record_failure(self, room: int, reason: str) -> None:
         """Record one room failure.
 
@@ -227,9 +237,113 @@ class PackedDecodeControlSender:
     send_message: Callable[[PackedWireMessage], None]
 
 
-@dataclasses.dataclass(frozen=True)
-class PackedPrefillSubmission:
-    """Complete source-local input for one packed request transfer.
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedLegacyAuxiliarySource:
+    """Canonical legacy DRAM metadata row.
+
+    :ivar row_index: Exact row copied from registered metadata buffers.
+    """
+
+    row_index: int
+
+    def __post_init__(self) -> None:
+        """Validate one non-negative source row."""
+
+        if type(self.row_index) is not int or self.row_index < 0:
+            raise ValueError("legacy auxiliary row_index must be non-negative")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedTerminalDFlashAuxiliarySource:
+    """Canonical terminal DFlash device-row ownership.
+
+    :ivar prefill_source: Active all-VRAM row and frozen scalar counters.
+    """
+
+    prefill_source: DFlashBoundaryPrefillSource
+
+    def __post_init__(self) -> None:
+        """Validate one active DFlash source."""
+
+        if type(self.prefill_source) is not DFlashBoundaryPrefillSource:
+            raise TypeError("prefill_source must be DFlashBoundaryPrefillSource")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedNoncanonicalAuxiliarySource:
+    """Explicit proof that this source rank owns no auxiliary transfer."""
+
+
+PackedPrefillAuxiliarySource = (
+    PackedLegacyAuxiliarySource
+    | PackedTerminalDFlashAuxiliarySource
+    | PackedNoncanonicalAuxiliarySource
+)
+PackedPrefillAuxiliaryOutcome = PackedAuxiliaryOutcome | PackedDFlashBoundaryOutcome
+
+
+def _validate_prefill_launch_fields(
+    *,
+    plan: PackedAuxiliaryPlan,
+    destination: PackedDestinationCapability,
+    destination_registration: PackedDestinationRegistration,
+    control: PackedDecodeControlSender,
+    components: tuple[PackedComponentPages, ...],
+    auxiliary_source: PackedPrefillAuxiliarySource,
+) -> tuple[PackedComponentPages, ...]:
+    """Validate the immutable source plan shared across launch and submission.
+
+    :param plan: Decoder-authored auxiliary metadata plan.
+    :param destination: Request-scoped destination capability.
+    :param destination_registration: Decode cache geometry.
+    :param control: Exact decoder route.
+    :param components: Main-KV and SWA page projections.
+    :param auxiliary_source: Explicit rank-local auxiliary ownership.
+    :returns: Canonical immutable component tuple.
+    """
+
+    if type(plan) is not PackedAuxiliaryPlan:
+        raise TypeError("packed source plan must be PackedAuxiliaryPlan")
+    if type(destination) is not PackedDestinationCapability:
+        raise TypeError("packed source destination must be PackedDestinationCapability")
+    if type(destination_registration) is not PackedDestinationRegistration:
+        raise TypeError(
+            "packed source registration must be PackedDestinationRegistration"
+        )
+    if type(control) is not PackedDecodeControlSender:
+        raise TypeError("packed source control must be PackedDecodeControlSender")
+    canonical_components = tuple(components)
+    if len(canonical_components) == 0:
+        raise ValueError("packed source request must contain cache components")
+    if any(
+        type(component) is not PackedComponentPages
+        for component in canonical_components
+    ):
+        raise TypeError("packed source components must be PackedComponentPages")
+    auxiliary_types = (
+        PackedLegacyAuxiliarySource,
+        PackedTerminalDFlashAuxiliarySource,
+        PackedNoncanonicalAuxiliarySource,
+    )
+    if type(auxiliary_source) not in auxiliary_types:
+        raise TypeError("packed source auxiliary ownership is invalid")
+    if type(auxiliary_source) is PackedTerminalDFlashAuxiliarySource:
+        if len(plan.destination_segments) != 1:
+            raise ValueError("terminal DFlash requires one destination row")
+        if plan.destination_segments[0].item_length != DFLASH_BOUNDARY_ROW_BYTES:
+            raise ValueError("terminal DFlash destination must contain eight bytes")
+    if destination.request_generation != plan.key.request_generation:
+        raise ValueError(
+            "packed source capability generation differs from auxiliary plan"
+        )
+    if destination.route.peer != control.peer:
+        raise ValueError("packed source control peer differs from destination")
+    return canonical_components
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedPrefillLaunchPlan:
+    """Complete source request ownership frozen before model submission.
 
     :ivar plan: Decoder-authored auxiliary metadata plan.
     :ivar destination: Request-scoped registered destination capability.
@@ -237,7 +351,61 @@ class PackedPrefillSubmission:
         canonical layout.
     :ivar control: Exact decoder control and native data route.
     :ivar components: Main-KV and SWA source/destination page projections.
-    :ivar auxiliary_source_index: Source metadata row copied by the canonical writer.
+    :ivar auxiliary_source: Explicit legacy, DFlash, or noncanonical ownership.
+    """
+
+    plan: PackedAuxiliaryPlan
+    destination: PackedDestinationCapability
+    destination_registration: PackedDestinationRegistration
+    control: PackedDecodeControlSender
+    components: tuple[PackedComponentPages, ...]
+    auxiliary_source: PackedPrefillAuxiliarySource
+
+    def __post_init__(self) -> None:
+        """Own and validate one immutable pre-launch plan."""
+
+        canonical_components = _validate_prefill_launch_fields(
+            plan=self.plan,
+            destination=self.destination,
+            destination_registration=self.destination_registration,
+            control=self.control,
+            components=self.components,
+            auxiliary_source=self.auxiliary_source,
+        )
+        object.__setattr__(self, "components", canonical_components)
+
+    def bind_producer_event(
+        self,
+        producer_event: torch.cuda.Event,
+    ) -> "PackedPrefillSubmission":
+        """Bind exact producer completion after model host submission.
+
+        :param producer_event: Event recorded after every source-side copy.
+        :returns: Complete immutable terminal transport submission.
+        """
+
+        return PackedPrefillSubmission(
+            plan=self.plan,
+            destination=self.destination,
+            destination_registration=self.destination_registration,
+            control=self.control,
+            components=self.components,
+            auxiliary_source=self.auxiliary_source,
+            producer_event=producer_event,
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedPrefillSubmission:
+    """Complete source-local input bound to producer completion.
+
+    :ivar plan: Decoder-authored auxiliary metadata plan.
+    :ivar destination: Request-scoped registered destination capability.
+    :ivar destination_registration: Decode cache geometry used to rebuild the
+        canonical layout.
+    :ivar control: Exact decoder control and native data route.
+    :ivar components: Main-KV and SWA source/destination page projections.
+    :ivar auxiliary_source: Explicit legacy, DFlash, or noncanonical ownership.
     :ivar producer_event: Event recorded after the exact source cache writes.
     """
 
@@ -246,42 +414,23 @@ class PackedPrefillSubmission:
     destination_registration: PackedDestinationRegistration
     control: PackedDecodeControlSender
     components: tuple[PackedComponentPages, ...]
-    auxiliary_source_index: int
+    auxiliary_source: PackedPrefillAuxiliarySource
     producer_event: torch.cuda.Event
 
     def __post_init__(self) -> None:
         """Own and validate one immutable source submission."""
 
-        if type(self.plan) is not PackedAuxiliaryPlan:
-            raise TypeError("packed source plan must be PackedAuxiliaryPlan")
-        if type(self.destination) is not PackedDestinationCapability:
-            raise TypeError(
-                "packed source destination must be PackedDestinationCapability"
-            )
-        if type(self.destination_registration) is not PackedDestinationRegistration:
-            raise TypeError(
-                "packed source registration must be PackedDestinationRegistration"
-            )
-        if type(self.control) is not PackedDecodeControlSender:
-            raise TypeError("packed source control must be PackedDecodeControlSender")
-        components = tuple(self.components)
-        object.__setattr__(self, "components", components)
-        if len(components) == 0:
-            raise ValueError("packed source request must contain cache components")
-        if any(type(component) is not PackedComponentPages for component in components):
-            raise TypeError("packed source components must be PackedComponentPages")
-        if type(self.auxiliary_source_index) is not int:
-            raise TypeError("packed auxiliary source index must be an integer")
-        if self.auxiliary_source_index < 0:
-            raise ValueError("packed auxiliary source index must be non-negative")
+        canonical_components = _validate_prefill_launch_fields(
+            plan=self.plan,
+            destination=self.destination,
+            destination_registration=self.destination_registration,
+            control=self.control,
+            components=self.components,
+            auxiliary_source=self.auxiliary_source,
+        )
+        object.__setattr__(self, "components", canonical_components)
         if not isinstance(self.producer_event, torch.cuda.Event):
             raise TypeError("packed source producer event must be a CUDA event")
-        if self.destination.request_generation != self.plan.key.request_generation:
-            raise ValueError(
-                "packed source capability generation differs from auxiliary plan"
-            )
-        if self.destination.route.peer != self.control.peer:
-            raise ValueError("packed source control peer differs from destination")
 
 
 def encode_packed_control_frames(
@@ -852,7 +1001,7 @@ class _PrefillRequestRecord:
     main_handle: object | None = None
     auxiliary_handle: object | None = None
     main_outcome: PackedWriterOutcome | None = None
-    auxiliary_outcome: PackedAuxiliaryOutcome | None = None
+    auxiliary_outcome: PackedPrefillAuxiliaryOutcome | None = None
     outcomes_sent: bool = False
     main_handle_released: bool = False
     auxiliary_handle_released: bool = False
@@ -869,6 +1018,8 @@ class _PrefillRequestRecord:
     terminal_teardown: PackedRequestTeardown | None = None
     terminal_ack_sent: bool = False
     terminal_quarantined: bool = False
+    terminal_main_failure_settled: bool = False
+    terminal_auxiliary_failure_settled: bool = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1207,11 +1358,11 @@ class PackedPrefillRuntime:
         settle_main: Callable[
             [PackedTransferLane, NativeTerminalOwnerAction], PackedWriterOutcome
         ],
-        settle_auxiliary: Callable[
-            [object, NativeTerminalOwnerAction], PackedAuxiliaryOutcome
-        ]
-        | None,
-    ) -> tuple[PackedWriterOutcome, PackedAuxiliaryOutcome | None]:
+        settle_auxiliary: (
+            Callable[[object, NativeTerminalOwnerAction], PackedPrefillAuxiliaryOutcome]
+            | None
+        ),
+    ) -> tuple[PackedWriterOutcome, PackedPrefillAuxiliaryOutcome | None]:
         """Construct and send outcomes under exact native terminal authority.
 
         Settlement callbacks may consume take-once native completion receipts,
@@ -1249,7 +1400,7 @@ class PackedPrefillRuntime:
         try:
             main_outcome = settle_main(lane, action)
             self._validate_terminal_main_outcome(record, main_outcome)
-            auxiliary_outcome: PackedAuxiliaryOutcome | None = None
+            auxiliary_outcome: PackedPrefillAuxiliaryOutcome | None = None
             if canonical:
                 if auxiliary_handle is None or settle_auxiliary is None:
                     raise RuntimeError("terminal auxiliary settlement disappeared")
@@ -1318,9 +1469,7 @@ class PackedPrefillRuntime:
     def settle_terminal_owner_teardown(
         self,
         action: NativeTerminalOwnerAction,
-        release_main: Callable[
-            [PackedTransferLane, NativeTerminalOwnerAction], None
-        ],
+        release_main: Callable[[PackedTransferLane, NativeTerminalOwnerAction], None],
         release_auxiliary: Callable[[object, NativeTerminalOwnerAction], None] | None,
     ) -> PackedRequestTeardownAck:
         """Release exact handles and ACK only under teardown owner authority.
@@ -1397,11 +1546,15 @@ class PackedPrefillRuntime:
         self,
         action: NativeTerminalOwnerAction,
         reason: str,
+        settle_main: Callable[[PackedTransferLane, NativeTerminalOwnerAction], None],
+        settle_auxiliary: Callable[[object, NativeTerminalOwnerAction], None] | None,
     ) -> None:
         """Retain every ambiguous source resource under native quarantine.
 
         :param action: Exact quarantine or process-fatal owner action.
         :param reason: Stable fail-closed evidence.
+        :param settle_main: Main-lane failure settlement callback.
+        :param settle_auxiliary: Canonical auxiliary failure settlement callback.
         """
 
         if type(action) is not NativeTerminalOwnerAction:
@@ -1411,8 +1564,34 @@ class PackedPrefillRuntime:
             NativeTerminalOwnerActionKind.PROCESS_FATAL,
         ):
             raise ValueError("source quarantine requires a failure owner action")
+        if not callable(settle_main):
+            raise TypeError("settle_main must be callable")
         record = self._terminal_record_for_action(action, action.kind)
         self._quarantine_terminal_record(record, reason)
+        canonical = self._writer_id == record.submission.plan.canonical_writer_id
+        with record.condition:
+            lane = record.main_lane
+            auxiliary_handle = record.auxiliary_handle
+            main_settled = record.terminal_main_failure_settled
+            auxiliary_settled = record.terminal_auxiliary_failure_settled
+        if (
+            canonical
+            and auxiliary_handle is not None
+            and not callable(settle_auxiliary)
+        ):
+            raise TypeError("canonical source failure requires auxiliary settlement")
+        if not canonical and settle_auxiliary is not None:
+            raise ValueError("noncanonical source has no auxiliary failure settlement")
+        if lane is not None and not main_settled:
+            settle_main(lane, action)
+            with record.condition:
+                record.terminal_main_failure_settled = True
+        if auxiliary_handle is not None and not auxiliary_settled:
+            if settle_auxiliary is None:
+                raise RuntimeError("auxiliary failure settlement disappeared")
+            settle_auxiliary(auxiliary_handle, action)
+            with record.condition:
+                record.terminal_auxiliary_failure_settled = True
 
     def retire_terminal_owner_request(
         self,
@@ -1675,7 +1854,7 @@ class PackedPrefillRuntime:
     def _validate_terminal_auxiliary_outcome(
         self,
         record: _PrefillRequestRecord,
-        outcome: PackedAuxiliaryOutcome,
+        outcome: PackedPrefillAuxiliaryOutcome,
     ) -> None:
         """Validate auxiliary settlement before control publication.
 
@@ -1683,8 +1862,11 @@ class PackedPrefillRuntime:
         :param outcome: Candidate canonical auxiliary outcome.
         """
 
-        if type(outcome) is not PackedAuxiliaryOutcome:
-            raise TypeError("auxiliary settlement must return PackedAuxiliaryOutcome")
+        if type(outcome) not in (
+            PackedAuxiliaryOutcome,
+            PackedDFlashBoundaryOutcome,
+        ):
+            raise TypeError("auxiliary settlement returned an unsupported outcome")
         if (
             outcome.plan != record.submission.plan
             or outcome.writer_id != self._writer_id
@@ -1692,6 +1874,22 @@ class PackedPrefillRuntime:
             raise RuntimeError(
                 "auxiliary settlement outcome differs from actor ownership"
             )
+
+    @staticmethod
+    def _auxiliary_handle_generation(
+        outcome: PackedPrefillAuxiliaryOutcome,
+    ) -> int:
+        """Return the native generation from either auxiliary schema.
+
+        :param outcome: Exact canonical legacy or DFlash boundary outcome.
+        :returns: Native transfer-handle generation named by teardown.
+        """
+
+        if type(outcome) is PackedAuxiliaryOutcome:
+            return outcome.native_dram_handle_generation
+        if type(outcome) is PackedDFlashBoundaryOutcome:
+            return outcome.native_handle_generation
+        raise TypeError("auxiliary outcome schema is unsupported")
 
     def _validate_terminal_teardown(
         self,
@@ -1725,7 +1923,7 @@ class PackedPrefillRuntime:
                 raise RuntimeError("canonical terminal teardown lacks aux outcome")
             if (
                 request.auxiliary_handle_generation
-                != auxiliary_outcome.native_dram_handle_generation
+                != self._auxiliary_handle_generation(auxiliary_outcome)
             ):
                 raise RuntimeError("terminal teardown names another aux handle")
         elif request.auxiliary_handle_generation is not None:
@@ -2099,11 +2297,12 @@ class PackedPrefillRuntime:
             record.main_handle = handle
             record.main_lane = lane
         record.main_transport_started_at = time.perf_counter()
+        if binding_digest is None:
+            post = self._manager._post_transfer_when_ready
+        else:
+            post = self._manager._post_terminal_transfer_once
         lane.post_submission(
-            lambda exact_handle: self._manager._post_transfer_when_ready(
-                exact_handle,
-                "packed main NIXL transfer",
-            )
+            lambda exact_handle: post(exact_handle, "packed main NIXL transfer")
         )
         return handle, lane
 
@@ -2239,6 +2438,9 @@ class PackedPrefillRuntime:
                 "terminal-owner auxiliary transport requires device-resident storage"
             )
         plan = record.submission.plan
+        auxiliary_source = record.submission.auxiliary_source
+        if type(auxiliary_source) is not PackedLegacyAuxiliarySource:
+            raise RuntimeError("legacy auxiliary transport requires a DRAM row source")
         source_ptrs = tuple(self._manager.kv_args.aux_data_ptrs)
         source_item_lens = tuple(self._manager.kv_args.aux_item_lens)
         if len(source_ptrs) != len(source_item_lens):
@@ -2257,8 +2459,7 @@ class PackedPrefillRuntime:
                 raise ValueError("source and destination auxiliary lengths differ")
             source_requests.append(
                 (
-                    source_ptr
-                    + source_length * record.submission.auxiliary_source_index,
+                    source_ptr + source_length * auxiliary_source.row_index,
                     source_length,
                     0,
                 )
@@ -2358,7 +2559,10 @@ class PackedPrefillRuntime:
         plan_segments = record.submission.plan.destination_segments
         if type(segments) is not tuple or len(segments) != len(plan_segments):
             raise ValueError("auxiliary receipt segment count differs from its plan")
-        source_index = record.submission.auxiliary_source_index
+        auxiliary_source = record.submission.auxiliary_source
+        if type(auxiliary_source) is not PackedLegacyAuxiliarySource:
+            raise RuntimeError("legacy auxiliary receipt requires a DRAM row source")
+        source_index = auxiliary_source.row_index
         for index, (segment, destination) in enumerate(
             zip(segments, plan_segments, strict=True)
         ):
@@ -2413,7 +2617,7 @@ class PackedPrefillRuntime:
                 raise RuntimeError("canonical teardown lacks auxiliary ownership")
             if (
                 request.auxiliary_handle_generation
-                != auxiliary_outcome.native_dram_handle_generation
+                != self._auxiliary_handle_generation(auxiliary_outcome)
             ):
                 raise RuntimeError("canonical teardown names another auxiliary handle")
             if not record.auxiliary_handle_released:

@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedChunkKey,
@@ -307,14 +308,23 @@ class RecordingTerminalOwner(NixlTerminalOwnerBoundary):
             raise RuntimeError("terminal cancellation changed authority")
         self.calls.append("cancel")
 
-    def release_transfer(self, transfer: object) -> None:
+    def release_transfer(
+        self,
+        transfer: object,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
         """Release one settled transfer exactly once.
 
         :param transfer: Exact settled transfer authority.
+        :param action: Matching source ACK action.
         """
 
         if transfer is not self.transfer:
             raise RuntimeError("terminal release changed authority")
+        if action.kind is not NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
+            raise RuntimeError("terminal release received another action")
+        if action.binding.digest != transfer[1]:
+            raise RuntimeError("terminal release changed request binding")
         self.calls.append("release")
         self.transfer = None
 
@@ -1293,8 +1303,7 @@ def test_dflash_target_and_draft_geometry_survives_asymmetric_tp(
 
         kv_args = KVArgs()
         kv_args.kv_data_ptrs = [
-            0x100000 + entry_index * 0x10000
-            for entry_index in range(len(item_lens))
+            0x100000 + entry_index * 0x10000 for entry_index in range(len(item_lens))
         ]
         kv_args.kv_data_lens = [item_len * 64 for item_len in item_lens]
         kv_args.kv_item_lens = item_lens

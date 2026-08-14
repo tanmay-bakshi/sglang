@@ -7,6 +7,7 @@ import traceback
 from collections.abc import Callable
 
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    CudaTerminalEventKind,
     CudaTerminalProducer,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
@@ -15,10 +16,6 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
-)
-from sglang.srt.disaggregation.terminal_progress.nixl_adapter import (
-    NixlDirectTerminalAgentBoundary,
-    NixlDirectTerminalOwnerAdapter,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalProducerDelivery,
@@ -33,7 +30,7 @@ from sglang.srt.disaggregation.terminal_progress.startup_producers import (
     build_terminal_startup_python_producer_plan,
 )
 
-TERMINAL_NATIVE_NIXL_PRODUCER_NAME = "terminal-native-nixl"
+TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME = "terminal-native-cuda-source"
 TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME = "terminal-native-cuda-scatter"
 
 
@@ -114,15 +111,15 @@ class TerminalRankNativeProducerPlan:
     """Role-specific native producer namespaces appended after Python.
 
     :ivar role: Local source or decode owner role.
-    :ivar specs: Complete contiguous native producer suffix.
-    :ivar nixl_producer_id: Native NIXL completion producer namespace.
+    :ivar specs: Complete one-producer native suffix.
+    :ivar cuda_source_producer_id: Source CUDA completion namespace, if any.
     :ivar cuda_scatter_producer_id: Decode CUDA completion namespace, if any.
     :ivar next_producer_id: First unallocated producer identifier.
     """
 
     role: TerminalOwnerRole
     specs: tuple[NativeTerminalRuntimeProducerSpec, ...]
-    nixl_producer_id: int
+    cuda_source_producer_id: int | None
     cuda_scatter_producer_id: int | None
     next_producer_id: int
 
@@ -131,19 +128,20 @@ class TerminalRankNativeProducerPlan:
 
         if type(self.role) is not TerminalOwnerRole:
             raise TypeError("role must be TerminalOwnerRole")
-        expected_count = 1 if self.role is TerminalOwnerRole.SOURCE else 2
+        expected_count = 1
         if type(self.specs) is not tuple or len(self.specs) != expected_count:
             raise ValueError("native producer population disagrees with its role")
         if any(
             type(spec) is not NativeTerminalRuntimeProducerSpec for spec in self.specs
         ):
             raise TypeError("specs contain an invalid producer specification")
+        first_producer_id = self.specs[0].registration.producer_id
         producer_ids = tuple(spec.registration.producer_id for spec in self.specs)
         if producer_ids != tuple(
-            range(self.nixl_producer_id, self.nixl_producer_id + expected_count)
+            range(first_producer_id, first_producer_id + expected_count)
         ):
-            raise ValueError("native producer IDs must be contiguous and NIXL-first")
-        if self.next_producer_id != self.nixl_producer_id + expected_count:
+            raise ValueError("native producer IDs must be contiguous")
+        if self.next_producer_id != first_producer_id + expected_count:
             raise ValueError("next_producer_id must follow every native producer")
         if any(
             spec.delivery is not NativeTerminalProducerDelivery.NATIVE
@@ -161,11 +159,16 @@ class TerminalRankNativeProducerPlan:
             for spec in self.specs
         ):
             raise ValueError("native producer role disagrees with the local owner")
-        expected_cuda_id = (
-            None if self.role is TerminalOwnerRole.SOURCE else self.nixl_producer_id + 1
+        expected_cuda_source_id = (
+            first_producer_id if self.role is TerminalOwnerRole.SOURCE else None
         )
-        if self.cuda_scatter_producer_id != expected_cuda_id:
-            raise ValueError("CUDA producer presence disagrees with the local role")
+        expected_cuda_scatter_id = (
+            first_producer_id if self.role is TerminalOwnerRole.DECODE else None
+        )
+        if self.cuda_source_producer_id != expected_cuda_source_id:
+            raise ValueError("source CUDA producer disagrees with the local role")
+        if self.cuda_scatter_producer_id != expected_cuda_scatter_id:
+            raise ValueError("scatter CUDA producer disagrees with the local role")
 
 
 def _native_role(role: TerminalOwnerRole) -> NativeTerminalOwnerRole:
@@ -239,48 +242,42 @@ def build_terminal_rank_native_producer_plan(
 
     _require_consistent_binding(binding)
     local = binding.advertisement
-    nixl_producer_id = binding.python_producers.next_producer_id
-    specs = [
-        _native_producer_spec(
-            nixl_producer_id,
-            TERMINAL_NATIVE_NIXL_PRODUCER_NAME,
-            local.role,
-        )
-    ]
+    cuda_producer_id = binding.python_producers.next_producer_id
+    cuda_source_producer_id: int | None = None
     cuda_scatter_producer_id: int | None = None
-    if local.role is TerminalOwnerRole.DECODE:
-        cuda_scatter_producer_id = nixl_producer_id + 1
-        specs.append(
-            _native_producer_spec(
-                cuda_scatter_producer_id,
-                TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME,
-                local.role,
-            )
-        )
+    if local.role is TerminalOwnerRole.SOURCE:
+        cuda_source_producer_id = cuda_producer_id
+        cuda_producer_name = TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME
+    else:
+        cuda_scatter_producer_id = cuda_producer_id
+        cuda_producer_name = TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME
+    specs = (_native_producer_spec(cuda_producer_id, cuda_producer_name, local.role),)
     return TerminalRankNativeProducerPlan(
         role=local.role,
-        specs=tuple(specs),
-        nixl_producer_id=nixl_producer_id,
+        specs=specs,
+        cuda_source_producer_id=cuda_source_producer_id,
         cuda_scatter_producer_id=cuda_scatter_producer_id,
-        next_producer_id=nixl_producer_id + len(specs),
+        next_producer_id=cuda_producer_id + len(specs),
     )
 
 
-def _bind_nixl_producer(
-    agent: NixlDirectTerminalAgentBoundary,
+def _bind_cuda_source_producer(
     runtime: NativeTerminalRuntime,
-) -> NixlDirectTerminalOwnerAdapter:
-    """Bind the rank's qualified direct NIXL producer.
+    *,
+    testing: bool,
+) -> CudaTerminalProducer:
+    """Bind the source rank's direct CUDA completion producer.
 
-    :param agent: Initialized rank-local NIXL agent.
     :param runtime: Dormant immutable native runtime.
-    :returns: Runtime-owned direct terminal adapter.
+    :param testing: Whether deterministic native test controls are required.
+    :returns: Runtime-owned direct CUDA producer.
     """
 
-    return NixlDirectTerminalOwnerAdapter.from_runtime(
-        agent,
+    return CudaTerminalProducer.from_runtime(
         runtime,
-        TERMINAL_NATIVE_NIXL_PRODUCER_NAME,
+        TERMINAL_NATIVE_CUDA_SOURCE_PRODUCER_NAME,
+        CudaTerminalEventKind.SOURCE_PRODUCER_COMPLETED,
+        testing=testing,
     )
 
 
@@ -299,6 +296,7 @@ def _bind_cuda_scatter_producer(
     return CudaTerminalProducer.from_runtime(
         runtime,
         TERMINAL_NATIVE_CUDA_SCATTER_PRODUCER_NAME,
+        CudaTerminalEventKind.DECODE_SCATTER_TERMINAL,
         testing=testing,
     )
 
@@ -310,7 +308,7 @@ class TerminalRankRuntimeEnrollment:
     _config: TerminalRankRuntimeConfig
     _native_plan: TerminalRankNativeProducerPlan
     _runtime: NativeTerminalRuntime
-    _nixl: NixlDirectTerminalOwnerAdapter
+    _cuda_source: CudaTerminalProducer | None
     _cuda_scatter: CudaTerminalProducer | None
     _native_producer_disposition: TerminalRankNativeProducerDisposition
     _retirement_failure: str | None
@@ -323,7 +321,7 @@ class TerminalRankRuntimeEnrollment:
         config: TerminalRankRuntimeConfig,
         native_plan: TerminalRankNativeProducerPlan,
         runtime: NativeTerminalRuntime,
-        nixl: NixlDirectTerminalOwnerAdapter,
+        cuda_source: CudaTerminalProducer | None,
         cuda_scatter: CudaTerminalProducer | None,
     ) -> None:
         """Retain exact process-lifetime ownership.
@@ -332,7 +330,7 @@ class TerminalRankRuntimeEnrollment:
         :param config: Frozen queue and retirement bounds.
         :param native_plan: Role-specific native producer namespace.
         :param runtime: Sole dormant native owner runtime.
-        :param nixl: Direct NIXL completion producer.
+        :param cuda_source: Source-only CUDA completion producer.
         :param cuda_scatter: Decode-only CUDA scatter producer.
         """
 
@@ -340,7 +338,7 @@ class TerminalRankRuntimeEnrollment:
         self._config = config
         self._native_plan = native_plan
         self._runtime = runtime
-        self._nixl = nixl
+        self._cuda_source = cuda_source
         self._cuda_scatter = cuda_scatter
         self._native_producer_disposition = TerminalRankNativeProducerDisposition.OPEN
         self._retirement_failure = None
@@ -374,15 +372,6 @@ class TerminalRankRuntimeEnrollment:
         return self._runtime
 
     @property
-    def nixl(self) -> NixlDirectTerminalOwnerAdapter:
-        """Return the direct NIXL producer without transferring its lifetime.
-
-        :returns: Rank-local direct NIXL adapter.
-        """
-
-        return self._nixl
-
-    @property
     def cuda_scatter(self) -> CudaTerminalProducer | None:
         """Return the decode CUDA producer when this is a decode rank.
 
@@ -390,6 +379,15 @@ class TerminalRankRuntimeEnrollment:
         """
 
         return self._cuda_scatter
+
+    @property
+    def cuda_source(self) -> CudaTerminalProducer | None:
+        """Return the source CUDA producer when this is a source rank.
+
+        :returns: Source-only CUDA completion producer.
+        """
+
+        return self._cuda_source
 
     @property
     def native_producer_disposition(self) -> TerminalRankNativeProducerDisposition:
@@ -474,21 +472,27 @@ class TerminalRankRuntimeEnrollment:
     def _retire_native_producers_locked(self) -> None:
         """Perform one ordered native producer retirement under the lock."""
 
-        self._nixl.stop_admission()
+        cuda_source = self._cuda_source
         cuda_scatter = self._cuda_scatter
+        if cuda_source is not None:
+            cuda_source.stop_admission()
         if cuda_scatter is not None:
             cuda_scatter.stop_admission()
         deadline = (
             time.monotonic() + self._config.native_producer_retirement_timeout_seconds
         )
-        if not self._join_before_deadline(self._nixl.join, deadline):
-            raise TimeoutError("NIXL terminal producer retirement timed out")
+        if cuda_source is not None and not self._join_before_deadline(
+            cuda_source.join,
+            deadline,
+        ):
+            raise TimeoutError("source CUDA terminal producer retirement timed out")
         if cuda_scatter is not None and not self._join_before_deadline(
             cuda_scatter.join,
             deadline,
         ):
             raise TimeoutError("CUDA terminal producer retirement timed out")
-        self._nixl.close()
+        if cuda_source is not None:
+            cuda_source.close()
         if cuda_scatter is not None:
             cuda_scatter.close()
 
@@ -566,7 +570,6 @@ class TerminalRankRuntimeEnrollmentFactory:
 
     def create(
         self,
-        nixl_agent: NixlDirectTerminalAgentBoundary,
         *,
         cuda_testing: bool = False,
     ) -> TerminalRankRuntimeEnrollment:
@@ -575,7 +578,6 @@ class TerminalRankRuntimeEnrollmentFactory:
         Construction is consumed before the first native allocation. A failed
         attempt cannot be retried against a partially initialized owner.
 
-        :param nixl_agent: Initialized rank-local direct NIXL agent.
         :param cuda_testing: Whether decode CUDA test controls are required.
         :returns: Sole rank-lifetime runtime enrollment.
         """
@@ -608,9 +610,14 @@ class TerminalRankRuntimeEnrollmentFactory:
                 publisher_capacity=config.publisher_capacity,
                 observation_capacity=config.observation_capacity,
             )
-            nixl = _bind_nixl_producer(nixl_agent, runtime)
+            cuda_source: CudaTerminalProducer | None = None
             cuda_scatter: CudaTerminalProducer | None = None
-            if self._native_plan.role is TerminalOwnerRole.DECODE:
+            if self._native_plan.role is TerminalOwnerRole.SOURCE:
+                cuda_source = _bind_cuda_source_producer(
+                    runtime,
+                    testing=cuda_testing,
+                )
+            else:
                 cuda_scatter = _bind_cuda_scatter_producer(
                     runtime,
                     testing=cuda_testing,
@@ -620,7 +627,7 @@ class TerminalRankRuntimeEnrollmentFactory:
                 config=config,
                 native_plan=self._native_plan,
                 runtime=runtime,
-                nixl=nixl,
+                cuda_source=cuda_source,
                 cuda_scatter=cuda_scatter,
             )
             self._enrollment = enrollment

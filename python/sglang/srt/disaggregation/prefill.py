@@ -186,6 +186,7 @@ class PrefillBootstrapQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
+        kv_args.terminal_request_capacity = self.scheduler.max_running_requests * 2
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         layer_shard_enabled = getattr(

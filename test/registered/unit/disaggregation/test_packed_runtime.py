@@ -164,6 +164,17 @@ class _FakeManager:
         del context
         return handle
 
+    def _post_terminal_transfer_once(self, handle: object, context: str) -> object:
+        """Return one exact fake terminal handle without retrying.
+
+        :param handle: Exact fake handle.
+        :param context: Diagnostic operation label.
+        :returns: The supplied handle.
+        """
+
+        del context
+        return handle
+
     def record_failure(self, room: int, reason: str) -> None:
         """Record one actor failure.
 
