@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 import numpy.typing as npt
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -30,6 +31,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryOutcome,
     PackedAuxiliaryPlan,
     PackedChunkKey,
+    PackedDFlashBoundaryOutcome,
     PackedPrepare,
     PackedProtocolState,
     PackedReady,
@@ -88,6 +90,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
+    PackedDFlashBoundaryDecodeAdoption,
     PackedRequestChunkPlan,
     PackedRequestCommitReceipt,
     PackedRequestPublication,
@@ -95,6 +98,9 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
+)
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryDeviceRowPool,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -627,6 +633,129 @@ class AdoptedPackedAuxiliarySlotAllocation:
         self._require_reservation(reservation)
         if owner is not self._owner:
             raise RuntimeError("metadata reservation owner is stale")
+
+
+class DFlashBoundaryPackedAuxiliarySlotAllocation:
+    """Give one packed transaction exclusive ownership of a pool reservation."""
+
+    def __init__(self, pool: DFlashBoundaryDeviceRowPool) -> None:
+        """Initialize one unallocated terminal DFlash boundary row.
+
+        :param pool: Process-lifetime registered destination row pool.
+        """
+
+        if type(pool) is not DFlashBoundaryDeviceRowPool:
+            raise TypeError("pool must be DFlashBoundaryDeviceRowPool")
+        self._pool = pool
+        self._reservation: object | None = None
+        self._owner: object | None = None
+        self._released = False
+        self._quarantined = False
+        self._lock = threading.Lock()
+
+    @property
+    def released(self) -> bool:
+        """Return whether the exact row generation was returned.
+
+        :returns: Exact release state.
+        """
+
+        with self._lock:
+            return self._released
+
+    @property
+    def quarantined(self) -> bool:
+        """Return whether the exact row was withheld from reuse.
+
+        :returns: Exact quarantine state.
+        """
+
+        with self._lock:
+            return self._quarantined
+
+    def allocate_packed_auxiliary_slot(self, owner: object) -> object:
+        """Acquire one pool row under the packed allocation authority.
+
+        :param owner: Exact process-local reservation authority.
+        :returns: Opaque pool reservation.
+        """
+
+        with self._lock:
+            if self._reservation is not None:
+                raise RuntimeError("DFlash boundary row was already allocated")
+            reservation = self._pool.allocate_packed_auxiliary_slot(owner)
+            self._reservation = reservation
+            self._owner = owner
+            return reservation
+
+    def packed_auxiliary_slot_reservation_snapshot(
+        self,
+        reservation: object,
+    ) -> PackedAuxiliarySlotReservationSnapshot:
+        """Return the exact live pool generation and registered geometry.
+
+        :param reservation: Exact pool reservation.
+        :returns: Immutable live row snapshot.
+        """
+
+        with self._lock:
+            self._require_reservation(reservation)
+            return self._pool.packed_auxiliary_slot_reservation_snapshot(
+                reservation
+            )
+
+    def release_packed_auxiliary_slot(
+        self,
+        reservation: object,
+        owner: object,
+    ) -> None:
+        """Return the exact completed row to process-lifetime ownership.
+
+        :param reservation: Exact pool reservation.
+        :param owner: Exact reservation authority.
+        """
+
+        with self._lock:
+            self._require_owner(reservation, owner)
+            if self._released or self._quarantined:
+                raise RuntimeError("DFlash boundary row is already terminal")
+            self._pool.release_packed_auxiliary_slot(reservation, owner)
+            self._released = True
+
+    def quarantine_packed_auxiliary_slot(
+        self,
+        reservation: object,
+        owner: object,
+    ) -> None:
+        """Permanently withhold one ambiguous row from reuse.
+
+        :param reservation: Exact pool reservation.
+        :param owner: Exact reservation authority.
+        """
+
+        with self._lock:
+            self._require_owner(reservation, owner)
+            if self._released:
+                raise RuntimeError("released DFlash boundary row cannot be quarantined")
+            if self._quarantined:
+                return
+            self._pool.quarantine_packed_auxiliary_slot(reservation, owner)
+            self._quarantined = True
+
+    def _require_reservation(self, reservation: object) -> None:
+        if self._reservation is None or reservation is not self._reservation:
+            raise RuntimeError("DFlash boundary reservation belongs to another request")
+
+    def _require_owner(self, reservation: object, owner: object) -> None:
+        self._require_reservation(reservation)
+        if owner is not self._owner:
+            raise RuntimeError("DFlash boundary reservation owner is stale")
+
+
+PackedDecodeAuxiliarySlotAllocation = (
+    AdoptedPackedAuxiliarySlotAllocation
+    | DFlashBoundaryPackedAuxiliarySlotAllocation
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2404,7 +2533,7 @@ class _DecodeRequestRecord:
     """Decode actor state retained through scheduler metadata consumption."""
 
     transaction: PackedDecodeRequestTransaction
-    auxiliary_allocation: AdoptedPackedAuxiliarySlotAllocation
+    auxiliary_allocation: PackedDecodeAuxiliarySlotAllocation
     chunk_keys: tuple[PackedChunkKey, ...]
     routes: dict[StagingWriterId, PackedControlSender] = dataclasses.field(
         default_factory=dict
@@ -2565,6 +2694,7 @@ class PackedDecodeRuntime:
         arena: PackedStagingArena,
         runtime_artifacts: PackedNixlRuntimeArtifactCohort,
         visibility_policy: PackedDestinationVisibilityPolicy,
+        dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None = None,
     ) -> None:
         """Initialize the process-lifetime decode actor.
 
@@ -2572,6 +2702,7 @@ class PackedDecodeRuntime:
         :param arena: Persistent adopted staging arena.
         :param runtime_artifacts: Exact native runtime cohort.
         :param visibility_policy: Same-host route visibility policy.
+        :param dflash_boundary_pool: Optional registered terminal DFlash rows.
         """
 
         if manager.attn_tp_size not in (1, 2):
@@ -2582,6 +2713,14 @@ class PackedDecodeRuntime:
         self._arena = arena
         self._runtime_artifacts = runtime_artifacts
         self._visibility_policy = visibility_policy
+        if (
+            dflash_boundary_pool is not None
+            and type(dflash_boundary_pool) is not DFlashBoundaryDeviceRowPool
+        ):
+            raise TypeError(
+                "dflash_boundary_pool must be DFlashBoundaryDeviceRowPool"
+            )
+        self._dflash_boundary_pool = dflash_boundary_pool
         self._outcomes = PackedDestinationOutcomeCoordinator(
             arena.protocol,
             _UnexpectedVisibilityActionExecutor(),
@@ -2625,6 +2764,15 @@ class PackedDecodeRuntime:
         )
 
     @property
+    def dflash_boundary_pool(self) -> DFlashBoundaryDeviceRowPool | None:
+        """Return the registered terminal DFlash destination rows.
+
+        :returns: Exact process-lifetime row pool, or ``None`` for legacy mode.
+        """
+
+        return self._dflash_boundary_pool
+
+    @property
     def ready(self) -> bool:
         """Return whether scheduler metadata ownership is attached.
 
@@ -2665,7 +2813,7 @@ class PackedDecodeRuntime:
         *,
         room_id: int,
         request_owner: object,
-        metadata_buffer_index: int,
+        metadata_buffer_index: int | None,
         allocation_lease: DecodeAllocationLease,
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
@@ -2675,7 +2823,8 @@ class PackedDecodeRuntime:
 
         :param room_id: Decoder-minted room.
         :param request_owner: Exact retained decode request.
-        :param metadata_buffer_index: Already reserved metadata row.
+        :param metadata_buffer_index: Legacy pre-reserved metadata row. Terminal
+            DFlash requests must pass ``None`` and acquire registered VRAM here.
         :param allocation_lease: Exact pinned decode allocation.
         :param allocation_authority: Exact allocation authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
@@ -2686,8 +2835,10 @@ class PackedDecodeRuntime:
         with self._lock:
             auxiliary_authority = self._auxiliary_authority
             metadata_allocator = self._metadata_allocator
-            if auxiliary_authority is None or metadata_allocator is None:
+            if auxiliary_authority is None:
                 raise RuntimeError("packed decode scheduler ownership is unavailable")
+            if self._dflash_boundary_pool is None and metadata_allocator is None:
+                raise RuntimeError("packed metadata allocator is unavailable")
             if room_id in self._records_by_room:
                 raise RuntimeError("packed decode room is already registered")
 
@@ -2769,29 +2920,50 @@ class PackedDecodeRuntime:
                 for writer in snapshot.writer_manifest.writers
             ),
         )
-        auxiliary_allocation = AdoptedPackedAuxiliarySlotAllocation(
-            metadata_allocator,
-            metadata_buffer_index,
-            self._manager.kv_args,
-        )
+        dflash_boundary_pool = self._dflash_boundary_pool
+        if dflash_boundary_pool is None:
+            if metadata_allocator is None:
+                raise RuntimeError("packed metadata allocator is unavailable")
+            if type(metadata_buffer_index) is not int:
+                raise TypeError("legacy metadata_buffer_index must be an integer")
+            auxiliary_allocation: PackedDecodeAuxiliarySlotAllocation = (
+                AdoptedPackedAuxiliarySlotAllocation(
+                    metadata_allocator,
+                    metadata_buffer_index,
+                    self._manager.kv_args,
+                )
+            )
+        else:
+            if metadata_buffer_index is not None:
+                raise ValueError(
+                    "terminal DFlash transaction cannot adopt a legacy metadata row"
+                )
+            auxiliary_allocation = DFlashBoundaryPackedAuxiliarySlotAllocation(
+                dflash_boundary_pool
+            )
         auxiliary_lease = auxiliary_authority.acquire(auxiliary_allocation)
-        transaction = PackedDecodeRequestTransaction(
-            room_id=room_id,
-            request_owner=request_owner,
-            allocation_lease=allocation_lease,
-            allocation_authority=allocation_authority,
-            lifecycle_authority=lifecycle_authority,
-            protocol=self._arena.protocol,
-            outcome_coordinator=self._outcomes,
-            chunk_plans=(plan,),
-            auxiliary_allocation_lease=auxiliary_lease,
-            auxiliary_allocation_authority=auxiliary_authority,
-            destination_process_generation=uuid.UUID(
-                self._manager.process_generation
-            ).bytes,
-            native_route_digest=self._visibility_policy.digest,
-            runtime_cohort_digest=self._runtime_artifacts.digest,
-        )
+        try:
+            transaction = PackedDecodeRequestTransaction(
+                room_id=room_id,
+                request_owner=request_owner,
+                allocation_lease=allocation_lease,
+                allocation_authority=allocation_authority,
+                lifecycle_authority=lifecycle_authority,
+                protocol=self._arena.protocol,
+                outcome_coordinator=self._outcomes,
+                chunk_plans=(plan,),
+                auxiliary_allocation_lease=auxiliary_lease,
+                auxiliary_allocation_authority=auxiliary_authority,
+                destination_process_generation=uuid.UUID(
+                    self._manager.process_generation
+                ).bytes,
+                native_route_digest=self._visibility_policy.digest,
+                runtime_cohort_digest=self._runtime_artifacts.digest,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            auxiliary_authority.cancel_unpublished(auxiliary_lease)
+            auxiliary_authority.retire_terminal(auxiliary_lease)
+            raise
         request_key = PackedRequestKey.from_chunk_key(key)
         with self._lock:
             if request_key in self._records or room_id in self._records_by_room:
@@ -3041,6 +3213,19 @@ class PackedDecodeRuntime:
                     record,
                     authenticated_writer_id,
                 )
+            if type(message) is PackedDFlashBoundaryOutcome:
+                if self._dflash_boundary_pool is None:
+                    raise RuntimeError(
+                        "DFlash boundary outcome reached a legacy auxiliary runtime"
+                    )
+                record.transaction.handle_dflash_boundary_outcome(
+                    message,
+                    authenticated_writer_id,
+                )
+                return self._take_writer_manifest_signal(
+                    record,
+                    authenticated_writer_id,
+                )
             if type(message) is PackedRequestTeardownAck:
                 receipt = record.transaction.handle_teardown_ack(
                     message,
@@ -3255,6 +3440,7 @@ class PackedDecodeRuntime:
     def complete_terminal_owner_metadata_consumption(
         self,
         transaction: PackedDecodeRequestTransaction,
+        dflash_adoption: PackedDFlashBoundaryDecodeAdoption | None = None,
     ) -> None:
         """Release copied metadata while retaining lifecycle actor identity.
 
@@ -3262,6 +3448,8 @@ class PackedDecodeRuntime:
         what makes teardown inventory authoritative after scheduler adoption.
 
         :param transaction: Exact adopted terminal-owner transaction.
+        :param dflash_adoption: Exact row-copy authority after its CUDA event
+            reached terminal success.
         """
 
         record = self._record_for_transaction(transaction)
@@ -3275,7 +3463,10 @@ class PackedDecodeRuntime:
                     raise RuntimeError("metadata consumption lacks allocation adoption")
                 if record.metadata_consumed_by_owner:
                     raise RuntimeError("metadata consumption authority was replayed")
-                transaction.complete_auxiliary_consumption_on_scheduler_thread(consumer)
+                transaction.complete_auxiliary_consumption_on_scheduler_thread(
+                    consumer,
+                    dflash_adoption=dflash_adoption,
+                )
                 if not record.auxiliary_allocation.released:
                     raise RuntimeError(
                         "packed metadata adapter did not release its row"
@@ -3787,7 +3978,7 @@ def _request_key_for_message(message: PackedWireMessage) -> PackedRequestKey:
         return PackedRequestKey.from_chunk_key(message.key)
     if type(message) is PackedAuxiliaryPlan:
         return message.key
-    if type(message) is PackedAuxiliaryOutcome:
+    if type(message) in (PackedAuxiliaryOutcome, PackedDFlashBoundaryOutcome):
         return message.plan.key
     if type(message) in (PackedRequestTeardown, PackedRequestTeardownAck):
         return message.key

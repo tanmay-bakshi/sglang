@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -14,6 +15,9 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLease,
     DecodeAllocationLeaseAuthority,
     DecodeWriterManifest,
+)
+from sglang.srt.disaggregation.common.packed_auxiliary_allocation import (
+    PackedAuxiliarySlotReservationSnapshot,
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryDestinationSegment,
@@ -63,6 +67,9 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestTransactionState,
+)
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryDeviceRowPool,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
@@ -297,12 +304,15 @@ class _DecodeTransaction:
     def complete_auxiliary_consumption_on_scheduler_thread(
         self,
         consumer: object,
+        dflash_adoption: object | None = None,
     ) -> None:
         """Record consumption and release the fake metadata row.
 
         :param consumer: Exact scheduler consumer authority.
+        :param dflash_adoption: Optional terminal DFlash copy authority.
         """
 
+        assert dflash_adoption is None
         self.consumers.append(consumer)
         self.auxiliary_allocation.released = True
 
@@ -598,12 +608,15 @@ class _DecodeLifecycleTransaction:
     def complete_auxiliary_consumption_on_scheduler_thread(
         self,
         consumer: object,
+        dflash_adoption: object | None = None,
     ) -> None:
         """Release the configured metadata row after scheduler adoption.
 
         :param consumer: Exact fake scheduler consumer.
+        :param dflash_adoption: Optional terminal DFlash copy authority.
         """
 
+        assert dflash_adoption is None
         del consumer
         allocation = self.auxiliary_allocation
         if allocation is None:
@@ -1409,6 +1422,69 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
     assert tuple(message.writer_id for message in ready_messages) == (
         allocation_snapshot.writer_manifest.writers
     )
+
+
+def test_terminal_dflash_transaction_uses_registered_pool_not_metadata_allocator() -> (
+    None
+):
+    """Allocate and cancel a terminal boundary row without legacy metadata."""
+
+    artifacts = _runtime_artifacts()
+    policy = build_same_host_visibility_policy(artifacts)
+    decode_manager = _PackedDecodeManager(_packed_kv_args(item_length=1024))
+    protocol = PackedDecodeProtocol(_PackedLeaseAllocator())
+    pool = object.__new__(DFlashBoundaryDeviceRowPool)
+    row_allocator = Mock()
+    reservation = object()
+    slot = PackedAuxiliarySlotReservationSnapshot(
+        metadata_buffer_index=11,
+        metadata_slot_generation=b"g" * 16,
+        destination_segments=(
+            PackedAuxiliaryDestinationSegment(
+                address=0x700000,
+                item_length=8,
+            ),
+        ),
+    )
+    row_allocator.allocate_packed_auxiliary_slot.return_value = reservation
+    row_allocator.packed_auxiliary_slot_reservation_snapshot.return_value = slot
+    pool._row_allocator = row_allocator
+    decode_runtime = PackedDecodeRuntime(
+        decode_manager,
+        _PackedDecodeArena(protocol),
+        artifacts,
+        policy,
+        pool,
+    )
+    metadata_allocator = _PackedMetadataAllocator()
+    decode_runtime.attach_scheduler(metadata_allocator, object())
+    allocation_authority, allocation_lease, owner = _cache_hit_allocation(
+        decode_manager
+    )
+
+    transaction = decode_runtime.prepare_transaction(
+        room_id=94,
+        request_owner=owner,
+        metadata_buffer_index=None,
+        allocation_lease=allocation_lease,
+        allocation_authority=allocation_authority,
+        lifecycle_authority=decode_manager,
+        source_tp_size=2,
+    )
+
+    publication = transaction.prepared_publication()
+    assert publication.auxiliary_plan.metadata_buffer_index == 11
+    assert publication.auxiliary_plan.destination_segments == slot.destination_segments
+    assert metadata_allocator.released == []
+
+    assert decode_runtime.cancel_unpublished(transaction) is owner
+    assert metadata_allocator.released == []
+    row_allocator.release_packed_auxiliary_slot.assert_called_once()
+    released_reservation, released_owner = (
+        row_allocator.release_packed_auxiliary_slot.call_args.args
+    )
+    assert released_reservation is reservation
+    assert released_owner is not None
 
 
 def test_tp2_rank_one_decode_runtime_uses_destination_local_writer() -> None:

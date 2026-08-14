@@ -34,6 +34,8 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryPlan,
     PackedChunkKey,
     PackedDecodeProtocol,
+    PackedDFlashBoundaryMetadata,
+    PackedDFlashBoundaryOutcome,
     PackedLayoutSpec,
     PackedLease,
     PackedPrepare,
@@ -75,6 +77,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
+    PackedDFlashBoundaryDecodeAdoption,
     PackedRequestChunkPlan,
     PackedRequestPublication,
     PackedRequestTransactionError,
@@ -156,13 +159,33 @@ class _AuxiliaryAllocator:
     quarantines: list[object]
     releases: list[object]
 
-    def __init__(self) -> None:
-        """Initialize one allocator with no live reservation."""
+    def __init__(
+        self,
+        segments: tuple[PackedAuxiliaryDestinationSegment, ...] | None = None,
+    ) -> None:
+        """Initialize one allocator with no live reservation.
+
+        :param segments: Optional exact registered destination geometry.
+        """
 
         self._owner = None
         self._reservation = None
         self.quarantines = []
         self.releases = []
+        self._segments = (
+            (
+                PackedAuxiliaryDestinationSegment(
+                    address=0xA00000,
+                    item_length=128,
+                ),
+                PackedAuxiliaryDestinationSegment(
+                    address=0xA01000,
+                    item_length=64,
+                ),
+            )
+            if segments is None
+            else segments
+        )
 
     def allocate_packed_auxiliary_slot(self, owner: object) -> object:
         """Allocate one fake metadata row.
@@ -190,16 +213,7 @@ class _AuxiliaryAllocator:
         return PackedAuxiliarySlotReservationSnapshot(
             metadata_buffer_index=17,
             metadata_slot_generation=bytes(range(PACKED_REQUEST_GENERATION_BYTES)),
-            destination_segments=(
-                PackedAuxiliaryDestinationSegment(
-                    address=0xA00000,
-                    item_length=128,
-                ),
-                PackedAuxiliaryDestinationSegment(
-                    address=0xA01000,
-                    item_length=64,
-                ),
-            ),
+            destination_segments=self._segments,
         )
 
     def release_packed_auxiliary_slot(
@@ -480,6 +494,7 @@ def _fixture(
     swa_logical_start: int = 2,
     swa_logical_length: int = 2,
     page_size: int = 1,
+    auxiliary_segments: tuple[PackedAuxiliaryDestinationSegment, ...] | None = None,
 ) -> _Fixture:
     """Allocate one complete CPU request with FULL, SWA, and zero Mamba.
 
@@ -490,6 +505,7 @@ def _fixture(
     :param swa_logical_start: Request-local SWA migration start.
     :param swa_logical_length: Exact SWA migration length.
     :param page_size: Tokens represented by one allocation page.
+    :param auxiliary_segments: Optional exact auxiliary destination geometry.
     :returns: Complete transaction fixture.
     """
 
@@ -557,7 +573,7 @@ def _fixture(
         ),
     )
     snapshot = allocation_authority.snapshot(allocation_lease)
-    auxiliary_allocator = _AuxiliaryAllocator()
+    auxiliary_allocator = _AuxiliaryAllocator(auxiliary_segments)
     auxiliary_authority = PackedAuxiliaryAllocationLeaseAuthority(
         lifecycle_authority,
         consumer_authority,
@@ -710,6 +726,102 @@ def _complete_auxiliary(
         plan.canonical_writer_id,
     )
     return outcome
+
+
+def _complete_dflash_boundary(
+    transaction: PackedDecodeRequestTransaction,
+    publication: PackedRequestPublication,
+    *,
+    boundary_token_id: int = 17,
+    native_handle_generation: int = 29,
+) -> PackedDFlashBoundaryOutcome:
+    """Deliver one authenticated all-VRAM DFlash boundary outcome.
+
+    :param transaction: Published request transaction.
+    :param publication: Exact decoder-authored request publication.
+    :param boundary_token_id: Source-authored first decode token.
+    :param native_handle_generation: Exact terminal native handle generation.
+    :returns: Accepted terminal DFlash outcome.
+    """
+
+    plan = publication.auxiliary_plan
+    outcome = PackedDFlashBoundaryOutcome.create(
+        plan=plan,
+        writer_id=plan.canonical_writer_id,
+        native_handle_generation=native_handle_generation,
+        descriptor_digest=b"d" * PACKED_REQUEST_DIGEST_BYTES,
+        evidence_digest=b"e" * PACKED_REQUEST_DIGEST_BYTES,
+        metadata=PackedDFlashBoundaryMetadata(
+            boundary_token_id=boundary_token_id,
+            cached_tokens=4,
+            cached_tokens_device=3,
+            cached_tokens_host=2,
+            cached_tokens_storage=1,
+            image_tokens=7,
+            audio_tokens=8,
+            video_tokens=9,
+        ),
+    )
+    assert transaction.handle_dflash_boundary_outcome(
+        outcome,
+        plan.canonical_writer_id,
+    )
+    return outcome
+
+
+def _commit_completed_request(
+    transaction: PackedDecodeRequestTransaction,
+) -> None:
+    """Complete teardown and commit one fully transferred request.
+
+    :param transaction: Scatter-completed request.
+    """
+
+    receipt = None
+    for request in transaction.begin_teardown():
+        candidate = transaction.handle_teardown_ack(
+            _ack(request),
+            request.writer_id,
+        )
+        if candidate is not None:
+            receipt = candidate
+    assert receipt is not None
+    transaction.commit_on_scheduler_thread(receipt)
+
+
+def _committed_dflash_transaction(
+    *,
+    room_id: int,
+) -> tuple[
+    _Fixture,
+    PackedDecodeRequestTransaction,
+    PackedDFlashBoundaryOutcome,
+]:
+    """Build one destination-consumption-waiting DFlash transaction.
+
+    :param room_id: Decoder-minted request room.
+    :returns: Fixture, committed transaction, and authenticated outcome.
+    """
+
+    fixture = _fixture(
+        room_id=room_id,
+        auxiliary_segments=(
+            PackedAuxiliaryDestinationSegment(
+                address=0xA00000,
+                item_length=8,
+            ),
+        ),
+    )
+    transaction = _transaction(fixture)
+    publication = transaction.publish()
+    ready = [_prepare_chunk(transaction, plan) for plan in fixture.plans]
+    for plan, (digest, lease_id) in zip(fixture.plans, ready, strict=True):
+        _complete_writers(transaction, plan, digest, lease_id)
+        scatter = transaction.begin_scatter(plan.key)
+        transaction.complete_scatter(scatter)
+    outcome = _complete_dflash_boundary(transaction, publication)
+    _commit_completed_request(transaction)
+    return fixture, transaction, outcome
 
 
 def _complete_request_transfers(
@@ -1180,6 +1292,89 @@ def test_auxiliary_outcome_is_exactly_idempotent_and_conflicts_quarantine() -> N
     )
     with pytest.raises(PackedRequestTransactionError, match="conflicting duplicate"):
         transaction.handle_auxiliary_outcome(
+            conflicting,
+            conflicting.writer_id,
+        )
+    assert transaction.state is PackedRequestTransactionState.QUARANTINED
+
+
+def test_dflash_boundary_adoption_is_one_shot_and_gates_exact_row_release() -> None:
+    """Release a DFlash row only through its exact issued adoption authority."""
+
+    fixture, transaction, outcome = _committed_dflash_transaction(room_id=171)
+
+    adoption = transaction.begin_dflash_boundary_adoption_on_scheduler_thread()
+
+    assert type(adoption) is PackedDFlashBoundaryDecodeAdoption
+    assert adoption.metadata is outcome.metadata
+    assert adoption.outcome_digest == outcome.outcome_digest
+    assert adoption.lease.state is PackedAuxiliaryAllocationState.COMMITTED_TO_REQUEST
+    assert adoption.slot.metadata_buffer_index == 17
+    with pytest.raises(PackedRequestTransactionError, match="already issued"):
+        transaction.begin_dflash_boundary_adoption_on_scheduler_thread()
+
+    transaction.complete_auxiliary_consumption_on_scheduler_thread(
+        fixture.consumer_authority,
+        dflash_adoption=adoption,
+    )
+
+    assert transaction.state is PackedRequestTransactionState.COMMITTED
+    assert len(fixture.auxiliary_allocator.releases) == 1
+    with pytest.raises(PackedAuxiliaryAllocationError, match="not registered"):
+        fixture.auxiliary_authority.snapshot(fixture.auxiliary_lease)
+
+
+def test_dflash_boundary_release_without_exact_adoption_fails_closed() -> None:
+    """Quarantine the row when scheduler consumption lacks copy authority."""
+
+    fixture, transaction, outcome = _committed_dflash_transaction(room_id=172)
+    adoption = transaction.begin_dflash_boundary_adoption_on_scheduler_thread()
+    conflicting = dataclasses.replace(
+        adoption,
+        outcome_digest=_different_bytes(outcome.outcome_digest),
+    )
+
+    with pytest.raises(PackedRequestTransactionError, match="exact adoption"):
+        transaction.complete_auxiliary_consumption_on_scheduler_thread(
+            fixture.consumer_authority,
+            dflash_adoption=conflicting,
+        )
+
+    assert transaction.state is PackedRequestTransactionState.QUARANTINED
+    assert len(fixture.auxiliary_allocator.releases) == 0
+    assert len(fixture.auxiliary_allocator.quarantines) == 1
+
+
+def test_dflash_boundary_outcome_is_idempotent_and_conflicts_quarantine() -> None:
+    """Accept one exact DFlash outcome and quarantine conflicting evidence."""
+
+    fixture = _fixture(
+        room_id=173,
+        auxiliary_segments=(
+            PackedAuxiliaryDestinationSegment(
+                address=0xA00000,
+                item_length=8,
+            ),
+        ),
+    )
+    transaction = _transaction(fixture)
+    publication = transaction.publish()
+    outcome = _complete_dflash_boundary(transaction, publication)
+
+    assert not transaction.handle_dflash_boundary_outcome(
+        outcome,
+        outcome.writer_id,
+    )
+    conflicting = PackedDFlashBoundaryOutcome.create(
+        plan=outcome.plan,
+        writer_id=outcome.writer_id,
+        native_handle_generation=outcome.native_handle_generation + 1,
+        descriptor_digest=outcome.descriptor_digest,
+        evidence_digest=outcome.evidence_digest,
+        metadata=outcome.metadata,
+    )
+    with pytest.raises(PackedRequestTransactionError, match="conflicting duplicate"):
+        transaction.handle_dflash_boundary_outcome(
             conflicting,
             conflicting.writer_id,
         )

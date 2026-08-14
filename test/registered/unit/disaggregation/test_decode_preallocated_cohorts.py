@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
     DecodeAllocationLeaseError,
@@ -598,6 +599,7 @@ def _queue_fixture(
     queue._preparing_request_ids = set()
     queue._seen_bootstrap_rooms = set()
     queue._terminal_decode_serving = None
+    queue._terminal_dflash_boundary_pool = None
 
     def free_request_slot(req: Req) -> None:
         """Release one partially prepared request slot.

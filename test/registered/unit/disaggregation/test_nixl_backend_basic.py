@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
+
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     NIXL_AGENT_METADATA_MAX_BYTES,
@@ -1466,6 +1467,112 @@ class TestNixlMetadataSnapshot(CustomTestCase):
 
         self.assertEqual(manager.agent_metadata, b"4096,8192")
         self.assertEqual(agent.metadata_snapshots, [b"4096,8192"])
+
+    def test_terminal_dflash_rows_register_before_agent_metadata_snapshot(self) -> None:
+        """Advertise manager-owned DFlash VRAM before terminal identity freezes."""
+
+        agent = MetadataSnapshotFakeAgent()
+        args = SimpleNamespace(
+            engine_rank=0,
+            gpu_id=0,
+            kv_data_lens=[4096],
+            kv_data_mem_kinds=["VRAM"],
+            kv_data_ptrs=[0x1000],
+            kv_item_lens=[64],
+            pp_rank=0,
+            terminal_request_capacity=4,
+        )
+        server_args = SimpleNamespace(
+            tp_size=1,
+            speculative_algorithm="DFLASH",
+            pd_terminal_deployment_cohort=object(),
+            pd_terminal_local_membership=object(),
+            pd_terminal_startup_timeout_seconds=60.0,
+        )
+        boundary_pool = object()
+
+        def register_boundary_pool(
+            pool_agent: MetadataSnapshotFakeAgent,
+            *,
+            row_capacity: int,
+            device: object,
+        ) -> object:
+            """Model the real pool's NIXL registration side effect.
+
+            :param pool_agent: Exact process-local fake NIXL agent.
+            :param row_capacity: Configured in-flight request bound.
+            :param device: Explicit indexed CUDA device.
+            :returns: Stable fake process-lifetime pool.
+            """
+
+            self.assertIs(pool_agent, agent)
+            self.assertEqual(row_capacity, 4)
+            self.assertEqual(str(device), "cuda:0")
+            pool_agent.register_memory([(0x3000, row_capacity * 8, 0, "")], "VRAM")
+            return boundary_pool
+
+        with (
+            patch.object(
+                CommonKVManager,
+                "__init__",
+                new=self._common_manager_init,
+            ),
+            patch.object(
+                NixlKVManager,
+                "register_buffer_to_engine",
+                new=self._register_payload_memory,
+            ),
+            patch.object(
+                NixlKVManager,
+                "_init_staging_decode_ctx",
+                new=self._register_decode_staging_memory,
+            ),
+            patch.object(
+                NixlKVManager,
+                "_join_terminal_startup_cohort",
+                return_value=None,
+            ),
+            patch.object(NixlKVManager, "_start_decode_runtime_workers"),
+            patch.object(
+                envs.SGLANG_DISAGGREGATION_NIXL_BACKEND,
+                "get",
+                return_value="UCX",
+            ),
+            patch.object(
+                envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS,
+                "get",
+                return_value="{}",
+            ),
+            patch.object(
+                envs.SGLANG_DISAGG_STAGING_BUFFER,
+                "get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.DFlashBoundaryDeviceRowPool",
+                side_effect=register_boundary_pool,
+            ),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.PackedNixlDecodeController"
+            ) as controller_constructor,
+            patch("nixl._api.nixl_agent", return_value=agent),
+            patch("nixl._api.nixl_agent_config", return_value=object()),
+        ):
+            manager = NixlKVManager(
+                args,
+                DisaggregationMode.DECODE,
+                server_args,
+            )
+
+        self.assertEqual(manager.agent_metadata, b"4096,12288,8192")
+        self.assertEqual(agent.metadata_snapshots, [b"4096,12288,8192"])
+        self.assertIs(manager.terminal_dflash_boundary_pool(), boundary_pool)
+        controller_constructor.assert_called_once_with(
+            manager,
+            manager._staging_ctx.allocator.buffer.buffer,
+            manager._decode_staging_registration,
+            boundary_pool,
+        )
 
     def test_supported_prefill_widths_initialize_live_packed_runtime(self) -> None:
         """Select the real packed source actor for TP1, TP2, and TP4."""

@@ -2,6 +2,7 @@ import uuid
 from collections.abc import Callable
 
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationLease,
@@ -29,6 +30,9 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestPublication,
 )
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryDeviceRowPool,
+)
 
 
 class PackedNixlDecodeController:
@@ -44,6 +48,7 @@ class PackedNixlDecodeController:
         manager: PackedRuntimeManager,
         staging_tensor: torch.Tensor,
         staging_registration: object,
+        dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None = None,
     ) -> None:
         """Initialize the persistent decode actor over legacy staging storage.
 
@@ -54,6 +59,7 @@ class PackedNixlDecodeController:
         :param manager: Owning TP1 or TP2 NIXL decode manager.
         :param staging_tensor: Existing process-lifetime staging byte tensor.
         :param staging_registration: Existing NIXL registration for the tensor.
+        :param dflash_boundary_pool: Optional registered terminal DFlash rows.
         """
 
         if manager.attn_tp_size not in (1, 2):
@@ -84,11 +90,21 @@ class PackedNixlDecodeController:
             arena,
             artifacts,
             visibility_policy,
+            dflash_boundary_pool,
         )
         self._arena = arena
         self._manager = manager
         self._peer = peer
         self._runtime = runtime
+
+    @property
+    def dflash_boundary_pool(self) -> DFlashBoundaryDeviceRowPool | None:
+        """Return the exact process-lifetime terminal boundary pool.
+
+        :returns: Registered decoder rows, or ``None`` for legacy metadata.
+        """
+
+        return self._runtime.dflash_boundary_pool
 
     @property
     def advertisement(self) -> PackedRegistrationAdvertisement:
@@ -150,7 +166,7 @@ class PackedNixlDecodeController:
         *,
         room_id: int,
         request_owner: object,
-        metadata_buffer_index: int,
+        metadata_buffer_index: int | None,
         allocation_lease: DecodeAllocationLease,
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
@@ -160,7 +176,8 @@ class PackedNixlDecodeController:
 
         :param room_id: Decoder-minted room.
         :param request_owner: Exact retained decode request.
-        :param metadata_buffer_index: Already reserved metadata row.
+        :param metadata_buffer_index: Legacy pre-reserved metadata row, or
+            ``None`` when terminal DFlash allocates registered VRAM.
         :param allocation_lease: Exact pinned decode allocation.
         :param allocation_authority: Exact allocation authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.

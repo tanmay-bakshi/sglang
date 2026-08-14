@@ -59,6 +59,9 @@ if TYPE_CHECKING:
         PackedDecodeRequestTransaction,
         PackedRequestPublication,
     )
+    from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+        DFlashBoundaryDeviceRowPool,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +342,16 @@ class CommonKVManager(BaseKVManager):
 
         return False
 
+    def terminal_dflash_boundary_pool(
+        self,
+    ) -> DFlashBoundaryDeviceRowPool | None:
+        """Return registered decoder boundary rows when terminal DFlash owns them.
+
+        :returns: Process-lifetime row pool, otherwise ``None``.
+        """
+
+        return None
+
     def prepared_grant_protocol(self) -> str | None:
         """Return the live prefill actor protocol for prepared decoder grants.
 
@@ -377,7 +390,7 @@ class CommonKVManager(BaseKVManager):
         *,
         room_id: int,
         request_owner: object,
-        metadata_buffer_index: int,
+        metadata_buffer_index: int | None,
         allocation_lease: DecodeAllocationLease,
         allocation_authority: DecodeAllocationLeaseAuthority,
         lifecycle_authority: object,
@@ -387,7 +400,8 @@ class CommonKVManager(BaseKVManager):
 
         :param room_id: Decoder-minted non-recycled bootstrap room.
         :param request_owner: Exact retained decode request.
-        :param metadata_buffer_index: Exact reserved auxiliary metadata slot.
+        :param metadata_buffer_index: Legacy reserved auxiliary slot, or
+            ``None`` for terminal DFlash registered VRAM.
         :param allocation_lease: Prepared decode allocation lease.
         :param allocation_authority: Exact allocation lease authority.
         :param lifecycle_authority: Trusted transport lifecycle authority.
