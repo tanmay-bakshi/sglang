@@ -21,12 +21,16 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestPublication,
 )
 from sglang.srt.disaggregation.terminal_progress.coordinator import (
+    TerminalRequestCoordinationTiming,
     TerminalRequestCoordinator,
     TerminalRequestCoordinatorDisposition,
     TerminalRequestCoordinatorEmission,
     TerminalRequestCoordinatorError,
     TerminalRequestCoordinatorManifest,
-    TerminalRequestCoordinationTiming,
+)
+from sglang.srt.disaggregation.terminal_progress.deadlines import (
+    TerminalDeadlineKind,
+    terminal_deadline_spec,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerInventory,
@@ -35,10 +39,6 @@ from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer impor
 )
 from sglang.srt.disaggregation.terminal_progress.decode_wiring import (
     PackedTerminalDecodeWiring,
-)
-from sglang.srt.disaggregation.terminal_progress.deadlines import (
-    TerminalDeadlineKind,
-    terminal_deadline_spec,
 )
 from sglang.srt.disaggregation.terminal_progress.evidence import (
     TerminalProgressTimingRecorder,
