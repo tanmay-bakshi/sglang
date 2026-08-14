@@ -14,6 +14,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -126,7 +127,22 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentLocalService,
     TerminalDeploymentRole,
 )
-from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
+from sglang.srt.disaggregation.terminal_progress.identity import (
+    TerminalOwnerRole,
+    TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.request_registration import (
+    PackedTerminalDecodeRequestAuthority,
+    PackedTerminalRequestRegistrationError,
+    build_packed_terminal_decode_request_authority,
+    project_packed_terminal_source_authority,
+    require_source_plan_request_key,
+)
+from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourceIdentityPlan,
+    PackedTerminalSourcePlan,
+    decode_packed_terminal_source_plan,
+)
 from sglang.srt.disaggregation.terminal_progress.startup_binding import (
     TerminalStartupRankBinding,
     join_terminal_startup_rank,
@@ -436,9 +452,10 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     process_generation: str = ""
     packed_plan: PackedAuxiliaryPlan | None = None
-    # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
-    # end so positional construction in from_zmq() continues to work.
+    # The staging slot keeps its historical positional index. Terminal source
+    # authority is appended after it so older direct constructors stay exact.
     staging: Optional[StagingTransferInfo] = None
+    terminal_source_plan_payload: bytes | None = None
 
     def is_dummy(self):
         # A transfer is "dummy" only for CP non-authoritative ranks.
@@ -449,11 +466,41 @@ class TransferInfo:
             return False
         return self.dst_kv_indices.size == 0
 
+    def decode_terminal_source_plan(self) -> PackedTerminalSourcePlan | None:
+        """Decode the exact terminal authority carried by request metadata.
+
+        :returns: Validated source plan, otherwise ``None`` for legacy packed
+            metadata.
+        """
+
+        payload = self.terminal_source_plan_payload
+        if payload is None:
+            return None
+        return decode_packed_terminal_source_plan(payload)
+
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
         dst_state_indices = (
             unpack_int_lists(msg[7], "i") if len(msg) > 7 and msg[7] != b"" else []
         )
+
+        packed_plan = (
+            _decode_packed_auxiliary_plan(msg[10])
+            if len(msg) > 10 and msg[10] != b""
+            else None
+        )
+        terminal_source_plan_payload = (
+            bytes(msg[11]) if len(msg) > 11 and msg[11] != b"" else None
+        )
+        if terminal_source_plan_payload is not None:
+            if packed_plan is None:
+                raise ValueError(
+                    "terminal source authority requires packed request metadata"
+                )
+            terminal_source_plan = decode_packed_terminal_source_plan(
+                terminal_source_plan_payload
+            )
+            require_source_plan_request_key(terminal_source_plan, packed_plan.key)
 
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -470,11 +517,8 @@ class TransferInfo:
             process_generation=(
                 msg[9].decode("ascii") if len(msg) > 9 and msg[9] != b"" else ""
             ),
-            packed_plan=(
-                _decode_packed_auxiliary_plan(msg[10])
-                if len(msg) > 10 and msg[10] != b""
-                else None
-            ),
+            packed_plan=packed_plan,
+            terminal_source_plan_payload=terminal_source_plan_payload,
         )
 
 
@@ -1743,6 +1787,50 @@ class NixlKVManager(CommonKVManager):
             source_tp_size=source_tp_size,
         )
 
+    def build_terminal_decode_request_authority(
+        self,
+        *,
+        transaction: PackedDecodeRequestTransaction,
+        adopt_request: Callable[[object], None],
+        finalize_request: Callable[[object], None],
+        cancel_request: Callable[[object], None],
+        quarantine_request: Callable[[object, str], None],
+        destination_bindings: tuple[TerminalRequestBinding, ...] | None = None,
+        publication_generation: bytes | None = None,
+    ) -> PackedTerminalDecodeRequestAuthority:
+        """Derive one terminal request graph from sealed manager authority.
+
+        This operation is non-publishing. The caller must pass the result to
+        :func:`register_packed_terminal_decode_request`, which binds scheduler,
+        actor, and native lifecycle ownership before ``transaction.publish``.
+
+        :param transaction: Exact prepared packed transaction.
+        :param adopt_request: Scheduler request-adoption callback.
+        :param finalize_request: Scheduler post-adoption finalization callback.
+        :param cancel_request: Safe unpublished cancellation callback.
+        :param quarantine_request: Ambiguous scheduler retention callback.
+        :param destination_bindings: Cross-rank decode bindings for TP greater
+            than one.
+        :param publication_generation: Optional exact publication generation.
+        :returns: Complete immutable prepublication authority.
+        """
+
+        binding = self.terminal_startup_binding
+        if binding is None:
+            raise RuntimeError("terminal startup binding is not configured")
+        if binding.advertisement.role is not TerminalOwnerRole.DECODE:
+            raise RuntimeError("terminal decode authority requires a decode manager")
+        return build_packed_terminal_decode_request_authority(
+            startup_binding=binding,
+            transaction=transaction,
+            adopt_request=adopt_request,
+            finalize_request=finalize_request,
+            cancel_request=cancel_request,
+            quarantine_request=quarantine_request,
+            destination_bindings=destination_bindings,
+            publication_generation=publication_generation,
+        )
+
     def send_packed_decode_request_metadata(
         self,
         *,
@@ -1771,6 +1859,15 @@ class NixlKVManager(CommonKVManager):
             raise TypeError("packed NIXL metadata requires NixlKVReceiver")
         if publication.auxiliary_plan.metadata_buffer_index != metadata_buffer_index:
             raise RuntimeError("packed metadata index differs from publication")
+        terminal_payload = publication.terminal_source_plan
+        if self.terminal_startup_binding is not None and terminal_payload is None:
+            raise RuntimeError(
+                "terminal packed metadata has no encoded source authority"
+            )
+        if self.terminal_startup_binding is None and terminal_payload is not None:
+            raise RuntimeError(
+                "non-terminal packed metadata carries terminal source authority"
+            )
         routes = receiver.build_packed_control_routes(controller)
         controller.bind_publication(transaction, publication, routes)
         receiver.send_metadata(
@@ -1779,6 +1876,7 @@ class NixlKVManager(CommonKVManager):
             state_indices,
             decode_prefix_len=decode_prefix_len,
             packed_plan=publication.auxiliary_plan,
+            terminal_source_plan_payload=terminal_payload,
         )
 
     def poll_packed_decode_request_transaction(
@@ -2666,6 +2764,60 @@ class NixlKVManager(CommonKVManager):
         ):
             raise RuntimeError("decoder registration has no live packed capability")
         return transfer_info, registration
+
+    def terminal_source_identity_plan(
+        self,
+        transfer_info: TransferInfo,
+    ) -> PackedTerminalSourceIdentityPlan | None:
+        """Validate and project decoder-authored terminal source authority.
+
+        Terminal metadata is accepted only when its exact writer identities
+        and request-ready issuer are members of this manager's sealed startup
+        matrix. The returned projection selects the sole local writer without
+        request-time discovery or a second control channel.
+
+        :param transfer_info: Existing packed request metadata envelope.
+        :returns: Rank-local terminal identity plan, otherwise ``None`` outside
+            a terminal deployment.
+        """
+
+        if type(transfer_info) is not TransferInfo:
+            raise TypeError("transfer_info must be TransferInfo")
+        startup_binding = self.terminal_startup_binding
+        source_plan = transfer_info.decode_terminal_source_plan()
+        if startup_binding is None:
+            if source_plan is not None:
+                raise PackedTerminalRequestRegistrationError(
+                    "non-terminal manager received terminal source authority"
+                )
+            return None
+        if startup_binding.advertisement.role is not TerminalOwnerRole.SOURCE:
+            raise RuntimeError("terminal source authority requires a source manager")
+        if source_plan is None:
+            raise PackedTerminalRequestRegistrationError(
+                "terminal packed metadata omitted source authority"
+            )
+        packed_plan = transfer_info.packed_plan
+        if packed_plan is None:
+            raise PackedTerminalRequestRegistrationError(
+                "terminal source authority has no packed auxiliary plan"
+            )
+        require_source_plan_request_key(source_plan, packed_plan.key)
+        if source_plan.writers[0].writer_id != packed_plan.canonical_writer_id:
+            raise PackedTerminalRequestRegistrationError(
+                "terminal publisher writer differs from packed auxiliary authority"
+            )
+        runtime = self._packed_prefill_runtime
+        if runtime is None:
+            raise RuntimeError("terminal source authority has no packed source actor")
+        return project_packed_terminal_source_authority(
+            startup_binding=startup_binding,
+            source_plan=source_plan,
+            local_writer_id=runtime.writer_id,
+            destination_process_generation=(
+                packed_plan.destination_process_generation
+            ),
+        )
 
     def _packed_destination_manifest(
         self,
@@ -6007,6 +6159,7 @@ class NixlKVManager(CommonKVManager):
                             raise RuntimeError(
                                 "Packed transfer runtime cohort is stale"
                             )
+                    self.terminal_source_identity_plan(transfer_info)
                 except Exception:
                     reason = (
                         "Rejected generation-bound decoder transfer metadata:\n"
@@ -6264,6 +6417,7 @@ class NixlKVReceiver(CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         *,
         packed_plan: PackedAuxiliaryPlan | None = None,
+        terminal_source_plan_payload: bytes | None = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -6271,6 +6425,17 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+        if terminal_source_plan_payload is not None:
+            if type(terminal_source_plan_payload) is not bytes:
+                raise TypeError("terminal_source_plan_payload must be bytes")
+            if packed_plan is None:
+                raise ValueError(
+                    "terminal source authority requires packed request metadata"
+                )
+            terminal_source_plan = decode_packed_terminal_source_plan(
+                terminal_source_plan_payload
+            )
+            require_source_plan_request_key(terminal_source_plan, packed_plan.key)
 
         expected_state_indices: set[int] = set()
         if state_indices is not None:
@@ -6393,6 +6558,8 @@ class NixlKVReceiver(CommonKVReceiver):
                 if is_dummy:
                     raise RuntimeError("packed transfer does not support dummy writers")
                 metadata_frames.append(encode_packed_message(packed_plan))
+                if terminal_source_plan_payload is not None:
+                    metadata_frames.append(terminal_source_plan_payload)
             try:
                 with lock:
                     sock.send_multipart(metadata_frames)

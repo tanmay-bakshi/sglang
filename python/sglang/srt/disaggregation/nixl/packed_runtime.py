@@ -107,6 +107,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourcePlan,
+    encode_packed_terminal_source_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -1904,6 +1905,10 @@ class PackedDecodeRuntime:
                 )
             if binding.digest in self._records_by_terminal_binding:
                 raise RuntimeError("decode terminal binding is already registered")
+            transaction.bind_terminal_owner_authority(
+                encode_packed_terminal_source_plan(source_plan),
+                binding.digest,
+            )
             record.terminal_owner_bound = True
             record.terminal_source_plan = source_plan
             record.terminal_binding = binding
