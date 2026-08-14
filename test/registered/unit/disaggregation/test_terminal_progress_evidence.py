@@ -60,6 +60,19 @@ class _CollectingSink:
         self.samples.append(sample)
 
 
+def _isolated_logger(name: str) -> logging.Logger:
+    """Return a named logger without state inherited from another test.
+
+    :param name: Logger name unique to the test purpose.
+    :returns: Logger with no handlers and propagation disabled.
+    """
+
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    logger.propagate = False
+    return logger
+
+
 def _binding(
     field: TerminalOwnerTimingField,
     *,
@@ -140,7 +153,7 @@ def test_timing_log_round_trip_preserves_complete_identity() -> None:
 
 def test_timing_logger_emits_one_parser_stable_record() -> None:
     stream = io.StringIO()
-    logger = logging.Logger("terminal-progress-evidence-test")
+    logger = _isolated_logger("terminal-progress-evidence-test")
     handler = logging.StreamHandler(stream)
     logger.addHandler(handler)
     sink = TerminalProgressTimingLogger(logger)
@@ -153,7 +166,7 @@ def test_timing_logger_emits_one_parser_stable_record() -> None:
 
 def test_timing_emitter_keeps_evidence_failure_off_lifecycle_path() -> None:
     stream = io.StringIO()
-    logger = logging.Logger("terminal-progress-evidence-failure-test")
+    logger = _isolated_logger("terminal-progress-evidence-failure-test")
     logger.addHandler(logging.StreamHandler(stream))
     emitter = TerminalProgressTimingEmitter(_RejectingSink(), logger)
     field = TerminalOwnerTimingField.GATEWAY_PUBLICATION
@@ -172,7 +185,7 @@ def test_timing_emitter_keeps_evidence_failure_off_lifecycle_path() -> None:
 
 def test_timing_recorder_pairs_raw_anchors_and_discards_incomplete_state() -> None:
     stream = io.StringIO()
-    logger = logging.Logger("terminal-progress-recorder-test")
+    logger = _isolated_logger("terminal-progress-recorder-test")
     logger.addHandler(logging.StreamHandler(stream))
     sink = _CollectingSink()
     clock_values = iter((10, 20, 30))
