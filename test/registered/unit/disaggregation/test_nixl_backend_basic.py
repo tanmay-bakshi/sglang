@@ -1414,7 +1414,12 @@ class TestNixlMetadataSnapshot(CustomTestCase):
             kv_item_lens=[64],
             pp_rank=0,
         )
-        server_args = SimpleNamespace(tp_size=1)
+        server_args = SimpleNamespace(
+            tp_size=1,
+            pd_terminal_deployment_cohort=None,
+            pd_terminal_local_membership=None,
+            pd_terminal_startup_timeout_seconds=None,
+        )
 
         with (
             patch.object(
@@ -1478,7 +1483,12 @@ class TestNixlMetadataSnapshot(CustomTestCase):
                     kv_item_lens=[64],
                     pp_rank=0,
                 )
-                server_args = SimpleNamespace(tp_size=source_tp_size)
+                server_args = SimpleNamespace(
+                    tp_size=source_tp_size,
+                    pd_terminal_deployment_cohort=None,
+                    pd_terminal_local_membership=None,
+                    pd_terminal_startup_timeout_seconds=None,
+                )
                 runtime = object()
                 with (
                     patch.object(
