@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
     PackedAuxiliaryDestinationSegment,
     PackedAuxiliaryPlan,
+    PackedDFlashBoundaryCounters,
     PackedDFlashBoundaryMetadata,
     PackedDFlashBoundaryOutcome,
 )
@@ -1211,6 +1212,45 @@ class DFlashBoundaryRowLease:
     def _require_active_locked(self) -> None:
         if self._state is not DFlashBoundaryRowLeaseState.ACTIVE:
             raise RuntimeError("DFlash boundary row lease is already terminal")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DFlashBoundaryPrefillSource:
+    """Pre-launch DFlash source state retained by one packed submission.
+
+    :ivar lease: Stable registered source row owned by terminal lifecycle.
+    :ivar counters: Scalar request state frozen before model submission.
+    """
+
+    lease: DFlashBoundaryRowLease
+    counters: PackedDFlashBoundaryCounters
+
+    def __post_init__(self) -> None:
+        """Validate one exact all-VRAM DFlash source projection."""
+
+        if type(self.lease) is not DFlashBoundaryRowLease:
+            raise TypeError("lease must be DFlashBoundaryRowLease")
+        if type(self.counters) is not PackedDFlashBoundaryCounters:
+            raise TypeError("counters must be PackedDFlashBoundaryCounters")
+        if self.lease.state is not DFlashBoundaryRowLeaseState.ACTIVE:
+            raise ValueError("DFlash boundary source lease must be active")
+
+    def metadata_from_result_slot(
+        self,
+        result_slot: TerminalGatewayResultSlot,
+    ) -> PackedDFlashBoundaryMetadata:
+        """Join frozen counters with the producer-complete boundary token.
+
+        Native request readiness proves the event covering both the device row
+        and pinned gateway slot has completed before this method is called.
+
+        :param result_slot: Exact stable slot bound to the producer event.
+        :returns: Complete authenticated DFlash boundary metadata.
+        """
+
+        if not isinstance(result_slot, TerminalGatewayResultSlot):
+            raise TypeError("result_slot must inherit TerminalGatewayResultSlot")
+        return self.counters.metadata(result_slot.read_next_token_id())
 
 
 class DFlashBoundarySourceTransferState(enum.StrEnum):

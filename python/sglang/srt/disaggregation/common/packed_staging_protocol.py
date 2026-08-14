@@ -347,6 +347,75 @@ class PackedAuxiliaryOutcome:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class PackedDFlashBoundaryCounters:
+    """Immutable pre-launch scalar state for one DFlash handoff.
+
+    The sampled boundary token does not exist until model submission. These
+    counters are frozen while the request is still scheduler-owned, then joined
+    with the producer-complete boundary token when the source outcome is
+    settled.
+
+    :ivar cached_tokens: Aggregate prefill cache-hit token count.
+    :ivar cached_tokens_device: Tokens restored from device cache.
+    :ivar cached_tokens_host: Tokens restored from host cache.
+    :ivar cached_tokens_storage: Tokens restored from durable storage.
+    :ivar image_tokens: Expanded image-token count.
+    :ivar audio_tokens: Expanded audio-token count.
+    :ivar video_tokens: Expanded video-token count.
+    """
+
+    cached_tokens: int
+    cached_tokens_device: int
+    cached_tokens_host: int
+    cached_tokens_storage: int
+    image_tokens: int
+    audio_tokens: int
+    video_tokens: int
+
+    def __post_init__(self) -> None:
+        """Validate exact unsigned scalar counters."""
+
+        for label, value in self._items:
+            _validate_nonnegative_uint64(value, label)
+
+    def metadata(self, boundary_token_id: int) -> "PackedDFlashBoundaryMetadata":
+        """Join these counters with one producer-complete boundary token.
+
+        :param boundary_token_id: Sampled target token read from the stable
+            gateway result slot after producer completion.
+        :returns: Complete authenticated DFlash boundary metadata.
+        """
+
+        return PackedDFlashBoundaryMetadata(
+            boundary_token_id=boundary_token_id,
+            cached_tokens=self.cached_tokens,
+            cached_tokens_device=self.cached_tokens_device,
+            cached_tokens_host=self.cached_tokens_host,
+            cached_tokens_storage=self.cached_tokens_storage,
+            image_tokens=self.image_tokens,
+            audio_tokens=self.audio_tokens,
+            video_tokens=self.video_tokens,
+        )
+
+    @property
+    def _items(self) -> tuple[tuple[str, int], ...]:
+        """Return named fields in canonical validation order.
+
+        :returns: Immutable field-name and value pairs.
+        """
+
+        return (
+            ("cached_tokens", self.cached_tokens),
+            ("cached_tokens_device", self.cached_tokens_device),
+            ("cached_tokens_host", self.cached_tokens_host),
+            ("cached_tokens_storage", self.cached_tokens_storage),
+            ("image_tokens", self.image_tokens),
+            ("audio_tokens", self.audio_tokens),
+            ("video_tokens", self.video_tokens),
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class PackedDFlashBoundaryMetadata:
     """Source-authored scalar state accompanying one DFlash boundary token.
 
