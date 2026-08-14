@@ -153,13 +153,13 @@ class NativeTerminalResource(enum.IntFlag):
     SOURCE_NIXL_HANDLES = 1 << 4
     SOURCE_RESULT_SLOT = 1 << 5
     SOURCE_REQUEST_IDENTITY = 1 << 6
-    SOURCE_DFLASH_AUX_VRAM_ROWS = 1 << 7
+    SOURCE_DFLASH_BOUNDARY_VRAM_ROWS = 1 << 7
     PUBLICATION_IDENTITY = 1 << 8
     DECODE_FULL_PAGES = 1 << 9
     DECODE_SWA_PAGES = 1 << 10
     DECODE_REQUEST_SLOT = 1 << 11
     DECODE_STAGING_LEASE = 1 << 12
-    DECODE_DFLASH_AUX_VRAM_ROWS = 1 << 13
+    DECODE_DFLASH_BOUNDARY_VRAM_ROWS = 1 << 13
     DECODE_WRITER_STATE = 1 << 14
     DECODE_NATIVE_IDENTITY = 1 << 15
 
@@ -172,7 +172,7 @@ NATIVE_SOURCE_RECLAIMABLE_MASK = int(
     | NativeTerminalResource.SOURCE_NIXL_HANDLES
     | NativeTerminalResource.SOURCE_RESULT_SLOT
     | NativeTerminalResource.SOURCE_REQUEST_IDENTITY
-    | NativeTerminalResource.SOURCE_DFLASH_AUX_VRAM_ROWS
+    | NativeTerminalResource.SOURCE_DFLASH_BOUNDARY_VRAM_ROWS
 )
 NATIVE_SOURCE_RESOURCE_MASK = int(
     NativeTerminalResource(NATIVE_SOURCE_RECLAIMABLE_MASK)
@@ -183,7 +183,7 @@ NATIVE_DECODE_RESOURCE_MASK = int(
     | NativeTerminalResource.DECODE_SWA_PAGES
     | NativeTerminalResource.DECODE_REQUEST_SLOT
     | NativeTerminalResource.DECODE_STAGING_LEASE
-    | NativeTerminalResource.DECODE_DFLASH_AUX_VRAM_ROWS
+    | NativeTerminalResource.DECODE_DFLASH_BOUNDARY_VRAM_ROWS
     | NativeTerminalResource.DECODE_WRITER_STATE
     | NativeTerminalResource.DECODE_NATIVE_IDENTITY
 )

@@ -43,13 +43,13 @@ class TerminalResourceKind(enum.StrEnum):
     SOURCE_NIXL_HANDLES = "source_nixl_handles"
     SOURCE_RESULT_SLOT = "source_result_slot"
     SOURCE_REQUEST_IDENTITY = "source_request_identity"
-    SOURCE_DFLASH_AUX_VRAM_ROWS = "source_dflash_aux_vram_rows"
+    SOURCE_DFLASH_BOUNDARY_VRAM_ROWS = "source_dflash_boundary_vram_rows"
     PUBLICATION_IDENTITY = "publication_identity"
     DECODE_FULL_PAGES = "decode_full_pages"
     DECODE_SWA_PAGES = "decode_swa_pages"
     DECODE_REQUEST_SLOT = "decode_request_slot"
     DECODE_STAGING_LEASE = "decode_staging_lease"
-    DECODE_DFLASH_AUX_VRAM_ROWS = "decode_dflash_aux_vram_rows"
+    DECODE_DFLASH_BOUNDARY_VRAM_ROWS = "decode_dflash_boundary_vram_rows"
     DECODE_WRITER_STATE = "decode_writer_state"
     DECODE_NATIVE_IDENTITY = "decode_native_identity"
 
@@ -63,7 +63,7 @@ SOURCE_RECLAIMABLE_RESOURCES = frozenset(
         TerminalResourceKind.SOURCE_NIXL_HANDLES,
         TerminalResourceKind.SOURCE_RESULT_SLOT,
         TerminalResourceKind.SOURCE_REQUEST_IDENTITY,
-        TerminalResourceKind.SOURCE_DFLASH_AUX_VRAM_ROWS,
+        TerminalResourceKind.SOURCE_DFLASH_BOUNDARY_VRAM_ROWS,
     )
 )
 SOURCE_RESOURCE_KINDS = SOURCE_RECLAIMABLE_RESOURCES | frozenset(
@@ -75,7 +75,7 @@ DECODE_RESOURCE_KINDS = frozenset(
         TerminalResourceKind.DECODE_SWA_PAGES,
         TerminalResourceKind.DECODE_REQUEST_SLOT,
         TerminalResourceKind.DECODE_STAGING_LEASE,
-        TerminalResourceKind.DECODE_DFLASH_AUX_VRAM_ROWS,
+        TerminalResourceKind.DECODE_DFLASH_BOUNDARY_VRAM_ROWS,
         TerminalResourceKind.DECODE_WRITER_STATE,
         TerminalResourceKind.DECODE_NATIVE_IDENTITY,
     )

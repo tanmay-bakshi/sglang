@@ -328,10 +328,10 @@ def test_deterministic_interleavings_replay_with_exact_resource_conservation(
     assert drained.state.decode.phase is DecodeLifecyclePhase.RETIRED
     assert drained.state.source.inventory.safely_retired == SOURCE_RESOURCE_KINDS
     assert drained.state.decode.inventory.safely_retired == DECODE_RESOURCE_KINDS
-    assert TerminalResourceKind.SOURCE_DFLASH_AUX_VRAM_ROWS in (
+    assert TerminalResourceKind.SOURCE_DFLASH_BOUNDARY_VRAM_ROWS in (
         drained.state.source.inventory.universe
     )
-    assert TerminalResourceKind.DECODE_DFLASH_AUX_VRAM_ROWS in (
+    assert TerminalResourceKind.DECODE_DFLASH_BOUNDARY_VRAM_ROWS in (
         drained.state.decode.inventory.universe
     )
     for entry in drained.trace:

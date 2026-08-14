@@ -782,13 +782,15 @@ def test_resource_inventory_rejects_missing_overlap_and_double_transition() -> N
         )
 
 
-def test_dflash_auxiliary_rows_are_explicit_vram_lifetime_resources() -> None:
-    """Neither owner can hide DFlash auxiliary rows in generic metadata."""
+def test_dflash_boundary_rows_are_explicit_vram_lifetime_resources() -> None:
+    """Neither owner can hide DFlash boundary rows in generic metadata."""
 
-    assert TerminalResourceKind.SOURCE_DFLASH_AUX_VRAM_ROWS in (
+    assert TerminalResourceKind.SOURCE_DFLASH_BOUNDARY_VRAM_ROWS in (
         SOURCE_RECLAIMABLE_RESOURCES
     )
-    assert TerminalResourceKind.DECODE_DFLASH_AUX_VRAM_ROWS in (DECODE_RESOURCE_KINDS)
+    assert TerminalResourceKind.DECODE_DFLASH_BOUNDARY_VRAM_ROWS in (
+        DECODE_RESOURCE_KINDS
+    )
     assert all(
         "metadata_row" not in resource.value for resource in TerminalResourceKind
     )

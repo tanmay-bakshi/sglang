@@ -149,8 +149,8 @@ def test_native_deadline_table_is_exactly_the_packaged_hash_bound_table() -> Non
 
 
 def test_native_resource_vocabulary_matches_canonical_dflash_lifetimes() -> None:
-    assert NativeTerminalResource.SOURCE_DFLASH_AUX_VRAM_ROWS.value == 1 << 7
-    assert NativeTerminalResource.DECODE_DFLASH_AUX_VRAM_ROWS.value == 1 << 13
+    assert NativeTerminalResource.SOURCE_DFLASH_BOUNDARY_VRAM_ROWS.value == 1 << 7
+    assert NativeTerminalResource.DECODE_DFLASH_BOUNDARY_VRAM_ROWS.value == 1 << 13
     assert "SOURCE_METADATA" not in NativeTerminalResource.__members__
     assert "DECODE_METADATA_ROW" not in NativeTerminalResource.__members__
 
