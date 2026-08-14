@@ -7,8 +7,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Protocol, cast
 
-from sglang.srt.disaggregation.terminal_progress.native_owner import (
-    NativeTerminalOwner,
+from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalNativeProducerBinding,
+    NativeTerminalRuntime,
 )
 from torch.utils.cpp_extension import CUDA_HOME, load
 
@@ -243,36 +244,68 @@ def cuda_terminal_producer_abi(*, testing: bool = False) -> dict[str, object]:
 class CudaTerminalProducer:
     """Process-lifetime direct CUDA callback producer for one native owner."""
 
+    _binding: NativeTerminalNativeProducerBinding
     _native: _NativeCudaTerminalProducer
     _testing: bool
 
     def __init__(
         self,
-        owner: NativeTerminalOwner,
-        producer_id: int,
+        binding: NativeTerminalNativeProducerBinding,
         *,
         testing: bool = False,
     ) -> None:
         """Bind one registered producer namespace to CUDA callbacks.
 
-        :param owner: Native owner containing the producer registration.
-        :param producer_id: Registered local decode producer identity.
+        :param binding: Runtime-owned API and producer-context capsules.
         :param testing: Whether native test controls are required.
         """
 
-        if type(owner) is not NativeTerminalOwner:
-            raise TypeError("owner must be NativeTerminalOwner")
-        if type(producer_id) is not int or producer_id < 0:
-            raise ValueError("producer_id must be a non-negative integer")
+        if type(binding) is not NativeTerminalNativeProducerBinding:
+            raise TypeError("binding must be NativeTerminalNativeProducerBinding")
+        if type(testing) is not bool:
+            raise TypeError("testing must be bool")
         module = _load_native_cuda_terminal_producer(testing=testing)
         self._native = cast(
             _NativeCudaTerminalProducer,
             module.CudaTerminalProducer(
-                owner.producer_api(),
-                owner.producer_capsule(producer_id),
+                binding.producer_api,
+                binding.producer_context,
             ),
         )
+        self._binding = binding
         self._testing = testing
+
+    @classmethod
+    def from_runtime(
+        cls,
+        runtime: NativeTerminalRuntime,
+        producer_name: str,
+        *,
+        testing: bool = False,
+    ) -> "CudaTerminalProducer":
+        """Construct from one runtime-registered native producer.
+
+        :param runtime: Dormant or running immutable owner runtime.
+        :param producer_name: Stable pre-registered native producer name.
+        :param testing: Whether native test controls are required.
+        :returns: Bound direct CUDA terminal producer.
+        """
+
+        if type(runtime) is not NativeTerminalRuntime:
+            raise TypeError("runtime must be NativeTerminalRuntime")
+        return cls(
+            runtime.native_producer_binding(producer_name),
+            testing=testing,
+        )
+
+    @property
+    def producer_id(self) -> int:
+        """Return the exact native owner producer namespace.
+
+        :returns: Runtime-registered producer ID.
+        """
+
+        return self._binding.producer_id
 
     def arm(self, binding_digest: bytes) -> None:
         """Arm one exact lifecycle before scatter submission.

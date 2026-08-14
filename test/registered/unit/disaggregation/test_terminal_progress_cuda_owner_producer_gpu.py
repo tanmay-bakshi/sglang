@@ -25,6 +25,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProducerRegistration,
     NativeTerminalRequestBinding,
 )
+from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalNativeProducerBinding,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
@@ -135,8 +138,11 @@ def _build_scatter_owner() -> tuple[
             )
         )
     producer = CudaTerminalProducer(
-        owner,
-        _CUDA_PRODUCER_ID,
+        NativeTerminalNativeProducerBinding(
+            producer_id=_CUDA_PRODUCER_ID,
+            producer_api=owner.producer_api(),
+            producer_context=owner.producer_capsule(_CUDA_PRODUCER_ID),
+        ),
         testing=True,
     )
     producer.arm(binding.digest)

@@ -28,6 +28,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProducerRegistration,
     NativeTerminalRequestBinding,
 )
+from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalNativeProducerBinding,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -183,6 +186,20 @@ def _register_scatter_inflight(
     return binding
 
 
+def _cuda_binding(owner: NativeTerminalOwner) -> NativeTerminalNativeProducerBinding:
+    """Build the runtime-shaped binding for the registered CUDA producer.
+
+    :param owner: Native owner containing the producer registration.
+    :returns: Opaque producer API and context binding.
+    """
+
+    return NativeTerminalNativeProducerBinding(
+        producer_id=_CUDA_PRODUCER_ID,
+        producer_api=owner.producer_api(),
+        producer_context=owner.producer_capsule(_CUDA_PRODUCER_ID),
+    )
+
+
 def _wait_for_phase(
     owner: NativeTerminalOwner,
     binding_digest: bytes,
@@ -242,11 +259,7 @@ def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
         source_identity,
         room_id=401,
     )
-    producer = CudaTerminalProducer(
-        owner,
-        _CUDA_PRODUCER_ID,
-        testing=True,
-    )
+    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
     producer.arm(binding.digest)
     owner.start()
     producer.complete_synchronously_for_testing(binding.digest)
@@ -274,11 +287,7 @@ def test_concurrent_callbacks_preserve_owner_assigned_queue_order() -> None:
         )
         for index in range(16)
     )
-    producer = CudaTerminalProducer(
-        owner,
-        _CUDA_PRODUCER_ID,
-        testing=True,
-    )
+    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
     for binding in bindings:
         producer.arm(binding.digest)
     owner.start()
@@ -310,11 +319,7 @@ def test_close_with_live_callback_fails_closed_and_keeps_capsule_lifetime() -> N
         source_identity,
         room_id=601,
     )
-    producer = CudaTerminalProducer(
-        owner,
-        _CUDA_PRODUCER_ID,
-        testing=True,
-    )
+    producer = CudaTerminalProducer(_cuda_binding(owner), testing=True)
     producer.arm(binding.digest)
     owner.start()
     producer.begin_held_callback_for_testing(binding.digest)
