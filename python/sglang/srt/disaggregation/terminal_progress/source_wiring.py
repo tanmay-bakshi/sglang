@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerObservation,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalPublicationIdentity,
@@ -176,6 +177,14 @@ class PackedTerminalSourceMetricsSink(Protocol):
         :param metric: Source lifecycle event timing.
         """
 
+    def emit_submission_commit(
+        self, observation: NativeTerminalOwnerObservation
+    ) -> None:
+        """Consume one exact producer-to-owner handoff interval.
+
+        :param observation: Actionless authoritative commit evidence.
+        """
+
 
 @runtime_checkable
 class PackedTerminalSourcePublisher(Protocol):
@@ -295,6 +304,7 @@ class _SourceRecord:
 
     submission: PackedTerminalSourceSubmission
     lifecycle_published: bool = False
+    submission_commit_observed: bool = False
     request_ready_receipt: TerminalReceipt | None = None
     request_failure_receipt: TerminalReceipt | None = None
     publication_action: NativeTerminalOwnerAction | None = None
@@ -427,6 +437,30 @@ class PackedTerminalSourceWiring:
             digest,
             NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
         )
+
+    def submission_committed(self, observation: NativeTerminalOwnerObservation) -> None:
+        """Project the exact native submission commit into evidence.
+
+        :param observation: Evidence-only actionless native commit.
+        """
+
+        if type(observation) is not NativeTerminalOwnerObservation:
+            raise TypeError("observation must be NativeTerminalOwnerObservation")
+        expected_owner = NativeTerminalProcessIdentity.from_identity(
+            self._local_identity
+        )
+        if observation.binding.owner != expected_owner:
+            raise RuntimeError("submission observation belongs to another source rank")
+        digest = observation.binding.digest
+        record = self._record(digest)
+        with self._lock:
+            current = self._records.get(digest)
+            if current is not record:
+                raise RuntimeError("source record changed during commit observation")
+            if current.submission_commit_observed:
+                raise RuntimeError("source submission commit was observed twice")
+            current.submission_commit_observed = True
+        self._metrics_sink.emit_submission_commit(observation)
 
     def lifecycle_published(self, binding_digest: bytes) -> bool:
         """Return whether a lifecycle crossed the native publication boundary.

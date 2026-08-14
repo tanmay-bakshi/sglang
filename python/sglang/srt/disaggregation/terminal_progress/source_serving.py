@@ -20,13 +20,14 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
-    NativeTerminalOwnerOutput,
+    NativeTerminalOwnerObservation,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     TerminalGatewayPublicationResult,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import TerminalReceipt
 from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalObservation,
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
     NativeTerminalRuntimeSnapshot,
@@ -77,7 +78,7 @@ class PackedTerminalSourceWork:
         [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
     ]
     quarantine: Callable[[NativeTerminalOwnerAction], None]
-    observe_output: Callable[[NativeTerminalOwnerOutput], None]
+    observe_output: Callable[[NativeTerminalObservation], None]
 
     def __post_init__(self) -> None:
         """Validate every process-lifetime source work boundary."""
@@ -344,8 +345,19 @@ class PackedTerminalSourceServing:
         consumed += self._drain_publisher_actions()
         consumed += self._drain_lifecycle_actions()
         observations = self._runtime.observations.drain()
-        for output in observations:
-            self._work.observe_output(output)
+        for observation in observations:
+            try:
+                if type(observation) is NativeTerminalOwnerObservation:
+                    self._wiring.submission_committed(observation)
+                else:
+                    self._work.observe_output(observation)
+            except Exception:
+                formatted_traceback = traceback.format_exc()
+                self._runtime.report_observation_loss(observation)
+                logger.error(
+                    "Source terminal observation failed without gating lifecycle: %s",
+                    formatted_traceback,
+                )
         consumed += len(observations)
         self._propagate_runtime_fatal()
         return consumed

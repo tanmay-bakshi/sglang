@@ -279,6 +279,18 @@ struct Output {
   std::vector<Action> actions{};
 };
 
+struct Observation {
+  RequestBinding binding{};
+  std::uint64_t owner_sequence{0};
+  std::uint64_t producer_id{0};
+  std::uint64_t producer_sequence{0};
+  std::uint32_t producer_rank{0};
+  EventKind event_kind{EventKind::kSourceSubmissionAccepted};
+  std::uint64_t enqueued_ns{0};
+  std::uint64_t completed_ns{0};
+  OwnerRole role{OwnerRole::kSource};
+};
+
 struct Trace {
   Event event{};
   std::uint64_t completed_ns{0};
@@ -609,6 +621,20 @@ py::dict output_to_python(const Output &value) {
   return result;
 }
 
+py::dict observation_to_python(const Observation &value) {
+  py::dict result;
+  result["binding"] = binding_to_python(value.binding);
+  result["owner_sequence"] = value.owner_sequence;
+  result["producer_id"] = value.producer_id;
+  result["producer_sequence"] = value.producer_sequence;
+  result["producer_rank"] = value.producer_rank;
+  result["event_kind"] = static_cast<int>(value.event_kind);
+  result["enqueued_ns"] = value.enqueued_ns;
+  result["completed_ns"] = value.completed_ns;
+  result["role"] = static_cast<int>(value.role);
+  return result;
+}
+
 py::dict trace_to_python(const Trace &value) {
   py::dict result;
   result["machine_index"] = value.machine_index;
@@ -664,6 +690,7 @@ struct SharedOwner {
   std::condition_variable qualification_condition{};
   std::size_t input_capacity{0};
   std::size_t output_capacity{0};
+  std::size_t observation_capacity{0};
   std::size_t maximum_live_lifecycles{0};
   ProcessIdentity owner_identity{};
   Digest deadline_table_digest{};
@@ -673,6 +700,7 @@ struct SharedOwner {
   std::deque<InputCommand> input_queue{};
   std::deque<Output> output_queue{};
   std::deque<Output> fatal_output_queue{};
+  std::deque<Observation> observation_queue{};
   std::unordered_map<std::uint64_t, Action> pending_actions{};
   std::unordered_set<std::uint64_t> consumed_actions{};
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
@@ -681,11 +709,16 @@ struct SharedOwner {
   std::thread reactor{};
   int input_fd{-1};
   int output_fd{-1};
+  int observation_fd{-1};
   int timer_fd{-1};
   int shutdown_fd{-1};
   std::uint64_t next_owner_sequence{0};
   std::uint64_t next_action_id{1};
   std::uint64_t total_action_count{0};
+  std::uint64_t observation_count{0};
+  std::uint64_t delivered_observation_count{0};
+  std::uint64_t dropped_observation_count{0};
+  std::uint64_t observation_eventfd_error_count{0};
   bool started{false};
   bool admission_open{true};
   bool event_admission_open{true};
@@ -697,6 +730,7 @@ struct SharedOwner {
   bool reactor_stopped{false};
   bool closed{false};
   bool output_drain_active{false};
+  bool observation_wake_armed{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   bool test_clock_enabled{false};
   std::uint64_t test_now_ns{0};
@@ -756,6 +790,30 @@ void signal_fd_locked(SharedOwner &owner, int fd) noexcept {
       owner.fatal_system_error = result < 0 ? errno : EIO;
     }
     return;
+  }
+}
+
+bool signal_observation_fd_locked(SharedOwner &owner) noexcept {
+  if (owner.observation_wake_armed) {
+    return true;
+  }
+  if (owner.observation_fd < 0) {
+    ++owner.observation_eventfd_error_count;
+    return false;
+  }
+  constexpr std::uint64_t increment = 1;
+  for (;;) {
+    const ssize_t result =
+        ::write(owner.observation_fd, &increment, sizeof(increment));
+    if (result == static_cast<ssize_t>(sizeof(increment))) {
+      owner.observation_wake_armed = true;
+      return true;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    ++owner.observation_eventfd_error_count;
+    return false;
   }
 }
 
@@ -1859,6 +1917,39 @@ void register_lifecycle_locked(SharedOwner &owner, Lifecycle lifecycle) {
   quarantine_all_locked(owner, FatalCode::kDuplicateBinding, &trigger, reason);
 }
 
+void observe_submission_commit_locked(SharedOwner &owner,
+                                      const Output &output) noexcept {
+  if (output.event_kind != EventKind::kSourceSubmissionAccepted ||
+      !output.actions.empty()) {
+    return;
+  }
+  ++owner.observation_count;
+  if (owner.observation_queue.size() >= owner.observation_capacity) {
+    ++owner.dropped_observation_count;
+    return;
+  }
+  try {
+    Observation observation{};
+    observation.binding = output.binding;
+    observation.owner_sequence = output.owner_sequence;
+    observation.producer_id = output.producer_id;
+    observation.producer_sequence = output.producer_sequence;
+    observation.producer_rank = output.binding.owner.tp_rank;
+    observation.event_kind = output.event_kind;
+    observation.enqueued_ns = output.enqueued_ns;
+    observation.completed_ns = output.completed_ns;
+    observation.role = output.role;
+    owner.observation_queue.push_back(std::move(observation));
+  } catch (...) {
+    ++owner.dropped_observation_count;
+    return;
+  }
+  if (!signal_observation_fd_locked(owner)) {
+    owner.observation_queue.pop_back();
+    ++owner.dropped_observation_count;
+  }
+}
+
 void dispatch_event_locked(SharedOwner &owner, const Event &event) {
   const auto producer_iterator = owner.producers.find(event.producer_id);
   if (producer_iterator == owner.producers.end()) {
@@ -1961,6 +2052,7 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
                 lifecycle.phase};
     finish_qualification_transition_locked(owner, canonical_event, trace,
                                             output);
+    observe_submission_commit_locked(owner, output);
     if (!output.actions.empty()) {
       if (owner.output_queue.size() >= owner.output_capacity) {
         discard_unpublished_actions_locked(owner, output);
@@ -2315,17 +2407,20 @@ class NativeTerminalOwnerBridge {
 public:
   NativeTerminalOwnerBridge(std::size_t input_capacity,
                             std::size_t output_capacity,
+                            std::size_t observation_capacity,
                             std::size_t maximum_live_lifecycles,
                             const py::dict &owner_identity,
                             const py::sequence &deadline_table,
                             const py::bytes &deadline_table_digest)
       : owner_(std::make_shared<SharedOwner>()) {
     if (input_capacity == 0 || output_capacity == 0 ||
+        observation_capacity == 0 ||
         maximum_live_lifecycles == 0) {
       throw std::invalid_argument("owner queue capacities must be positive");
     }
     owner_->input_capacity = input_capacity;
     owner_->output_capacity = output_capacity;
+    owner_->observation_capacity = observation_capacity;
     owner_->maximum_live_lifecycles = maximum_live_lifecycles;
     owner_->owner_identity = process_identity_from_python(owner_identity);
     owner_->deadline_table_digest =
@@ -2359,13 +2454,16 @@ public:
     }
     owner_->input_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     owner_->output_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    owner_->observation_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     owner_->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     owner_->shutdown_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (owner_->input_fd < 0 || owner_->output_fd < 0 ||
+        owner_->observation_fd < 0 ||
         owner_->timer_fd < 0 || owner_->shutdown_fd < 0) {
       const int error = errno;
       close_fd(owner_->input_fd);
       close_fd(owner_->output_fd);
+      close_fd(owner_->observation_fd);
       close_fd(owner_->timer_fd);
       close_fd(owner_->shutdown_fd);
       throw std::system_error(error, std::generic_category(),
@@ -2508,6 +2606,11 @@ public:
     return owner_->output_fd;
   }
 
+  int observation_fileno() const {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    return owner_->observation_fd;
+  }
+
   py::list drain_outputs() {
     std::deque<Output> outputs;
     {
@@ -2548,6 +2651,30 @@ public:
     py::list result;
     for (const Output &output : outputs) {
       result.append(output_to_python(output));
+    }
+    return result;
+  }
+
+  py::list drain_observations() {
+    std::deque<Observation> observations;
+    {
+      std::lock_guard<std::mutex> lock(owner_->mutex);
+      const int error = consume_fd(owner_->observation_fd);
+      owner_->observation_wake_armed = false;
+      if (error != 0) {
+        ++owner_->observation_eventfd_error_count;
+        owner_->dropped_observation_count += owner_->observation_queue.size();
+        owner_->observation_queue.clear();
+        owner_->condition.notify_all();
+        return py::list();
+      }
+      observations.swap(owner_->observation_queue);
+      owner_->delivered_observation_count += observations.size();
+      owner_->condition.notify_all();
+    }
+    py::list result;
+    for (const Observation &observation : observations) {
+      result.append(observation_to_python(observation));
     }
     return result;
   }
@@ -3165,10 +3292,18 @@ private:
     result["input_capacity"] = owner_->input_capacity;
     result["output_capacity"] = owner_->output_capacity;
     result["fatal_output_capacity"] = owner_->maximum_live_lifecycles;
+    result["observation_capacity"] = owner_->observation_capacity;
     result["queued_input_count"] = owner_->input_queue.size();
     result["queued_output_count"] =
         owner_->output_queue.size() + owner_->fatal_output_queue.size();
     result["queued_fatal_output_count"] = owner_->fatal_output_queue.size();
+    result["queued_observation_count"] = owner_->observation_queue.size();
+    result["delivered_observation_count"] =
+        owner_->delivered_observation_count;
+    result["dropped_observation_count"] = owner_->dropped_observation_count;
+    result["observation_count"] = owner_->observation_count;
+    result["observation_eventfd_error_count"] =
+        owner_->observation_eventfd_error_count;
     result["registered_producer_count"] = owner_->producers.size();
     result["joined_producer_count"] = std::count_if(
         owner_->producers.begin(), owner_->producers.end(),
@@ -3186,6 +3321,7 @@ private:
     result["draining"] = !owner_->admission_open && !owner_->closed;
     result["input_eventfd_open"] = owner_->input_fd >= 0;
     result["output_eventfd_open"] = owner_->output_fd >= 0;
+    result["observation_eventfd_open"] = owner_->observation_fd >= 0;
     if (owner_->fatal_code == FatalCode::kNone) {
       result["fatal_binding_digest"] = py::none();
     } else {
@@ -3254,8 +3390,12 @@ private:
   }
 
   void close_fds_locked() noexcept {
+    owner_->dropped_observation_count += owner_->observation_queue.size();
+    owner_->observation_queue.clear();
+    owner_->observation_wake_armed = false;
     close_fd(owner_->input_fd);
     close_fd(owner_->output_fd);
+    close_fd(owner_->observation_fd);
     close_fd(owner_->timer_fd);
     close_fd(owner_->shutdown_fd);
   }
@@ -3295,9 +3435,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("PRODUCER_CONTEXT_CAPSULE_NAME") =
       SGLANG_TERMINAL_OWNER_PRODUCER_CONTEXT_CAPSULE_NAME;
   py::class_<NativeTerminalOwnerBridge>(module, "NativeTerminalOwnerBridge")
-      .def(py::init<std::size_t, std::size_t, std::size_t, const py::dict &,
-                    const py::sequence &, const py::bytes &>(),
+      .def(py::init<std::size_t, std::size_t, std::size_t, std::size_t,
+                    const py::dict &, const py::sequence &,
+                    const py::bytes &>(),
            py::arg("input_capacity"), py::arg("output_capacity"),
+           py::arg("observation_capacity"),
            py::arg("maximum_live_lifecycles"),
            py::arg("owner_identity"), py::arg("deadline_table"),
            py::arg("deadline_table_digest"))
@@ -3319,6 +3461,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("producer_id"))
       .def("output_fileno", &NativeTerminalOwnerBridge::output_fileno)
       .def("drain_outputs", &NativeTerminalOwnerBridge::drain_outputs)
+      .def("observation_fileno",
+           &NativeTerminalOwnerBridge::observation_fileno)
+      .def("drain_observations",
+           &NativeTerminalOwnerBridge::drain_observations)
       .def("acknowledge_action",
            &NativeTerminalOwnerBridge::acknowledge_action,
            py::arg("action_id"), py::call_guard<py::gil_scoped_release>())

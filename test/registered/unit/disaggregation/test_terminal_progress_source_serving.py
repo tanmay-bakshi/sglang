@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerObservation,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
@@ -87,11 +88,13 @@ class _Metrics:
     """Record non-gating source metrics."""
 
     values: list[PackedTerminalSourceMetric]
+    submission_commits: list[NativeTerminalOwnerObservation]
 
     def __init__(self) -> None:
         """Create an empty metric ledger."""
 
         self.values = []
+        self.submission_commits = []
 
     def emit(self, metric: PackedTerminalSourceMetric) -> None:
         """Record one source metric.
@@ -100,6 +103,16 @@ class _Metrics:
         """
 
         self.values.append(metric)
+
+    def emit_submission_commit(
+        self, observation: NativeTerminalOwnerObservation
+    ) -> None:
+        """Record one exact native submission interval.
+
+        :param observation: Evidence-only native commit.
+        """
+
+        self.submission_commits.append(observation)
 
 
 class _Publisher:
@@ -270,24 +283,26 @@ def _serving(
     PackedTerminalSourceServing,
     NativeTerminalRuntime,
     _Publisher,
+    _Metrics,
     list[str],
     list[object],
 ]:
     """Construct one source composition and its observation ledgers.
 
     :param identity: Exact source identity graph.
-    :returns: Serving, runtime, publisher, work labels, and fatal inventories.
+    :returns: Serving, runtime, publisher, metrics, work labels, and fatal inventories.
     """
 
     runtime = _runtime(identity)
     publisher = _Publisher()
+    metrics = _Metrics()
     work_labels: list[str] = []
     fatal_inventories: list[object] = []
     serving = PackedTerminalSourceServing(
         runtime=runtime,
         local_identity=identity.local_binding.owner,
         publisher=publisher,
-        metrics_sink=_Metrics(),
+        metrics_sink=metrics,
         clock_ns=lambda: 1_000,
         physical_capacity=8,
         process_fatal_handler=fatal_inventories.append,
@@ -302,7 +317,7 @@ def _serving(
         ),
         retire_submission=lambda submission: None,
     )
-    return serving, runtime, publisher, work_labels, fatal_inventories
+    return serving, runtime, publisher, metrics, work_labels, fatal_inventories
 
 
 def _pump(
@@ -330,7 +345,7 @@ def test_composition_binds_both_scheduler_owners_before_lifecycle() -> None:
     """The native lifecycle cannot race either scheduler-owned registry."""
 
     identity = _identity()
-    serving, _, _, _, _ = _serving(identity)
+    serving, _, _, _, _, _ = _serving(identity)
     serving.start()
     release_calls: list[int] = []
     try:
@@ -355,7 +370,7 @@ def test_bind_failure_pairs_unpublished_scheduler_cancellation() -> None:
     """A pre-publication source mismatch leaves neither scheduler registry live."""
 
     identity = _identity()
-    serving, _, _, _, _ = _serving(identity)
+    serving, _, _, _, _, _ = _serving(identity)
     serving.start()
     try:
         with pytest.raises(RuntimeError, match="another runtime"):
@@ -375,7 +390,7 @@ def test_full_source_composition_retires_exactly_once() -> None:
     """Pump every source action through runtime, scheduler, and publisher joins."""
 
     identity = _identity()
-    serving, runtime, publisher, work_labels, _ = _serving(identity)
+    serving, runtime, publisher, metrics, work_labels, _ = _serving(identity)
     submission = _submission(identity)
     release_calls: list[PackedTerminalSourceSubmission] = []
     serving.start()
@@ -385,6 +400,14 @@ def test_full_source_composition_retires_exactly_once() -> None:
         serving.wiring.producer_completed(digest)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
+        assert len(metrics.submission_commits) == 1
+        commit = metrics.submission_commits[0]
+        assert commit.binding.digest == digest
+        assert commit.event_kind is (
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED
+        )
+        assert commit.enqueued_ns == 1_000
+        assert commit.completed_ns >= commit.enqueued_ns
 
         runtime._owner.submit(
             NativeTerminalOwnerEvent(
@@ -449,7 +472,7 @@ def test_runtime_fatal_marks_scheduler_and_quarantines_retained_release() -> Non
     """Owner death wakes the scheduler and preserves mutable source resources."""
 
     identity = _identity()
-    serving, runtime, _, _, fatal_inventories = _serving(identity)
+    serving, runtime, _, _, _, fatal_inventories = _serving(identity)
     serving.start()
     try:
         serving.bind_submission(_submission(identity), lambda submission: None)

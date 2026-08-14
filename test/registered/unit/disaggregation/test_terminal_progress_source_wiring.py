@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerObservation,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalReceipt,
@@ -88,6 +89,7 @@ class _Metrics:
     """Non-gating source metric ledger fixture."""
 
     values: list[PackedTerminalSourceMetric]
+    submission_commits: list[NativeTerminalOwnerObservation]
     fail: bool
 
     def __init__(self, *, fail: bool = False) -> None:
@@ -97,6 +99,7 @@ class _Metrics:
         """
 
         self.values = []
+        self.submission_commits = []
         self.fail = fail
 
     def emit(self, metric: PackedTerminalSourceMetric) -> None:
@@ -108,6 +111,18 @@ class _Metrics:
         if self.fail:
             raise RuntimeError("synthetic metric failure")
         self.values.append(metric)
+
+    def emit_submission_commit(
+        self, observation: NativeTerminalOwnerObservation
+    ) -> None:
+        """Record or reject one exact native submission interval.
+
+        :param observation: Evidence-only native commit.
+        """
+
+        if self.fail:
+            raise RuntimeError("synthetic metric failure")
+        self.submission_commits.append(observation)
 
 
 class _Publisher:

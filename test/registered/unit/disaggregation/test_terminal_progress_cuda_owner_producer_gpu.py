@@ -73,6 +73,7 @@ def _build_scatter_owner() -> tuple[
     owner = NativeTerminalOwner(
         input_capacity=64,
         output_capacity=64,
+        observation_capacity=64,
         owner_identity=identity,
         testing=True,
     )

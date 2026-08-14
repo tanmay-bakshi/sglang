@@ -924,6 +924,7 @@ def run_gil_qualification(
     owner = NativeTerminalOwner(
         input_capacity=_NATIVE_QUEUE_CAPACITY,
         output_capacity=_NATIVE_QUEUE_CAPACITY,
+        observation_capacity=_NATIVE_QUEUE_CAPACITY,
         owner_identity=owner_identity,
     )
     hog = _PurePythonSchedulerHog()

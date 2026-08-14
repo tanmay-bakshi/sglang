@@ -272,6 +272,7 @@ def test_active_qualification_abort_is_bounded_and_closes_the_reactor() -> None:
     owner = NativeTerminalOwner(
         input_capacity=64,
         output_capacity=64,
+        observation_capacity=64,
         owner_identity=identity,
         testing=True,
     )
@@ -606,6 +607,7 @@ def _make_dynamic_source_owner(
     owner = NativeTerminalOwner(
         input_capacity=64,
         output_capacity=64,
+        observation_capacity=64,
         owner_identity=identity,
         testing=True,
     )

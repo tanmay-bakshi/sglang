@@ -2,6 +2,7 @@ import collections
 import dataclasses
 import enum
 import errno
+import logging
 import os
 import selectors
 import threading
@@ -19,6 +20,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerInventory,
+    NativeTerminalOwnerObservation,
     NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
@@ -26,6 +28,10 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProducerRegistration,
     NativeTerminalReceipt,
 )
+
+NativeTerminalObservation = NativeTerminalOwnerOutput | NativeTerminalOwnerObservation
+
+logger = logging.getLogger(__name__)
 
 
 class NativeTerminalRuntimeError(RuntimeError):
@@ -262,24 +268,29 @@ class _BoundedFdInbox[ValueT]:
                 self._fatal_reason = reason
             self._signal_locked()
 
-    def _close(self, *, require_empty: bool) -> None:
+    def _close(self, *, require_empty: bool) -> int:
         """Close both descriptors at the exact consumer boundary.
 
         :param require_empty: Whether retained queue entries reject closure.
+        :returns: Number of non-authoritative entries discarded at closure.
         """
 
         with self._lock:
             if self._closed:
-                return
+                return 0
             if require_empty and len(self._pending) > 0:
                 raise NativeTerminalRuntimeError(
                     f"runtime inbox {self._name} retained {len(self._pending)} values"
                 )
+            discarded_count = len(self._pending)
+            if not require_empty:
+                self._pending.clear()
             self._closed = True
             read_fd = self._read_fd
             write_fd = self._write_fd
         os.close(read_fd)
         os.close(write_fd)
+        return discarded_count
 
     def _signal_locked(self) -> None:
         """Arm one wake byte while the queue lock protects coalescing."""
@@ -314,7 +325,7 @@ class NativeTerminalActionInbox(_BoundedFdInbox[NativeTerminalOwnerAction]):
     """Fd-signalled immutable action queue for one execution context."""
 
 
-class NativeTerminalObservationInbox(_BoundedFdInbox[NativeTerminalOwnerOutput]):
+class NativeTerminalObservationInbox(_BoundedFdInbox[NativeTerminalObservation]):
     """Non-authoritative output-observation queue for metrics and evidence."""
 
 
@@ -527,6 +538,7 @@ class NativeTerminalRuntime:
     _fatal_reason: str | None
     _output_reactor_alive: bool
     _producers_joined: bool
+    _native_observation_delivery_count: int
     _dropped_observation_count: int
     _stop_read_fd: int
     _stop_write_fd: int
@@ -633,6 +645,7 @@ class NativeTerminalRuntime:
         owner = NativeTerminalOwner(
             input_capacity=input_capacity,
             output_capacity=output_capacity,
+            observation_capacity=observation_capacity,
             owner_identity=owner_identity,
             maximum_live_lifecycles=maximum_live_lifecycles,
         )
@@ -682,6 +695,7 @@ class NativeTerminalRuntime:
         self._fatal_reason = None
         self._output_reactor_alive = False
         self._producers_joined = False
+        self._native_observation_delivery_count = 0
         self._dropped_observation_count = 0
         self._stop_read_fd = stop_read_fd
         self._stop_write_fd = stop_write_fd
@@ -726,6 +740,21 @@ class NativeTerminalRuntime:
         """
 
         return self._observations
+
+    def report_observation_loss(self, observation: NativeTerminalObservation) -> None:
+        """Account for one drained evidence record rejected by its sink.
+
+        :param observation: Exact non-authoritative record which was lost.
+        """
+
+        if type(observation) not in (
+            NativeTerminalOwnerOutput,
+            NativeTerminalOwnerObservation,
+        ):
+            raise TypeError("observation has an invalid native evidence type")
+        with self._condition:
+            self._dropped_observation_count += 1
+            self._condition.notify_all()
 
     @property
     def source_work_actions(self) -> NativeTerminalActionInbox:
@@ -1343,7 +1372,6 @@ class NativeTerminalRuntime:
             self._source_work_actions,
             self._decode_work_actions,
             self._publisher_actions,
-            self._observations,
         )
         if not self.wait_for_output_projection_quiescence(
             self._OUTPUT_QUIESCENCE_TIMEOUT_SECONDS
@@ -1427,7 +1455,6 @@ class NativeTerminalRuntime:
             self._source_work_actions,
             self._decode_work_actions,
             self._publisher_actions,
-            self._observations,
         )
         if not self.wait_for_output_projection_quiescence(
             self._OUTPUT_QUIESCENCE_TIMEOUT_SECONDS
@@ -1552,31 +1579,76 @@ class NativeTerminalRuntime:
             self._owner.submit(event)
 
     def _run_output_reactor(self) -> None:
-        """Drain native actions into bounded execution-context inboxes."""
+        """Drain native actions and non-gating evidence into typed inboxes."""
 
         selector = selectors.DefaultSelector()
         current_binding: bytes | None = None
         try:
             selector.register(self._owner.output_fileno(), selectors.EVENT_READ, 1)
             selector.register(self._stop_read_fd, selectors.EVENT_READ, 2)
+            selector.register(self._owner.observation_fileno(), selectors.EVENT_READ, 3)
             with self._condition:
                 self._output_reactor_alive = True
                 self._condition.notify_all()
             while True:
                 ready = selector.select()
-                should_stop = False
-                for key, _ in ready:
-                    if key.data == 2:
-                        self._drain_stop_wake()
-                        should_stop = True
-                        continue
+                ready_kinds = frozenset(int(key.data) for key, _ in ready)
+                if 1 in ready_kinds:
                     with self._output_projection_lock:
                         outputs = self._owner.drain_outputs()
                         for output in outputs:
                             current_binding = output.binding.digest
                             self._route_output(output)
                             current_binding = None
-                if should_stop:
+                if 3 in ready_kinds:
+                    try:
+                        batch = self._owner.drain_observations()
+                    except Exception:  # noqa: BLE001
+                        formatted_traceback = traceback.format_exc()
+                        logger.error(
+                            "Native observation drain failed without gating lifecycle: %s",
+                            formatted_traceback,
+                        )
+                        try:
+                            delivered_count = (
+                                self._owner.inventory().delivered_observation_count
+                            )
+                        except Exception:  # noqa: BLE001
+                            inventory_traceback = traceback.format_exc()
+                            logger.error(
+                                "Native observation loss accounting failed without "
+                                "gating lifecycle: %s",
+                                inventory_traceback,
+                            )
+                        else:
+                            with self._condition:
+                                newly_lost = (
+                                    delivered_count
+                                    - self._native_observation_delivery_count
+                                )
+                                if newly_lost < 0:
+                                    logger.error(
+                                        "Native observation delivery count regressed "
+                                        "from %d to %d",
+                                        self._native_observation_delivery_count,
+                                        delivered_count,
+                                    )
+                                else:
+                                    self._native_observation_delivery_count = (
+                                        delivered_count
+                                    )
+                                    self._dropped_observation_count += newly_lost
+                                    self._condition.notify_all()
+                    else:
+                        delivered_count = len(batch.observations) + batch.dropped_count
+                        with self._condition:
+                            self._native_observation_delivery_count += delivered_count
+                            self._dropped_observation_count += batch.dropped_count
+                            self._condition.notify_all()
+                        for observation in batch.observations:
+                            self._route_observation(observation)
+                if 2 in ready_kinds:
+                    self._drain_stop_wake()
                     break
         except Exception:  # noqa: BLE001
             formatted_traceback = traceback.format_exc()
@@ -1632,6 +1704,26 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
         for action in delivered_actions:
             self._owner.acknowledge_action(action)
+
+    def _route_observation(self, observation: NativeTerminalOwnerObservation) -> None:
+        """Project actionless native evidence without changing authority.
+
+        :param observation: Exact source-submission commit interval.
+        """
+
+        try:
+            if type(observation) is not NativeTerminalOwnerObservation:
+                raise TypeError("observation must be NativeTerminalOwnerObservation")
+            self._observations._enqueue(observation)
+        except Exception:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            logger.error(
+                "Native observation routing failed without gating lifecycle: %s",
+                formatted_traceback,
+            )
+            with self._condition:
+                self._dropped_observation_count += 1
+                self._condition.notify_all()
 
     def _route_action(self, action: NativeTerminalOwnerAction) -> None:
         """Route one action to its sole owning execution context.
@@ -1841,4 +1933,8 @@ class NativeTerminalRuntime:
         self._source_work_actions._close(require_empty=require_empty)
         self._decode_work_actions._close(require_empty=require_empty)
         self._publisher_actions._close(require_empty=require_empty)
-        self._observations._close(require_empty=require_empty)
+        dropped_count = self._observations._close(require_empty=False)
+        if dropped_count > 0:
+            with self._condition:
+                self._dropped_observation_count += dropped_count
+                self._condition.notify_all()

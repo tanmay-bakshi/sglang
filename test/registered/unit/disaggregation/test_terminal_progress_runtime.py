@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerObservation,
     NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
@@ -483,7 +484,6 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
         assert snapshot.dropped_observation_count > 0
         _retire_all_producers(runtime)
         runtime.join_producers()
-        _drain_observations(runtime)
         with pytest.raises(NativeTerminalRuntimeClosedError):
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
@@ -492,6 +492,65 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
                 reason="producer submitted after join",
             )
         runtime.close_clean()
+        closed = runtime.snapshot()
+        assert closed.observations.closed
+        assert closed.observations.queued_count == 0
+        assert closed.dropped_observation_count > 0
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_observation_sink_failure_isolated_per_record() -> None:
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registrations = (
+        _registration(owner, remote, 711),
+        _registration(owner, remote, 712),
+    )
+    observations = tuple(
+        NativeTerminalOwnerObservation(
+            binding=registration.binding,
+            owner_sequence=index,
+            producer_id=_LOCAL_PRODUCER_ID,
+            producer_sequence=index,
+            producer_rank=owner.tp_rank,
+            event_kind=NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=1_000 + index,
+            completed_ns=2_000 + index,
+            role=owner.role,
+        )
+        for index, registration in enumerate(registrations)
+    )
+    observation_type = type(runtime.observations)
+    original_enqueue = observation_type._enqueue
+    attempts = 0
+
+    def fail_first(
+        inbox: NativeTerminalObservationInbox,
+        observation: NativeTerminalOwnerObservation,
+    ) -> None:
+        """Reject one record, then delegate every later record.
+
+        :param inbox: Runtime observation inbox.
+        :param observation: Candidate immutable evidence record.
+        """
+
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("synthetic evidence sink failure")
+        original_enqueue(inbox, observation)
+
+    runtime.start()
+    try:
+        with mock.patch.object(observation_type, "_enqueue", fail_first):
+            for observation in observations:
+                runtime._route_observation(observation)
+
+        assert runtime.observations.drain() == (observations[1],)
+        snapshot = runtime.snapshot()
+        assert snapshot.disposition is NativeTerminalRuntimeDisposition.RUNNING
+        assert snapshot.dropped_observation_count == 1
+        assert snapshot.owner.fatal_code is NativeTerminalOwnerFatalCode.NONE
     finally:
         _finish_fail_closed(runtime)
 
@@ -858,8 +917,6 @@ def test_abort_preserves_every_registration_and_quarantine_identity() -> None:
         }
         for action in actions:
             runtime.acknowledge_aborted_action(action)
-        _drain_observations(runtime)
-
         snapshot = runtime.snapshot()
         assert snapshot.scheduler_live_count == 0
         assert set(snapshot.quarantined_binding_digests) == {
@@ -869,6 +926,10 @@ def test_abort_preserves_every_registration_and_quarantine_identity() -> None:
             snapshot.quarantined_binding_digests
         )
         runtime.finish_abort_close()
+        closed = runtime.snapshot()
+        assert closed.observations.closed
+        assert closed.observations.queued_count == 0
+        assert closed.dropped_observation_count > 0
     finally:
         _finish_fail_closed(runtime)
 

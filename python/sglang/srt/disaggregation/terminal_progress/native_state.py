@@ -1069,6 +1069,125 @@ class NativeTerminalOwnerEvent:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalOwnerObservation:
+    """Immutable non-authoritative evidence for one actionless native commit.
+
+    This value cannot authorize lifecycle progress. It carries the exact
+    source-submission commit interval across the native boundary without
+    weakening :class:`NativeTerminalOwnerOutput`'s non-empty action invariant.
+
+    :ivar binding: Exact lifecycle identity observed by the commit.
+    :ivar owner_sequence: Process-local authoritative commit sequence.
+    :ivar producer_id: Producer namespace which supplied the accepted event.
+    :ivar producer_sequence: Accepted producer-local sequence.
+    :ivar producer_rank: Source TP rank which owns the producer commit.
+    :ivar event_kind: Exact actionless event observed by the native owner.
+    :ivar enqueued_ns: Producer-side ``CLOCK_MONOTONIC_RAW`` timestamp.
+    :ivar completed_ns: Native commit ``CLOCK_MONOTONIC_RAW`` timestamp.
+    :ivar role: Lifecycle role carried by the exact binding.
+    """
+
+    binding: NativeTerminalRequestBinding
+    owner_sequence: int
+    producer_id: int
+    producer_sequence: int
+    producer_rank: int
+    event_kind: NativeTerminalOwnerEventKind
+    enqueued_ns: int
+    completed_ns: int
+    role: NativeTerminalOwnerRole
+
+    def __post_init__(self) -> None:
+        """Validate one exact, evidence-only submission observation."""
+
+        if type(self.binding) is not NativeTerminalRequestBinding:
+            raise TypeError("binding must be NativeTerminalRequestBinding")
+        counts = (
+            self.owner_sequence,
+            self.producer_id,
+            self.producer_sequence,
+            self.producer_rank,
+            self.enqueued_ns,
+            self.completed_ns,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("native observation integer fields must be non-negative")
+        if self.completed_ns < self.enqueued_ns:
+            raise ValueError("native completion cannot precede event enqueue")
+        if (
+            self.event_kind
+            is not NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED
+        ):
+            raise ValueError("native observation carries another event kind")
+        if self.role is not NativeTerminalOwnerRole.SOURCE:
+            raise ValueError("native submission observation must belong to source")
+        if self.binding.owner.role is not self.role:
+            raise ValueError("observation role differs from its exact binding")
+        if self.producer_rank != self.binding.owner.tp_rank:
+            raise ValueError("observation producer rank differs from its binding")
+
+    @property
+    def latency_ns(self) -> int:
+        """Return producer enqueue to native commit latency.
+
+        :returns: Native owner handoff latency in nanoseconds.
+        """
+
+        return self.completed_ns - self.enqueued_ns
+
+    @classmethod
+    def from_native(
+        cls, value: Mapping[str, object]
+    ) -> "NativeTerminalOwnerObservation":
+        """Parse one evidence-only observation returned by the native bridge.
+
+        :param value: Native observation mapping.
+        :returns: Validated immutable observation.
+        """
+
+        binding_value = value["binding"]
+        if not isinstance(binding_value, Mapping):
+            raise TypeError("native observation binding must be a mapping")
+        return cls(
+            binding=_binding_from_native(binding_value),
+            owner_sequence=int(value["owner_sequence"]),
+            producer_id=int(value["producer_id"]),
+            producer_sequence=int(value["producer_sequence"]),
+            producer_rank=int(value["producer_rank"]),
+            event_kind=NativeTerminalOwnerEventKind(int(value["event_kind"])),
+            enqueued_ns=int(value["enqueued_ns"]),
+            completed_ns=int(value["completed_ns"]),
+            role=NativeTerminalOwnerRole(int(value["role"])),
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalOwnerObservationBatch:
+    """Typed result of one non-gating native observation drain.
+
+    :ivar observations: Every native record which crossed validation.
+    :ivar dropped_count: Records rejected independently at the Python ABI
+        projection boundary.
+    """
+
+    observations: tuple[NativeTerminalOwnerObservation, ...]
+    dropped_count: int
+
+    def __post_init__(self) -> None:
+        """Validate one complete observation-drain result."""
+
+        if type(self.observations) is not tuple or any(
+            type(value) is not NativeTerminalOwnerObservation
+            for value in self.observations
+        ):
+            raise TypeError(
+                "observations must contain NativeTerminalOwnerObservation values"
+            )
+        if type(self.dropped_count) is not int or self.dropped_count < 0:
+            raise ValueError("dropped_count must be a non-negative integer")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class NativeTerminalOwnerOutput:
     """Immutable production action earned by an authoritative native commit.
 
@@ -1334,9 +1453,18 @@ class NativeTerminalOwnerInventory:
     :ivar input_capacity: Bounded native input capacity.
     :ivar output_capacity: Bounded production-action capacity.
     :ivar fatal_output_capacity: Reserved fail-closed action capacity.
+    :ivar observation_capacity: Bounded evidence-only commit capacity.
     :ivar queued_input_count: Inputs not yet committed.
     :ivar queued_output_count: Earned actions not yet consumed.
     :ivar queued_fatal_output_count: Reserved fail-closed actions not consumed.
+    :ivar queued_observation_count: Evidence records not yet consumed.
+    :ivar delivered_observation_count: Evidence records drained by the sole
+        observation consumer.
+    :ivar dropped_observation_count: Evidence records omitted without changing
+        lifecycle progress.
+    :ivar observation_count: Total actionless commits selected for evidence.
+    :ivar observation_eventfd_error_count: Non-gating observation wake or drain
+        failures.
     :ivar pending_action_count: Native actions not yet acknowledged.
     :ivar registered_producer_count: Exact producer registry size.
     :ivar joined_producer_count: Producers explicitly joined at drain.
@@ -1357,6 +1485,7 @@ class NativeTerminalOwnerInventory:
     :ivar closed: Whether exact clean closure completed.
     :ivar input_eventfd_open: Whether the native input descriptor remains open.
     :ivar output_eventfd_open: Whether the action descriptor remains open.
+    :ivar observation_eventfd_open: Whether the evidence descriptor remains open.
     :ivar output_drain_active: Whether the sole consumer owns a swapped batch.
     :ivar fatal_code: Sticky first process-fatal code.
     :ivar fatal_binding_digest: Exact triggering binding when request-local.
@@ -1366,9 +1495,15 @@ class NativeTerminalOwnerInventory:
     input_capacity: int
     output_capacity: int
     fatal_output_capacity: int
+    observation_capacity: int
     queued_input_count: int
     queued_output_count: int
     queued_fatal_output_count: int
+    queued_observation_count: int
+    delivered_observation_count: int
+    dropped_observation_count: int
+    observation_count: int
+    observation_eventfd_error_count: int
     pending_action_count: int
     registered_producer_count: int
     joined_producer_count: int
@@ -1388,6 +1523,7 @@ class NativeTerminalOwnerInventory:
     closed: bool
     input_eventfd_open: bool
     output_eventfd_open: bool
+    observation_eventfd_open: bool
     output_drain_active: bool
     fatal_code: NativeTerminalOwnerFatalCode
     fatal_binding_digest: bytes | None
@@ -1400,9 +1536,15 @@ class NativeTerminalOwnerInventory:
             self.input_capacity,
             self.output_capacity,
             self.fatal_output_capacity,
+            self.observation_capacity,
             self.queued_input_count,
             self.queued_output_count,
             self.queued_fatal_output_count,
+            self.queued_observation_count,
+            self.delivered_observation_count,
+            self.dropped_observation_count,
+            self.observation_count,
+            self.observation_eventfd_error_count,
             self.pending_action_count,
             self.registered_producer_count,
             self.joined_producer_count,
@@ -1421,6 +1563,7 @@ class NativeTerminalOwnerInventory:
             self.input_capacity == 0
             or self.output_capacity == 0
             or self.fatal_output_capacity == 0
+            or self.observation_capacity == 0
         ):
             raise ValueError("native inventory capacities must be positive")
         if self.queued_input_count > self.input_capacity:
@@ -1430,6 +1573,14 @@ class NativeTerminalOwnerInventory:
             raise ValueError("native output queue exceeds its physical capacity")
         if self.queued_fatal_output_count > self.fatal_output_capacity:
             raise ValueError("native fatal output queue exceeds its reserve")
+        if self.queued_observation_count > self.observation_capacity:
+            raise ValueError("native observation queue exceeds its physical capacity")
+        if self.observation_count != (
+            self.queued_observation_count
+            + self.delivered_observation_count
+            + self.dropped_observation_count
+        ):
+            raise ValueError("native observation inventory violates conservation")
         if self.joined_producer_count > self.registered_producer_count:
             raise ValueError("joined producer count exceeds registered producers")
         if type(self.quarantined_binding_digests) is not tuple or any(
@@ -1451,6 +1602,7 @@ class NativeTerminalOwnerInventory:
             self.closed,
             self.input_eventfd_open,
             self.output_eventfd_open,
+            self.observation_eventfd_open,
             self.output_drain_active,
         )
         if any(type(value) is not bool for value in flags):
@@ -1475,6 +1627,7 @@ class NativeTerminalOwnerInventory:
             if (
                 self.queued_input_count != 0
                 or self.queued_output_count != 0
+                or self.queued_observation_count != 0
                 or self.pending_action_count != 0
                 or self.active_source_count != 0
                 or self.active_decode_count != 0
@@ -1482,7 +1635,11 @@ class NativeTerminalOwnerInventory:
                 or self.output_drain_active
             ):
                 raise ValueError("closed native inventory retains active work")
-            if self.input_eventfd_open or self.output_eventfd_open:
+            if (
+                self.input_eventfd_open
+                or self.output_eventfd_open
+                or self.observation_eventfd_open
+            ):
                 raise ValueError("closed native inventory retains an eventfd")
 
     @classmethod
@@ -1501,9 +1658,17 @@ class NativeTerminalOwnerInventory:
             input_capacity=int(value["input_capacity"]),
             output_capacity=int(value["output_capacity"]),
             fatal_output_capacity=int(value["fatal_output_capacity"]),
+            observation_capacity=int(value["observation_capacity"]),
             queued_input_count=int(value["queued_input_count"]),
             queued_output_count=int(value["queued_output_count"]),
             queued_fatal_output_count=int(value["queued_fatal_output_count"]),
+            queued_observation_count=int(value["queued_observation_count"]),
+            delivered_observation_count=int(value["delivered_observation_count"]),
+            dropped_observation_count=int(value["dropped_observation_count"]),
+            observation_count=int(value["observation_count"]),
+            observation_eventfd_error_count=int(
+                value["observation_eventfd_error_count"]
+            ),
             pending_action_count=int(value["pending_action_count"]),
             registered_producer_count=int(value["registered_producer_count"]),
             joined_producer_count=int(value["joined_producer_count"]),
@@ -1525,6 +1690,7 @@ class NativeTerminalOwnerInventory:
             closed=bool(value["closed"]),
             input_eventfd_open=bool(value["input_eventfd_open"]),
             output_eventfd_open=bool(value["output_eventfd_open"]),
+            observation_eventfd_open=bool(value["observation_eventfd_open"]),
             output_drain_active=bool(value["output_drain_active"]),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
             fatal_binding_digest=fatal_binding_digest,
