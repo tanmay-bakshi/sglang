@@ -10,8 +10,8 @@ from sglang.srt.disaggregation.terminal_progress.evidence import (
     terminal_progress_timing_recorder,
 )
 from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
-    GroupedNixlTransferMember,
     GroupedNixlTerminalResult,
+    GroupedNixlTransferMember,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
