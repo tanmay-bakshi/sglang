@@ -210,10 +210,15 @@ class DFlashBoundaryDirectOwner(Protocol):
 
         ...
 
-    def release_transfer(self, transfer: DFlashBoundaryDirectTransfer) -> None:
+    def release_transfer(
+        self,
+        transfer: DFlashBoundaryDirectTransfer,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
         """Release one settled native handle under teardown authority.
 
         :param transfer: Exact settled transfer generation.
+        :param action: Matching source ACK authority.
         """
 
         ...

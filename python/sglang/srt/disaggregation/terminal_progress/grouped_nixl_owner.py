@@ -298,10 +298,6 @@ class GroupedNixlTerminalTransfer:
 
         if construction_seal is not _TRANSFER_CONSTRUCTION_SEAL:
             raise TypeError("grouped NIXL transfers are owner constructed")
-        if type(handle_identity) is not int or not 0 < handle_identity <= _UINT64_MAX:
-            raise ValueError("handle_identity must be a positive uint64")
-        if type(generation) is not int or not 0 < generation <= _UINT64_MAX:
-            raise ValueError("generation must be a positive uint64")
         self._owner_nonce = owner_nonce
         self._token = token
         self._handle_identity = handle_identity
