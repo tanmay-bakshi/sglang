@@ -39,7 +39,12 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import (
+    StateType,
+    TerminalPrefillAuthorityMismatch,
+    TerminalPrefillAuthorityUnavailable,
+    TerminalPrefillRequestAuthority,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
@@ -74,11 +79,11 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
 )
-from sglang.srt.disaggregation.terminal_progress.decode_serving import (
-    PackedTerminalDecodeServing,
-)
 from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
     TerminalDFlashDecodeAdoption,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_serving import (
+    PackedTerminalDecodeServing,
 )
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryAdoptedValue,
@@ -242,9 +247,9 @@ class DecodeReqToTokenPool(RequestSlotPinOwner):
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert len(reusing) <= 1, (
-            "only one chunked request may reuse req_pool_idx in a batch"
-        )
+        assert (
+            len(reusing) <= 1
+        ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -438,6 +443,24 @@ class _DecodePreparedCohortState(enum.StrEnum):
     QUARANTINED = "quarantined"
 
 
+@dataclass(frozen=True)
+class _DecodePreparedReceiverSeal:
+    """Immutable proof that PREPARE initialized one exact receiver.
+
+    :ivar decode_req: Exact request and receiver owner.
+    :ivar receiver: Exact initialized receiver identity.
+    :ivar authority: Generation-bound source authority consumed by initialization.
+    :ivar source_tp_size: Receiver-observed source writer width.
+    :ivar prefill_dp_rank: Receiver-observed source DP rank.
+    """
+
+    decode_req: DecodeRequest
+    receiver: CommonKVReceiver
+    authority: TerminalPrefillRequestAuthority
+    source_tp_size: int
+    prefill_dp_rank: int
+
+
 @dataclass
 class _DecodePreparedCohortRecord:
     """Mutable queue-owned state for one keyed decoder reservation.
@@ -449,6 +472,7 @@ class _DecodePreparedCohortRecord:
     :ivar decode_reqs: Ordered exact reserved decode requests.
     :ivar packed_transactions: Ordered request-scoped packed transfer owners.
     :ivar allocations: Ordered immutable allocation receipts.
+    :ivar prepared_receiver_seals: PREPARE-retained initialized receiver proofs.
     :ivar packed_publications: Irreversible transfer publications after promotion.
     :ivar state: Current queue-local lifecycle state.
     :ivar metadata_published: Whether the cohort crossed metadata publication.
@@ -462,6 +486,7 @@ class _DecodePreparedCohortRecord:
     decode_reqs: tuple[DecodeRequest, ...]
     packed_transactions: tuple[PackedDecodeRequestTransaction, ...]
     allocations: tuple[DecodeReservationAllocation, ...]
+    prepared_receiver_seals: tuple[_DecodePreparedReceiverSeal, ...] | None = None
     packed_publications: tuple[PackedRequestPublication, ...] | None = None
     state: _DecodePreparedCohortState = _DecodePreparedCohortState.PREPARED
     metadata_published: bool = False
@@ -622,9 +647,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_queue.allocation_lifecycle_authority = (
             self.allocation_lifecycle_authority
         )
-        terminal_dflash_boundary_pool = (
-            self.kv_manager.terminal_dflash_boundary_pool()
-        )
+        terminal_dflash_boundary_pool = self.kv_manager.terminal_dflash_boundary_pool()
         if terminal_dflash_boundary_pool is not None:
             if not self.scheduler.spec_algorithm.is_dflash():
                 raise RuntimeError(
@@ -909,6 +932,47 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             attempt.child_request_ids,
         )
 
+        terminal_prefill_authorities: (
+            tuple[TerminalPrefillRequestAuthority, ...] | None
+        ) = None
+        if self._terminal_decode_serving is not None:
+            bootstrap_addr = NetworkAddress(
+                attempt.prefill_bootstrap_endpoint.host,
+                attempt.prefill_bootstrap_endpoint.port,
+            ).to_host_port_str()
+            resolved_authorities: list[TerminalPrefillRequestAuthority] = []
+            for req in owned_requests:
+                try:
+                    authority = (
+                        self.kv_manager.resolve_terminal_prefill_request_authority(
+                            bootstrap_addr=bootstrap_addr,
+                            prefill_process_url=attempt.prefill_process.url,
+                            prefill_process_instance_id=(
+                                attempt.prefill_process.instance_id
+                            ),
+                            prefill_dp_rank=req.disagg_prefill_dp_rank,
+                            source_tp_size=attempt.source_tp_size,
+                        )
+                    )
+                except TerminalPrefillAuthorityUnavailable as error:
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    raise DecodeReservationAdmissionRefused(
+                        "terminal_prefill_authority_unavailable",
+                        DecodeReservationRefusalDisposition.RETRY_SAME_DECODER,
+                        str(error),
+                    ) from error
+                except TerminalPrefillAuthorityMismatch as error:
+                    if self.scheduler.metrics_reporter.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    raise DecodeReservationAdmissionRefused(
+                        "terminal_prefill_authority_mismatch",
+                        DecodeReservationRefusalDisposition.TERMINAL,
+                        str(error),
+                    ) from error
+                resolved_authorities.append(authority)
+            terminal_prefill_authorities = tuple(resolved_authorities)
+
         with self._prepared_cohort_lock:
             self._claim_preallocated_request_ids_locked(
                 grant_id,
@@ -917,6 +981,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         prepared_decode_reqs: list[DecodeRequest] = []
+        prepared_receiver_seals: list[_DecodePreparedReceiverSeal] = []
         prepared_packed_transactions: list[PackedDecodeRequestTransaction] = []
         allocations: list[DecodeReservationAllocation] = []
         try:
@@ -926,9 +991,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req.bootstrap_room = room
 
             prefix_matches: list[DecodePrefixMatch | None] = []
-            for req in owned_requests:
+            for request_index, req in enumerate(owned_requests):
                 decode_req = self._create_receiver(req)
                 prepared_decode_reqs.append(decode_req)
+                if terminal_prefill_authorities is not None:
+                    authority = terminal_prefill_authorities[request_index]
+                    try:
+                        decode_req.kv_receiver.init_from_terminal_authority(authority)
+                    except TerminalPrefillAuthorityMismatch as error:
+                        if self.scheduler.metrics_reporter.enable_metrics:
+                            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                        raise DecodeReservationAdmissionRefused(
+                            "terminal_prefill_authority_mismatch",
+                            DecodeReservationRefusalDisposition.TERMINAL,
+                            str(error),
+                        ) from error
+                    if decode_req.kv_receiver.conclude_state is KVPoll.Failed:
+                        if self.scheduler.metrics_reporter.enable_metrics:
+                            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                        raise DecodeAllocationLeaseError(
+                            "terminal decode receiver initialization failed"
+                        )
+                    actual_source_tp_size = (
+                        decode_req.kv_receiver.prefill_info.attn_tp_size
+                    )
+                    if actual_source_tp_size != attempt.source_tp_size:
+                        raise DecodeAllocationLeaseError(
+                            "bootstrap source TP width differs from reservation"
+                        )
+                    prepared_receiver_seals.append(
+                        _DecodePreparedReceiverSeal(
+                            decode_req=decode_req,
+                            receiver=decode_req.kv_receiver,
+                            authority=authority,
+                            source_tp_size=actual_source_tp_size,
+                            prefill_dp_rank=decode_req.kv_receiver.prefill_dp_rank,
+                        )
+                    )
+                    req.time_stats.set_bootstrap_done_time()
                 prefix_match = self._match_preallocated_prefix_and_lock(req)
                 decode_req.prefix_match = prefix_match
                 prefix_matches.append(prefix_match)
@@ -1004,8 +1104,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prepared_packed_transactions.append(packed_transaction)
                 if self._terminal_dflash_boundary_pool is not None:
                     boundary_row_index = (
-                        packed_transaction.prepared_publication()
-                        .auxiliary_plan.metadata_buffer_index
+                        packed_transaction.prepared_publication().auxiliary_plan.metadata_buffer_index
                     )
                     decode_req.metadata_buffer_index = boundary_row_index
                 slot_generation = uuid.UUID(bytes=snapshot.lease_id)
@@ -1085,6 +1184,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_reqs=tuple(prepared_decode_reqs),
             packed_transactions=tuple(prepared_packed_transactions),
             allocations=tuple(allocations),
+            prepared_receiver_seals=(
+                tuple(prepared_receiver_seals)
+                if terminal_prefill_authorities is not None
+                else None
+            ),
         )
         with self._prepared_cohort_lock:
             if grant_id not in self._preparing_grant_ids:
@@ -1315,8 +1419,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             owner,
         )
         with self._prepared_cohort_lock:
-            self.transfer_queue.quarantine_terminal_request(decode_req, transaction)
+            removed = self.transfer_queue.quarantine_terminal_request(
+                decode_req,
+                transaction,
+            )
             self._quarantine_preallocated_record_locked(record, reason)
+        if removed and self.scheduler.metrics_reporter.enable_metrics:
+            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
 
     def _require_terminal_callback_owner(
         self,
@@ -1517,22 +1626,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise DecodeAllocationLeaseError(
                 "terminal decode serving received a non-terminal transaction"
             )
+        receiver_seals = record.prepared_receiver_seals
+        if receiver_seals is None or len(receiver_seals) != len(record.decode_reqs):
+            raise DecodeAllocationLeaseError(
+                "terminal decode cohort has no prepared receiver seal"
+            )
 
         submissions: list[_DecodeMetadataSubmission] = []
-        for decode_req in record.decode_reqs:
+        for decode_req, receiver_seal in zip(
+            record.decode_reqs,
+            receiver_seals,
+            strict=True,
+        ):
             if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
                 raise DecodeAllocationLeaseError(
                     "terminal decode ownership requires the NIXL transport"
                 )
-            prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
-            if prefill_dp_rank is None:
+            if (
+                receiver_seal.decode_req is not decode_req
+                or receiver_seal.receiver is not decode_req.kv_receiver
+                or receiver_seal.source_tp_size != record.source_tp_size
+                or receiver_seal.prefill_dp_rank
+                != decode_req.kv_receiver.prefill_dp_rank
+                or decode_req.kv_receiver.conclude_state is KVPoll.Failed
+            ):
                 raise DecodeAllocationLeaseError(
-                    "terminal decode attachment requires cached prefill rank authority"
-                )
-            decode_req.kv_receiver.init(prefill_dp_rank)
-            if decode_req.kv_receiver.conclude_state is KVPoll.Failed:
-                raise DecodeAllocationLeaseError(
-                    "terminal decode receiver initialization failed"
+                    "terminal decode receiver differs from its prepared seal"
                 )
             actual_source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
             if actual_source_tp_size != record.source_tp_size:
@@ -1733,6 +1852,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "packed_runtime_unavailable",
                 DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
             )
+        if (
+            self._terminal_decode_serving is not None
+            and self.scheduler.enable_decode_hicache
+        ):
+            raise DecodeReservationAdmissionRefused(
+                "terminal_decode_hicache_not_supported",
+                DecodeReservationRefusalDisposition.TERMINAL,
+                "terminal ownership has no HiCache restore consumer",
+            )
         if len(requests) == 0 or len(requests) != len(attempt.child_request_ids):
             raise ValueError("request count differs from reserve child count")
         if any(not isinstance(req, Req) for req in requests):
@@ -1779,9 +1907,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         boundary_pool = self._terminal_dflash_boundary_pool
         if boundary_pool is None:
             metadata_allocator = self._require_legacy_metadata_allocator()
-            if (
-                metadata_allocator.available_size() < request_count
-            ):
+            if metadata_allocator.available_size() < request_count:
                 raise DecodeReservationAdmissionRefused(
                     "decode_metadata_capacity",
                     DecodeReservationRefusalDisposition.RETRY_ANOTHER_DECODER,
@@ -1798,6 +1924,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "request_exceeds_decode_capacity",
                     DecodeReservationRefusalDisposition.TERMINAL,
                 )
+            if self._uses_swa_tail_prealloc():
+                _, swa_required = self._prealloc_required_tokens(req)
+                if swa_required > self.token_to_kv_pool_allocator.size_swa:
+                    raise DecodeReservationAdmissionRefused(
+                        "request_exceeds_decode_swa_capacity",
+                        DecodeReservationRefusalDisposition.TERMINAL,
+                    )
 
     def _validate_preallocated_capacity(
         self,
@@ -3810,9 +3943,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -4535,13 +4668,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         decode_req: DecodeRequest,
         transaction: PackedDecodeRequestTransaction,
-    ) -> None:
+    ) -> bool:
         """Remove an ambiguous terminal request from active owner callbacks.
 
         The prepared cohort remains its process-lifetime retention owner.
 
         :param decode_req: Exact ambiguous decode request.
         :param transaction: Exact quarantined packed transaction.
+        :returns: Whether this call removed the live terminal owner.
         """
 
         digest = transaction.terminal_binding_digest
@@ -4551,12 +4685,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         owned = self._terminal_requests.get(digest)
         if owned is None:
-            return
+            return False
         if owned is not decode_req or decode_req.packed_transaction is not transaction:
             raise DecodeAllocationLeaseError(
                 "terminal registry retains another packed transaction"
             )
         del self._terminal_requests[digest]
+        return True
 
     def _require_terminal_transfer_request(
         self,
@@ -4874,9 +5009,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

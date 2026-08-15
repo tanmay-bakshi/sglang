@@ -4,6 +4,7 @@ import sys
 import threading
 import uuid
 from array import array
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +12,11 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import (
+    TerminalPrefillAuthorityMismatch,
+    TerminalPrefillRequestAuthority,
+)
 from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeAllocationComponent,
     DecodeAllocationLeaseError,
@@ -37,7 +43,15 @@ from sglang.srt.disaggregation.decode_reservations import (
     DecodeReservationAttempt,
     DecodeReservationBootstrapEndpoint,
     DecodeReservationProcess,
+    DecodeReservationRefusalDisposition,
     DecodeReservationState,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+    NixlKVReceiver,
+    NixlTerminalPrefillRequestAuthority,
+    _NixlPrefillPeer,
+    _TerminalStartupPeerEnrollment,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestPublication,
@@ -45,14 +59,35 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
 )
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
 from sglang.srt.disaggregation.terminal_progress.request_registration import (
     PackedTerminalRequestRegistrationError,
 )
+from sglang.srt.disaggregation.terminal_progress.startup_binding import (
+    TerminalStartupRankBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
+    TerminalStartupCohortMatrix,
+    TerminalStartupRankAdvertisement,
+)
+from sglang.srt.disaggregation.terminal_progress.startup_producers import (
+    build_terminal_startup_python_producer_plan,
+)
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.utils.network import NetworkAddress
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+TERMINAL_PREFILL_AUTHORITY_COVERAGE = {
+    "TPA-COLD-001": "resolve frozen source authority before receiver construction",
+    "TPA-ORDER-002": "refuse before request identity or resource ownership",
+    "TPA-ATTACH-003": "attach from retained authority without discovery caches",
+    "TPA-TP-004": "reject source TP drift as terminal",
+    "TPA-GENERATION-005": "reject source generation drift as terminal",
+    "TPA-MULTI-006": "retain deterministic authority for every request",
+}
 
 
 @dataclasses.dataclass
@@ -167,6 +202,7 @@ class _FakePackedTransaction:
     publish_count: int
     quarantine_count: int
     request_owner: DecodeRequest
+    terminal_binding_digest_value: bytes | None
 
     def __init__(
         self,
@@ -225,6 +261,7 @@ class _FakePackedTransaction:
         self.publish_count = 0
         self.quarantine_count = 0
         self.request_owner = request_owner
+        self.terminal_binding_digest_value = None
 
     def publish(self) -> PackedRequestPublication:
         """Cross the sole fake publication boundary.
@@ -245,7 +282,7 @@ class _FakePackedTransaction:
         :returns: Always ``None``.
         """
 
-        return None
+        return self.terminal_binding_digest_value
 
     def cancel_unpublished(self) -> DecodeRequest:
         """Retire an unpublished fake lease and return its owner.
@@ -307,6 +344,32 @@ class _FakePackedRuntimeManager:
         """
 
         return True
+
+    def resolve_terminal_prefill_request_authority(
+        self,
+        *,
+        bootstrap_addr: str,
+        prefill_process_url: str,
+        prefill_process_instance_id: uuid.UUID,
+        prefill_dp_rank: int | None,
+        source_tp_size: int,
+    ) -> TerminalPrefillRequestAuthority:
+        """Return a stable fake authority for terminal lifecycle tests.
+
+        :param bootstrap_addr: Candidate source bootstrap address.
+        :param prefill_process_url: Candidate source service URL.
+        :param prefill_process_instance_id: Candidate source launch instance.
+        :param prefill_dp_rank: Candidate explicit source DP rank.
+        :param source_tp_size: Reservation-authenticated source TP width.
+        :returns: Opaque fake source authority.
+        """
+
+        assert bootstrap_addr == "prefill.internal:8998"
+        assert prefill_process_url == "http://prefill.internal:30000"
+        assert prefill_process_instance_id == uuid.UUID(int=1)
+        assert prefill_dp_rank is None
+        assert source_tp_size in (1, 2, 4)
+        return TerminalPrefillRequestAuthority()
 
     def prepare_packed_decode_request_transaction(
         self,
@@ -396,6 +459,9 @@ class _FakeReceiver:
     clear_count: int
     abort_count: int
     metadata_count: int
+    terminal_authorities: list[TerminalPrefillRequestAuthority]
+    conclude_state: int | None
+    prefill_dp_rank: int
 
     def __init__(self, source_tp_size: int) -> None:
         """Initialize one receiver.
@@ -408,6 +474,9 @@ class _FakeReceiver:
         self.clear_count = 0
         self.abort_count = 0
         self.metadata_count = 0
+        self.terminal_authorities = []
+        self.conclude_state = None
+        self.prefill_dp_rank = 0
 
     def init(self, rank: int) -> None:
         """Record asynchronous receiver initialization.
@@ -416,6 +485,17 @@ class _FakeReceiver:
         """
 
         self.init_ranks.append(rank)
+
+    def init_from_terminal_authority(
+        self,
+        authority: TerminalPrefillRequestAuthority,
+    ) -> None:
+        """Record one immutable terminal source authority.
+
+        :param authority: PREPARE-retained source authority.
+        """
+
+        self.terminal_authorities.append(authority)
 
     def clear(self) -> None:
         """Record terminal unpublished cleanup."""
@@ -483,6 +563,42 @@ class _FakeMetadataAllocator:
         self.free_slots.append(slot)
 
 
+class _ForbiddenLookupDict(dict[str, object]):
+    """Empty mapping that fails if a legacy discovery consumer reads it."""
+
+    def __contains__(self, key: object) -> bool:
+        """Reject membership lookup.
+
+        :param key: Candidate legacy cache key.
+        :returns: Never returns.
+        :raises AssertionError: Always.
+        """
+
+        raise AssertionError(f"legacy cache membership lookup: {key!r}")
+
+    def __getitem__(self, key: str) -> object:
+        """Reject indexed lookup.
+
+        :param key: Candidate legacy cache key.
+        :returns: Never returns.
+        :raises AssertionError: Always.
+        """
+
+        raise AssertionError(f"legacy cache indexed lookup: {key!r}")
+
+    def get(self, key: str, default: object = None) -> object:
+        """Reject optional lookup.
+
+        :param key: Candidate legacy cache key.
+        :param default: Unused fallback value.
+        :returns: Never returns.
+        :raises AssertionError: Always.
+        """
+
+        del default
+        raise AssertionError(f"legacy cache optional lookup: {key!r}")
+
+
 @dataclasses.dataclass
 class _QueueFixture:
     """Minimal queue and observable resource state for lifecycle tests.
@@ -536,6 +652,7 @@ def _request(child_id: uuid.UUID, *, prompt_tokens: int = 8) -> Req:
     req.cache_protected_len = 0
     req.finished_reason = None
     req.return_logprob = False
+    req.disagg_prefill_dp_rank = None
     return req
 
 
@@ -543,17 +660,19 @@ def _attempt(
     child_ids: tuple[uuid.UUID, ...],
     *,
     source_tp_size: int,
+    prefill_instance_id: uuid.UUID = uuid.UUID(int=1),
 ) -> DecodeReservationAttempt:
     """Build one exact reservation attempt for a child cohort.
 
     :param child_ids: Ordered request identities.
     :param source_tp_size: Supported packed source width.
+    :param prefill_instance_id: Reservation-authenticated source launch instance.
     :returns: Reservation attempt consumed by the queue.
     """
 
     prefill_process = DecodeReservationProcess(
-        url="http://prefill:30000",
-        instance_id=uuid.uuid4(),
+        url="http://prefill.internal:30000",
+        instance_id=prefill_instance_id,
     )
     return DecodeReservationAttempt(
         prefill_process=prefill_process,
@@ -761,6 +880,573 @@ def _queue_fixture(
         released_request_ids=released_request_ids,
         pre_alloc_calls=pre_alloc_calls,
     )
+
+
+def _terminal_rank(
+    *,
+    role: TerminalOwnerRole,
+    tp_rank: int,
+    tp_size: int,
+    generation: int,
+) -> TerminalStartupRankAdvertisement:
+    """Build one exact terminal startup rank for authority tests.
+
+    :param role: Source or decode role.
+    :param tp_rank: Rank within the service.
+    :param tp_size: Exact service TP width.
+    :param generation: Non-nil process-generation integer.
+    :returns: Immutable startup rank.
+    """
+
+    service_id = "prefill-a" if role is TerminalOwnerRole.SOURCE else "decode-a"
+    metadata = f"{service_id}-metadata-{tp_rank}".encode("ascii")
+    return TerminalStartupRankAdvertisement(
+        group_id="group-a",
+        cohort_sha256=b"c" * 32,
+        service_id=service_id,
+        service_origin=(
+            "http://prefill.internal:30000"
+            if role is TerminalOwnerRole.SOURCE
+            else "http://decode.internal:30001"
+        ),
+        role=role,
+        launch_instance_id=uuid.UUID(
+            int=1 if role is TerminalOwnerRole.SOURCE else 2
+        ).bytes,
+        tensor_parallel_rank=tp_rank,
+        tensor_parallel_size=tp_size,
+        process_generation=uuid.UUID(int=generation).bytes,
+        nixl_agent_name=f"{service_id}-agent-{tp_rank}",
+        nixl_agent_metadata_sha256=hashlib.sha256(metadata).digest(),
+    )
+
+
+def _install_terminal_prefill_authority(
+    fixture: _QueueFixture,
+) -> tuple[TerminalStartupRankBinding, _TerminalStartupPeerEnrollment]:
+    """Install the real NIXL authority resolver over a cold fake runtime.
+
+    :param fixture: Queue fixture receiving terminal startup state.
+    :returns: Exact local binding and mutable test enrollment.
+    """
+
+    source_ranks = (
+        _terminal_rank(
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=0,
+            tp_size=2,
+            generation=101,
+        ),
+        _terminal_rank(
+            role=TerminalOwnerRole.SOURCE,
+            tp_rank=1,
+            tp_size=2,
+            generation=102,
+        ),
+    )
+    decode_rank = _terminal_rank(
+        role=TerminalOwnerRole.DECODE,
+        tp_rank=0,
+        tp_size=1,
+        generation=201,
+    )
+    matrix = TerminalStartupCohortMatrix(
+        group_id="group-a",
+        cohort_sha256=b"c" * 32,
+        ranks=(*source_ranks, decode_rank),
+    )
+    binding = TerminalStartupRankBinding(
+        advertisement=decode_rank,
+        matrix=matrix,
+        python_producers=build_terminal_startup_python_producer_plan(
+            matrix,
+            local_service_id=decode_rank.service_id,
+            local_tensor_parallel_rank=decode_rank.tensor_parallel_rank,
+            first_producer_id=0,
+        ),
+    )
+    enrollment = _TerminalStartupPeerEnrollment(
+        binding=binding,
+        expected_remote_ranks=source_ranks,
+    )
+    for rank in source_ranks:
+        peer = _NixlPrefillPeer(
+            bootstrap_addr="prefill.internal:8998",
+            attn_dp_rank=0,
+            attn_cp_rank=0,
+            attn_tp_rank=rank.tensor_parallel_rank,
+            pp_rank=0,
+            transfer_source_rank=rank.tensor_parallel_rank,
+            agent_name=rank.nixl_agent_name,
+            metadata_sha256=rank.nixl_agent_metadata_sha256.hex(),
+            process_generation=str(uuid.UUID(bytes=rank.process_generation)),
+            control_endpoint=NetworkAddress(
+                "127.0.0.1",
+                31000 + rank.tensor_parallel_rank,
+            ),
+            handle=object(),
+        )
+        enrollment.prefill_peers[rank.key] = peer
+    enrollment.frozen = True
+    enrollment.frozen_event.set()
+
+    manager = fixture.packed_runtime
+    manager.terminal_startup_binding = binding
+    manager._terminal_startup_peer_enrollment = enrollment
+    manager._quarantined_remote_handles = set()
+    manager.kv_args = SimpleNamespace(engine_rank=0, page_size=1)
+    manager.enable_staging = True
+    manager.prefill_info_table = {}
+    manager.connection_pool = {}
+    manager.resolve_terminal_prefill_request_authority = (
+        NixlKVManager.resolve_terminal_prefill_request_authority.__get__(manager)
+    )
+    fixture.queue._terminal_decode_serving = object()
+    fixture.queue.scheduler.enable_decode_hicache = False
+    fixture.queue.scheduler.server_args.disable_radix_cache = True
+    fixture.queue.scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+    return binding, enrollment
+
+
+def _assert_no_preparation_ownership(
+    fixture: _QueueFixture,
+    requests: tuple[Req, ...],
+) -> None:
+    """Assert refusal preceded every mutable preparation category.
+
+    :param fixture: Exact queue and resource fixture.
+    :param requests: Candidate requests which must remain untouched.
+    """
+
+    assert fixture.receivers == []
+    assert fixture.pre_alloc_calls == []
+    assert fixture.metadata_allocator.allocated == []
+    assert fixture.queue._preparing_grant_ids == set()
+    assert fixture.queue._preparing_request_ids == set()
+    assert fixture.queue._prepared_grant_ids == {}
+    assert fixture.queue._prepared_request_ids == {}
+    assert all(req.bootstrap_host is None for req in requests)
+    assert all(req.bootstrap_port is None for req in requests)
+    assert all(req.bootstrap_room is None for req in requests)
+    assert all(req.req_pool_idx is None for req in requests)
+
+
+def test_terminal_prepare_resolves_cold_authority_before_receiver_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPA-COLD-001 and TPA-MULTI-006 retain deterministic cold authority."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    child_ids = (uuid.uuid4(), uuid.uuid4())
+    requests = tuple(_request(child_id) for child_id in child_ids)
+    events: list[str] = []
+    real_resolver = fixture.packed_runtime.resolve_terminal_prefill_request_authority
+    real_create_receiver = fixture.queue._create_receiver
+    real_pre_alloc = fixture.queue._pre_alloc
+
+    def resolve_authority(**kwargs: object) -> TerminalPrefillRequestAuthority:
+        """Record real authority resolution without replacing its behavior.
+
+        :param kwargs: Exact resolver keyword arguments.
+        :returns: Generation-bound resolver result.
+        """
+
+        events.append("authority")
+        return real_resolver(**kwargs)
+
+    def create_receiver(req: Req, *, is_rebootstrap: bool = False) -> DecodeRequest:
+        """Record the first receiver-owned side effect.
+
+        :param req: Request receiving the receiver.
+        :param is_rebootstrap: Whether this is a rebootstrap request.
+        :returns: Created decode request.
+        """
+
+        events.append("receiver")
+        decode_req = real_create_receiver(req, is_rebootstrap=is_rebootstrap)
+        real_init = decode_req.kv_receiver.init_from_terminal_authority
+
+        def initialize(authority: TerminalPrefillRequestAuthority) -> None:
+            """Record consumption by the exact newly created receiver.
+
+            :param authority: PREPARE-retained source authority.
+            """
+
+            events.append("receiver_init")
+            real_init(authority)
+
+        decode_req.kv_receiver.init_from_terminal_authority = initialize
+        return decode_req
+
+    def pre_alloc(*args: object, **kwargs: object) -> np.ndarray:
+        """Record the first KV ownership operation.
+
+        :param args: Allocation positional inputs.
+        :param kwargs: Allocation keyword inputs.
+        :returns: Fake destination indices.
+        """
+
+        events.append("kv_allocation")
+        return real_pre_alloc(*args, **kwargs)
+
+    fixture.packed_runtime.resolve_terminal_prefill_request_authority = (
+        resolve_authority
+    )
+    fixture.queue._create_receiver = create_receiver
+    fixture.queue._pre_alloc = pre_alloc
+    assert fixture.packed_runtime.prefill_info_table == {}
+    assert fixture.packed_runtime.connection_pool == {}
+    assert fixture.receivers == []
+
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt(child_ids, source_tp_size=2),
+        requests=requests,
+    )
+
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    receiver_seals = record.prepared_receiver_seals
+    assert receiver_seals is not None
+    authorities = tuple(seal.authority for seal in receiver_seals)
+    assert len(authorities) == 2
+    assert tuple(seal.receiver for seal in receiver_seals) == tuple(fixture.receivers)
+    assert all(
+        type(value) is NixlTerminalPrefillRequestAuthority for value in authorities
+    )
+    assert all(
+        tuple(peer.attn_tp_rank for peer in value.peers) == (0, 1)
+        for value in authorities
+    )
+    assert events == [
+        "authority",
+        "authority",
+        "receiver",
+        "receiver_init",
+        "receiver",
+        "receiver_init",
+        "kv_allocation",
+        "kv_allocation",
+    ]
+    assert all(
+        req.time_stats.set_bootstrap_done_time.call_count == 1 for req in requests
+    )
+    assert fixture.packed_runtime.prefill_info_table == {}
+    assert fixture.packed_runtime.connection_pool == {}
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        authorities[0].prefill_dp_rank = 1
+
+
+def test_terminal_prepare_to_attach_uses_real_receiver_without_legacy_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPA-COLD-001 and TPA-ATTACH-003 compose through the real receiver."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    manager = fixture.packed_runtime
+    manager.addr_to_rooms_tracker = defaultdict(set)
+    manager.required_prefill_response_num_table = {}
+    manager.update_status = MagicMock()
+    manager.prefill_info_table = _ForbiddenLookupDict()
+    manager.connection_pool = _ForbiddenLookupDict()
+    created_receivers: list[NixlKVReceiver] = []
+
+    def create_receiver(req: Req, *, is_rebootstrap: bool = False) -> DecodeRequest:
+        """Construct the production NIXL receiver without publishing it.
+
+        :param req: Exact request receiving terminal authority.
+        :param is_rebootstrap: Whether the request is a rebootstrap.
+        :returns: Exact request and production receiver owner.
+        """
+
+        receiver = NixlKVReceiver(
+            mgr=manager,
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+            bootstrap_room=req.bootstrap_room,
+        )
+        created_receivers.append(receiver)
+        return DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            is_rebootstrap=is_rebootstrap,
+        )
+
+    fixture.queue._create_receiver = create_receiver
+    fixture.queue.transfer_queue = SimpleNamespace(
+        register_terminal_requests=MagicMock(),
+        quarantine_terminal_request=MagicMock(return_value=True),
+    )
+    fixture.queue._rebootstrap_prefill_len = MagicMock(return_value=8)
+    fixture.queue._build_decode_metadata_submission = MagicMock()
+    manager.build_terminal_decode_request_authority = MagicMock(return_value=object())
+    monkeypatch.setattr(
+        "sglang.srt.disaggregation.decode.register_packed_terminal_decode_request",
+        lambda serving, authority: None,
+    )
+    child_id = uuid.uuid4()
+    request = _request(child_id)
+
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(request,),
+    )
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    receiver = created_receivers[0]
+    receiver_seals = record.prepared_receiver_seals
+    assert receiver_seals is not None
+    seal = receiver_seals[0]
+    transaction = fixture.packed_runtime.transactions[0]
+    assert record.packed_transactions[0] is transaction
+    transaction.terminal_binding_digest_value = b"t" * 32
+    fixture.queue._build_decode_metadata_submission.return_value = (
+        _DecodeMetadataSubmission(
+            decode_req=record.decode_reqs[0],
+            page_indices=np.arange(8, dtype=np.int32),
+            state_indices=None,
+            decode_prefix_len=0,
+        )
+    )
+
+    fixture.queue.promote_preallocated(cohort)
+    fixture.queue.attach_preallocated(cohort)
+
+    assert seal.decode_req is record.decode_reqs[0]
+    assert seal.receiver is receiver
+    assert tuple(peer.attn_tp_rank for peer in seal.authority.peers) == (0, 1)
+    assert receiver.prefill_peers == list(seal.authority.peers)
+    assert receiver.prefill_info.attn_tp_size == 2
+    assert fixture.queue.queue == []
+    assert fixture.queue.pending_reqs == []
+    fixture.queue.transfer_queue.register_terminal_requests.assert_called_once_with(
+        record.decode_reqs
+    )
+    assert fixture.packed_runtime.metadata_publications == [(transaction, receiver)]
+    assert manager.prefill_info_table == {}
+    assert manager.connection_pool == {}
+
+
+def test_terminal_prepare_transient_authority_refusal_has_no_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPA-ORDER-002 refuses incomplete enrollment before all side effects."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _, enrollment = _install_terminal_prefill_authority(fixture)
+    enrollment.frozen = False
+    enrollment.frozen_event.clear()
+    fixture.queue.scheduler.metrics_reporter.enable_metrics = True
+    fixture.queue.scheduler.metrics_collector = MagicMock()
+    child_ids = (uuid.uuid4(),)
+    requests = tuple(_request(child_id) for child_id in child_ids)
+
+    with pytest.raises(DecodeReservationAdmissionRefused) as raised:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt(child_ids, source_tp_size=2),
+            requests=requests,
+        )
+
+    assert raised.value.reason_code == "terminal_prefill_authority_unavailable"
+    assert (
+        raised.value.disposition
+        is DecodeReservationRefusalDisposition.RETRY_SAME_DECODER
+    )
+    fixture.queue.scheduler.metrics_collector.increment_bootstrap_failed_reqs.assert_called_once_with()
+    _assert_no_preparation_ownership(fixture, requests)
+
+
+def test_terminal_prepare_rejects_hicache_without_restore_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal ownership fails closed before an unsupported HiCache restore."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    fixture.queue.scheduler.enable_decode_hicache = True
+    child_id = uuid.uuid4()
+    requests = (_request(child_id),)
+
+    with pytest.raises(
+        DecodeReservationAdmissionRefused,
+        match="terminal_decode_hicache_not_supported",
+    ) as raised:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt((child_id,), source_tp_size=2),
+            requests=requests,
+        )
+
+    assert raised.value.disposition is DecodeReservationRefusalDisposition.TERMINAL
+    _assert_no_preparation_ownership(fixture, requests)
+
+
+def test_terminal_receiver_initialization_failure_rolls_back_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A receiver authority failure clears its partial owner and metric once."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    fixture.queue.scheduler.metrics_reporter.enable_metrics = True
+    fixture.queue.scheduler.metrics_collector = MagicMock()
+    real_create_receiver = fixture.queue._create_receiver
+
+    def create_failing_receiver(
+        req: Req,
+        *,
+        is_rebootstrap: bool = False,
+    ) -> DecodeRequest:
+        """Create a receiver whose first authority consumption fails.
+
+        :param req: Request receiving the receiver.
+        :param is_rebootstrap: Whether this is a rebootstrap request.
+        :returns: Decode request with an injected terminal failure.
+        """
+
+        decode_req = real_create_receiver(req, is_rebootstrap=is_rebootstrap)
+        decode_req.kv_receiver.init_from_terminal_authority = MagicMock(
+            side_effect=TerminalPrefillAuthorityMismatch("injected receiver drift")
+        )
+        return decode_req
+
+    fixture.queue._create_receiver = create_failing_receiver
+    child_ids = (uuid.uuid4(),)
+    request = _request(child_ids[0])
+
+    with pytest.raises(
+        DecodeReservationAdmissionRefused,
+        match="terminal_prefill_authority_mismatch",
+    ) as raised:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt(child_ids, source_tp_size=2),
+            requests=(request,),
+        )
+
+    assert raised.value.disposition is DecodeReservationRefusalDisposition.TERMINAL
+    assert raised.value.diagnostic == "injected receiver drift"
+    assert len(fixture.receivers) == 1
+    assert fixture.receivers[0].clear_count == 1
+    assert fixture.pre_alloc_calls == []
+    assert fixture.metadata_allocator.allocated == []
+    assert fixture.queue._preparing_grant_ids == set()
+    assert fixture.queue._preparing_request_ids == set()
+    bootstrap_failure = (
+        fixture.queue.scheduler.metrics_collector.increment_bootstrap_failed_reqs
+    )
+    bootstrap_failure.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("tp", "peer_generation", "attempt_generation"),
+)
+def test_terminal_prepare_authority_mismatch_is_terminal_without_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    """TPA-TP-004 and TPA-GENERATION-005 reject frozen-authority drift."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _, enrollment = _install_terminal_prefill_authority(fixture)
+    source_tp_size = 4 if mismatch == "tp" else 2
+    if mismatch == "peer_generation":
+        rank = enrollment.expected_remote_ranks[0]
+        peer = enrollment.prefill_peers[rank.key]
+        enrollment.prefill_peers[rank.key] = dataclasses.replace(
+            peer,
+            process_generation=str(uuid.UUID(int=999)),
+        )
+    child_ids = (uuid.uuid4(),)
+    requests = tuple(_request(child_id) for child_id in child_ids)
+    prefill_instance_id = (
+        uuid.UUID(int=999) if mismatch == "attempt_generation" else uuid.UUID(int=1)
+    )
+
+    with pytest.raises(DecodeReservationAdmissionRefused) as raised:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt(
+                child_ids,
+                source_tp_size=source_tp_size,
+                prefill_instance_id=prefill_instance_id,
+            ),
+            requests=requests,
+        )
+
+    assert raised.value.reason_code == "terminal_prefill_authority_mismatch"
+    assert raised.value.disposition is DecodeReservationRefusalDisposition.TERMINAL
+    _assert_no_preparation_ownership(fixture, requests)
+
+
+def test_terminal_receiver_consumes_retained_authority_with_caches_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPA-ATTACH-003 initializes directly from PREPARE-retained writers."""
+
+    fixture = _queue_fixture(monkeypatch)
+    binding, _ = _install_terminal_prefill_authority(fixture)
+    manager = fixture.packed_runtime
+    authority = manager.resolve_terminal_prefill_request_authority(
+        bootstrap_addr="prefill.internal:8998",
+        prefill_process_url="http://prefill.internal:30000",
+        prefill_process_instance_id=uuid.UUID(int=1),
+        prefill_dp_rank=None,
+        source_tp_size=2,
+    )
+    manager.update_status = MagicMock()
+    manager.required_prefill_response_num_table = {}
+    receiver = object.__new__(NixlKVReceiver)
+    receiver.kv_mgr = manager
+    receiver.bootstrap_addr = "prefill.internal:8998"
+    receiver.bootstrap_room = 41
+    receiver.prefill_peers = []
+    receiver.conclude_state = None
+    receiver._terminal_authority_initialized = False
+
+    assert manager.terminal_startup_binding is binding
+    assert manager.prefill_info_table == {}
+    assert manager.connection_pool == {}
+    receiver.init_from_terminal_authority(authority)
+
+    assert tuple(peer.attn_tp_rank for peer in receiver.prefill_peers) == (0, 1)
+    assert receiver.required_prefill_response_num == 2
+    assert manager.required_prefill_response_num_table == {41: 2}
+    assert manager.prefill_info_table == {}
+    assert manager.connection_pool == {}
+    manager.update_status.assert_called_once_with(41, KVPoll.WaitingForInput)
+    with pytest.raises(
+        TerminalPrefillAuthorityMismatch,
+        match="already initialized",
+    ):
+        receiver.init_from_terminal_authority(authority)
+    manager.update_status.assert_called_once_with(41, KVPoll.WaitingForInput)
+
+
+def test_terminal_structural_swa_oversize_is_terminal_without_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single impossible SWA request preserves legacy BAD_REQUEST semantics."""
+
+    fixture = _queue_fixture(monkeypatch)
+    fixture.queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+    fixture.queue._prealloc_required_tokens = MagicMock(return_value=(8, 65))
+    fixture.queue.token_to_kv_pool_allocator.size_swa = 64
+    child_ids = (uuid.uuid4(),)
+    requests = tuple(_request(child_id) for child_id in child_ids)
+
+    with pytest.raises(DecodeReservationAdmissionRefused) as raised:
+        fixture.queue.prepare_preallocated(
+            grant_id=uuid.uuid4(),
+            attempt=_attempt(child_ids, source_tp_size=2),
+            requests=requests,
+        )
+
+    assert raised.value.reason_code == "request_exceeds_decode_swa_capacity"
+    assert raised.value.disposition is DecodeReservationRefusalDisposition.TERMINAL
+    _assert_no_preparation_ownership(fixture, requests)
 
 
 @pytest.mark.parametrize("source_tp_size", (1, 2, 4))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -97,6 +98,22 @@ class KVPoll:
     Success = 4
 
 
+class TerminalPrefillAuthorityError(RuntimeError):
+    """Base failure while establishing immutable terminal source authority."""
+
+
+class TerminalPrefillAuthorityUnavailable(TerminalPrefillAuthorityError):
+    """Transient absence of the complete terminal source authority."""
+
+
+class TerminalPrefillAuthorityMismatch(TerminalPrefillAuthorityError):
+    """Permanent conflict between requested and frozen source authority."""
+
+
+class TerminalPrefillRequestAuthority:
+    """Opaque backend-owned authority for one terminal decode request."""
+
+
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
@@ -121,6 +138,39 @@ class BaseKVManager(ABC):
         """
 
         return None
+
+    def resolve_terminal_prefill_request_authority(
+        self,
+        *,
+        bootstrap_addr: str,
+        prefill_process_url: str,
+        prefill_process_instance_id: uuid.UUID,
+        prefill_dp_rank: int | None,
+        source_tp_size: int,
+    ) -> TerminalPrefillRequestAuthority:
+        """Resolve immutable source authority before request ownership begins.
+
+        :param bootstrap_addr: Exact source bootstrap service address.
+        :param prefill_process_url: Reservation-authenticated source service URL.
+        :param prefill_process_instance_id: Reservation-authenticated source
+            launch instance.
+        :param prefill_dp_rank: Explicit source DP rank, otherwise ``None``.
+        :param source_tp_size: Reservation-authenticated source TP width.
+        :returns: Backend-owned immutable request authority.
+        :raises TerminalPrefillAuthorityMismatch: If the backend has no terminal
+            authority implementation.
+        """
+
+        del (
+            bootstrap_addr,
+            prefill_process_url,
+            prefill_process_instance_id,
+            prefill_dp_rank,
+            source_tp_size,
+        )
+        raise TerminalPrefillAuthorityMismatch(
+            "transfer backend has no terminal prefill authority"
+        )
 
 
 class BaseKVSender(ABC):
@@ -210,6 +260,22 @@ class BaseKVReceiver(ABC):
         Resolve bootstrap metadata and mark the receiver ready for transfer metadata.
         """
         ...
+
+    def init_from_terminal_authority(
+        self,
+        authority: TerminalPrefillRequestAuthority,
+    ) -> None:
+        """Initialize without request-time discovery or mutable cache lookup.
+
+        :param authority: Exact authority retained by terminal preparation.
+        :raises TerminalPrefillAuthorityMismatch: If the receiver cannot consume
+            terminal authority.
+        """
+
+        del authority
+        raise TerminalPrefillAuthorityMismatch(
+            "transfer backend cannot consume terminal prefill authority"
+        )
 
     @abstractmethod
     def send_metadata(

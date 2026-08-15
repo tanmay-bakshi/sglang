@@ -4,7 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import TerminalPrefillRequestAuthority
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodePreparedAllocationCohort,
@@ -13,6 +15,7 @@ from sglang.srt.disaggregation.decode import (
     _DecodeMetadataSubmission,
     _DecodePreparedCohortRecord,
     _DecodePreparedCohortState,
+    _DecodePreparedReceiverSeal,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
@@ -21,6 +24,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _transaction(
@@ -207,6 +213,60 @@ def test_terminal_handoff_rejects_duplicate_binding_without_partial_visibility()
     assert queue.live_requests() == ()
 
 
+def test_terminal_quarantine_records_transfer_failure_exactly_once() -> None:
+    """Terminal owner quarantine preserves the external transfer-failure metric."""
+
+    transaction = _transaction(binding_digest=b"t" * 32)
+    decode_req = _request("terminal-transfer-failure", transaction=transaction)
+    decode_req.allocation_lease = None
+    transfer_queue = _queue()
+    transfer_queue.register_terminal_requests((decode_req,))
+
+    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    queue.queue = []
+    queue.pending_reqs = []
+    queue.transfer_queue = transfer_queue
+    queue.scheduler = SimpleNamespace(
+        metrics_reporter=SimpleNamespace(enable_metrics=True),
+        metrics_collector=MagicMock(),
+    )
+    queue._prepared_cohort_lock = threading.RLock()
+    queue._prepared_cohort_nonce = object()
+    handle = object.__new__(DecodePreparedAllocationCohort)
+    handle._queue_nonce = queue._prepared_cohort_nonce
+    handle._token = object()
+    record = _DecodePreparedCohortRecord(
+        handle=handle,
+        grant_id=uuid.uuid4(),
+        reservation_attempt_id=uuid.uuid4(),
+        source_tp_size=2,
+        decode_reqs=(decode_req,),
+        packed_transactions=(transaction,),
+        allocations=(),
+        state=_DecodePreparedCohortState.ATTACHED,
+    )
+    queue._prepared_cohorts = {handle._token: record}
+
+    queue._quarantine_terminal_decode_request(
+        record,
+        decode_req,
+        transaction,
+        decode_req,
+        "injected transfer failure",
+    )
+    queue._quarantine_terminal_decode_request(
+        record,
+        decode_req,
+        transaction,
+        decode_req,
+        "duplicate callback",
+    )
+
+    transfer_failure = queue.scheduler.metrics_collector.increment_transfer_failed_reqs
+    transfer_failure.assert_called_once_with()
+    assert record.state is _DecodePreparedCohortState.QUARANTINED
+
+
 def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> None:
     """Promotion attaches directly to owner progress before metadata publication."""
 
@@ -227,7 +287,7 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
     queue._terminal_decode_serving = object()
     queue._prepared_cohort_lock = threading.RLock()
     queue._prepared_cohort_nonce = object()
-    queue._resolve_prefill_dp_rank = MagicMock(return_value=0)
+    queue._resolve_prefill_dp_rank = MagicMock()
     queue._resolve_pending_reqs = MagicMock()
     queue._update_handshake_waiters = MagicMock()
     queue._rebootstrap_prefill_len = MagicMock(return_value=8)
@@ -242,6 +302,15 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
     handle = object.__new__(DecodePreparedAllocationCohort)
     handle._queue_nonce = queue._prepared_cohort_nonce
     handle._token = object()
+    authority = TerminalPrefillRequestAuthority()
+    receiver_seal = _DecodePreparedReceiverSeal(
+        decode_req=decode_req,
+        receiver=decode_req.kv_receiver,
+        authority=authority,
+        source_tp_size=2,
+        prefill_dp_rank=0,
+    )
+    decode_req.kv_receiver.prefill_dp_rank = 0
     record = _DecodePreparedCohortRecord(
         handle=handle,
         grant_id=uuid.uuid4(),
@@ -250,6 +319,7 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
         decode_reqs=(decode_req,),
         packed_transactions=(transaction,),
         allocations=(),
+        prepared_receiver_seals=(receiver_seal,),
         packed_publications=(object(),),
         state=_DecodePreparedCohortState.PROMOTED,
     )
@@ -261,6 +331,7 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
     collective.assert_not_called()
     queue._resolve_pending_reqs.assert_not_called()
     queue._update_handshake_waiters.assert_not_called()
+    queue._resolve_prefill_dp_rank.assert_not_called()
     assert queue.queue == []
     assert queue.pending_reqs == []
     assert transfer_queue.queue == []
@@ -268,5 +339,9 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
     assert record.state is _DecodePreparedCohortState.ATTACHED
     assert record.metadata_published
     assert decode_req.packed_transaction is transaction
-    decode_req.kv_receiver.init.assert_called_once_with(0)
+    decode_req.req.time_stats.set_bootstrap_done_time.assert_not_called()
+    decode_req.req.time_stats.set_decode_transfer_queue_entry_time.assert_called_once_with()
+    decode_req.kv_receiver.init.assert_not_called()
+    decode_req.kv_receiver.init_from_terminal_authority.assert_not_called()
+    decode_req.kv_receiver.validate_terminal_authority.assert_not_called()
     queue.kv_manager.send_packed_decode_request_metadata.assert_called_once()

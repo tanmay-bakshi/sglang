@@ -37,7 +37,14 @@ if TYPE_CHECKING:
 
     from nixl._api import nixl_remote_agent_handle
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    StateType,
+    TerminalPrefillAuthorityMismatch,
+    TerminalPrefillAuthorityUnavailable,
+    TerminalPrefillRequestAuthority,
+)
 from sglang.srt.disaggregation.common.asymmetric_kv_geometry import (
     require_uniform_asymmetric_kv_entry_geometry,
 )
@@ -840,6 +847,54 @@ class _NixlPrefillPeer:
     handle: nixl_remote_agent_handle
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _NixlTerminalPrefillTopology:
+    """Request-local projection of the frozen terminal source topology."""
+
+    source_tp_size: int
+    target_tp_rank: int
+    target_tp_ranks: tuple[int, ...]
+    required_dst_info_num: int
+    required_prefill_response_num: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class NixlTerminalPrefillRequestAuthority(TerminalPrefillRequestAuthority):
+    """Immutable generation-bound source authority retained through attach.
+
+    :ivar bootstrap_addr: Exact enrolled source bootstrap address.
+    :ivar startup_binding: Exact local terminal startup generation.
+    :ivar prefill_dp_rank: Sole terminal source data-parallel rank.
+    :ivar topology: Per-decoder-rank source projection.
+    :ivar peers: Canonically ordered selected source writers.
+    """
+
+    bootstrap_addr: str
+    startup_binding: TerminalStartupRankBinding
+    prefill_dp_rank: int
+    topology: _NixlTerminalPrefillTopology
+    peers: tuple[_NixlPrefillPeer, ...]
+
+    def __post_init__(self) -> None:
+        """Validate one closed authority value."""
+
+        if type(self.bootstrap_addr) is not str or len(self.bootstrap_addr) == 0:
+            raise ValueError("bootstrap_addr must be nonempty")
+        if type(self.startup_binding) is not TerminalStartupRankBinding:
+            raise TypeError("startup_binding must be TerminalStartupRankBinding")
+        if self.prefill_dp_rank != 0:
+            raise ValueError("terminal prefill authority requires DP rank zero")
+        if type(self.topology) is not _NixlTerminalPrefillTopology:
+            raise TypeError("topology must be _NixlTerminalPrefillTopology")
+        if type(self.peers) is not tuple or len(self.peers) == 0:
+            raise ValueError("terminal prefill authority requires source peers")
+        if any(type(peer) is not _NixlPrefillPeer for peer in self.peers):
+            raise TypeError("terminal prefill authority contains an invalid peer")
+        peer_ranks = tuple(peer.attn_tp_rank for peer in self.peers)
+        if peer_ranks != self.topology.target_tp_ranks:
+            raise ValueError("terminal prefill peers differ from topology projection")
+
+
 @dataclasses.dataclass(slots=True)
 class _TerminalStartupPeerEnrollment:
     """Manager-owned cross-role native peer roster for one startup epoch.
@@ -979,6 +1034,7 @@ class _NixlTerminalSourceMetrics(PackedTerminalSourceMetricsSink):
             metric.binding_digest.hex(),
             metric.timestamp_ns,
         )
+
 
 def expand_page_indices_for_slice(
     page_indices: npt.NDArray[np.int32],
@@ -1460,6 +1516,178 @@ class NixlKVManager(CommonKVManager):
         enrollment = self._terminal_startup_peer_enrollment
         return enrollment is not None and enrollment.frozen
 
+    def resolve_terminal_prefill_request_authority(
+        self,
+        *,
+        bootstrap_addr: str,
+        prefill_process_url: str,
+        prefill_process_instance_id: uuid.UUID,
+        prefill_dp_rank: int | None,
+        source_tp_size: int,
+    ) -> NixlTerminalPrefillRequestAuthority:
+        """Project one request's source writers from the frozen startup roster.
+
+        This resolver performs no request mutation, receiver construction, cache
+        lookup, or network operation. The startup enrollment is the sole source
+        of generation and topology authority.
+
+        :param bootstrap_addr: Exact source bootstrap service address.
+        :param prefill_process_url: Reservation-authenticated source service URL.
+        :param prefill_process_instance_id: Reservation-authenticated source
+            launch instance.
+        :param prefill_dp_rank: Explicit source DP rank, otherwise ``None``.
+        :param source_tp_size: Reservation-authenticated source TP width.
+        :returns: Immutable authority for receiver attachment.
+        :raises TerminalPrefillAuthorityUnavailable: If startup enrollment has
+            not frozen yet.
+        :raises TerminalPrefillAuthorityMismatch: If the reservation differs
+            from the frozen deployment generation or topology.
+        """
+
+        if type(bootstrap_addr) is not str or len(bootstrap_addr) == 0:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill bootstrap address is invalid"
+            )
+        if type(prefill_process_url) is not str or len(prefill_process_url) == 0:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill process URL is invalid"
+            )
+        if (
+            type(prefill_process_instance_id) is not uuid.UUID
+            or prefill_process_instance_id.int == 0
+        ):
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill process instance is invalid"
+            )
+        if prefill_dp_rank not in (None, 0):
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill authority requires DP rank zero"
+            )
+        if type(source_tp_size) is not int or source_tp_size <= 0:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill source TP width is invalid"
+            )
+        binding = self.terminal_startup_binding
+        enrollment = self._terminal_startup_peer_enrollment
+        if binding is None or enrollment is None or enrollment.binding != binding:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill startup authority is not configured"
+            )
+        if binding.advertisement.role is not TerminalOwnerRole.DECODE:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal prefill authority requires a decoder manager"
+            )
+
+        with enrollment.lock:
+            if not enrollment.frozen:
+                raise TerminalPrefillAuthorityUnavailable(
+                    "terminal prefill source enrollment is not frozen"
+                )
+            source_ranks = tuple(
+                rank
+                for rank in enrollment.expected_remote_ranks
+                if rank.role is TerminalOwnerRole.SOURCE
+            )
+            if len(source_ranks) == 0:
+                raise TerminalPrefillAuthorityMismatch(
+                    "terminal startup matrix has no source ranks"
+                )
+            source_service_ids = {rank.service_id for rank in source_ranks}
+            source_tp_sizes = {rank.tensor_parallel_size for rank in source_ranks}
+            if len(source_service_ids) != 1 or source_tp_sizes != {source_tp_size}:
+                raise TerminalPrefillAuthorityMismatch(
+                    "reservation source TP width differs from startup authority"
+                )
+            if len(source_ranks) != source_tp_size:
+                raise TerminalPrefillAuthorityMismatch(
+                    "terminal source rank population differs from its TP width"
+                )
+            if any(
+                rank.service_origin != prefill_process_url
+                or rank.launch_instance_id != prefill_process_instance_id.bytes
+                for rank in source_ranks
+            ):
+                raise TerminalPrefillAuthorityMismatch(
+                    "reservation source process differs from startup authority"
+                )
+            peers = tuple(
+                enrollment.prefill_peers.get(rank.key) for rank in source_ranks
+            )
+
+        if any(peer is None for peer in peers):
+            raise TerminalPrefillAuthorityMismatch(
+                "frozen terminal source enrollment is incomplete"
+            )
+        typed_peers = tuple(peer for peer in peers if peer is not None)
+        for rank, peer in zip(source_ranks, typed_peers, strict=True):
+            expected_generation = str(uuid.UUID(bytes=rank.process_generation))
+            if (
+                peer.bootstrap_addr != bootstrap_addr
+                or peer.attn_dp_rank != 0
+                or peer.attn_cp_rank != 0
+                or peer.attn_tp_rank != rank.tensor_parallel_rank
+                or peer.pp_rank != 0
+                or peer.transfer_source_rank != rank.tensor_parallel_rank
+                or peer.agent_name != rank.nixl_agent_name
+                or peer.metadata_sha256 != rank.nixl_agent_metadata_sha256.hex()
+                or peer.process_generation != expected_generation
+                or peer.handle in self._quarantined_remote_handles
+            ):
+                raise TerminalPrefillAuthorityMismatch(
+                    "terminal prefill peer differs from frozen startup authority"
+                )
+
+        decode_tp_size = self.attn_tp_size
+        if (
+            source_tp_size % decode_tp_size != 0
+            and decode_tp_size % source_tp_size != 0
+        ):
+            raise TerminalPrefillAuthorityMismatch(
+                "source and decode TP widths are not evenly divisible"
+            )
+        decode_rank = self.kv_args.engine_rank % decode_tp_size
+        if decode_tp_size == source_tp_size:
+            target_tp_rank = decode_rank
+            target_tp_ranks = (target_tp_rank,)
+            required_dst_info_num = 1
+            required_prefill_response_num = 1
+        elif decode_tp_size > source_tp_size:
+            decode_ranks_per_source = decode_tp_size // source_tp_size
+            target_tp_rank = decode_rank // decode_ranks_per_source
+            target_tp_ranks = (target_tp_rank,)
+            required_dst_info_num = decode_ranks_per_source
+            required_prefill_response_num = 1
+        else:
+            source_ranks_per_decode = source_tp_size // decode_tp_size
+            first_source_rank = decode_rank * source_ranks_per_decode
+            target_tp_ranks = tuple(
+                range(first_source_rank, first_source_rank + source_ranks_per_decode)
+            )
+            target_tp_rank = target_tp_ranks[0]
+            required_dst_info_num = 1
+            required_prefill_response_num = source_ranks_per_decode
+
+        peer_by_tp_rank = {peer.attn_tp_rank: peer for peer in typed_peers}
+        if any(rank not in peer_by_tp_rank for rank in target_tp_ranks):
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal source roster cannot satisfy the decode TP projection"
+            )
+        selected_peers = tuple(peer_by_tp_rank[rank] for rank in target_tp_ranks)
+        topology = _NixlTerminalPrefillTopology(
+            source_tp_size=source_tp_size,
+            target_tp_rank=target_tp_rank,
+            target_tp_ranks=target_tp_ranks,
+            required_dst_info_num=required_dst_info_num,
+            required_prefill_response_num=required_prefill_response_num,
+        )
+        return NixlTerminalPrefillRequestAuthority(
+            bootstrap_addr=bootstrap_addr,
+            startup_binding=binding,
+            prefill_dp_rank=0,
+            topology=topology,
+            peers=selected_peers,
+        )
+
     def install_terminal_runtime(
         self,
         installation: NixlTerminalRuntimeInstallation,
@@ -1578,9 +1806,7 @@ class NixlKVManager(CommonKVManager):
         self,
         submission: PackedTerminalSourceSubmission,
         release_resources: Callable[[PackedTerminalSourceSubmission], None],
-        commit_scheduler_retention: Callable[
-            [PackedTerminalSourceSubmission], None
-        ],
+        commit_scheduler_retention: Callable[[PackedTerminalSourceSubmission], None],
     ) -> None:
         """Bind every source owner and scheduler retention before PREPARE.
 
@@ -2791,9 +3017,7 @@ class NixlKVManager(CommonKVManager):
                 source_transfer_info_room_ids=source_transfer_rooms,
                 source_prefix_length_room_ids=source_prefix_rooms,
                 source_prefetched_room_ids=source_prefetched_rooms,
-                source_prefetch_requested_room_ids=(
-                    source_prefetch_requested_rooms
-                ),
+                source_prefetch_requested_room_ids=(source_prefetch_requested_rooms),
                 dflash_active_transfer_count=dflash_counts[0],
                 dflash_posted_transfer_count=dflash_counts[1],
                 dflash_settled_transfer_count=dflash_counts[2],
@@ -3956,15 +4180,11 @@ class NixlKVManager(CommonKVManager):
                     set(inventory.wiring.active_binding_digests)
                     | set(inventory.scheduler_consumer.active_binding_digests)
                     | set(inventory.resources.actor_active_binding_digests)
-                    | set(
-                        inventory.resources.request_ready_import_binding_digests
-                    )
+                    | set(inventory.resources.request_ready_import_binding_digests)
                     | set(
                         inventory.resources.publication_control_active_binding_digests
                     )
-                    | set(
-                        inventory.resources.unpublished_quarantined_binding_digests
-                    )
+                    | set(inventory.resources.unpublished_quarantined_binding_digests)
                     | set(inventory.runtime.quarantined_binding_digests)
                 )
             )
@@ -3973,12 +4193,8 @@ class NixlKVManager(CommonKVManager):
                     set(inventory.wiring.quarantined_binding_digests)
                     | set(inventory.resources.actor_quarantined_binding_digests)
                     | set(inventory.runtime.quarantined_binding_digests)
-                    | set(
-                        inventory.scheduler_consumer.quarantined_binding_digests
-                    )
-                    | set(
-                        inventory.resources.unpublished_quarantined_binding_digests
-                    )
+                    | set(inventory.scheduler_consumer.quarantined_binding_digests)
+                    | set(inventory.resources.unpublished_quarantined_binding_digests)
                 )
             )
             native = inventory.grouped_nixl.native
@@ -3996,13 +4212,9 @@ class NixlKVManager(CommonKVManager):
             return {
                 "role": "source",
                 "active_count": len(active),
-                "active_binding_digests": [
-                    digest.hex() for digest in active
-                ],
+                "active_binding_digests": [digest.hex() for digest in active],
                 "quarantine_count": len(quarantined),
-                "quarantined_binding_digests": [
-                    digest.hex() for digest in quarantined
-                ],
+                "quarantined_binding_digests": [digest.hex() for digest in quarantined],
                 "retained_resource_count": inventory.retained_resource_count,
                 "pending_owner_action_count": (
                     inventory.runtime.owner.pending_action_count
@@ -4079,13 +4291,9 @@ class NixlKVManager(CommonKVManager):
         return {
             "role": "decode",
             "active_count": len(active),
-            "active_binding_digests": [
-                digest.hex() for digest in active
-            ],
+            "active_binding_digests": [digest.hex() for digest in active],
             "quarantine_count": len(quarantined),
-            "quarantined_binding_digests": [
-                digest.hex() for digest in quarantined
-            ],
+            "quarantined_binding_digests": [digest.hex() for digest in quarantined],
             "retained_resource_count": (
                 inventory.retained_resource_count
                 + dflash_active_row_count
@@ -8878,6 +9086,8 @@ class NixlKVSender(CommonKVSender):
 
 
 class NixlKVReceiver(CommonKVReceiver):
+    _terminal_authority_initialized: bool
+
     def __init__(
         self,
         mgr: NixlKVManager,
@@ -8888,6 +9098,107 @@ class NixlKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
         self.prefill_peers: list[_NixlPrefillPeer] = []
+        self._terminal_authority_initialized = False
+
+    def init_from_terminal_authority(
+        self,
+        authority: TerminalPrefillRequestAuthority,
+    ) -> None:
+        """Initialize from PREPARE-retained source authority only.
+
+        :param authority: Exact immutable NIXL source projection.
+        :raises TerminalPrefillAuthorityMismatch: If manager, request, or source
+            generation differs from preparation.
+        """
+
+        if self._terminal_authority_initialized or len(self.prefill_peers) > 0:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal receiver authority is already initialized"
+            )
+        self._validate_terminal_authority_identity(authority)
+
+        assert type(authority) is NixlTerminalPrefillRequestAuthority
+        self._terminal_authority_initialized = True
+        topology = authority.topology
+        self.prefill_dp_rank = authority.prefill_dp_rank
+        self.prefill_info = PrefillServerInfo(
+            attn_tp_size=topology.source_tp_size,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=self.kv_mgr.kv_args.page_size,
+            kv_cache_dtype=None,
+            follow_bootstrap_room=True,
+            target_tp_rank=topology.target_tp_rank,
+            target_tp_ranks=list(topology.target_tp_ranks),
+            target_cp_ranks=[0],
+            target_pp_ranks=[0],
+            required_dst_info_num=topology.required_dst_info_num,
+            required_prefill_response_num=topology.required_prefill_response_num,
+        )
+        self.target_tp_rank = topology.target_tp_rank
+        self.target_tp_ranks = list(topology.target_tp_ranks)
+        self.target_cp_ranks = [0]
+        self.target_pp_ranks = [0]
+        self.required_dst_info_num = topology.required_dst_info_num
+        self.required_prefill_response_num = topology.required_prefill_response_num
+        self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
+            self.required_prefill_response_num
+        )
+        self.require_staging = (
+            self.kv_mgr.enable_staging
+            and topology.source_tp_size != self.kv_mgr.attn_tp_size
+        )
+        self.prefill_peers = list(authority.peers)
+        self.bootstrap_infos = [
+            {
+                "rank_ip": peer.control_endpoint.host,
+                "rank_port": peer.control_endpoint.port,
+                "attn_dp_rank": peer.attn_dp_rank,
+                "attn_cp_rank": peer.attn_cp_rank,
+                "attn_tp_rank": peer.attn_tp_rank,
+                "pp_rank": peer.pp_rank,
+                "transfer_source_rank": peer.transfer_source_rank,
+                "process_generation": peer.process_generation,
+                "nixl_agent_name": peer.agent_name,
+                "nixl_agent_metadata_sha256": peer.metadata_sha256,
+                "transport_protocol": NIXL_BOOTSTRAP_PEER_PROTOCOL,
+                "is_dummy": False,
+            }
+            for peer in authority.peers
+        ]
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+
+    def _validate_terminal_authority_identity(
+        self,
+        authority: TerminalPrefillRequestAuthority,
+    ) -> None:
+        """Validate immutable source identity against current process authority.
+
+        :param authority: Candidate generation-bound NIXL authority.
+        :raises TerminalPrefillAuthorityMismatch: If the authority is stale,
+            malformed, or quarantined.
+        """
+
+        if type(authority) is not NixlTerminalPrefillRequestAuthority:
+            raise TerminalPrefillAuthorityMismatch(
+                "receiver received another terminal prefill authority type"
+            )
+        if self.kv_mgr.terminal_startup_binding != authority.startup_binding:
+            raise TerminalPrefillAuthorityMismatch(
+                "terminal startup generation changed after preparation"
+            )
+        if self.bootstrap_addr != authority.bootstrap_addr:
+            raise TerminalPrefillAuthorityMismatch(
+                "receiver bootstrap address differs from preparation"
+            )
+        if any(
+            peer.handle in self.kv_mgr._quarantined_remote_handles
+            for peer in authority.peers
+        ):
+            raise TerminalPrefillAuthorityMismatch(
+                "prepared terminal prefill peer was quarantined"
+            )
 
     def _load_bootstrap_peers(self) -> None:
         """Load every selected prefill writer before this receiver is ready.
