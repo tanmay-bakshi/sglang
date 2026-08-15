@@ -22,8 +22,8 @@ import sys
 import time
 import uuid
 from array import array
-from collections.abc import Callable
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus

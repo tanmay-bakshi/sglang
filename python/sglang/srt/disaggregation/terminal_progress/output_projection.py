@@ -5,6 +5,7 @@ import json
 from array import array
 
 import torch
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
 )

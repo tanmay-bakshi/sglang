@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPla
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryPrefillSource,
 )
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalRequestBinding
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     FrozenPrefillGatewayOutputShell,
     PinnedTerminalGatewayResultSlot,
@@ -54,7 +55,6 @@ from sglang.srt.disaggregation.terminal_progress.output_projection import (
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
-from sglang.srt.disaggregation.terminal_progress.identity import TerminalRequestBinding
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceSubmission,
 )
