@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentCohort,
     TerminalDeploymentLocalService,
     TerminalDeploymentRole,
+    encode_terminal_deployment_cohort,
     load_terminal_deployment_cohort,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -8374,7 +8375,53 @@ class ServerArgs:
         for secret_field in secret_fields:
             public_values[secret_field] = None
             public_values[f"{secret_field}_configured"] = configured[secret_field]
+        public_values.update(self._terminal_deployment_public_fields())
         return public_values
+
+    def _terminal_deployment_public_fields(self) -> dict[str, object]:
+        """Project active terminal identity into JSON-native diagnostics.
+
+        The runtime keeps its cohort digest as authenticated bytes and UUIDs as
+        typed values. The public server-info boundary must not ask a generic
+        encoder to guess how those identities should appear on the wire.
+
+        :returns: Exact cohort and local-membership server-info fields.
+        """
+
+        cohort = self.pd_terminal_deployment_cohort
+        membership = self.pd_terminal_local_membership
+        if cohort is None and membership is None:
+            return {
+                "pd_terminal_deployment_cohort": None,
+                "pd_terminal_local_membership": None,
+            }
+        if type(cohort) is not TerminalDeploymentCohort:
+            raise TypeError("pd_terminal_deployment_cohort has an invalid type")
+        if type(membership) is not TerminalDeploymentLocalService:
+            raise TypeError("pd_terminal_local_membership has an invalid type")
+
+        cohort_payload = json.loads(encode_terminal_deployment_cohort(cohort))
+        if type(cohort_payload) is not dict:
+            raise RuntimeError("terminal deployment cohort encoded as a non-object")
+        bootstrap_endpoint = None
+        if membership.bootstrap_endpoint is not None:
+            bootstrap_endpoint = {
+                "host": membership.bootstrap_endpoint.host,
+                "port": membership.bootstrap_endpoint.port,
+            }
+        return {
+            "pd_terminal_deployment_cohort": cohort_payload,
+            "pd_terminal_local_membership": {
+                "group_id": membership.group_id,
+                "cohort_digest_sha256": membership.cohort_digest.hex(),
+                "role": membership.role.value,
+                "service_id": membership.service_id,
+                "launch_instance_id": str(membership.launch_instance_id),
+                "origin": membership.origin,
+                "tensor_parallel_size": membership.tensor_parallel_size,
+                "bootstrap_endpoint": bootstrap_endpoint,
+            },
+        }
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"

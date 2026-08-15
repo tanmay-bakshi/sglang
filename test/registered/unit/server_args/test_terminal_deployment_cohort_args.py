@@ -1,4 +1,5 @@
 import hashlib
+import json
 import uuid
 from pathlib import Path
 
@@ -87,6 +88,43 @@ def test_prefill_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "prefill-a"
 
+    public = args.public_server_args_dict()
+    assert public["pd_terminal_deployment_cohort"] == json.loads(
+        encode_terminal_deployment_cohort(_cohort())
+    )
+    assert public["pd_terminal_local_membership"] == {
+        "group_id": "group-a",
+        "cohort_digest_sha256": digest,
+        "role": "prefill",
+        "service_id": "prefill-a",
+        "launch_instance_id": str(uuid.UUID(int=1)),
+        "origin": "http://127.0.0.1:32001",
+        "tensor_parallel_size": 2,
+        "bootstrap_endpoint": {"host": "gemma-dev-1", "port": 32150},
+    }
+    json.dumps(
+        {
+            "pd_terminal_deployment_cohort": public["pd_terminal_deployment_cohort"],
+            "pd_terminal_local_membership": public["pd_terminal_local_membership"],
+        }
+    )
+
+    projected = args.public_server_args_dict(
+        {
+            "pd_terminal_deployment_cohort": b"raw-cohort",
+            "pd_terminal_local_membership": b"raw-membership",
+        }
+    )
+    assert (
+        projected["pd_terminal_deployment_cohort"]
+        == public["pd_terminal_deployment_cohort"]
+    )
+    assert (
+        projected["pd_terminal_local_membership"]
+        == public["pd_terminal_local_membership"]
+    )
+    json.dumps(projected)
+
 
 def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
     """Load and retain an exact decoder membership before runtime startup."""
@@ -110,6 +148,56 @@ def test_decode_server_args_bind_exact_local_cohort(tmp_path: Path) -> None:
 
     assert args.pd_terminal_local_membership is not None
     assert args.pd_terminal_local_membership.service_id == "decode-a"
+
+    public = args.public_server_args_dict()
+    assert public["pd_terminal_local_membership"] == {
+        "group_id": "group-a",
+        "cohort_digest_sha256": digest,
+        "role": "decode",
+        "service_id": "decode-a",
+        "launch_instance_id": str(uuid.UUID(int=2)),
+        "origin": "http://127.0.0.1:32002",
+        "tensor_parallel_size": 1,
+        "bootstrap_endpoint": None,
+    }
+
+
+def test_inactive_terminal_server_info_fields_are_explicitly_null() -> None:
+    """Diagnostics distinguish inactive terminal serving from missing fields."""
+
+    public = ServerArgs(model_path="dummy").public_server_args_dict()
+
+    assert public["pd_terminal_deployment_cohort"] is None
+    assert public["pd_terminal_local_membership"] is None
+
+
+def test_terminal_server_info_rejects_partial_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    """Diagnostics fail closed when runtime cohort ownership is inconsistent."""
+
+    path, digest = _write_cohort(tmp_path)
+    args = ServerArgs(
+        model_path="dummy",
+        disaggregation_mode="decode",
+        launch_instance_id=str(uuid.UUID(int=2)),
+        port=32002,
+        tp_size=1,
+        pd_model_fingerprint="11" * 32,
+        pd_logical_kv_layout_fingerprint="22" * 32,
+        pd_terminal_cohort_manifest=str(path),
+        pd_terminal_cohort_sha256=digest,
+        pd_terminal_local_service="decode-a",
+        pd_terminal_startup_timeout_seconds=60.0,
+    )
+    args._handle_pd_disaggregation()
+    args.pd_terminal_local_membership = None
+
+    with pytest.raises(
+        TypeError,
+        match="pd_terminal_local_membership has an invalid type",
+    ):
+        args.public_server_args_dict()
 
 
 def test_terminal_cohort_arguments_are_all_or_none(tmp_path: Path) -> None:
