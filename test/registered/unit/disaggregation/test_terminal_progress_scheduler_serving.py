@@ -578,46 +578,68 @@ def test_decode_launch_handoff_consumes_while_forward_barrier_remains_held(
     serving.close()
 
 
-def test_source_launch_binds_submission_before_gate_release(
+def test_source_launch_registers_before_racing_publication_is_consumed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The terminal submission binder remains inside the serialized handoff."""
+    """Binding may register in its inbox before a racing action is consumed."""
 
     consumer = _SourceConsumer()
     serving = _source_serving(consumer)
-    gate_held = False
-    original_handoff = serving._inbox.launch_handoff
+    binding = _binding(20, 20, TerminalOwnerRole.SOURCE)
+    action = _action(binding, 20)
+    begin_publication = threading.Event()
+    publication_announced = threading.Event()
+    original_begin = serving._inbox._begin_publication_intent
+    ordering: list[str] = []
 
-    def observed_handoff(
-        submit: Callable[[], object],
-        consume: Callable[[object], None],
-    ) -> object:
-        """Expose the full launch-gate callback lifetime."""
+    def observed_begin() -> int:
+        """Expose the publication linearization point."""
 
-        nonlocal gate_held
-        gate_held = True
-        try:
-            return original_handoff(submit, consume)
-        finally:
-            gate_held = False
+        intent = original_begin()
+        publication_announced.set()
+        return intent
 
-    monkeypatch.setattr(serving._inbox, "launch_handoff", observed_handoff)
+    monkeypatch.setattr(serving._inbox, "_begin_publication_intent", observed_begin)
+
+    def consume(consumed: NativeTerminalOwnerAction) -> None:
+        """Record scheduler consumption after immutable binding."""
+
+        assert consumed == action
+        ordering.append("consume")
+        consumer.actions.append(consumed)
+
+    monkeypatch.setattr(consumer, "consume_reclaim_authorized", consume)
+
+    def publisher() -> SchedulerReceiptPublishResult:
+        """Publish as soon as binding makes the request owner-visible."""
+
+        assert begin_publication.wait(timeout=5)
+        return serving.publish_action(action)
 
     def submit() -> str:
-        """Return one synthetic model-worker result while the gate is held."""
+        """Return one synthetic model-worker result."""
 
-        assert gate_held
+        ordering.append("submit")
         return "forward-result"
 
     def bind(result: str) -> str:
-        """Freeze one synthetic terminal submission before gate release."""
+        """Register the exact generation before owner publication."""
 
-        assert gate_held
         assert result == "forward-result"
+        serving.register_request(binding)
+        ordering.append("bind")
+        begin_publication.set()
+        assert publication_announced.wait(timeout=5)
         return "bound-submission"
 
-    assert serving.launch_and_bind_handoff(submit, bind) == "bound-submission"
-    assert not gate_held
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        publication = executor.submit(publisher)
+        assert serving.launch_and_bind_handoff(submit, bind) == "bound-submission"
+        assert publication.result(timeout=5) is SchedulerReceiptPublishResult.QUEUED
+
+    ordering.append("return")
+    assert ordering == ["submit", "bind", "consume", "return"]
+    assert consumer.actions == [action]
     serving.close()
 
 

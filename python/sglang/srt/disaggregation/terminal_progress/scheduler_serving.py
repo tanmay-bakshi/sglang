@@ -459,13 +459,24 @@ class TerminalSchedulerServing:
             raise TypeError("submit must be callable")
         if not callable(bind):
             raise TypeError("bind must be callable")
-
-        def submit_and_bind() -> BoundLaunchResultT:
-            """Keep only submission and immutable binding in the launch gate."""
-
-            return bind(submit())
-
-        return self.launch_handoff(submit_and_bind)
+        try:
+            return self._inbox.launch_and_bind_handoff(
+                submit=submit,
+                bind=bind,
+                consume=self._consume_receipt,
+            )
+        except SchedulerReceiptInboxFatalError as error:
+            self._deliver_process_fatal(error.inventory)
+            raise
+        except Exception:
+            inventory = self._inbox.inventory()
+            if inventory.fatal_cause is not None:
+                self._deliver_process_fatal(inventory)
+            logger.error(
+                "Terminal scheduler launch binding failed:\n%s",
+                traceback.format_exc(),
+            )
+            raise
 
     def mark_owner_dead(self) -> SchedulerReceiptInboxInventory:
         """Wake the scheduler after native owner or publisher death.

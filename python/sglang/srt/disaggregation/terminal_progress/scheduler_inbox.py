@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.terminal_progress.inbox import (
 from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 LaunchResultT = TypeVar("LaunchResultT")
+BoundLaunchResultT = TypeVar("BoundLaunchResultT")
 
 
 class SchedulerReceiptPublishResult(enum.StrEnum):
@@ -429,8 +430,65 @@ class TerminalReceiptInbox:
         :returns: Exact result returned by ``submit``.
         """
 
+        def retain_result(result: LaunchResultT) -> LaunchResultT:
+            """Return an unmodified launch result.
+
+            :param result: Exact host-submission result.
+            :returns: The same result.
+            """
+
+            return result
+
+        return self._launch_and_bind_handoff(
+            submit=submit,
+            bind=retain_result,
+            consume=consume,
+        )
+
+    def launch_and_bind_handoff(
+        self,
+        submit: Callable[[], LaunchResultT],
+        bind: Callable[[LaunchResultT], BoundLaunchResultT],
+        consume: Callable[[TerminalWireReceipt], None],
+    ) -> BoundLaunchResultT:
+        """Bind post-submit ownership inside the serialized handoff.
+
+        Binding runs after the state mutex protecting host submission is
+        released, because the binder registers the new live generation through
+        this inbox. The scheduler-consumer mutex remains held until binding,
+        racing publication completion, and receipt draining all finish.
+
+        :param submit: Narrow host-submission callback.
+        :param bind: Immediate immutable post-submission binder.
+        :param consume: Scheduler-affine receipt consumer.
+        :returns: Exact result returned by ``bind``.
+        """
+
+        return self._launch_and_bind_handoff(
+            submit=submit,
+            bind=bind,
+            consume=consume,
+        )
+
+    def _launch_and_bind_handoff(
+        self,
+        *,
+        submit: Callable[[], LaunchResultT],
+        bind: Callable[[LaunchResultT], BoundLaunchResultT],
+        consume: Callable[[TerminalWireReceipt], None],
+    ) -> BoundLaunchResultT:
+        """Implement one submission, binding, and receipt-consumption gate.
+
+        :param submit: Narrow host-submission callback.
+        :param bind: Immediate immutable post-submission binder.
+        :param consume: Scheduler-affine receipt consumer.
+        :returns: Exact result returned by ``bind``.
+        """
+
         if not callable(submit):
             raise TypeError("submit must be callable")
+        if not callable(bind):
+            raise TypeError("bind must be callable")
         if not callable(consume):
             raise TypeError("consume must be callable")
         with self._consumer_lock:
@@ -445,7 +503,7 @@ class TerminalReceiptInbox:
                         if len(self._pending) > 0:
                             publication = self._take_next_locked()
                         else:
-                            result = submit()
+                            launch_result = submit()
                             publication_target = self._publication_intent_snapshot()
                             break
                 if len(publication_intents) > 0:
@@ -453,9 +511,13 @@ class TerminalReceiptInbox:
                     continue
                 if publication is not None:
                     self._consume_publication(publication, consume)
+            bound_result = bind(launch_result)
+            publication_target = publication_target.union(
+                self._publication_intent_snapshot()
+            )
             self._wait_for_publication_intents(publication_target)
             self._drain_ready(consume)
-            return result
+            return bound_result
 
     def mark_owner_dead(self) -> SchedulerReceiptInboxInventory:
         """Wake the scheduler into sticky process-fatal owner-death state.
