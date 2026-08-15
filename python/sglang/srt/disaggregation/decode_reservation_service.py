@@ -139,7 +139,7 @@ class DecodeReservationSchedulerService:
         inference_route: str,
         request_body: bytes,
     ) -> None:
-        """Attach and publish one exact promoted inference request.
+        """Attach one exact promoted inference request to its response owner.
 
         :param grant_id: Exact promoted grant identity.
         :param inference_route: Actual normal inference route.
@@ -157,9 +157,9 @@ class DecodeReservationSchedulerService:
             self._allocator.attach(owner)
         except Exception as attachment_error:
             attachment_traceback = traceback.format_exc()
-            diagnostic = "allocator failed while publishing inference attachment"
+            diagnostic = "allocator failed while attaching inference ownership"
             logger.error(
-                "Inference attachment publication failed; quarantining the exact "
+                "Inference ownership attachment failed; quarantining the exact "
                 "reservation owner:\n%s",
                 attachment_traceback,
             )

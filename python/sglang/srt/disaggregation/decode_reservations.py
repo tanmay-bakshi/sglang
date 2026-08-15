@@ -283,7 +283,7 @@ class DecodeReservationAllocator(Protocol):
         ...
 
     def promote(self, owner: object) -> None:
-        """Authorize one prepared cohort for inference attachment.
+        """Publish one prepared cohort's transport ownership.
 
         :param owner: Exact retained cohort.
         """
@@ -291,7 +291,7 @@ class DecodeReservationAllocator(Protocol):
         ...
 
     def attach(self, owner: object) -> None:
-        """Publish one promoted cohort after exact inference attachment.
+        """Attach exact inference ownership to one promoted cohort.
 
         :param owner: Exact retained cohort.
         """

@@ -226,6 +226,7 @@ def test_terminal_quarantine_records_transfer_failure_exactly_once() -> None:
     queue.queue = []
     queue.pending_reqs = []
     queue.transfer_queue = transfer_queue
+    queue._terminal_decode_serving = object()
     queue.scheduler = SimpleNamespace(
         metrics_reporter=SimpleNamespace(enable_metrics=True),
         metrics_collector=MagicMock(),
@@ -264,6 +265,7 @@ def test_terminal_quarantine_records_transfer_failure_exactly_once() -> None:
 
     transfer_failure = queue.scheduler.metrics_collector.increment_transfer_failed_reqs
     transfer_failure.assert_called_once_with()
+    assert transfer_queue.live_requests() == ()
     assert record.state is _DecodePreparedCohortState.QUARANTINED
 
 
@@ -326,7 +328,7 @@ def test_terminal_attachment_bypasses_preallocation_handshake_and_queue() -> Non
     queue._prepared_cohorts = {handle._token: record}
 
     with patch("sglang.srt.disaggregation.decode.poll_and_all_reduce") as collective:
-        queue.attach_preallocated(handle)
+        queue._attach_promoted_preallocated_record(record)
 
     collective.assert_not_called()
     queue._resolve_pending_reqs.assert_not_called()

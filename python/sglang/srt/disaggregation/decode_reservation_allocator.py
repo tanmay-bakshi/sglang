@@ -123,7 +123,7 @@ class DecodePreallocQueueReservationAllocator:
         return tuple(requests)
 
     def promote(self, owner: object) -> None:
-        """Authorize a prepared cohort without publishing runnable work.
+        """Publish a prepared cohort's transport ownership.
 
         :param owner: Exact retained cohort.
         """
@@ -131,7 +131,7 @@ class DecodePreallocQueueReservationAllocator:
         self._queue.promote_preallocated(_prepared_cohort(owner))
 
     def attach(self, owner: object) -> None:
-        """Publish a promoted cohort through the native decode queue.
+        """Attach exact inference ownership to a promoted cohort.
 
         :param owner: Exact retained cohort.
         """

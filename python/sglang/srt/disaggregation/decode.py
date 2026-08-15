@@ -75,6 +75,7 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedDFlashBoundaryDecodeAdoption,
     PackedRequestPublication,
+    PackedRequestTransactionState,
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
     SUPPORTED_PACKED_SOURCE_TP_SIZES,
@@ -1226,7 +1227,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         cohort: DecodePreparedAllocationCohort,
     ) -> None:
-        """Authorize one prepared cohort without enqueuing its requests.
+        """Publish one prepared cohort's transport ownership.
+
+        Terminal transport publication includes destination metadata because
+        prefill cannot run until that metadata exists. Legacy cohorts retain
+        their scheduler attachment boundary at the inference request.
 
         :param cohort: Exact queue-owned prepared cohort.
         """
@@ -1300,6 +1305,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 raise
             record.packed_publications = tuple(publications)
             record.state = _DecodePreparedCohortState.PROMOTED
+            if terminal_serving is not None:
+                try:
+                    self._attach_promoted_preallocated_record(record)
+                except Exception:  # noqa: BLE001
+                    if record.state is not _DecodePreparedCohortState.QUARANTINED:
+                        self._quarantine_preallocated_record_locked(
+                            record,
+                            "terminal promotion failed after packed publication",
+                        )
+                    raise
 
     def _adopt_terminal_decode_request(
         self,
@@ -1419,13 +1434,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             owner,
         )
         with self._prepared_cohort_lock:
-            removed = self.transfer_queue.quarantine_terminal_request(
-                decode_req,
-                transaction,
-            )
-            self._quarantine_preallocated_record_locked(record, reason)
-        if removed and self.scheduler.metrics_reporter.enable_metrics:
-            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+            removed_count = self._quarantine_preallocated_record_locked(record, reason)
+        if self.scheduler.metrics_reporter.enable_metrics:
+            for _ in range(removed_count):
+                self.scheduler.metrics_collector.increment_transfer_failed_reqs()
 
     def _require_terminal_callback_owner(
         self,
@@ -1473,99 +1485,167 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         cohort: DecodePreparedAllocationCohort,
     ) -> None:
-        """Attach one promoted cohort to its process-lifetime progress owner.
+        """Attach exact inference ownership to one promoted cohort.
+
+        Terminal cohorts already belong to their process-lifetime progress
+        owner at promotion. Their inference attachment therefore validates the
+        retained state without republishing transport metadata. Legacy cohorts
+        enter scheduler-owned progress here.
 
         :param cohort: Exact queue-owned promoted cohort.
         """
 
         with self._prepared_cohort_lock:
             record = self._require_preallocated_cohort_locked(cohort)
-            if record.state is not _DecodePreparedCohortState.PROMOTED:
+            if self._terminal_decode_serving is not None:
+                self._validate_terminal_inference_attachment_locked(record)
+                return
+            self._attach_promoted_preallocated_record(record)
+
+    def _validate_terminal_inference_attachment_locked(
+        self,
+        record: _DecodePreparedCohortRecord,
+    ) -> None:
+        """Validate retained terminal transport ownership without mutation.
+
+        :param record: Exact cohort receiving its inference response owner.
+        """
+
+        if record.state is not _DecodePreparedCohortState.ATTACHED:
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment requires transport publication, "
+                f"not state {record.state.value}"
+            )
+        publications = record.packed_publications
+        if publications is None or len(publications) != len(record.decode_reqs):
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment lost packed publication evidence"
+            )
+        receiver_seals = record.prepared_receiver_seals
+        if receiver_seals is None or len(receiver_seals) != len(record.decode_reqs):
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment lost prepared receiver evidence"
+            )
+        if not record.metadata_published:
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment preceded metadata publication"
+            )
+
+        for decode_req, transaction, publication, allocation, receiver_seal in zip(
+            record.decode_reqs,
+            record.packed_transactions,
+            publications,
+            record.allocations,
+            receiver_seals,
+            strict=True,
+        ):
+            if transaction.request_owner is not decode_req:
                 raise DecodeAllocationLeaseError(
-                    f"cohort attachment is invalid in state {record.state.value}"
+                    "terminal inference attachment retained another request owner"
                 )
-            if any(
-                any(entry is decode_req for entry in self.queue)
-                or any(entry is decode_req for entry in self.pending_reqs)
-                for decode_req in record.decode_reqs
+            if (
+                publication.key.room_id != allocation.bootstrap_room
+                or publication.key.request_generation
+                != allocation.decoder_slot_generation.bytes
+                or publication.request_slot_generation
+                != allocation.request_generation
+                or publication.writer_manifest_digest
+                != allocation.writer_manifest_digest
+                or publication.allocation_digest != allocation.allocation_digest
+                or publication.terminal_source_plan is None
             ):
+                raise DecodeAllocationLeaseError(
+                    "terminal inference attachment publication differs from its "
+                    "prepared allocation"
+                )
+            if (
+                receiver_seal.decode_req is not decode_req
+                or receiver_seal.source_tp_size != record.source_tp_size
+            ):
+                raise DecodeAllocationLeaseError(
+                    "terminal inference attachment receiver evidence changed"
+                )
+            self.transfer_queue.validate_terminal_inference_attachment(
+                decode_req,
+                transaction,
+                receiver_seal.receiver,
+            )
+
+    def _attach_promoted_preallocated_record(
+        self,
+        record: _DecodePreparedCohortRecord,
+    ) -> None:
+        """Attach one promoted record to its role-specific progress owner.
+
+        :param record: Exact promoted record retained by this queue.
+        """
+
+        if record.state is not _DecodePreparedCohortState.PROMOTED:
+            raise DecodeAllocationLeaseError(
+                f"cohort attachment is invalid in state {record.state.value}"
+            )
+        if any(
+            any(entry is decode_req for entry in self.queue)
+            or any(entry is decode_req for entry in self.pending_reqs)
+            for decode_req in record.decode_reqs
+        ):
+            self._quarantine_preallocated_record_locked(
+                record,
+                "cohort attachment found duplicate queue ownership",
+            )
+            raise DecodeAllocationLeaseError(
+                "prepared cohort is already present in a decode queue"
+            )
+
+        for decode_req, transaction in zip(
+            record.decode_reqs,
+            record.packed_transactions,
+            strict=True,
+        ):
+            if decode_req.packed_transaction is not None:
                 self._quarantine_preallocated_record_locked(
                     record,
-                    "cohort attachment found duplicate queue ownership",
+                    "cohort attachment found existing packed ownership",
                 )
                 raise DecodeAllocationLeaseError(
-                    "prepared cohort is already present in a decode queue"
+                    "prepared request already owns a packed transaction"
                 )
-
-            for decode_req, transaction in zip(
-                record.decode_reqs,
-                record.packed_transactions,
-                strict=True,
-            ):
-                if decode_req.packed_transaction is not None:
-                    self._quarantine_preallocated_record_locked(
-                        record,
-                        "cohort attachment found existing packed ownership",
-                    )
-                    raise DecodeAllocationLeaseError(
-                        "prepared request already owns a packed transaction"
-                    )
-                if transaction.request_owner is not decode_req:
-                    self._quarantine_preallocated_record_locked(
-                        record,
-                        "cohort attachment found another packed request owner",
-                    )
-                    raise DecodeAllocationLeaseError(
-                        "packed transaction retained another decode request"
-                    )
-                decode_req.packed_transaction = transaction
-
-            try:
-                if self._terminal_decode_serving is None:
-                    self._attach_legacy_preallocated_record(record)
-                else:
-                    self._attach_terminal_preallocated_record(record)
-            except Exception:  # noqa: BLE001
-                attachment_traceback = traceback.format_exc()
-                self.queue = [
-                    entry
-                    for entry in self.queue
-                    if all(entry is not owned for owned in record.decode_reqs)
-                ]
-                self.pending_reqs = [
-                    entry
-                    for entry in self.pending_reqs
-                    if all(entry is not owned for owned in record.decode_reqs)
-                ]
-                terminal_cleanup_failures: list[str] = []
-                if self._terminal_decode_serving is not None:
-                    for decode_req, transaction in zip(
-                        record.decode_reqs,
-                        record.packed_transactions,
-                        strict=True,
-                    ):
-                        try:
-                            self.transfer_queue.quarantine_terminal_request(
-                                decode_req,
-                                transaction,
-                            )
-                        except Exception:  # noqa: BLE001
-                            terminal_cleanup_failures.append(traceback.format_exc())
+            if transaction.request_owner is not decode_req:
                 self._quarantine_preallocated_record_locked(
                     record,
-                    "cohort attachment failed after progress ownership may have begun",
+                    "cohort attachment found another packed request owner",
                 )
-                if len(terminal_cleanup_failures) > 0:
-                    logger.critical(
-                        "Terminal registry cleanup failed during attachment "
-                        "quarantine:\n%s",
-                        "\n".join(terminal_cleanup_failures),
-                    )
-                logger.error(
-                    "Reserved decode cohort attachment failed and was quarantined:\n%s",
-                    attachment_traceback,
+                raise DecodeAllocationLeaseError(
+                    "packed transaction retained another decode request"
                 )
-                raise
+            decode_req.packed_transaction = transaction
+
+        try:
+            if self._terminal_decode_serving is None:
+                self._attach_legacy_preallocated_record(record)
+            else:
+                self._attach_terminal_preallocated_record(record)
+        except Exception:  # noqa: BLE001
+            attachment_traceback = traceback.format_exc()
+            self.queue = [
+                entry
+                for entry in self.queue
+                if all(entry is not owned for owned in record.decode_reqs)
+            ]
+            self.pending_reqs = [
+                entry
+                for entry in self.pending_reqs
+                if all(entry is not owned for owned in record.decode_reqs)
+            ]
+            self._quarantine_preallocated_record_locked(
+                record,
+                "cohort attachment failed after progress ownership may have begun",
+            )
+            logger.error(
+                "Reserved decode cohort attachment failed and was quarantined:\n%s",
+                attachment_traceback,
+            )
+            raise
 
     def _attach_legacy_preallocated_record(
         self,
@@ -2266,15 +2346,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         record: _DecodePreparedCohortRecord,
         reason: str,
-    ) -> None:
+    ) -> int:
         """Retain all live child owners and remove runnable queue visibility.
 
         :param record: Exact live cohort record.
         :param reason: First stable quarantine reason.
+        :returns: Number of terminal callback registrations removed.
         """
 
+        removed_count = 0
+        if record.state in (
+            _DecodePreparedCohortState.ATTACHED,
+            _DecodePreparedCohortState.QUARANTINED,
+        ) and self._terminal_decode_serving is not None:
+            cleanup_failures: list[str] = []
+            for decode_req, transaction in zip(
+                record.decode_reqs,
+                record.packed_transactions,
+                strict=True,
+            ):
+                try:
+                    removed = self.transfer_queue.quarantine_terminal_request(
+                        decode_req,
+                        transaction,
+                    )
+                    removed_count += int(removed)
+                except Exception:  # noqa: BLE001
+                    cleanup_failures.append(traceback.format_exc())
+            if len(cleanup_failures) > 0:
+                logger.critical(
+                    "Terminal registry cleanup failed while quarantining a "
+                    "prepared cohort:\n%s",
+                    "\n".join(cleanup_failures),
+                )
         if record.state is _DecodePreparedCohortState.QUARANTINED:
-            return
+            return removed_count
         if record.state in (
             _DecodePreparedCohortState.CANCELLED,
             _DecodePreparedCohortState.COMPLETED,
@@ -2315,6 +2421,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     packed_transaction.quarantine(reason)
             if decode_req.kv_receiver is not None:
                 decode_req.kv_receiver.abort()
+        return removed_count
 
     def _retire_preallocated_record_locked(
         self,
@@ -4467,6 +4574,54 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             terminal.append((digest, decode_req))
 
         self._terminal_requests.update(terminal)
+
+    def validate_terminal_inference_attachment(
+        self,
+        decode_req: DecodeRequest,
+        transaction: PackedDecodeRequestTransaction,
+        prepared_receiver: CommonKVReceiver,
+    ) -> None:
+        """Validate active or legitimately finalized terminal ownership.
+
+        :param decode_req: Exact prepared request receiving response ownership.
+        :param transaction: Immutable request-scoped transport owner.
+        :param prepared_receiver: Receiver identity retained from PREPARE.
+        """
+
+        digest = transaction.terminal_binding_digest
+        if digest is None:
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment lacks binding authority"
+            )
+        owned = self._terminal_requests.get(digest)
+        active_transaction = decode_req.packed_transaction
+        if active_transaction is transaction:
+            if owned is not decode_req:
+                raise DecodeAllocationLeaseError(
+                    "terminal inference attachment lost singular registry ownership"
+                )
+            if decode_req.kv_receiver is not prepared_receiver:
+                raise DecodeAllocationLeaseError(
+                    "terminal inference attachment changed its prepared receiver"
+                )
+            return
+        if active_transaction is not None:
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment retained another transaction"
+            )
+        if owned is not None:
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment registry outlived request ownership"
+            )
+        if (
+            transaction.state is not PackedRequestTransactionState.COMMITTED
+            or decode_req.allocation_lease is not None
+            or decode_req.kv_receiver is not None
+            or decode_req.metadata_buffer_index != -1
+        ):
+            raise DecodeAllocationLeaseError(
+                "terminal inference attachment has incomplete finalized ownership"
+            )
 
     def live_requests(self) -> tuple[DecodeRequest, ...]:
         """Return every legacy-polled and terminal-owned transfer request.

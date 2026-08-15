@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodePreparedAllocationCohort,
     DecodeRequest,
+    DecodeTransferQueue,
     _DecodeMetadataSubmission,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -55,6 +56,7 @@ from sglang.srt.disaggregation.nixl.conn import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedRequestPublication,
+    PackedRequestTransactionState,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
@@ -202,6 +204,7 @@ class _FakePackedTransaction:
     publish_count: int
     quarantine_count: int
     request_owner: DecodeRequest
+    state: PackedRequestTransactionState
     terminal_binding_digest_value: bytes | None
 
     def __init__(
@@ -261,6 +264,7 @@ class _FakePackedTransaction:
         self.publish_count = 0
         self.quarantine_count = 0
         self.request_owner = request_owner
+        self.state = PackedRequestTransactionState.PREPARED
         self.terminal_binding_digest_value = None
 
     def publish(self) -> PackedRequestPublication:
@@ -273,6 +277,7 @@ class _FakePackedTransaction:
         self.authority.record_publication(self.lease, self.authority.lifecycle)
         if self.fail_publication_after_transition:
             raise RuntimeError("injected packed publication failure")
+        self.state = PackedRequestTransactionState.PUBLISHED
         return self.publication
 
     @property
@@ -297,6 +302,7 @@ class _FakePackedTransaction:
             assert self.cancel_release.wait(timeout=5)
         self.authority.rollback_to_request(self.lease)
         self.authority.retire_terminal(self.lease)
+        self.state = PackedRequestTransactionState.CANCELLED
         return self.request_owner
 
     def quarantine(self, reason: str) -> None:
@@ -307,6 +313,7 @@ class _FakePackedTransaction:
 
         self.quarantine_count += 1
         self.authority.quarantine(self.lease, reason)
+        self.state = PackedRequestTransactionState.QUARANTINED
 
 
 class _FakePackedRuntimeManager:
@@ -1008,6 +1015,72 @@ def _install_terminal_prefill_authority(
     return binding, enrollment
 
 
+def _install_terminal_transfer_publication(
+    fixture: _QueueFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> DecodeTransferQueue:
+    """Install the production terminal registry with deterministic wire authority.
+
+    :param fixture: Queue fixture receiving terminal transfer ownership.
+    :param monkeypatch: Pytest mutation fixture.
+    :returns: Production transfer registry used by the queue.
+    """
+
+    transfer_queue = object.__new__(DecodeTransferQueue)
+    transfer_queue.queue = []
+    transfer_queue._terminal_requests = {}
+    fixture.queue.transfer_queue = transfer_queue
+    fixture.queue._rebootstrap_prefill_len = lambda req: len(req.origin_input_ids)
+
+    def build_submission(
+        decode_req: DecodeRequest,
+        **kwargs: object,
+    ) -> _DecodeMetadataSubmission:
+        """Build deterministic destination metadata for one prepared request.
+
+        :param decode_req: Exact prepared request.
+        :param kwargs: Production shape arguments, unused by the fixture.
+        :returns: One immutable metadata submission.
+        """
+
+        del kwargs
+        return _DecodeMetadataSubmission(
+            decode_req=decode_req,
+            page_indices=np.arange(len(decode_req.req.origin_input_ids)),
+            state_indices=None,
+            decode_prefix_len=0,
+        )
+
+    def build_authority(**kwargs: object) -> object:
+        """Bind the terminal source plan before packed publication.
+
+        :param kwargs: Exact production authority inputs.
+        :returns: Opaque registered owner authority.
+        """
+
+        transaction = kwargs["transaction"]
+        assert type(transaction) is _FakePackedTransaction
+        binding_digest = hashlib.sha256(
+            transaction.publication.key.request_generation
+        ).digest()
+        transaction.terminal_binding_digest_value = binding_digest
+        transaction.publication = dataclasses.replace(
+            transaction.publication,
+            terminal_source_plan=b"sealed terminal source plan",
+        )
+        return object()
+
+    fixture.queue._build_decode_metadata_submission = build_submission
+    fixture.packed_runtime.build_terminal_decode_request_authority = MagicMock(
+        side_effect=build_authority
+    )
+    monkeypatch.setattr(
+        "sglang.srt.disaggregation.decode.register_packed_terminal_decode_request",
+        lambda serving, authority: None,
+    )
+    return transfer_queue
+
+
 def _assert_no_preparation_ownership(
     fixture: _QueueFixture,
     requests: tuple[Req, ...],
@@ -1173,17 +1246,7 @@ def test_terminal_prepare_to_attach_uses_real_receiver_without_legacy_caches(
         )
 
     fixture.queue._create_receiver = create_receiver
-    fixture.queue.transfer_queue = SimpleNamespace(
-        register_terminal_requests=MagicMock(),
-        quarantine_terminal_request=MagicMock(return_value=True),
-    )
-    fixture.queue._rebootstrap_prefill_len = MagicMock(return_value=8)
-    fixture.queue._build_decode_metadata_submission = MagicMock()
-    manager.build_terminal_decode_request_authority = MagicMock(return_value=object())
-    monkeypatch.setattr(
-        "sglang.srt.disaggregation.decode.register_packed_terminal_decode_request",
-        lambda serving, authority: None,
-    )
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
     child_id = uuid.uuid4()
     request = _request(child_id)
 
@@ -1199,17 +1262,15 @@ def test_terminal_prepare_to_attach_uses_real_receiver_without_legacy_caches(
     seal = receiver_seals[0]
     transaction = fixture.packed_runtime.transactions[0]
     assert record.packed_transactions[0] is transaction
-    transaction.terminal_binding_digest_value = b"t" * 32
-    fixture.queue._build_decode_metadata_submission.return_value = (
-        _DecodeMetadataSubmission(
-            decode_req=record.decode_reqs[0],
-            page_indices=np.arange(8, dtype=np.int32),
-            state_indices=None,
-            decode_prefix_len=0,
-        )
-    )
 
     fixture.queue.promote_preallocated(cohort)
+
+    assert record.state.value == "attached"
+    assert record.metadata_published
+    assert record.decode_reqs[0].packed_transaction is transaction
+    assert transfer_queue.live_requests() == record.decode_reqs
+    assert fixture.packed_runtime.metadata_publications == [(transaction, receiver)]
+    publication_count = len(fixture.packed_runtime.metadata_publications)
     fixture.queue.attach_preallocated(cohort)
 
     assert seal.decode_req is record.decode_reqs[0]
@@ -1219,10 +1280,9 @@ def test_terminal_prepare_to_attach_uses_real_receiver_without_legacy_caches(
     assert receiver.prefill_info.attn_tp_size == 2
     assert fixture.queue.queue == []
     assert fixture.queue.pending_reqs == []
-    fixture.queue.transfer_queue.register_terminal_requests.assert_called_once_with(
-        record.decode_reqs
-    )
+    assert transfer_queue.live_requests() == record.decode_reqs
     assert fixture.packed_runtime.metadata_publications == [(transaction, receiver)]
+    assert len(fixture.packed_runtime.metadata_publications) == publication_count
     assert manager.prefill_info_table == {}
     assert manager.connection_pool == {}
 
@@ -1691,19 +1751,20 @@ def test_promote_authorizes_and_attach_is_take_once_queue_publication(
 def test_terminal_registration_precedes_allocation_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bind full serving and its source plan immediately before publication."""
+    """Publish immutable evidence before registry and metadata visibility."""
 
     fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
     child_id = uuid.uuid4()
     _, cohort = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
         attempt=_attempt((child_id,), source_tp_size=2),
         requests=(_request(child_id),),
     )
+    record = fixture.queue._prepared_cohorts[cohort._token]
     transaction = fixture.packed_runtime.transactions[0]
-    serving = object.__new__(PackedTerminalDecodeServing)
-    fixture.queue.bind_terminal_decode_serving(serving)
-    fixture.packed_runtime.terminal_startup_binding = object()
+    serving = fixture.queue._terminal_decode_serving
     events: list[str] = []
     callbacks: dict[str, object] = {}
     authority = object()
@@ -1729,6 +1790,7 @@ def test_terminal_registration_precedes_allocation_publication(
         assert serving_arg is serving
         assert authority_arg is authority
         events.append("register")
+        transaction.terminal_binding_digest_value = b"t" * 32
         transaction.publication = dataclasses.replace(
             transaction.publication,
             terminal_source_plan=b"sealed terminal source plan",
@@ -1750,6 +1812,36 @@ def test_terminal_registration_precedes_allocation_publication(
         side_effect=build_authority
     )
     transaction.publish = MagicMock(side_effect=publish)
+    original_transfer_registration = transfer_queue.register_terminal_requests
+
+    def register_transfer(decode_reqs: tuple[DecodeRequest, ...]) -> None:
+        """Require immutable publication and request binding before visibility.
+
+        :param decode_reqs: Exact promoted request cohort.
+        """
+
+        events.append("transfer_registry")
+        assert record.packed_publications == (transaction.publication,)
+        assert record.state.value == "promoted"
+        assert not record.metadata_published
+        assert decode_reqs[0].packed_transaction is transaction
+        original_transfer_registration(decode_reqs)
+
+    transfer_queue.register_terminal_requests = register_transfer
+    original_metadata_send = fixture.packed_runtime.send_packed_decode_request_metadata
+
+    def send_metadata(**kwargs: object) -> None:
+        """Require attached registry ownership before metadata visibility.
+
+        :param kwargs: Exact packed metadata submission.
+        """
+
+        events.append("metadata")
+        assert record.state.value == "attached"
+        assert not record.metadata_published
+        original_metadata_send(**kwargs)
+
+    fixture.packed_runtime.send_packed_decode_request_metadata = send_metadata
     monkeypatch.setattr(
         "sglang.srt.disaggregation.decode.register_packed_terminal_decode_request",
         register,
@@ -1757,10 +1849,19 @@ def test_terminal_registration_precedes_allocation_publication(
 
     fixture.queue.promote_preallocated(cohort)
 
-    assert events == ["build", "register", "publish"]
+    assert events == [
+        "build",
+        "register",
+        "publish",
+        "transfer_registry",
+        "metadata",
+    ]
     assert callbacks["transaction"] is transaction
     assert "destination_bindings" not in callbacks
     assert transaction.publish_count == 1
+    assert record.state.value == "attached"
+    assert record.metadata_published
+    assert transfer_queue.live_requests() == record.decode_reqs
 
 
 def test_terminal_callback_rejects_another_request_identity(
@@ -1769,15 +1870,14 @@ def test_terminal_callback_rejects_another_request_identity(
     """A callback cannot mutate queues for an aliased mutable request owner."""
 
     fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    _install_terminal_transfer_publication(fixture, monkeypatch)
     child_id = uuid.uuid4()
     _, cohort = fixture.queue.prepare_preallocated(
         grant_id=uuid.uuid4(),
         attempt=_attempt((child_id,), source_tp_size=2),
         requests=(_request(child_id),),
     )
-    serving = object.__new__(PackedTerminalDecodeServing)
-    fixture.queue.bind_terminal_decode_serving(serving)
-    fixture.packed_runtime.terminal_startup_binding = object()
     callbacks: dict[str, object] = {}
 
     def build_authority(**kwargs: object) -> object:
@@ -1788,6 +1888,13 @@ def test_terminal_callback_rejects_another_request_identity(
         """
 
         callbacks.update(kwargs)
+        transaction = kwargs["transaction"]
+        assert type(transaction) is _FakePackedTransaction
+        transaction.terminal_binding_digest_value = b"t" * 32
+        transaction.publication = dataclasses.replace(
+            transaction.publication,
+            terminal_source_plan=b"sealed terminal source plan",
+        )
         return object()
 
     fixture.packed_runtime.build_terminal_decode_request_authority = MagicMock(
@@ -1809,8 +1916,134 @@ def test_terminal_callback_rejects_another_request_identity(
 
     assert tuple(fixture.queue.queue) == queue_before
     assert tuple(fixture.queue.pending_reqs) == pending_before
-    assert record.state.value == "promoted"
+    assert record.state.value == "attached"
     assert fixture.packed_runtime.transactions[0].publish_count == 1
+
+
+def test_terminal_inference_attachment_accepts_early_transport_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validate immutable evidence after terminal transfer ownership retires."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    child_id = uuid.uuid4()
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(_request(child_id),),
+    )
+    fixture.queue.promote_preallocated(cohort)
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    decode_req = record.decode_reqs[0]
+    transaction = record.packed_transactions[0]
+    publication_count = len(fixture.packed_runtime.metadata_publications)
+    digest = transaction.terminal_binding_digest
+    assert digest is not None
+    assert transfer_queue._terminal_requests.pop(digest) is decode_req
+    transaction.state = PackedRequestTransactionState.COMMITTED
+    decode_req.packed_transaction = None
+    decode_req.allocation_lease = None
+    decode_req.kv_receiver = None
+    decode_req.metadata_buffer_index = -1
+
+    fixture.queue.attach_preallocated(cohort)
+
+    assert len(fixture.packed_runtime.metadata_publications) == publication_count
+    assert transfer_queue.live_requests() == ()
+    assert record.state.value == "attached"
+
+
+def test_terminal_abort_after_promotion_removes_callback_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort a published cohort before inference attachment, fail closed."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    callbacks: dict[str, object] = {}
+    base_builder = fixture.packed_runtime.build_terminal_decode_request_authority
+
+    def capture_authority(**kwargs: object) -> object:
+        """Retain owner callbacks while preserving deterministic binding.
+
+        :param kwargs: Exact production authority inputs.
+        :returns: Opaque owner authority.
+        """
+
+        callbacks.update(kwargs)
+        return base_builder(**kwargs)
+
+    fixture.packed_runtime.build_terminal_decode_request_authority = MagicMock(
+        side_effect=capture_authority
+    )
+    child_id = uuid.uuid4()
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(_request(child_id),),
+    )
+    fixture.queue.promote_preallocated(cohort)
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    decode_req = record.decode_reqs[0]
+    transaction = record.packed_transactions[0]
+    assert transfer_queue.live_requests() == (decode_req,)
+
+    terminal = fixture.queue.abort_preallocated(
+        cohort,
+        "gateway_dispatch_failed",
+        None,
+    )
+
+    assert terminal is DecodeReservationState.QUARANTINED
+    assert record.state.value == "quarantined"
+    assert transfer_queue.live_requests() == ()
+    assert decode_req.packed_transaction is transaction
+    assert transaction.state is PackedRequestTransactionState.QUARANTINED
+    assert decode_req.allocation_lease is not None
+    assert decode_req.allocation_lease.state is DecodeAllocationLeaseState.QUARANTINED
+    adopt_request = callbacks["adopt_request"]
+    assert callable(adopt_request)
+    with pytest.raises(DecodeAllocationLeaseError, match="attached prepared cohort"):
+        adopt_request(decode_req)
+    assert fixture.queue.scheduler.waiting_queue == []
+
+
+def test_terminal_explicit_quarantine_removes_callback_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit quarantine retains resources outside the callback registry."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    child_id = uuid.uuid4()
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(_request(child_id),),
+    )
+    fixture.queue.promote_preallocated(cohort)
+    record = fixture.queue._prepared_cohorts[cohort._token]
+
+    first = fixture.queue.quarantine_preallocated(
+        cohort,
+        "operator_quarantine",
+        None,
+    )
+    second = fixture.queue.quarantine_preallocated(
+        cohort,
+        "operator_quarantine",
+        None,
+    )
+
+    assert first is DecodeReservationState.QUARANTINED
+    assert second is DecodeReservationState.QUARANTINED
+    assert transfer_queue.live_requests() == ()
+    assert record.state.value == "quarantined"
+    assert record.quarantine_reason == "operator_quarantine"
 
 
 def test_terminal_promotion_without_full_serving_fails_before_publication(
@@ -1833,6 +2066,36 @@ def test_terminal_promotion_without_full_serving_fails_before_publication(
     record = next(iter(fixture.queue._prepared_cohorts.values()))
     assert record.state.value == "quarantined"
     assert fixture.packed_runtime.transactions[0].publish_count == 0
+
+
+def test_terminal_metadata_failure_after_publication_quarantines_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A promotion-time metadata failure cannot remain merely promoted."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    child_id = uuid.uuid4()
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(_request(child_id),),
+    )
+    fixture.packed_runtime.send_packed_decode_request_metadata = MagicMock(
+        side_effect=RuntimeError("injected metadata publication failure")
+    )
+
+    with pytest.raises(RuntimeError, match="metadata publication failure"):
+        fixture.queue.promote_preallocated(cohort)
+
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    transaction = record.packed_transactions[0]
+    assert transaction.publish_count == 1
+    assert record.state.value == "quarantined"
+    assert not record.metadata_published
+    assert transfer_queue.live_requests() == ()
+    assert transaction.state is PackedRequestTransactionState.QUARANTINED
 
 
 def test_terminal_tp2_without_cross_rank_bindings_fails_before_publication(
