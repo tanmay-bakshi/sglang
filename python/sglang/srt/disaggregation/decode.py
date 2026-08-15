@@ -1868,12 +1868,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Relinquishing the migration lease makes Req scheduler-owned.
                 # Keep waiting/running cleanup and tokenizer notification on the
                 # scheduler's singular abort path.
-                self.scheduler.abort_request(
-                    AbortReq(
-                        rid=decode_req.req.rid,
-                        abort_message=f"Decode reservation aborted: {reason_code}",
-                    )
-                )
+                self.scheduler.abort_request(AbortReq(rid=decode_req.req.rid))
             if any(
                 decode_req.allocation_lease is not None
                 for decode_req in record.decode_reqs

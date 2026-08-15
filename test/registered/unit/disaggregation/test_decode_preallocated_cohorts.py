@@ -2164,9 +2164,6 @@ def test_terminal_reservation_abort_after_finalization_uses_scheduler_cleanup(
     abort_request, output_req = send_output.call_args.args
     assert type(abort_request) is AbortReq
     assert abort_request.rid == decode_req.req.rid
-    assert abort_request.abort_message == (
-        "Decode reservation aborted: gateway_dispatch_failed"
-    )
     assert output_req is decode_req.req
 
 
