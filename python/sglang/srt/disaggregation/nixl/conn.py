@@ -5899,10 +5899,12 @@ class NixlKVManager(CommonKVManager):
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
-        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM")
-        logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
-        if not self.aux_descs:
-            raise Exception("NIXL memory registration failed for aux tensors")
+        self.aux_descs = None
+        if len(aux_addrs) > 0:
+            self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM")
+            logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
+            if not self.aux_descs:
+                raise Exception("NIXL memory registration failed for aux tensors")
 
         state_addrs = []
         for comp_ptrs, comp_lens in zip(

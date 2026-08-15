@@ -3023,12 +3023,12 @@ class PackedDecodeRuntime:
 
     def attach_scheduler(
         self,
-        metadata_allocator: PackedMetadataIndexAllocator,
+        metadata_allocator: PackedMetadataIndexAllocator | None,
         consumer_authority: object,
     ) -> None:
         """Bind exact scheduler metadata ownership once.
 
-        :param metadata_allocator: Existing row allocator.
+        :param metadata_allocator: Legacy row allocator, absent for terminal DFlash.
         :param consumer_authority: Decode transfer queue consuming row contents.
         """
 
