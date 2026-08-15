@@ -3,6 +3,7 @@ from array import array
 
 import pytest
 import zmq
+
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     FrozenPrefillGatewayOutputShell,
     PrefillTerminalGatewayOutputProjection,
