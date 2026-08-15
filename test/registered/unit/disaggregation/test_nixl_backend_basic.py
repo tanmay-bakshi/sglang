@@ -2860,6 +2860,28 @@ class TestNixlStaging(CustomTestCase):
         self.assertEqual(mgr.kv_descs, [["desc"], ["desc"]])
         self.assertEqual(mgr.aux_descs, ["desc"])
 
+    def test_register_buffer_to_engine_skips_absent_auxiliary_memory(self):
+        """An empty auxiliary schema must not issue a native DRAM registration."""
+
+        agent = StagingFakeAgent(register_result=["desc"])
+        mgr = self._make_manager(agent)
+        mgr.kv_args.kv_data_ptrs = [0x1000]
+        mgr.kv_args.kv_data_lens = [64]
+        mgr.kv_args.kv_data_mem_kinds = ["VRAM"]
+        mgr.kv_args.aux_data_ptrs = []
+        mgr.kv_args.aux_data_lens = []
+        mgr.kv_args.state_data_ptrs = []
+        mgr.kv_args.state_data_lens = []
+
+        mgr.register_buffer_to_engine()
+
+        self.assertEqual(
+            agent.register_memory_calls,
+            [([(0x1000, 64, 1, "")], "VRAM")],
+        )
+        self.assertEqual(mgr.kv_descs, [["desc"]])
+        self.assertIsNone(mgr.aux_descs)
+
     def test_post_failure_logs_attestation_before_releasing_handle(self) -> None:
         agent = TransferFailureFakeAgent()
         mgr = self._make_manager(agent)

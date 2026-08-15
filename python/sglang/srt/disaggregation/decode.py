@@ -540,8 +540,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
-        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetadataBuffers,
+        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator | None,
+        metadata_buffers: MetadataBuffers | None,
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
@@ -675,6 +675,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return self._terminal_decode_serving
 
+    def _require_legacy_metadata_allocator(self) -> ReqToMetadataIdxAllocator:
+        """Return legacy metadata allocation authority outside terminal DFlash.
+
+        :returns: The process-local legacy row allocator.
+        :raises DecodeAllocationLeaseError: If a legacy path enters terminal DFlash.
+        """
+
+        allocator = self.req_to_metadata_buffer_idx_allocator
+        if allocator is None:
+            raise DecodeAllocationLeaseError(
+                "terminal DFlash cannot allocate a legacy metadata row"
+            )
+        return allocator
+
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
             isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
@@ -782,9 +796,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.page_size = self.token_to_kv_pool.page_size
         kv_args.terminal_request_capacity = self.req_to_token_pool.size
 
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
-        )
+        if self.metadata_buffers is None:
+            kv_args.aux_data_ptrs = []
+            kv_args.aux_data_lens = []
+            kv_args.aux_item_lens = []
+        else:
+            (
+                kv_args.aux_data_ptrs,
+                kv_args.aux_data_lens,
+                kv_args.aux_item_lens,
+            ) = self.metadata_buffers.get_buf_infos()
 
         setup_state_kv_args(
             kv_args,
@@ -933,9 +954,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 metadata_index: int | None = None
                 if self._terminal_dflash_boundary_pool is None:
-                    metadata_index = (
-                        self.req_to_metadata_buffer_idx_allocator.alloc()
-                    )
+                    metadata_index = self._require_legacy_metadata_allocator().alloc()
                     if metadata_index is None:
                         raise DecodeReservationAdmissionRefused(
                             "decode_metadata_capacity",
@@ -1758,9 +1777,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         boundary_pool = self._terminal_dflash_boundary_pool
         if boundary_pool is None:
+            metadata_allocator = self._require_legacy_metadata_allocator()
             if (
-                self.req_to_metadata_buffer_idx_allocator.available_size()
-                < request_count
+                metadata_allocator.available_size() < request_count
             ):
                 raise DecodeReservationAdmissionRefused(
                     "decode_metadata_capacity",
@@ -2085,7 +2104,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.prefix_match = None
             try:
                 if decode_req.metadata_buffer_index != -1:
-                    self.req_to_metadata_buffer_idx_allocator.free(
+                    self._require_legacy_metadata_allocator().free(
                         decode_req.metadata_buffer_index
                     )
                     decode_req.metadata_buffer_index = -1
@@ -2830,7 +2849,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+            if self._require_legacy_metadata_allocator().available_size() <= 0:
                 break
 
             if hisparse_req_budget <= 0:
@@ -3212,7 +3231,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         if allocate_metadata_index:
             decode_req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
+                self._require_legacy_metadata_allocator().alloc()
             )
             if decode_req.metadata_buffer_index is None:
                 raise RuntimeError("decode metadata allocator returned no slot")
@@ -4093,9 +4112,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def __init__(
         self,
         gloo_group: ProcessGroup,
-        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
+        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator | None,
         tp_rank: int,
-        metadata_buffers: MetadataBuffers,
+        metadata_buffers: MetadataBuffers | None,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
@@ -4117,6 +4136,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.allocation_lease_authority: DecodeAllocationLeaseAuthority | None = None
         self.allocation_lifecycle_authority: CommonKVManager | None = None
         self.terminal_dflash_boundary_pool: DFlashBoundaryDeviceRowPool | None = None
+
+    def _require_legacy_metadata_resources(
+        self,
+    ) -> tuple[ReqToMetadataIdxAllocator, MetadataBuffers]:
+        """Return the paired legacy row resources outside terminal DFlash.
+
+        :returns: Legacy metadata allocator and buffers.
+        :raises DecodeAllocationLeaseError: If a legacy path enters terminal DFlash.
+        """
+
+        allocator = self.req_to_metadata_buffer_idx_allocator
+        buffers = self.metadata_buffers
+        if allocator is None or buffers is None:
+            raise DecodeAllocationLeaseError(
+                "terminal DFlash cannot enter a legacy metadata path"
+            )
+        return allocator, buffers
 
     def install_terminal_dflash_boundary_pool(
         self,
@@ -4140,6 +4176,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "terminal request cannot enter the legacy transfer queue"
             )
+        self._require_legacy_metadata_resources()
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
@@ -4150,6 +4187,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "terminal requests require the terminal ownership handoff"
             )
+        self._require_legacy_metadata_resources()
         self.queue.extend(decode_reqs)
 
     def register_terminal_requests(
@@ -4241,7 +4279,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "packed request lost its metadata row before consumption"
             )
-        self.metadata_buffers.bootstrap_room[metadata_index] = 0
+        _, metadata_buffers = self._require_legacy_metadata_resources()
+        metadata_buffers.bootstrap_room[metadata_index] = 0
         manager.complete_packed_decode_request_metadata_consumption(transaction)
         decode_req.metadata_buffer_index = -1
         decode_req.allocation_lease = None
@@ -4583,6 +4622,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         """
 
         idx = decode_req.metadata_buffer_index
+        _, metadata_buffers = self._require_legacy_metadata_resources()
         (
             output_id,
             cached_tokens,
@@ -4598,7 +4638,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_hidden_states,
             output_dsa_topk_indices,
             output_bootstrap_room,
-        ) = self.metadata_buffers.get_buf(idx)
+        ) = metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -4771,6 +4811,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
+        _, metadata_buffers = self._require_legacy_metadata_resources()
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
             if self.scheduler.enable_decode_hicache
@@ -4780,17 +4821,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
-            metadata_buffers=self.metadata_buffers,
+            metadata_buffers=metadata_buffers,
             server_args=self.scheduler.server_args,
             singleton_progress_policy=self.tp1_poll_progress_policy,
         )
 
     def _poll_with_staging(self) -> list:
+        _, metadata_buffers = self._require_legacy_metadata_resources()
         return poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
             self.gloo_group,
-            metadata_buffers=self.metadata_buffers,
+            metadata_buffers=metadata_buffers,
             server_args=self.scheduler.server_args,
             singleton_progress_policy=self.tp1_poll_progress_policy,
         )
@@ -4806,6 +4848,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "packed decode progress authority is unavailable"
             )
+        _, metadata_buffers = self._require_legacy_metadata_resources()
         pollers: list[
             _PackedDecodeTransactionPoller | _LegacyStagingTransactionPoller
         ] = []
@@ -4815,7 +4858,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 pollers.append(
                     _LegacyStagingTransactionPoller(
                         decode_req,
-                        self.metadata_buffers,
+                        metadata_buffers,
                         self.scheduler.server_args,
                         self.staging_handler,
                     )
@@ -4988,10 +5031,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             idx = self.queue[i].metadata_buffer_index
             if idx == -1:
                 continue
+            metadata_allocator, metadata_buffers = (
+                self._require_legacy_metadata_resources()
+            )
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
-            self.metadata_buffers.bootstrap_room[idx] = 0
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            metadata_buffers.bootstrap_room[idx] = 0
+            metadata_allocator.free(idx)
             self.queue[i].metadata_buffer_index = -1
 
         self.queue = [

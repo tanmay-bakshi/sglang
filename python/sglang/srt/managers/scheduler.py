@@ -388,6 +388,28 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _uses_terminal_dflash_boundary(
+    server_args: ServerArgs,
+    spec_algorithm: SpeculativeAlgorithm,
+) -> bool:
+    """Determine whether terminal DFlash owns the complete metadata boundary.
+
+    :param server_args: Resolved server configuration.
+    :param spec_algorithm: Active speculative decoding algorithm.
+    :returns: Whether legacy disaggregation metadata must remain absent.
+    :raises ValueError: If another speculative schema enters terminal serving.
+    """
+
+    if server_args.pd_terminal_local_membership is None:
+        return False
+    if not spec_algorithm.is_dflash():
+        raise ValueError(
+            "packed-terminal serving supports only the DFlash boundary schema; "
+            "EAGLE auxiliary state requires a separate terminal schema"
+        )
+    return True
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1281,10 +1303,17 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
-        # The PD metadata wire schema must match on P and D even when only D
-        # enables spec decoding; a seedless prefill writes the invalid sentinel.
-        output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
-            self.model_config.hf_config
+        uses_terminal_dflash_boundary = _uses_terminal_dflash_boundary(
+            self.server_args,
+            self.spec_algorithm,
+        )
+        # The legacy PD metadata wire schema must match on P and D even when
+        # only D enables spec decoding; a seedless prefill writes the invalid
+        # sentinel. Terminal DFlash has its own device-side boundary schema.
+        output_dsa_topk_indices_dim = (
+            0
+            if uses_terminal_dflash_boundary
+            else get_dsa_seed_metadata_dim(self.model_config.hf_config)
         )
 
         if (
@@ -1294,16 +1323,20 @@ class Scheduler(
                 8 if is_minimax_sparse(self.model_config.hf_config) else 2
             )
             buffer_size = (self.req_to_token_pool.size) * buffer_multiplier
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=disagg_hidden_size,
-                hidden_states_dtype=disagg_hidden_states_dtype,
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-            )
+            if uses_terminal_dflash_boundary:
+                self.req_to_metadata_buffer_idx_allocator = None
+                self.disagg_metadata_buffers = None
+            else:
+                self.req_to_metadata_buffer_idx_allocator = (
+                    ReqToMetadataIdxAllocator(buffer_size)
+                )
+                self.disagg_metadata_buffers = MetadataBuffers(
+                    buffer_size,
+                    hidden_size=disagg_hidden_size,
+                    hidden_states_dtype=disagg_hidden_states_dtype,
+                    custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                    output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -1338,8 +1371,7 @@ class Scheduler(
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            terminal_source = self.server_args.pd_terminal_local_membership is not None
-            if terminal_source:
+            if uses_terminal_dflash_boundary:
                 self.req_to_metadata_buffer_idx_allocator = None
                 self.disagg_metadata_buffers = None
             else:
@@ -2971,15 +3003,24 @@ class Scheduler(
         if (
             req.return_sampling_mask
             and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
         ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            return False
+            metadata_buffers = self.disagg_metadata_buffers
+            if metadata_buffers is None:
+                error_msg = (
+                    "return_sampling_mask is unavailable with terminal DFlash "
+                    "because its boundary schema carries no sampling-mask metadata."
+                )
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                return False
+            if not metadata_buffers.enable_sampling_mask:
+                error_msg = (
+                    "return_sampling_mask with disaggregation requires "
+                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+                )
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                return False
 
         if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
             error_msg = (
