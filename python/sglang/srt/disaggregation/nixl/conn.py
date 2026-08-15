@@ -3455,6 +3455,9 @@ class NixlKVManager(CommonKVManager):
             wire_receipt,
             authenticated_issuer,
         )
+        # Receipt ingress proves decode terminality, not source retirement. The
+        # REQUEST_RETIRED action owns replay-state deletion after reclaim and
+        # gateway publication have both joined.
         serving = self.terminal_source_serving
         if is_ready:
             serving.request_ready(
@@ -3471,7 +3474,6 @@ class NixlKVManager(CommonKVManager):
                 authenticated_issuer=authenticated_issuer,
                 reason="request-global coordination failed",
             )
-        importer.retire_binding(wire_receipt.binding)
 
     def _authenticated_terminal_control_rank(
         self,

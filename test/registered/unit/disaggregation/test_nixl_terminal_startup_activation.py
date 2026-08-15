@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.terminal_progress.startup_producers import (
     build_terminal_startup_python_producer_plan,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
+    TerminalWireReceiptImportNamespace,
     TerminalWireReceiptIssuer,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1280,8 +1281,8 @@ def test_decode_control_ingress_authenticates_same_service_rank_receipt() -> Non
     manager._terminal_process_reactor.notify_coordinator_deadline_changed.assert_called_once_with()
 
 
-def test_source_routes_authenticated_failure_to_failure_ingress() -> None:
-    """Keep decode failure terminality distinct from request readiness."""
+def test_source_routes_failure_without_retiring_replay_authority() -> None:
+    """Decode terminality cannot retire source replay state prematurely."""
 
     local_binding = _binding("prefill-a", 0)
     local = local_binding.advertisement.terminal_identity
@@ -1309,7 +1310,50 @@ def test_source_routes_authenticated_failure_to_failure_ingress() -> None:
         reason="request-global coordination failed",
     )
     manager._terminal_source_serving.request_ready.assert_not_called()
-    importer.retire_binding.assert_called_once_with(issued.wire_receipt.binding)
+    importer.retire_binding.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("kind", "outcome"),
+    (
+        (TerminalReceiptKind.REQUEST_READY, TerminalReceiptOutcome.SUCCESS),
+        (TerminalReceiptKind.FAILURE, TerminalReceiptOutcome.FAILURE),
+    ),
+)
+def test_source_retains_real_import_authority_until_joined_retirement(
+    kind: TerminalReceiptKind,
+    outcome: TerminalReceiptOutcome,
+) -> None:
+    """Keep live replay authority through decode terminal receipt ingress.
+
+    :param kind: Decode terminal receipt kind.
+    :param outcome: Matching terminal receipt outcome.
+    """
+
+    local_binding = _binding("prefill-a", 0)
+    local = local_binding.advertisement.terminal_identity
+    decoder = local_binding.matrix.rank("decode-a", 0).terminal_identity
+    manager = _manager(local_binding, {})
+    manager._terminal_startup_peer_enrollment = SimpleNamespace(binding=local_binding)
+    manager._terminal_source_serving = MagicMock()
+    importer = TerminalWireReceiptImportNamespace(decoder)
+    manager._terminal_source_receipt_importers = {decoder: importer}
+    issued = TerminalWireReceiptIssuer(decoder).issue(
+        binding=_request_binding(local),
+        kind=kind,
+        outcome=outcome,
+        terminal_timestamp_ns=43,
+    )
+    importer.register_binding(issued.wire_receipt.binding)
+
+    manager.receive_terminal_source_receipt(issued.wire_receipt, decoder)
+
+    assert importer.active_binding_count == 1
+    assert importer.imported_receipt_count == 1
+    importer.require_active_binding(issued.wire_receipt.binding)
+    importer.retire_binding(issued.wire_receipt.binding)
+    assert importer.active_binding_count == 0
+    assert importer.imported_receipt_count == 0
 
 
 def test_source_rejects_mismatched_failure_outcome_before_import() -> None:
