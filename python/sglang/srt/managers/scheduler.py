@@ -121,6 +121,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -410,6 +411,81 @@ def _uses_terminal_dflash_boundary(
     return True
 
 
+def resolve_scheduler_process_dp_rank(dp_rank: int | None) -> int | None:
+    """Resolve the scheduler's externally assigned data-parallel identity.
+
+    :param dp_rank: Rank supplied by an in-process DP controller, if present.
+    :returns: Controller rank, routed process rank, or ``None`` for TP-only serving.
+    :raises ValueError: If the routed process rank is not an integer.
+    """
+
+    if dp_rank is not None:
+        return dp_rank
+    routed_dp_rank = os.environ.get("SGLANG_DP_RANK")
+    if routed_dp_rank is None:
+        return None
+    try:
+        return int(routed_dp_rank)
+    except ValueError as error:
+        raise ValueError("SGLANG_DP_RANK must be an integer") from error
+
+
+def build_scheduler_parallel_state(
+    server_args: ServerArgs,
+    *,
+    gpu_id: int,
+    tp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    attn_cp_rank: int,
+    moe_dp_rank: int | None,
+    dp_rank: int | None,
+) -> ParallelState:
+    """Build the process-local scheduler rank state from launch configuration.
+
+    :param server_args: Resolved server parallelism configuration.
+    :param gpu_id: Process-local accelerator identity.
+    :param tp_rank: Tensor-parallel process rank.
+    :param moe_ep_rank: Mixture-of-experts parallel process rank.
+    :param pp_rank: Pipeline-parallel process rank.
+    :param attn_cp_rank: Attention context-parallel process rank.
+    :param moe_dp_rank: Mixture-of-experts data-parallel process rank.
+    :param dp_rank: Controller rank, routed rank source, or ``None``.
+    :returns: Exact immutable rank state consumed by the scheduler.
+    """
+
+    resolved_dp_rank = resolve_scheduler_process_dp_rank(dp_rank)
+    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+        compute_dp_attention_world_info(
+            server_args.enable_dp_attention,
+            tp_rank,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.attn_cp_size,
+        )
+    )
+    return ParallelState(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        pp_rank=pp_rank,
+        pp_size=server_args.pp_size,
+        dp_rank=resolved_dp_rank,
+        dp_size=server_args.dp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=server_args.attn_cp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_dp_size=attn_dp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        moe_dp_rank=moe_dp_rank,
+        moe_dp_size=server_args.moe_dp_size,
+        dcp_size=server_args.dcp_size,
+        gpu_id=gpu_id,
+    )
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -483,36 +559,18 @@ class Scheduler(
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
 
-        # Distributed rank info
-        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-            compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
-                tp_rank,
-                server_args.tp_size,
-                server_args.dp_size,
-                server_args.attn_cp_size,
-            )
-        )
-        self.ps = ParallelState(
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
-            dp_rank=dp_rank,
-            dp_size=server_args.dp_size,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dp_rank=attn_dp_rank,
-            attn_dp_size=attn_dp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
-            dcp_size=server_args.dcp_size,
+        self.ps = build_scheduler_parallel_state(
+            server_args,
             gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            moe_dp_rank=moe_dp_rank,
+            dp_rank=dp_rank,
         )
+        self.output_identity = SchedulerOutputIdentity.from_parallel_state(self.ps)
+        dp_rank = self.ps.dp_rank
 
         # Init model configs
         self.init_model_config()
@@ -756,11 +814,7 @@ class Scheduler(
         ):
             raise ValueError("terminal gateway endpoint must be a non-empty string")
         self.terminal_gateway_endpoint: str = terminal_gateway_endpoint
-        is_rank_zero = (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        )
+        is_rank_zero = self.output_identity.is_gateway_publisher
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
@@ -1471,6 +1525,10 @@ class Scheduler(
                 "terminal NIXL manager requires a positive request capacity"
             )
         local_rank = binding.advertisement
+        self.output_identity.require_terminal_binding(
+            tensor_parallel_rank=local_rank.tensor_parallel_rank,
+            tensor_parallel_size=local_rank.tensor_parallel_size,
+        )
         gateway_endpoint: str | None = None
         bind_source_serving: Callable[[PackedTerminalSourceServing], None] | None = (
             None
@@ -1481,7 +1539,7 @@ class Scheduler(
         if self.disaggregation_mode is DisaggregationMode.PREFILL:
             if local_rank.role is not TerminalOwnerRole.SOURCE:
                 raise RuntimeError("prefill scheduler received a decode startup row")
-            if local_rank.tensor_parallel_rank == 0:
+            if self.output_identity.is_gateway_publisher:
                 gateway_endpoint = self.terminal_gateway_endpoint
             bind_source_serving = self.bind_terminal_source_serving
         elif self.disaggregation_mode is DisaggregationMode.DECODE:
@@ -2677,7 +2735,7 @@ class Scheduler(
         self.output_streamer = SchedulerOutputStreamer(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
             tree_cache=self.tree_cache,
-            ps=self.ps,
+            output_identity=self.output_identity,
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
@@ -5495,9 +5553,7 @@ def configure_scheduler_process(
     kill_itself_when_parent_died()
 
     # Generate the logger prefix
-    if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-        # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
-        dp_rank = int(os.environ["SGLANG_DP_RANK"])
+    dp_rank = resolve_scheduler_process_dp_rank(dp_rank)
 
     shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
     shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank

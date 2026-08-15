@@ -3,7 +3,6 @@ from array import array
 
 import pytest
 import zmq
-
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     FrozenPrefillGatewayOutputShell,
     PrefillTerminalGatewayOutputProjection,
@@ -12,17 +11,19 @@ from sglang.srt.disaggregation.terminal_progress.output_projection import (
     freeze_prefill_gateway_output_shell,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     encode_ipc_payload,
     sock_recv,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import build_scheduler_parallel_state
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -63,7 +64,42 @@ class _StableResultSlot(TerminalGatewayResultSlot):
         return self._next_token_id
 
 
-def _shell() -> FrozenPrefillGatewayOutputShell:
+def _output_identity(
+    dp_rank: int | None = 0,
+    *,
+    dp_size: int = 1,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> SchedulerOutputIdentity:
+    """Build one canonical identity through the production constructor.
+
+    :param dp_rank: Scheduler data-parallel output identity.
+    :param dp_size: Data-parallel width.
+    :param tp_rank: Tensor-parallel process rank.
+    :param tp_size: Tensor-parallel width.
+    :returns: Validated canonical scheduler output identity.
+    """
+
+    parallel_state = build_scheduler_parallel_state(
+        ServerArgs(
+            model_path="dummy",
+            dp_size=dp_size,
+            tp_size=tp_size,
+        ),
+        gpu_id=tp_rank,
+        tp_rank=tp_rank,
+        moe_ep_rank=0,
+        pp_rank=0,
+        attn_cp_rank=0,
+        moe_dp_rank=0,
+        dp_rank=dp_rank,
+    )
+    return SchedulerOutputIdentity.from_parallel_state(parallel_state)
+
+
+def _shell(
+    output_identity: SchedulerOutputIdentity | None = None,
+) -> FrozenPrefillGatewayOutputShell:
     """Build one production-shaped non-logprob output shell.
 
     :returns: Complete immutable prefill shell.
@@ -86,7 +122,9 @@ def _shell() -> FrozenPrefillGatewayOutputShell:
         audio_tokens=0,
         video_tokens=0,
         retraction_count=0,
-        dp_rank=0,
+        output_identity=(
+            _output_identity() if output_identity is None else output_identity
+        ),
         speculative=True,
         spec_verify_ct=0,
         spec_num_correct_drafts=0,
@@ -195,7 +233,7 @@ def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> Non
     shell = freeze_prefill_gateway_output_shell(
         request,
         cached_tokens_details={"host": 0, "device": 4},
-        dp_rank=2,
+        output_identity=_output_identity(2),
         speculative=True,
     )
 
@@ -205,7 +243,7 @@ def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> Non
     assert shell.prompt_tokens == 7
     assert shell.cached_tokens_details == (("device", 4), ("host", 0))
     assert shell.reasoning_tokens == 2
-    assert shell.dp_rank == 2
+    assert shell.output_identity.dp_rank == 2
     assert shell.speculative is True
     assert shell.spec_verify_ct == 3
     assert shell.spec_correct_drafts_histogram == (7, 8)
@@ -216,14 +254,28 @@ def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> Non
     assert tuple(request.output_ids) == before_output_ids
 
 
-def test_non_dp_rank_matches_the_established_wire_domain() -> None:
-    """Terminal publication preserves the established no-DP ``None`` rank."""
+@pytest.mark.parametrize("rank_domain", ("tp_only", "routed", "true_dp"))
+def test_output_identity_matches_the_established_wire_domain(
+    rank_domain: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy and terminal publication preserve every supported DP rank domain."""
 
-    parallel_state = ParallelState.trivial(dp_rank=None)
+    monkeypatch.delenv("SGLANG_DP_RANK", raising=False)
+    if rank_domain == "tp_only":
+        output_identity = _output_identity(None)
+        expected_dp_rank = None
+    elif rank_domain == "routed":
+        monkeypatch.setenv("SGLANG_DP_RANK", "7")
+        output_identity = _output_identity(None)
+        expected_dp_rank = 7
+    else:
+        output_identity = _output_identity(1, dp_size=2)
+        expected_dp_rank = 1
     terminal_shell = freeze_prefill_gateway_output_shell(
         _request(),
         cached_tokens_details=None,
-        dp_rank=parallel_state.dp_rank,
+        output_identity=output_identity,
         speculative=False,
     )
     terminal_projection = PrefillTerminalGatewayOutputProjection(
@@ -252,23 +304,33 @@ def test_non_dp_rank_matches_the_established_wire_domain() -> None:
     )
     legacy_accumulator.accept(req=legacy_request)
     legacy_payload = legacy_accumulator.to_payload(
-        dp_rank=parallel_state.dp_rank,
+        output_identity=output_identity,
         is_idle_batch=False,
     )
     assert legacy_payload is not None
     decoded_legacy_payload = _decode_payload(encode_ipc_payload(legacy_payload))
 
-    assert terminal_shell.dp_rank is None
-    assert terminal_payload.dp_ranks == decoded_legacy_payload.dp_ranks == [None]
+    assert (
+        type(terminal_payload).__struct_fields__
+        == type(decoded_legacy_payload).__struct_fields__
+    )
+    expected_wire_rank = [expected_dp_rank]
+    assert terminal_payload.dp_ranks == expected_wire_rank
+    assert decoded_legacy_payload.dp_ranks == expected_wire_rank
+    assert len(terminal_payload.dp_ranks) == len(terminal_payload.rids)
+    assert all(
+        rank is None or (type(rank) is int and rank >= 0)
+        for rank in terminal_payload.dp_ranks
+    )
 
 
-def test_shell_validates_dp_rank_outside_counter_validation() -> None:
-    """Rank nullability cannot weaken the independent integer rank domain."""
+def test_shell_rejects_nonpublisher_output_identity() -> None:
+    """Only the scheduler's authenticated output rank may own a shell."""
 
-    with pytest.raises(TypeError, match="integer or None"):
-        dataclasses.replace(_shell(), dp_rank=True)
-    with pytest.raises(ValueError, match="dp_rank must be non-negative"):
-        dataclasses.replace(_shell(), dp_rank=-1)
+    nonpublisher = _output_identity(None, tp_rank=1, tp_size=2)
+
+    with pytest.raises(ValueError, match="publication authority"):
+        dataclasses.replace(_shell(), output_identity=nonpublisher)
 
 
 def test_shell_builder_rejects_result_modes_without_stable_slots() -> None:
@@ -281,7 +343,7 @@ def test_shell_builder_rejects_result_modes_without_stable_slots() -> None:
         freeze_prefill_gateway_output_shell(
             request,
             cached_tokens_details=None,
-            dp_rank=0,
+            output_identity=_output_identity(),
             speculative=True,
         )
 
@@ -296,7 +358,7 @@ def test_shell_builder_rejects_a_prior_output_boundary() -> None:
         freeze_prefill_gateway_output_shell(
             request,
             cached_tokens_details=None,
-            dp_rank=0,
+            output_identity=_output_identity(),
             speculative=True,
         )
 

@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
@@ -77,7 +79,13 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         accumulator.accept(req=_FakeReq("r2", [30], customized_info={"other": [300]}))
 
-        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        output_identity = SchedulerOutputIdentity.from_parallel_state(
+            ParallelState.trivial(dp_rank=None)
+        )
+        payload = accumulator.to_payload(
+            output_identity=output_identity,
+            is_idle_batch=False,
+        )
         customized_info = unwrap_from_pickle(payload.customized_info)
 
         self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30]])

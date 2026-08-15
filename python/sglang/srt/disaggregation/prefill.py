@@ -941,7 +941,7 @@ class SchedulerDisaggregationPrefillMixin:
                     output_shell = freeze_prefill_gateway_output_shell(
                         req,
                         cached_tokens_details=cached_details,
-                        dp_rank=self.ps.dp_rank,
+                        output_identity=self.output_identity,
                         speculative=self.spec_algorithm.is_some(),
                     )
                     result_slot = PinnedTerminalGatewayResultSlot(uuid.uuid4().bytes)

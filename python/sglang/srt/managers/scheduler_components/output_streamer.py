@@ -13,7 +13,7 @@ import torch
 import zmq
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -39,7 +39,7 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 class SchedulerOutputStreamer:
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
+    output_identity: SchedulerOutputIdentity
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -161,7 +161,7 @@ class SchedulerOutputStreamer:
 
         # Send to detokenizer
         payload = acc.to_payload(
-            dp_rank=self.ps.dp_rank,
+            output_identity=self.output_identity,
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
@@ -170,7 +170,7 @@ class SchedulerOutputStreamer:
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
             req.finished()
-            and self.ps.attn_tp_rank == 0
+            and self.output_identity.attn_tp_rank == 0
             and self.server_args.enable_request_time_stats_logging
         ):
             req.log_time_stats()
@@ -553,11 +553,16 @@ class _GenerationStreamAccumulator:
                 per_request_values.append([None] * current_output_len)
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool
+        self,
+        *,
+        output_identity: SchedulerOutputIdentity,
+        is_idle_batch: bool,
     ) -> Optional[BatchTokenIDOutput]:
+        if type(output_identity) is not SchedulerOutputIdentity:
+            raise TypeError("output_identity must be SchedulerOutputIdentity")
         if not (self.rids or is_idle_batch):
             return None
-        dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        dp_ranks = [output_identity.dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,

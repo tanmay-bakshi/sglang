@@ -5,7 +5,6 @@ import json
 from array import array
 
 import torch
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PACKED_REQUEST_GENERATION_BYTES,
 )
@@ -14,6 +13,7 @@ from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
     TerminalGatewayPayloadEncoder,
 )
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     CachedTokensDetails,
@@ -151,8 +151,7 @@ class FrozenPrefillGatewayOutputShell:
     :ivar audio_tokens: Expanded audio-token count.
     :ivar video_tokens: Expanded video-token count.
     :ivar retraction_count: Number of prior scheduler retractions.
-    :ivar dp_rank: Data-parallel rank which produced the request, or ``None``
-        when the scheduler does not use data parallelism.
+    :ivar output_identity: Exact scheduler output rank and publication authority.
     :ivar speculative: Whether speculative counters are present in the active
         output schema.
     :ivar spec_verify_ct: Speculative verification count.
@@ -179,7 +178,7 @@ class FrozenPrefillGatewayOutputShell:
     audio_tokens: int
     video_tokens: int
     retraction_count: int
-    dp_rank: int | None
+    output_identity: SchedulerOutputIdentity
     speculative: bool
     spec_verify_ct: int
     spec_num_correct_drafts: int
@@ -217,6 +216,10 @@ class FrozenPrefillGatewayOutputShell:
             raise TypeError("tokenizer controls must be booleans")
         if type(self.speculative) is not bool:
             raise TypeError("speculative must be a boolean")
+        if type(self.output_identity) is not SchedulerOutputIdentity:
+            raise TypeError("output_identity must be SchedulerOutputIdentity")
+        if not self.output_identity.is_gateway_publisher:
+            raise ValueError("output shell requires gateway publication authority")
         counters = (
             self.prompt_tokens,
             self.reasoning_tokens,
@@ -232,11 +235,6 @@ class FrozenPrefillGatewayOutputShell:
         )
         if any(type(value) is not int or value < 0 for value in counters):
             raise ValueError("output shell counters must be non-negative integers")
-        if self.dp_rank is not None:
-            if type(self.dp_rank) is not int:
-                raise TypeError("dp_rank must be an integer or None")
-            if self.dp_rank < 0:
-                raise ValueError("dp_rank must be non-negative")
         if self.cached_tokens_details is not None:
             if type(self.cached_tokens_details) is not tuple:
                 raise TypeError("cached_tokens_details must be a tuple or None")
@@ -277,7 +275,7 @@ class FrozenPrefillGatewayOutputShell:
             separators=(",", ":"),
         ).encode("utf-8")
         digest = hashlib.sha256()
-        digest.update(b"sglang.packed-terminal.prefill-output-shell.v1")
+        digest.update(b"sglang.packed-terminal.prefill-output-shell.v2")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
         return digest.digest()
@@ -287,7 +285,7 @@ def freeze_prefill_gateway_output_shell(
     req: Req,
     *,
     cached_tokens_details: CachedTokensDetails | None,
-    dp_rank: int | None,
+    output_identity: SchedulerOutputIdentity,
     speculative: bool,
 ) -> FrozenPrefillGatewayOutputShell:
     """Freeze scheduler-owned response state without mutating the request.
@@ -300,8 +298,7 @@ def freeze_prefill_gateway_output_shell(
     :param req: Scheduler-owned prefill request before model submission.
     :param cached_tokens_details: Exact cache-tier breakdown reported for the
         request.
-    :param dp_rank: Data-parallel rank producing the response, or ``None``
-        when the scheduler does not use data parallelism.
+    :param output_identity: Exact scheduler output rank and publication authority.
     :param speculative: Whether the active scheduler emits speculative
         counters.
     :returns: Immutable non-logprob gateway response shell.
@@ -379,7 +376,7 @@ def freeze_prefill_gateway_output_shell(
         audio_tokens=audio_tokens,
         video_tokens=video_tokens,
         retraction_count=req.retraction_count,
-        dp_rank=dp_rank,
+        output_identity=output_identity,
         speculative=speculative,
         spec_verify_ct=req.spec_verify_ct,
         spec_num_correct_drafts=req.spec_num_correct_drafts,
@@ -516,7 +513,7 @@ class PrefillTerminalGatewayPayloadEncoder(TerminalGatewayPayloadEncoder):
             retraction_counts=[shell.retraction_count],
             token_steps=None,
             customized_info=None,
-            dp_ranks=[shell.dp_rank],
+            dp_ranks=[shell.output_identity.dp_rank],
             time_stats=None,
             spec_verify_ct=spec_verify_ct,
             spec_num_correct_drafts=spec_num_correct_drafts,

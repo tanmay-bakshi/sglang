@@ -58,11 +58,38 @@ from sglang.srt.disaggregation.terminal_progress.source_serving import (
     PackedTerminalSourceServing,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.scheduler import Scheduler, run_scheduler_process
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.scheduler_output_identity import SchedulerOutputIdentity
+from sglang.srt.managers.scheduler import (
+    Scheduler,
+    build_scheduler_parallel_state,
+    run_scheduler_process,
+)
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def _scheduler_parallel_state(tp_rank: int, tp_size: int) -> ParallelState:
+    """Build scheduler ranks through the production launch assembly path.
+
+    :param tp_rank: Tensor-parallel process rank.
+    :param tp_size: Tensor-parallel width.
+    :returns: Exact process-local scheduler rank state.
+    """
+
+    return build_scheduler_parallel_state(
+        ServerArgs(model_path="dummy", tp_size=tp_size),
+        gpu_id=tp_rank,
+        tp_rank=tp_rank,
+        moe_ep_rank=0,
+        pp_rank=0,
+        attn_cp_rank=0,
+        moe_dp_rank=0,
+        dp_rank=None,
+    )
 
 
 def _identity(marker: int, role: TerminalOwnerRole) -> TerminalProcessIdentity:
@@ -903,10 +930,9 @@ def test_scheduler_persists_role_correct_gateway_endpoint(
         enable_metrics=False,
         enable_metrics_for_all_schedulers=False,
     )
-    scheduler.ps = SimpleNamespace(
-        pp_rank=1,
-        attn_tp_rank=0,
-        attn_cp_rank=0,
+    scheduler.ps = _scheduler_parallel_state(tp_rank=1, tp_size=2)
+    scheduler.output_identity = SchedulerOutputIdentity.from_parallel_state(
+        scheduler.ps
     )
     port_args = SimpleNamespace(
         tokenizer_ipc_name="ipc://tokenizer",
@@ -958,6 +984,7 @@ def test_scheduler_installs_role_runtime_before_activation(
         advertisement=SimpleNamespace(
             role=role,
             tensor_parallel_rank=tp_rank,
+            tensor_parallel_size=2,
         )
     )
     manager.kv_args = SimpleNamespace(terminal_request_capacity=37)
@@ -970,6 +997,10 @@ def test_scheduler_installs_role_runtime_before_activation(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.disaggregation_mode = mode
     scheduler.terminal_gateway_endpoint = "ipc://gateway"
+    parallel_state = _scheduler_parallel_state(tp_rank=tp_rank, tp_size=2)
+    scheduler.output_identity = SchedulerOutputIdentity.from_parallel_state(
+        parallel_state
+    )
 
     Scheduler._activate_terminal_kv_manager(scheduler, manager)
 
