@@ -77,6 +77,9 @@ from sglang.srt.disaggregation.runtime_capabilities import (
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryAdoptedValue,
     DFlashBoundaryDeviceRowPool,
@@ -366,27 +369,33 @@ class DecodeRequest:
     def priority(self) -> Optional[int]:
         return self.req.priority
 
+    @property
+    def terminal_binding_digest(self) -> bytes | None:
+        """Return the exact terminal completion authority, when installed.
 
-@dataclass(frozen=True, slots=True)
-class TerminalDFlashDecodeAdoption:
-    """Pending device-copy authority returned to the terminal owner.
+        :returns: Terminal binding digest, otherwise ``None``.
+        """
 
-    :ivar transaction_adoption: Exact actor-issued row generation and metadata.
-    :ivar device_value: Request-owned token and completion event for row release.
-    """
+        transaction = self.packed_transaction
+        if transaction is None:
+            return None
+        return transaction.terminal_binding_digest
 
-    transaction_adoption: PackedDFlashBoundaryDecodeAdoption
-    device_value: DFlashBoundaryAdoptedValue
+    def record_terminal_cancellation(self) -> bool:
+        """Record client intent without revoking published terminal ownership.
 
-    def __post_init__(self) -> None:
-        """Validate exact cross-layer adoption authority."""
+        The owner still adopts and releases every transport resource. Once the
+        request becomes scheduler-visible, the ordinary one-forward abort path
+        consumes ``to_finish`` and performs normal request cleanup.
 
-        if type(self.transaction_adoption) is not PackedDFlashBoundaryDecodeAdoption:
-            raise TypeError(
-                "transaction_adoption must be PackedDFlashBoundaryDecodeAdoption"
-            )
-        if type(self.device_value) is not DFlashBoundaryAdoptedValue:
-            raise TypeError("device_value must be DFlashBoundaryAdoptedValue")
+        :returns: Whether terminal ownership retained the cancellation.
+        """
+
+        if self.terminal_binding_digest is None:
+            return False
+        if self.req.to_finish is None:
+            self.req.to_finish = FINISH_ABORT()
+        return True
 
 
 class DecodePreparedAllocationCohort:
@@ -1335,7 +1344,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         cohort: DecodePreparedAllocationCohort,
     ) -> None:
-        """Take ownership of one promoted cohort in runnable queue state.
+        """Attach one promoted cohort to its process-lifetime progress owner.
 
         :param cohort: Exact queue-owned promoted cohort.
         """
@@ -1382,20 +1391,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.packed_transaction = transaction
 
-            self.queue.extend(record.decode_reqs)
             try:
-                for decode_req in record.decode_reqs:
-                    if _is_fake_transfer(
-                        decode_req.req,
-                        self.scheduler.server_args,
-                    ):
-                        decode_req.kv_receiver.init(0)
-                        continue
-                    prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
-                    if prefill_dp_rank is None:
-                        self.pending_reqs.append(decode_req)
-                        continue
-                    decode_req.kv_receiver.init(prefill_dp_rank)
+                if self._terminal_decode_serving is None:
+                    self._attach_legacy_preallocated_record(record)
+                else:
+                    self._attach_terminal_preallocated_record(record)
             except Exception:  # noqa: BLE001
                 attachment_traceback = traceback.format_exc()
                 self.queue = [
@@ -1408,16 +1408,160 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     for entry in self.pending_reqs
                     if all(entry is not owned for owned in record.decode_reqs)
                 ]
+                terminal_cleanup_failures: list[str] = []
+                if self._terminal_decode_serving is not None:
+                    for decode_req, transaction in zip(
+                        record.decode_reqs,
+                        record.packed_transactions,
+                        strict=True,
+                    ):
+                        try:
+                            self.transfer_queue.quarantine_terminal_request(
+                                decode_req,
+                                transaction,
+                            )
+                        except Exception:  # noqa: BLE001
+                            terminal_cleanup_failures.append(traceback.format_exc())
                 self._quarantine_preallocated_record_locked(
                     record,
-                    "cohort attachment failed after receiver activation may have begun",
+                    "cohort attachment failed after progress ownership may have begun",
                 )
+                if len(terminal_cleanup_failures) > 0:
+                    logger.critical(
+                        "Terminal registry cleanup failed during attachment "
+                        "quarantine:\n%s",
+                        "\n".join(terminal_cleanup_failures),
+                    )
                 logger.error(
                     "Reserved decode cohort attachment failed and was quarantined:\n%s",
                     attachment_traceback,
                 )
                 raise
-            record.state = _DecodePreparedCohortState.ATTACHED
+
+    def _attach_legacy_preallocated_record(
+        self,
+        record: _DecodePreparedCohortRecord,
+    ) -> None:
+        """Attach one non-terminal cohort to legacy scheduler polling.
+
+        :param record: Exact promoted cohort retaining every child.
+        """
+
+        if any(
+            transaction.terminal_binding_digest is not None
+            for transaction in record.packed_transactions
+        ):
+            raise DecodeAllocationLeaseError(
+                "terminal transaction has no terminal decode serving owner"
+            )
+        self.queue.extend(record.decode_reqs)
+        for decode_req in record.decode_reqs:
+            if _is_fake_transfer(
+                decode_req.req,
+                self.scheduler.server_args,
+            ):
+                decode_req.kv_receiver.init(0)
+                continue
+            prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
+            if prefill_dp_rank is None:
+                self.pending_reqs.append(decode_req)
+                continue
+            decode_req.kv_receiver.init(prefill_dp_rank)
+        record.state = _DecodePreparedCohortState.ATTACHED
+
+    def _attach_terminal_preallocated_record(
+        self,
+        record: _DecodePreparedCohortRecord,
+    ) -> None:
+        """Publish one owner-driven cohort without legacy progress queues.
+
+        Receiver bootstrap and destination-metadata construction remain
+        scheduler-affine. Once promotion installed terminal authority, however,
+        no child may enter the legacy preallocation handshake or transfer poller.
+        The scheduler thread cannot drain owner receipts while this method runs,
+        so the complete registry and metadata cohort becomes visible atomically
+        before the first adoption callback can execute.
+
+        :param record: Exact promoted terminal cohort retaining every child.
+        """
+
+        publications = record.packed_publications
+        if publications is None or len(publications) != len(record.decode_reqs):
+            raise DecodeAllocationLeaseError(
+                "terminal cohort publication count differs from its request count"
+            )
+        if any(
+            transaction.terminal_binding_digest is None
+            for transaction in record.packed_transactions
+        ):
+            raise DecodeAllocationLeaseError(
+                "terminal decode serving received a non-terminal transaction"
+            )
+
+        submissions: list[_DecodeMetadataSubmission] = []
+        for decode_req in record.decode_reqs:
+            if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+                raise DecodeAllocationLeaseError(
+                    "terminal decode ownership requires the NIXL transport"
+                )
+            prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
+            if prefill_dp_rank is None:
+                raise DecodeAllocationLeaseError(
+                    "terminal decode attachment requires cached prefill rank authority"
+                )
+            decode_req.kv_receiver.init(prefill_dp_rank)
+            if decode_req.kv_receiver.conclude_state is KVPoll.Failed:
+                raise DecodeAllocationLeaseError(
+                    "terminal decode receiver initialization failed"
+                )
+            actual_source_tp_size = decode_req.kv_receiver.prefill_info.attn_tp_size
+            if actual_source_tp_size != record.source_tp_size:
+                raise DecodeAllocationLeaseError(
+                    "bootstrap source TP width differs from reservation"
+                )
+            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            prefix_match = decode_req.prefix_match
+            prefix_len = 0 if prefix_match is None else prefix_match.l1_prefix_len
+            total_prefix_len = (
+                0 if prefix_match is None else prefix_match.decode_prefix_len
+            )
+            decode_req.req.cache_protected_len = total_prefix_len
+            submissions.append(
+                self._build_decode_metadata_submission(
+                    decode_req,
+                    origin_input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    total_prefix_len=total_prefix_len,
+                    dst_kv_indices=None,
+                    allocate_metadata_index=False,
+                )
+            )
+
+        self.transfer_queue.register_terminal_requests(record.decode_reqs)
+        record.state = _DecodePreparedCohortState.ATTACHED
+        for submission, transaction, publication in zip(
+            submissions,
+            record.packed_transactions,
+            publications,
+            strict=True,
+        ):
+            decode_req = submission.decode_req
+            self.kv_manager.send_packed_decode_request_metadata(
+                transaction=transaction,
+                publication=publication,
+                receiver=decode_req.kv_receiver,
+                page_indices=submission.page_indices,
+                metadata_buffer_index=decode_req.metadata_buffer_index,
+                state_indices=submission.state_indices,
+                decode_prefix_len=submission.decode_prefix_len,
+            )
+            if decode_req.is_rebootstrap:
+                self.kv_manager.submit_prefill_recompute(
+                    decode_req.kv_receiver,
+                    decode_req.req.build_rebootstrap_payload(),
+                )
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+        record.metadata_published = True
 
     def cancel_preallocated(
         self,
@@ -2613,7 +2757,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             hisparse_req_budget = max(
                 0,
                 hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
+                - len(self.transfer_queue.live_requests()),
             )
 
         # Then, preallocate the remaining requests if possible
@@ -3186,7 +3330,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def num_tokens_pre_allocated(self):
         return sum(
-            decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
+            decode_req.req.extend_range.end
+            for decode_req in self.transfer_queue.live_requests()
         )
 
     def _need_space_for_single_req(
@@ -3210,7 +3355,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
             len(self.scheduler.running_batch.reqs)
-            + len(self.transfer_queue.queue)
+            + len(self.transfer_queue.live_requests())
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
@@ -3943,6 +4088,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     tp1_poll_progress_policy: SingletonPollProgressPolicy
+    _terminal_requests: dict[bytes, DecodeRequest]
 
     def __init__(
         self,
@@ -3954,6 +4100,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
+        self._terminal_requests = {}
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -3989,10 +4136,69 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.terminal_dflash_boundary_pool = pool
 
     def add(self, decode_req: DecodeRequest) -> None:
+        if decode_req.terminal_binding_digest is not None:
+            raise DecodeAllocationLeaseError(
+                "terminal request cannot enter the legacy transfer queue"
+            )
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+        if any(
+            decode_req.terminal_binding_digest is not None
+            for decode_req in decode_reqs
+        ):
+            raise DecodeAllocationLeaseError(
+                "terminal requests require the terminal ownership handoff"
+            )
         self.queue.extend(decode_reqs)
+
+    def register_terminal_requests(
+        self,
+        decode_reqs: tuple[DecodeRequest, ...],
+    ) -> None:
+        """Register one complete owner-driven cohort before metadata publication.
+
+        The legacy queue is deliberately not an input or output of this method.
+        Validation completes before any request becomes visible to owner
+        callbacks, so duplicate identities cannot partially attach a cohort.
+
+        :param decode_reqs: Exact terminal children entering owner progress.
+        """
+
+        terminal: list[tuple[bytes, DecodeRequest]] = []
+        new_terminal_digests: set[bytes] = set()
+        for decode_req in decode_reqs:
+            digest = decode_req.terminal_binding_digest
+            if digest is None:
+                raise DecodeAllocationLeaseError(
+                    "terminal registry received a legacy request"
+                )
+            if digest in new_terminal_digests or digest in self._terminal_requests:
+                raise DecodeAllocationLeaseError(
+                    "terminal transfer binding identity was reused"
+                )
+            if any(entry is decode_req for entry in self.queue) or any(
+                entry is decode_req for entry in self._terminal_requests.values()
+            ):
+                raise DecodeAllocationLeaseError(
+                    "preallocated request already has transfer ownership"
+                )
+            new_terminal_digests.add(digest)
+            terminal.append((digest, decode_req))
+
+        self._terminal_requests.update(terminal)
+
+    def live_requests(self) -> tuple[DecodeRequest, ...]:
+        """Return every legacy-polled and terminal-owned transfer request.
+
+        :returns: Exact scheduler-visible transfer ownership population.
+        """
+
+        terminal = tuple(
+            self._terminal_requests[digest]
+            for digest in sorted(self._terminal_requests)
+        )
+        return (*self.queue, *terminal)
 
     def _commit_consumed_allocation(self, decode_req: DecodeRequest) -> None:
         """Release a legacy migration lease after metadata consumption.
@@ -4083,7 +4289,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     ) -> TerminalDFlashDecodeAdoption:
         """Adopt authenticated DFlash state without releasing its VRAM row.
 
-        :param decode_req: Exact transfer-queue request.
+        :param decode_req: Exact terminal-registry request.
         :param transaction: Exact terminal-owned packed transaction.
         :returns: Device-copy completion authority retained by the owner.
         """
@@ -4159,15 +4365,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # The terminal owner releases the exact VRAM row only after the D2D
         # completion event. The cloned token remains request-owned until DFlash
         # consumes it while constructing the first decode batch.
+        binding_digest = transaction.terminal_binding_digest
+        if binding_digest is None:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization lost binding authority"
+            )
         decode_req.metadata_buffer_index = -1
         decode_req.allocation_lease = None
         decode_req.packed_transaction = None
         receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
-        self.queue = [entry for entry in self.queue if entry is not decode_req]
-        if len(self.queue) == 0:
-            self.tp1_poll_progress_policy.mark_idle()
+        owned = self._terminal_requests.pop(binding_digest, None)
+        if owned is not decode_req:
+            raise DecodeAllocationLeaseError(
+                "terminal finalization removed another registry owner"
+            )
         self.scheduler.waiting_queue.append(decode_req.req)
 
     def quarantine_terminal_request(
@@ -4175,7 +4388,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req: DecodeRequest,
         transaction: PackedDecodeRequestTransaction,
     ) -> None:
-        """Remove an ambiguous terminal request from active transfer polling.
+        """Remove an ambiguous terminal request from active owner callbacks.
 
         The prepared cohort remains its process-lifetime retention owner.
 
@@ -4183,27 +4396,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         :param transaction: Exact quarantined packed transaction.
         """
 
-        matches = sum(entry is decode_req for entry in self.queue)
-        if matches > 1:
+        digest = transaction.terminal_binding_digest
+        if digest is None:
             raise DecodeAllocationLeaseError(
-                "terminal request appears more than once in the transfer queue"
+                "terminal quarantine lacks terminal binding authority"
             )
-        if matches == 0:
+        owned = self._terminal_requests.get(digest)
+        if owned is None:
             return
-        if decode_req.packed_transaction is not transaction:
+        if owned is not decode_req or decode_req.packed_transaction is not transaction:
             raise DecodeAllocationLeaseError(
-                "terminal transfer queue retains another packed transaction"
+                "terminal registry retains another packed transaction"
             )
-        self.queue = [entry for entry in self.queue if entry is not decode_req]
-        if len(self.queue) == 0:
-            self.tp1_poll_progress_policy.mark_idle()
+        del self._terminal_requests[digest]
 
     def _require_terminal_transfer_request(
         self,
         decode_req: DecodeRequest,
         transaction: PackedDecodeRequestTransaction,
     ) -> None:
-        """Require exact singular transfer-queue ownership.
+        """Require exact singular terminal-registry ownership.
 
         :param decode_req: Candidate terminal request.
         :param transaction: Candidate request transaction.
@@ -4217,9 +4429,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise DecodeAllocationLeaseError(
                 "terminal transfer transaction retains another request owner"
             )
-        if sum(entry is decode_req for entry in self.queue) != 1:
+        digest = transaction.terminal_binding_digest
+        if digest is None:
             raise DecodeAllocationLeaseError(
-                "terminal transfer callback lacks singular queue ownership"
+                "terminal callback lacks terminal binding authority"
+            )
+        if self._terminal_requests.get(digest) is not decode_req:
+            raise DecodeAllocationLeaseError(
+                "terminal callback lacks singular registry ownership"
             )
 
     def _commit_terminal_dflash_metadata_to_req(
@@ -4787,6 +5004,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if len(self._terminal_requests) > 0:
+            raise DecodeAllocationLeaseError(
+                "cannot release memory with terminal requests in flight"
+            )
         self.queue.clear()
         self.tp1_poll_progress_policy.mark_idle()
 

@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedAuxiliaryPlan,
+    PackedDFlashBoundaryCounters,
     PackedReady,
     PackedRequestTeardown,
     PackedTerminalReceipt,
@@ -153,6 +154,9 @@ from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeWireDelivery,
     PackedTerminalDecodeWork,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentCohort,
     TerminalDeploymentLocalService,
@@ -181,6 +185,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     PrefillTerminalGatewayOutputProjection,
     PrefillTerminalGatewayPayloadEncoder,
+    TerminalGatewayResultSlot,
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     PackedTerminalOutputPublisher,
@@ -216,10 +221,12 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
     decode_packed_terminal_source_plan,
 )
 from sglang.srt.disaggregation.terminal_progress.source_serving import (
+    PackedTerminalSourceResourceInventory,
     PackedTerminalSourceServing,
     PackedTerminalSourceWork,
 )
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceMetric,
     PackedTerminalSourceMetricsSink,
     PackedTerminalSourceSubmission,
@@ -1127,6 +1134,10 @@ class NixlKVManager(CommonKVManager):
         self._terminal_source_receipt_importers: dict[
             TerminalProcessIdentity, TerminalWireReceiptImportNamespace
         ] = {}
+        self._terminal_unpublished_source_quarantine: dict[
+            bytes, PackedTerminalSourceSubmission
+        ] = {}
+        self._terminal_unpublished_source_quarantine_lock = threading.Lock()
         self._terminal_control_thread: threading.Thread | None = None
         self._terminal_control_read_fd: int | None = None
         self._terminal_control_write_fd: int | None = None
@@ -1567,70 +1578,124 @@ class NixlKVManager(CommonKVManager):
         self,
         submission: PackedTerminalSourceSubmission,
         release_resources: Callable[[PackedTerminalSourceSubmission], None],
+        commit_scheduler_retention: Callable[
+            [PackedTerminalSourceSubmission], None
+        ],
     ) -> None:
-        """Bind actor, scheduler, receipt, and native ownership before PREPARE.
+        """Bind every source owner and scheduler retention before PREPARE.
 
         :param submission: Exact immutable post-model-return handoff.
         :param release_resources: Scheduler-affine one-shot resource release.
+        :param commit_scheduler_retention: Scheduler-affine request retention
+            committed immediately before PREPARE can become observable.
         """
 
         if type(submission) is not PackedTerminalSourceSubmission:
             raise TypeError("submission must be PackedTerminalSourceSubmission")
         if not callable(release_resources):
             raise TypeError("release_resources must be callable")
-        self.terminal_process_reactor.require_admission_open()
-        serving = self.terminal_source_serving
-        runtime = self._packed_prefill_runtime
-        if runtime is None:
-            raise RuntimeError("packed source actor is unavailable")
-        transport = submission.transport_submission
-        if type(transport) is not PackedPrefillSubmission:
-            raise TypeError(
-                "source transport_submission must be PackedPrefillSubmission"
-            )
-        identity = submission.identity
-        importer = self._terminal_source_receipt_importers.get(
-            identity.request_ready_issuer
-        )
-        if importer is None:
-            raise RuntimeError(
-                "source request-ready issuer is absent from sealed startup"
-            )
-        publication_control = self._terminal_source_publication_control
-        if publication_control is None:
-            raise RuntimeError("source publication control is unavailable")
-
-        runtime.bind_terminal_owner(transport, identity)
-        importer.register_binding(identity.local_binding)
+        if not callable(commit_scheduler_retention):
+            raise TypeError("commit_scheduler_retention must be callable")
+        serving: PackedTerminalSourceServing | None = None
+        serving_bind_started = False
+        lifecycle_committed = False
         try:
+            self.terminal_process_reactor.require_admission_open()
+            serving = self.terminal_source_serving
+            runtime = self._packed_prefill_runtime
+            if runtime is None:
+                raise RuntimeError("packed source actor is unavailable")
+            transport = submission.transport_submission
+            if type(transport) is not PackedPrefillSubmission:
+                raise TypeError(
+                    "source transport_submission must be PackedPrefillSubmission"
+                )
+            identity = submission.identity
+            if (
+                identity.local_binding.owner.tp_rank == 0
+                and type(submission.output_projection)
+                is not PrefillTerminalGatewayOutputProjection
+            ):
+                raise TypeError(
+                    "canonical source requires a pinned prefill output projection"
+                )
+            importer = self._terminal_source_receipt_importers.get(
+                identity.request_ready_issuer
+            )
+            if importer is None:
+                raise RuntimeError(
+                    "source request-ready issuer is absent from sealed startup"
+                )
+            publication_control = self._terminal_source_publication_control
+            if publication_control is None:
+                raise RuntimeError("source publication control is unavailable")
+            runtime.bind_terminal_owner(transport, identity)
+            importer.register_binding(identity.local_binding)
+            serving_bind_started = True
             serving.bind_submission(submission, release_resources)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            active = serving.inventory().wiring.active_binding_digests
-            if identity.local_binding.digest not in active:
-                importer.retire_binding(identity.local_binding)
-                runtime.cancel_terminal_owner_unpublished(transport)
-            else:
-                self._record_terminal_component_failure(
-                    "source serving bind failed after lifecycle commit",
-                    traceback.format_exc(),
+            lifecycle_committed = True
+            publication_control.register_binding(identity.local_binding)
+            commit_scheduler_retention(submission)
+            runtime.publish_terminal_owner_prepare(transport)
+        except Exception as error:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            cleanup_failures: list[str] = []
+            if serving_bind_started and not lifecycle_committed and serving is not None:
+                try:
+                    lifecycle_committed = (
+                        submission.identity.local_binding.digest
+                        in serving.inventory().wiring.active_binding_digests
+                    )
+                except Exception:  # noqa: BLE001
+                    cleanup_failures.append(traceback.format_exc())
+            if not lifecycle_committed:
+                try:
+                    self.quarantine_unpublished_terminal_source_submission(submission)
+                except Exception:  # noqa: BLE001
+                    cleanup_failures.append(traceback.format_exc())
+            try:
+                self.fail_terminal_source_process(
+                    "terminal source bind failed after producer submission",
+                    formatted_traceback,
+                )
+            except Exception:  # noqa: BLE001
+                cleanup_failures.append(traceback.format_exc())
+            if len(cleanup_failures) > 0:
+                error.add_note(
+                    "terminal source bind quarantine failed:\n"
+                    + "\n".join(cleanup_failures)
                 )
             raise
-        try:
-            publication_control.register_binding(identity.local_binding)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            self._record_terminal_component_failure(
-                "source publication binding failed after lifecycle commit",
-                traceback.format_exc(),
-            )
-            raise
-        try:
-            runtime.publish_terminal_owner_prepare(transport)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            self._record_terminal_component_failure(
-                "source PREPARE publication failed after lifecycle commit",
-                traceback.format_exc(),
-            )
-            raise
+
+    def quarantine_unpublished_terminal_source_submission(
+        self,
+        submission: PackedTerminalSourceSubmission,
+    ) -> None:
+        """Retain CUDA-touched transport and result state fail closed.
+
+        :param submission: Exact transport, device row, and pinned result slot.
+        """
+
+        if type(submission) is not PackedTerminalSourceSubmission:
+            raise TypeError("submission must be PackedTerminalSourceSubmission")
+        transport = submission.transport_submission
+        if type(transport) is not PackedPrefillSubmission:
+            raise TypeError("source transport_submission has another schema")
+        digest = submission.identity.local_binding.digest
+        with self._terminal_unpublished_source_quarantine_lock:
+            existing = self._terminal_unpublished_source_quarantine.get(digest)
+            if existing is not None:
+                if existing is submission:
+                    return
+                raise RuntimeError("source quarantine identity was reused")
+            self._terminal_unpublished_source_quarantine[digest] = submission
+        auxiliary = transport.auxiliary_source
+        if type(auxiliary) is not PackedTerminalDFlashAuxiliarySource:
+            return
+        owner = self._terminal_dflash_source_owner
+        if owner is None:
+            raise RuntimeError("terminal DFlash source owner is unavailable")
+        owner.quarantine_unpublished_source_row(auxiliary.prefill_source.lease)
 
     def install_terminal_startup_binding(
         self,
@@ -2616,13 +2681,133 @@ class NixlKVManager(CommonKVManager):
                 clock_ns=terminal_clock_ns,
             )
 
-        def retire_submission(submission: PackedTerminalSourceSubmission) -> None:
+        def retire_submission(
+            submission: PackedTerminalSourceSubmission,
+            action: NativeTerminalOwnerAction,
+        ) -> None:
             """Retire route replay state after native lifecycle retirement.
 
             :param submission: Successfully retired source submission.
+            :param action: Exact joined native retirement authority.
             """
 
+            transport = submission.transport_submission
+            if type(transport) is not PackedPrefillSubmission:
+                raise TypeError("retired source transport has another schema")
+            importer = self._terminal_source_receipt_importers.get(
+                submission.identity.request_ready_issuer
+            )
+            if importer is None:
+                raise RuntimeError("retired source importer disappeared")
+            actor.require_terminal_owner_retirement(action, transport)
+            importer.require_active_binding(submission.identity.local_binding)
+            publication_control.require_retirable_binding(
+                submission.identity.local_binding
+            )
+            importer.retire_binding(submission.identity.local_binding)
             publication_control.retire_binding(submission.identity.local_binding)
+            retired_transport = actor.retire_terminal_owner_request(action)
+            if retired_transport is not transport:
+                raise RuntimeError("actor retired another source transport")
+            self._retire_successful_source_room(transport.plan.key.room_id)
+
+        def resource_inventory() -> PackedTerminalSourceResourceInventory:
+            """Project every external source owner into one health receipt.
+
+            :returns: Actor, DFlash, and pre-lifecycle quarantine inventory.
+            """
+
+            actor_inventory = actor.terminal_owner_inventory()
+            request_ready_imports = tuple(
+                sorted(
+                    {
+                        digest
+                        for importer in self._terminal_source_receipt_importers.values()
+                        for digest in importer.active_binding_digests
+                    }
+                )
+            )
+            publication_inventory = publication_control.inventory()
+            source_transfer_rooms = tuple(sorted(self.transfer_infos))
+            source_prefix_rooms = tuple(sorted(self.req_to_decode_prefix_len))
+            source_prefetched_rooms: tuple[int, ...] = ()
+            source_prefetch_requested_rooms: tuple[int, ...] = ()
+            if self.enable_staging and self._staging_ctx is not None:
+                source_prefetched_rooms = tuple(
+                    sorted(self._staging_ctx.prefetched_rooms)
+                )
+                source_prefetch_requested_rooms = tuple(
+                    sorted({key[0] for key in self._staging_ctx.prefetch_requested})
+                )
+            if dflash_owner is None:
+                dflash_counts = (0, 0, 0, 0, 0, 0)
+                row_counts = (0, 0, 0)
+            else:
+                dflash_inventory = dflash_owner.inventory()
+                dflash_counts = (
+                    dflash_inventory.active_count,
+                    dflash_inventory.posted_count,
+                    dflash_inventory.settled_count,
+                    dflash_inventory.released_count,
+                    dflash_inventory.quarantined_count,
+                    dflash_inventory.unowned_native_handle_count,
+                )
+                row_counts = dflash_owner.source_row_inventory()
+            with self._terminal_unpublished_source_quarantine_lock:
+                unpublished = tuple(
+                    sorted(self._terminal_unpublished_source_quarantine)
+                )
+                unpublished_result_slots = tuple(
+                    sorted(
+                        digest
+                        for digest, submission in (
+                            self._terminal_unpublished_source_quarantine.items()
+                        )
+                        if submission.output_projection is not None
+                    )
+                )
+            return PackedTerminalSourceResourceInventory(
+                actor_active_binding_digests=actor_inventory.active_bindings,
+                actor_quarantined_binding_digests=(
+                    actor_inventory.quarantined_bindings
+                ),
+                actor_waiting_for_ready_binding_digests=(
+                    actor_inventory.waiting_for_ready_bindings
+                ),
+                actor_main_handle_binding_digests=(
+                    actor_inventory.main_handle_bindings
+                ),
+                actor_auxiliary_handle_binding_digests=(
+                    actor_inventory.auxiliary_handle_bindings
+                ),
+                actor_lane_binding_digests=actor_inventory.lane_bindings,
+                request_ready_import_binding_digests=request_ready_imports,
+                publication_control_active_binding_digests=(
+                    publication_inventory.active_binding_digests
+                ),
+                publication_control_terminal_binding_digests=(
+                    publication_inventory.terminal_binding_digests
+                ),
+                source_transfer_info_room_ids=source_transfer_rooms,
+                source_prefix_length_room_ids=source_prefix_rooms,
+                source_prefetched_room_ids=source_prefetched_rooms,
+                source_prefetch_requested_room_ids=(
+                    source_prefetch_requested_rooms
+                ),
+                dflash_active_transfer_count=dflash_counts[0],
+                dflash_posted_transfer_count=dflash_counts[1],
+                dflash_settled_transfer_count=dflash_counts[2],
+                dflash_released_transfer_count=dflash_counts[3],
+                dflash_quarantined_transfer_count=dflash_counts[4],
+                dflash_unowned_native_handle_count=dflash_counts[5],
+                dflash_free_row_count=row_counts[0],
+                dflash_active_row_count=row_counts[1],
+                dflash_quarantined_row_count=row_counts[2],
+                unpublished_quarantined_binding_digests=unpublished,
+                unpublished_quarantined_result_slot_binding_digests=(
+                    unpublished_result_slots
+                ),
+            )
 
         serving = PackedTerminalSourceServing(
             runtime=enrollment.runtime,
@@ -2635,6 +2820,7 @@ class NixlKVManager(CommonKVManager):
             grouped_nixl=grouped_nixl,
             work=source_work,
             retire_native_producers=enrollment.retire_native_producers,
+            resource_inventory=resource_inventory,
             retire_submission=retire_submission,
         )
 
@@ -3505,6 +3691,17 @@ class NixlKVManager(CommonKVManager):
                 error,
                 traceback.format_exc(),
             )
+        if self._terminal_decode_serving is not None:
+            try:
+                self._require_terminal_decode_dflash_teardown(
+                    process_fatal=must_abort or first_error is not None,
+                )
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal decode DFlash row teardown failed",
+                    error,
+                    traceback.format_exc(),
+                )
         if publisher is not None:
             try:
                 if not publisher.stop_admission_and_join():
@@ -3530,6 +3727,45 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("terminal runtime teardown failed") from first_error
         with self._terminal_runtime_close_lock:
             self._terminal_runtime_closed = True
+
+    def _terminal_decode_dflash_row_counts(self) -> tuple[int, int]:
+        """Return active and quarantined decoder boundary-row populations.
+
+        :returns: Active and quarantined registered DFlash row counts.
+        """
+
+        pool = self._terminal_dflash_boundary_pool
+        if pool is None:
+            return 0, 0
+        free_count, active_count, quarantined_count = pool.inventory()
+        counts = (free_count, active_count, quarantined_count)
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise RuntimeError("terminal DFlash row inventory is malformed")
+        if sum(counts) != pool.row_capacity:
+            raise RuntimeError("terminal DFlash row inventory violates conservation")
+        return active_count, quarantined_count
+
+    def _require_terminal_decode_dflash_teardown(
+        self,
+        *,
+        process_fatal: bool,
+    ) -> None:
+        """Require every decode boundary row to have a terminal disposition.
+
+        Clean close permits no retained rows. Fail-closed teardown may retain
+        quarantined rows process-lifetime, but an active row means ownership
+        never reached either release or quarantine and remains ambiguous.
+
+        :param process_fatal: Whether quarantined retention is authoritative.
+        """
+
+        if type(process_fatal) is not bool:
+            raise TypeError("process_fatal must be bool")
+        active_count, quarantined_count = self._terminal_decode_dflash_row_counts()
+        if active_count != 0:
+            raise RuntimeError("terminal decode close retains active DFlash rows")
+        if not process_fatal and quarantined_count != 0:
+            raise RuntimeError("clean terminal decode close retains DFlash quarantine")
 
     def activate_terminal_startup(self) -> None:
         """Commit immutable cross-role peers before exposing service readiness.
@@ -3602,6 +3838,312 @@ class NixlKVManager(CommonKVManager):
         if controller is None or not controller.ready:
             return None
         return PACKED_KV_TRANSFER_PROTOCOL
+
+    def uses_terminal_source_publication(self) -> bool:
+        """Return whether the activated manager owns terminal source progress.
+
+        :returns: Whether this process is an activated terminal source rank.
+        """
+
+        binding = self.terminal_startup_binding
+        return (
+            self.disaggregation_mode is DisaggregationMode.PREFILL
+            and binding is not None
+            and binding.advertisement.role is TerminalOwnerRole.SOURCE
+            and self._terminal_runtime_activated.is_set()
+        )
+
+    def terminal_source_is_canonical(self) -> bool:
+        """Return whether this source rank owns gateway and DFlash publication.
+
+        :returns: Whether the active terminal identity is source TP rank zero.
+        """
+
+        if not self.uses_terminal_source_publication():
+            return False
+        binding = self.terminal_startup_binding
+        if binding is None:
+            raise RuntimeError("terminal source binding disappeared")
+        return binding.advertisement.tensor_parallel_rank == 0
+
+    def lease_terminal_dflash_source(
+        self,
+        counters: PackedDFlashBoundaryCounters,
+    ) -> DFlashBoundaryPrefillSource:
+        """Lease canonical device storage for one terminal DFlash boundary.
+
+        :param counters: Immutable scheduler-owned DFlash scalar counters.
+        :returns: Active source row and its authenticated counters.
+        """
+
+        if type(counters) is not PackedDFlashBoundaryCounters:
+            raise TypeError("counters must be PackedDFlashBoundaryCounters")
+        if not self.terminal_source_is_canonical():
+            raise RuntimeError("only canonical terminal source may lease DFlash")
+        owner = self._terminal_dflash_source_owner
+        if owner is None:
+            raise RuntimeError("terminal DFlash source owner is unavailable")
+        return DFlashBoundaryPrefillSource(
+            lease=owner.lease_source_row(),
+            counters=counters,
+        )
+
+    def cancel_unpublished_terminal_dflash_source(
+        self,
+        source: DFlashBoundaryPrefillSource,
+    ) -> None:
+        """Release one canonical row before native lifecycle publication.
+
+        :param source: Exact unpublished DFlash source ownership.
+        """
+
+        if type(source) is not DFlashBoundaryPrefillSource:
+            raise TypeError("source must be DFlashBoundaryPrefillSource")
+        owner = self._terminal_dflash_source_owner
+        if owner is None:
+            raise RuntimeError("terminal DFlash source owner is unavailable")
+        owner.cancel_unpublished_source_row(source.lease)
+
+    def fail_terminal_source_process(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Stop source admission and enter native fail-closed drain.
+
+        :param reason: Stable process-fatal failure boundary.
+        :param formatted_traceback: Complete originating traceback, if any.
+        """
+
+        if self.disaggregation_mode is not DisaggregationMode.PREFILL:
+            raise RuntimeError("only a terminal source process may fail this way")
+        self._record_terminal_component_failure(reason, formatted_traceback)
+        self.terminal_source_serving.begin_fail_closed_abort()
+
+    def cancel_terminal_source_request(
+        self,
+        binding: TerminalRequestBinding,
+        reason: str,
+    ) -> PackedTerminalSourceCancellationDisposition:
+        """Record client intent while the published source lifecycle completes.
+
+        :param binding: Exact scheduler-retained source generation.
+        :param reason: Stable client-cancellation reason.
+        :returns: Completion-required or too-late-for-rollback disposition.
+        """
+
+        try:
+            return self.terminal_source_serving.cancel_submission(binding, reason)
+        except Exception:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            self.fail_terminal_source_process(
+                "terminal source cancellation recording failed",
+                formatted_traceback,
+            )
+            raise
+
+    def packed_terminal_health(self) -> dict[str, object] | None:
+        """Return a JSON-native role-neutral terminal ownership projection.
+
+        :returns: In-campaign health evidence, or ``None`` before activation.
+        """
+
+        source_serving = self._terminal_source_serving
+        if source_serving is not None:
+            inventory = source_serving.inventory()
+            active = tuple(
+                sorted(
+                    set(inventory.wiring.active_binding_digests)
+                    | set(inventory.scheduler_consumer.active_binding_digests)
+                    | set(inventory.resources.actor_active_binding_digests)
+                    | set(
+                        inventory.resources.request_ready_import_binding_digests
+                    )
+                    | set(
+                        inventory.resources.publication_control_active_binding_digests
+                    )
+                    | set(
+                        inventory.resources.unpublished_quarantined_binding_digests
+                    )
+                    | set(inventory.runtime.quarantined_binding_digests)
+                )
+            )
+            quarantined = tuple(
+                sorted(
+                    set(inventory.wiring.quarantined_binding_digests)
+                    | set(inventory.resources.actor_quarantined_binding_digests)
+                    | set(inventory.runtime.quarantined_binding_digests)
+                    | set(
+                        inventory.scheduler_consumer.quarantined_binding_digests
+                    )
+                    | set(
+                        inventory.resources.unpublished_quarantined_binding_digests
+                    )
+                )
+            )
+            native = inventory.grouped_nixl.native
+            native_problem: str | None = None
+            if int(native.fatal) != 0 or native.eventfd_error != 0:
+                native_problem = (
+                    "grouped NIXL channel fatal="
+                    f"{int(native.fatal)} eventfd_error={native.eventfd_error}"
+                )
+            fatal_reason = inventory.runtime.fatal_reason
+            if fatal_reason is None:
+                fatal_reason = native_problem
+            elif native_problem is not None:
+                fatal_reason = f"{fatal_reason}; {native_problem}"
+            return {
+                "role": "source",
+                "active_count": len(active),
+                "active_binding_digests": [
+                    digest.hex() for digest in active
+                ],
+                "quarantine_count": len(quarantined),
+                "quarantined_binding_digests": [
+                    digest.hex() for digest in quarantined
+                ],
+                "retained_resource_count": inventory.retained_resource_count,
+                "pending_owner_action_count": (
+                    inventory.runtime.owner.pending_action_count
+                ),
+                "pending_runtime_action_count": (
+                    inventory.runtime.consumer_pending_count
+                ),
+                "pending_scheduler_action_count": (
+                    inventory.runtime.scheduler_pending_count
+                ),
+                "fatal_reason": fatal_reason,
+                "owner_dead": inventory.owner_dead_marked,
+                "output_reactor_alive": inventory.runtime.output_reactor_alive,
+                "grouped_nixl_quarantined_transfer_count": (
+                    inventory.grouped_nixl.quarantined_transfer_count
+                ),
+                "grouped_nixl_unowned_handle_count": (
+                    inventory.grouped_nixl.unowned_handle_count
+                ),
+                "completion_required_count": len(
+                    inventory.wiring.completion_required_binding_digests
+                ),
+                "active_result_slot_count": len(
+                    inventory.wiring.active_result_slot_binding_digests
+                ),
+                "quarantined_result_slot_count": (
+                    len(inventory.wiring.quarantined_result_slot_binding_digests)
+                    + len(
+                        inventory.resources.unpublished_quarantined_result_slot_binding_digests
+                    )
+                ),
+                "dflash_active_transfer_count": (
+                    inventory.resources.dflash_active_transfer_count
+                ),
+                "dflash_quarantined_transfer_count": (
+                    inventory.resources.dflash_quarantined_transfer_count
+                ),
+                "dflash_active_row_count": (
+                    inventory.resources.dflash_active_row_count
+                ),
+                "dflash_quarantined_row_count": (
+                    inventory.resources.dflash_quarantined_row_count
+                ),
+                "dflash_unowned_native_handle_count": (
+                    inventory.resources.dflash_unowned_native_handle_count
+                ),
+                "unpublished_quarantine_count": len(
+                    inventory.resources.unpublished_quarantined_binding_digests
+                ),
+            }
+
+        decode_serving = self._terminal_decode_serving
+        if decode_serving is None:
+            return None
+        inventory = decode_serving.inventory()
+        dflash_active_row_count, dflash_quarantined_row_count = (
+            self._terminal_decode_dflash_row_counts()
+        )
+        active = tuple(
+            sorted(
+                set(inventory.active_binding_digests)
+                | set(inventory.actor.active_bindings)
+                | set(inventory.scheduler_consumer.active_binding_digests)
+                | set(inventory.runtime.quarantined_binding_digests)
+            )
+        )
+        quarantined = tuple(
+            sorted(
+                set(inventory.actor.quarantined_bindings)
+                | set(inventory.runtime.quarantined_binding_digests)
+                | set(inventory.scheduler_consumer.quarantined_binding_digests)
+            )
+        )
+        return {
+            "role": "decode",
+            "active_count": len(active),
+            "active_binding_digests": [
+                digest.hex() for digest in active
+            ],
+            "quarantine_count": len(quarantined),
+            "quarantined_binding_digests": [
+                digest.hex() for digest in quarantined
+            ],
+            "retained_resource_count": (
+                inventory.retained_resource_count
+                + dflash_active_row_count
+                + dflash_quarantined_row_count
+            ),
+            "pending_owner_action_count": inventory.runtime.owner.pending_action_count,
+            "pending_runtime_action_count": inventory.runtime.consumer_pending_count,
+            "pending_scheduler_action_count": (
+                inventory.runtime.scheduler_pending_count
+            ),
+            "fatal_reason": inventory.runtime.fatal_reason,
+            "owner_dead": inventory.owner_dead_marked,
+            "output_reactor_alive": inventory.runtime.output_reactor_alive,
+            "grouped_nixl_quarantined_transfer_count": 0,
+            "grouped_nixl_unowned_handle_count": 0,
+            "completion_required_count": 0,
+            "active_result_slot_count": 0,
+            "quarantined_result_slot_count": 0,
+            # The boundary row rides the request's existing packed scatter. It
+            # introduces no independent decode transfer or native-handle owner.
+            "dflash_active_transfer_count": 0,
+            "dflash_quarantined_transfer_count": 0,
+            "dflash_active_row_count": dflash_active_row_count,
+            "dflash_quarantined_row_count": dflash_quarantined_row_count,
+            "dflash_unowned_native_handle_count": 0,
+            "unpublished_quarantine_count": 0,
+        }
+
+    def enqueue_terminal_dflash_source_projection(
+        self,
+        source: DFlashBoundaryPrefillSource,
+        boundary_token_id: torch.Tensor,
+        gateway_result_slot: TerminalGatewayResultSlot,
+        *,
+        stream: torch.cuda.Stream,
+        producer_event: torch.cuda.Event,
+    ) -> None:
+        """Stage the canonical boundary token and gateway result atomically.
+
+        :param source: Active canonical source row.
+        :param boundary_token_id: One device-resident sampled token.
+        :param gateway_result_slot: Stable pinned gateway result row.
+        :param stream: Exact model-producing CUDA stream.
+        :param producer_event: Event recorded after both copies.
+        """
+
+        if type(source) is not DFlashBoundaryPrefillSource:
+            raise TypeError("source must be DFlashBoundaryPrefillSource")
+        owner = self._terminal_dflash_source_owner
+        if owner is None:
+            raise RuntimeError("terminal DFlash source owner is unavailable")
+        owner.enqueue_source_projection(
+            source.lease,
+            boundary_token_id,
+            gateway_result_slot,
+            stream=stream,
+            producer_event=producer_event,
+        )
 
     def supports_packed_decode_request_transactions(self) -> bool:
         """Return whether every decode-side packed request actor is live.
@@ -3680,7 +4222,7 @@ class NixlKVManager(CommonKVManager):
         self,
         *,
         transaction: PackedDecodeRequestTransaction,
-        adopt_request: Callable[[object], None],
+        adopt_request: Callable[[object], TerminalDFlashDecodeAdoption],
         finalize_request: Callable[[object], None],
         cancel_request: Callable[[object], None],
         quarantine_request: Callable[[object, str], None],

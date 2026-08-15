@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 import threading
 import traceback
@@ -16,6 +17,7 @@ from sglang.srt.disaggregation.terminal_progress.grouped_nixl_owner import (
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
+    TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalLifecycleRegistration,
@@ -54,6 +56,14 @@ from sglang.srt.disaggregation.terminal_progress.wire import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class PackedTerminalSourceCancellationDisposition(enum.StrEnum):
+    """Scheduler cancellation disposition for one published source lifecycle."""
+
+    COMPLETION_REQUIRED = "completion_required"
+    ALREADY_RECORDED = "already_recorded"
+    TOO_LATE_FOR_ROLLBACK = "too_late_for_rollback"
 
 
 @runtime_checkable
@@ -209,7 +219,7 @@ class PackedTerminalSourceSubmission:
     """
 
     identity: PackedTerminalSourceIdentityPlan
-    output_projection: FrozenTerminalGatewayOutputProjection
+    output_projection: FrozenTerminalGatewayOutputProjection | None
     producer_event_generation: bytes
     transport_submission: object
 
@@ -218,13 +228,14 @@ class PackedTerminalSourceSubmission:
 
         if type(self.identity) is not PackedTerminalSourceIdentityPlan:
             raise TypeError("identity must be PackedTerminalSourceIdentityPlan")
-        if not isinstance(
+        canonical_rank = self.identity.local_binding.owner.tp_rank == 0
+        if canonical_rank and not isinstance(
             self.output_projection,
             FrozenTerminalGatewayOutputProjection,
         ):
-            raise TypeError(
-                "output_projection must inherit FrozenTerminalGatewayOutputProjection"
-            )
+            raise TypeError("canonical source requires an output projection")
+        if not canonical_rank and self.output_projection is not None:
+            raise ValueError("noncanonical source cannot own an output projection")
         if type(self.producer_event_generation) is not bytes:
             raise TypeError("producer_event_generation must be bytes")
         if len(self.producer_event_generation) != 16:
@@ -263,11 +274,19 @@ class PackedTerminalSourceInventory:
 
     :ivar active_binding_digests: Live identities retaining source records.
     :ivar quarantined_binding_digests: Fail-closed publication identities.
+    :ivar completion_required_binding_digests: Client-cancelled identities whose
+        already-published terminal protocol must still complete.
+    :ivar active_result_slot_binding_digests: Canonical live pinned result slots.
+    :ivar quarantined_result_slot_binding_digests: Pinned slots retained under
+        request quarantine.
     :ivar pending_publication_action_count: Native actions held during publication.
     """
 
     active_binding_digests: tuple[bytes, ...]
     quarantined_binding_digests: tuple[bytes, ...]
+    completion_required_binding_digests: tuple[bytes, ...]
+    active_result_slot_binding_digests: tuple[bytes, ...]
+    quarantined_result_slot_binding_digests: tuple[bytes, ...]
     pending_publication_action_count: int
 
     def __post_init__(self) -> None:
@@ -276,6 +295,9 @@ class PackedTerminalSourceInventory:
         identity_sets = (
             self.active_binding_digests,
             self.quarantined_binding_digests,
+            self.completion_required_binding_digests,
+            self.active_result_slot_binding_digests,
+            self.quarantined_result_slot_binding_digests,
         )
         if any(type(values) is not tuple for values in identity_sets):
             raise TypeError("inventory identity collections must be tuples")
@@ -291,6 +313,18 @@ class PackedTerminalSourceInventory:
             self.active_binding_digests
         ):
             raise ValueError("quarantined identities must remain active")
+        if not set(self.completion_required_binding_digests).issubset(
+            self.active_binding_digests
+        ):
+            raise ValueError("completion-required identities must remain active")
+        if not set(self.active_result_slot_binding_digests).issubset(
+            self.active_binding_digests
+        ):
+            raise ValueError("active result slots must remain source-active")
+        if not set(self.quarantined_result_slot_binding_digests).issubset(
+            self.active_result_slot_binding_digests
+        ):
+            raise ValueError("quarantined result slots must remain slot-active")
         if (
             type(self.pending_publication_action_count) is not int
             or self.pending_publication_action_count < 0
@@ -313,6 +347,7 @@ class _SourceRecord:
     publication_terminal: bool = False
     publication_failed: bool = False
     quarantined: bool = False
+    cancellation_reason: str | None = None
     claimed_action_ids: set[int] = dataclasses.field(default_factory=set)
 
 
@@ -513,6 +548,46 @@ class PackedTerminalSourceWiring:
             binding_digest,
             NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
         )
+
+    def cancel_request(
+        self,
+        binding: TerminalRequestBinding,
+        reason: str,
+    ) -> PackedTerminalSourceCancellationDisposition:
+        """Record client cancellation without revoking published ownership.
+
+        The scheduler exposes a request through its terminal registry only
+        after the same scheduler-thread call has published PREPARE. Rollback is
+        therefore no longer legal when this method can be reached. Recording
+        intent leaves every native action and transfer authority intact so the
+        lifecycle retires through its ordinary reclaim/publication join. The
+        gateway independently drops output for a disconnected client.
+
+        :param binding: Exact scheduler-retained source generation.
+        :param reason: Stable client-cancellation reason.
+        :returns: Whether completion was newly required, already recorded, or
+            request-global readiness had already committed.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be a TerminalRequestBinding")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        record = self._record(binding.digest)
+        if record.submission.identity.local_binding != binding:
+            raise RuntimeError("source cancellation targets another binding")
+        with self._lock:
+            current = self._records.get(binding.digest)
+            if current is not record:
+                raise RuntimeError("source registry changed during cancellation")
+            if current.cancellation_reason is not None:
+                return PackedTerminalSourceCancellationDisposition.ALREADY_RECORDED
+            if current.request_ready_receipt is not None:
+                return (
+                    PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
+                )
+            current.cancellation_reason = reason
+        return PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
 
     def grouped_native_terminal(self, result: GroupedNixlTerminalResult) -> None:
         """Commit one request-level grouped NIXL terminal result.
@@ -801,13 +876,16 @@ class PackedTerminalSourceWiring:
             raise error
         submission = record.submission
         identity = submission.identity
+        output_projection = submission.output_projection
+        if output_projection is None:
+            raise RuntimeError("canonical source output projection disappeared")
         try:
             publication = FrozenTerminalGatewayPublication(
                 identity=identity.publication_identity,
                 canonical_binding=identity.local_binding,
                 source_bindings=identity.source_bindings,
                 request_ready_receipt=ready_receipt,
-                output_projection=submission.output_projection,
+                output_projection=output_projection,
                 enqueued_ns=self._clock_ns(),
             )
             with self._lock:
@@ -926,10 +1004,15 @@ class PackedTerminalSourceWiring:
     def consume_terminal_action(
         self,
         action: NativeTerminalOwnerAction,
+        retire_submission: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
     ) -> PackedTerminalSourceSubmission | None:
-        """Consume native retirement or retain a quarantined source identity.
+        """Commit retirement side effects or retain quarantined authority.
 
         :param action: Exact ``REQUEST_RETIRED`` or ``REQUEST_QUARANTINED`` action.
+        :param retire_submission: Transactional external retirement boundary run
+            before native acknowledgement and wiring-record deletion.
         :returns: Retired immutable submission, otherwise ``None`` for quarantine.
         """
 
@@ -940,6 +1023,8 @@ class PackedTerminalSourceWiring:
             NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         ):
             raise ValueError("source terminal consumption requires a terminal action")
+        if not callable(retire_submission):
+            raise TypeError("retire_submission must be callable")
         record = self._claim_action(action, action.kind)
         if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
             with self._lock:
@@ -954,6 +1039,7 @@ class PackedTerminalSourceWiring:
                 or record.publication_action is not None
             ):
                 raise RuntimeError("native retirement preceded joined side effects")
+        retire_submission(record.submission, action)
         self._runtime.acknowledge_consumed_action(action)
         with self._lock:
             current = self._records.get(action.binding.digest)
@@ -983,9 +1069,34 @@ class PackedTerminalSourceWiring:
                 record.publication_action is not None
                 for record in self._records.values()
             )
+            completion_required = tuple(
+                sorted(
+                    digest
+                    for digest, record in self._records.items()
+                    if record.cancellation_reason is not None
+                )
+            )
+            active_result_slots = tuple(
+                sorted(
+                    digest
+                    for digest, record in self._records.items()
+                    if record.submission.output_projection is not None
+                )
+            )
+            quarantined_result_slots = tuple(
+                sorted(
+                    digest
+                    for digest, record in self._records.items()
+                    if record.quarantined
+                    and record.submission.output_projection is not None
+                )
+            )
         return PackedTerminalSourceInventory(
             active_binding_digests=active,
             quarantined_binding_digests=quarantined,
+            completion_required_binding_digests=completion_required,
+            active_result_slot_binding_digests=active_result_slots,
+            quarantined_result_slot_binding_digests=quarantined_result_slots,
             pending_publication_action_count=pending_publication_count,
         )
 

@@ -8,6 +8,9 @@ from typing import Protocol, runtime_checkable
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalRequestBinding,
@@ -51,7 +54,7 @@ class TerminalDecodeAdoptionWiring(Protocol):
     def consume_adoption_action(
         self,
         action: NativeTerminalOwnerAction,
-        adopt_request: Callable[[object], None],
+        adopt_request: Callable[[object], TerminalDFlashDecodeAdoption],
         finalize_request: Callable[[object], None],
     ) -> object:
         """Consume allocation and metadata authority around scheduler callbacks.
@@ -112,7 +115,7 @@ class PackedTerminalDecodeSchedulerRegistration:
     source_plan: PackedTerminalSourcePlan
     transaction: PackedDecodeRequestTransaction
     request_owner: object
-    adopt_request: Callable[[object], None]
+    adopt_request: Callable[[object], TerminalDFlashDecodeAdoption]
     finalize_request: Callable[[object], None]
     cancel_request: Callable[[object], None]
     quarantine_request: Callable[[object, str], None]
@@ -356,16 +359,25 @@ class PackedTerminalDecodeSchedulerConsumer:
         record.consuming = True
         registration = record.registration
 
-        def adopt_request(owner: object) -> None:
-            """Install the exact retained request while metadata stays pinned."""
+        def adopt_request(owner: object) -> TerminalDFlashDecodeAdoption:
+            """Install the retained request and return exact row-copy authority.
+
+            :param owner: Exact scheduler request retained by the transaction.
+            :returns: Authenticated DFlash row-copy completion authority.
+            """
 
             self._require_scheduler_thread()
             if owner is not registration.request_owner:
                 raise RuntimeError("decode adoption returned another request owner")
             if record.scheduler_adopted:
                 raise RuntimeError("decode scheduler request was adopted twice")
-            registration.adopt_request(owner)
+            adoption = registration.adopt_request(owner)
+            if type(adoption) is not TerminalDFlashDecodeAdoption:
+                raise RuntimeError(
+                    "decode scheduler adoption returned invalid DFlash authority"
+                )
             record.scheduler_adopted = True
+            return adoption
 
         def finalize_request(owner: object) -> None:
             """Finish scheduler state before local-ready publication."""

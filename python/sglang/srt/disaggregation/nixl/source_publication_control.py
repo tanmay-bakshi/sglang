@@ -621,6 +621,29 @@ class TerminalSourcePublicationControl:
             self._notify_process_fatal(fatal_reason)
             raise TerminalSourcePublicationControlError(fatal_reason)
 
+    def require_retirable_binding(self, binding: TerminalRequestBinding) -> None:
+        """Validate publication retirement without mutating route authority.
+
+        :param binding: Exact source binding at the joined retirement boundary.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        digest = binding.digest
+        with self._lock:
+            self._require_open_locked()
+            if self._active.get(digest) != binding:
+                raise TerminalSourcePublicationControlError(
+                    "source publication binding is not active"
+                )
+            if digest not in self._terminal:
+                raise TerminalSourcePublicationControlError(
+                    "source publication binding retired before terminal delivery"
+                )
+        importer = self._importer
+        if importer is not None:
+            importer.require_active_binding(binding)
+
     def inventory(self) -> TerminalSourcePublicationControlInventory:
         """Return route health and lifecycle retention.
 

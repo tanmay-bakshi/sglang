@@ -14,6 +14,9 @@ from sglang.srt.disaggregation.terminal_progress.coordinator import (
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerRegistration,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
 )
@@ -248,7 +251,7 @@ def build_packed_terminal_decode_request_authority(
     *,
     startup_binding: TerminalStartupRankBinding,
     transaction: PackedDecodeRequestTransaction,
-    adopt_request: Callable[[object], None],
+    adopt_request: Callable[[object], TerminalDFlashDecodeAdoption],
     finalize_request: Callable[[object], None],
     cancel_request: Callable[[object], None],
     quarantine_request: Callable[[object, str], None],

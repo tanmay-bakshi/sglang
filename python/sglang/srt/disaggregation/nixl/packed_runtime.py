@@ -1627,6 +1627,41 @@ class PackedPrefillRuntime:
             del self._records[key]
         return record.submission
 
+    def require_terminal_owner_retirement(
+        self,
+        action: NativeTerminalOwnerAction,
+        expected_submission: PackedPrefillSubmission,
+    ) -> None:
+        """Validate actor retirement without mutating retained ownership.
+
+        :param action: Exact joined ``REQUEST_RETIRED`` authority.
+        :param expected_submission: Submission the manager intends to retire.
+        """
+
+        if type(expected_submission) is not PackedPrefillSubmission:
+            raise TypeError("expected_submission must be PackedPrefillSubmission")
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        with self._lock:
+            if record.submission is not expected_submission:
+                raise RuntimeError("actor retirement targets another submission")
+            if record.terminal_quarantined:
+                raise RuntimeError("quarantined terminal source cannot retire")
+            if not record.terminal_ack_sent:
+                raise RuntimeError("terminal source retirement preceded ACK")
+            if (
+                record.main_handle is not None
+                or record.auxiliary_handle is not None
+                or record.main_lane is not None
+            ):
+                raise RuntimeError(
+                    "terminal source retirement retains native resources"
+                )
+            if self._records.get(record.submission.plan.key) is not record:
+                raise RuntimeError("packed source registry changed before retirement")
+
     def terminal_owner_inventory(self) -> PackedPrefillOwnerInventory:
         """Return exact actor-owned terminal source resource identities.
 

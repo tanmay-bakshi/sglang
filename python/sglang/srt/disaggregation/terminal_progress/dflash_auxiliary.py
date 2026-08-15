@@ -1419,6 +1419,39 @@ class DFlashBoundarySourceTransportOwner:
 
         return self._pool.lease_row(self._lifecycle_authority)
 
+    def cancel_unpublished_source_row(
+        self,
+        lease: DFlashBoundaryRowLease,
+    ) -> None:
+        """Release one row whose terminal lifecycle was never published.
+
+        This is intentionally distinct from transfer teardown. Once a source
+        transfer is posted, only native ACK authority may release its row.
+
+        :param lease: Exact active lease which never crossed publication.
+        """
+
+        if type(lease) is not DFlashBoundaryRowLease:
+            raise TypeError("lease must be DFlashBoundaryRowLease")
+        lease.release(self._lifecycle_authority)
+
+    def quarantine_unpublished_source_row(
+        self,
+        lease: DFlashBoundaryRowLease,
+    ) -> None:
+        """Retain a CUDA-touched row lacking published lifecycle authority.
+
+        A row may reach this boundary only while its process is entering
+        fail-closed teardown. Releasing it would race asynchronous producer
+        work, while manufacturing lifecycle completion would be unsound.
+
+        :param lease: Exact active lease with ambiguous producer completion.
+        """
+
+        if type(lease) is not DFlashBoundaryRowLease:
+            raise TypeError("lease must be DFlashBoundaryRowLease")
+        lease.quarantine(self._lifecycle_authority)
+
     def enqueue_source_projection(
         self,
         lease: DFlashBoundaryRowLease,
@@ -1662,6 +1695,14 @@ class DFlashBoundarySourceTransportOwner:
                 ),
                 unowned_native_handle_count=len(self._unowned_native_handles),
             )
+
+    def source_row_inventory(self) -> tuple[int, int, int]:
+        """Return free, active, and quarantined device-row counts.
+
+        :returns: Conservation-complete source row population.
+        """
+
+        return self._pool.inventory()
 
     def _require_record(
         self,

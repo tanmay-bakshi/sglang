@@ -51,10 +51,12 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
 from sglang.srt.disaggregation.terminal_progress.source_serving import (
+    PackedTerminalSourceResourceInventory,
     PackedTerminalSourceServing,
     PackedTerminalSourceWork,
 )
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceMetric,
     PackedTerminalSourceSubmission,
 )
@@ -371,7 +373,11 @@ def _submission(
 
     return PackedTerminalSourceSubmission(
         identity=identity,
-        output_projection=_Projection(payload=b"output"),
+        output_projection=(
+            _Projection(payload=b"output")
+            if identity.local_binding.owner.tp_rank == 0
+            else None
+        ),
         producer_event_generation=b"e" * 16,
         transport_submission=("packed", identity.local_binding.digest),
     )
@@ -398,6 +404,40 @@ def _serving(
     metrics = _Metrics()
     work_labels: list[str] = []
     fatal_inventories: list[object] = []
+
+    def resource_inventory() -> PackedTerminalSourceResourceInventory:
+        """Return exact-zero external ownership for the isolated fixture.
+
+        :returns: Empty actor, DFlash, and quarantine inventory.
+        """
+
+        return PackedTerminalSourceResourceInventory(
+            actor_active_binding_digests=(),
+            actor_quarantined_binding_digests=(),
+            actor_waiting_for_ready_binding_digests=(),
+            actor_main_handle_binding_digests=(),
+            actor_auxiliary_handle_binding_digests=(),
+            actor_lane_binding_digests=(),
+            request_ready_import_binding_digests=(),
+            publication_control_active_binding_digests=(),
+            publication_control_terminal_binding_digests=(),
+            source_transfer_info_room_ids=(),
+            source_prefix_length_room_ids=(),
+            source_prefetched_room_ids=(),
+            source_prefetch_requested_room_ids=(),
+            dflash_active_transfer_count=0,
+            dflash_posted_transfer_count=0,
+            dflash_settled_transfer_count=0,
+            dflash_released_transfer_count=0,
+            dflash_quarantined_transfer_count=0,
+            dflash_unowned_native_handle_count=0,
+            dflash_free_row_count=0,
+            dflash_active_row_count=0,
+            dflash_quarantined_row_count=0,
+            unpublished_quarantined_binding_digests=(),
+            unpublished_quarantined_result_slot_binding_digests=(),
+        )
+
     serving = PackedTerminalSourceServing(
         runtime=runtime,
         local_identity=identity.local_binding.owner,
@@ -417,7 +457,8 @@ def _serving(
         retire_native_producers=lambda: runtime._owner.retire_python_producer(
             _NATIVE_PRODUCER_ID
         ),
-        retire_submission=lambda submission: None,
+        resource_inventory=resource_inventory,
+        retire_submission=lambda submission, action: None,
     )
     return serving, runtime, publisher, metrics, work_labels, fatal_inventories
 
@@ -468,6 +509,27 @@ def test_composition_binds_both_scheduler_owners_before_lifecycle() -> None:
         serving.abort_and_close()
 
 
+def test_retained_resource_count_covers_native_subscription_authority() -> None:
+    """A native subscription leak keeps the clean-close scalar nonzero."""
+
+    serving, _, _, _, _, _ = _serving(_identity())
+    serving.start()
+    try:
+        inventory = serving.inventory()
+        assert inventory.retained_resource_count == 0
+
+        native = dataclasses.replace(
+            inventory.grouped_nixl.native,
+            active_channel_subscriptions=1,
+        )
+        grouped_nixl = dataclasses.replace(inventory.grouped_nixl, native=native)
+        retained = dataclasses.replace(inventory, grouped_nixl=grouped_nixl)
+
+        assert retained.retained_resource_count == 1
+    finally:
+        serving.abort_and_close()
+
+
 def test_bind_failure_pairs_unpublished_scheduler_cancellation() -> None:
     """A pre-publication source mismatch leaves neither scheduler registry live."""
 
@@ -508,6 +570,13 @@ def test_full_source_composition_retires_exactly_once(
         serving.wiring.producer_completed(digest)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
+        assert serving.cancel_submission(identity.local_binding, "client disconnected") is (
+            PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
+        )
+        assert (
+            serving.inventory().wiring.completion_required_binding_digests
+            == (digest,)
+        )
         samples = tuple(
             sample
             for record in caplog.records
@@ -572,6 +641,7 @@ def test_full_source_composition_retires_exactly_once(
         serving.publisher_result(result)
         _pump(serving, runtime)
         assert serving.inventory().wiring.active_binding_digests == ()
+        assert serving.inventory().wiring.completion_required_binding_digests == ()
 
         serving.stop_admission_and_retire_producers()
         serving.close_clean(_WAIT_SECONDS)

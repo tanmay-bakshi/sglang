@@ -1338,18 +1338,22 @@ class Scheduler(
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=disagg_hidden_size,
-                hidden_states_dtype=disagg_hidden_states_dtype,
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
-            )
+            terminal_source = self.server_args.pd_terminal_local_membership is not None
+            if terminal_source:
+                self.req_to_metadata_buffer_idx_allocator = None
+                self.disagg_metadata_buffers = None
+            else:
+                buffer_size = self.max_running_requests * 2
+                self.req_to_metadata_buffer_idx_allocator = (
+                    ReqToMetadataIdxAllocator(buffer_size)
+                )
+                self.disagg_metadata_buffers = MetadataBuffers(
+                    buffer_size,
+                    hidden_size=disagg_hidden_size,
+                    hidden_states_dtype=disagg_hidden_states_dtype,
+                    custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                    output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1371,6 +1375,10 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             self.disagg_prefill_deferred_producer_events: dict[
                 str, torch.cuda.Event
+            ] = {}
+            self.disagg_prefill_terminal_requests: dict[str, Req] = {}
+            self.disagg_prefill_terminal_bindings: dict[
+                str, TerminalRequestBinding
             ] = {}
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1761,6 +1769,72 @@ class Scheduler(
         if manager.terminal_startup_binding is None:
             return None
         return manager
+
+    def packed_terminal_health_by_tp_rank(
+        self,
+    ) -> list[dict[str, object]] | None:
+        """Gather terminal lifecycle health from every local TP scheduler.
+
+        ``GetInternalStateReq`` is broadcast to every TP rank before this
+        method runs. The existing CPU process group can therefore gather the
+        rank-local owner inventories without adding a collective to inference
+        or completion progress.
+
+        :returns: Ordered rank-tagged health entries, or ``None`` outside a
+            terminal deployment.
+        """
+
+        if self.server_args.pd_terminal_local_membership is None:
+            return None
+        local_error: str | None = None
+        try:
+            manager = self.terminal_nixl_manager()
+            local_health = (
+                None if manager is None else manager.packed_terminal_health()
+            )
+        except Exception:  # noqa: BLE001
+            local_health = None
+            local_error = get_exception_traceback()
+        local_entry: dict[str, object] = {
+            "tp_rank": self.ps.tp_rank,
+            "packed_terminal_health": local_health,
+            "error": local_error,
+        }
+        gathered = (
+            [local_entry]
+            if self.ps.tp_size == 1
+            else self.tp_group.all_gather_object(local_entry)
+        )
+        if len(gathered) != self.ps.tp_size:
+            raise RuntimeError("terminal health TP-rank population is incomplete")
+
+        rank_health: list[dict[str, object]] = []
+        for expected_rank, raw_entry in enumerate(gathered):
+            if type(raw_entry) is not dict or set(raw_entry) != {
+                "tp_rank",
+                "packed_terminal_health",
+                "error",
+            }:
+                raise RuntimeError("terminal health TP-rank entry is malformed")
+            if raw_entry["tp_rank"] != expected_rank:
+                raise RuntimeError("terminal health TP-rank order differs")
+            rank_error = raw_entry["error"]
+            if rank_error is not None:
+                logger.error(
+                    "Terminal health projection failed on TP rank %d:\n%s",
+                    expected_rank,
+                    rank_error,
+                )
+                raise RuntimeError("terminal health failed on one TP rank")
+            if type(raw_entry["packed_terminal_health"]) is not dict:
+                raise RuntimeError("terminal health is unavailable on one TP rank")
+            rank_health.append(
+                {
+                    "tp_rank": expected_rank,
+                    "packed_terminal_health": raw_entry["packed_terminal_health"],
+                }
+            )
+        return rank_health
 
     def close_terminal_runtime(self, *, process_fatal: bool) -> None:
         """Close the manager-owned runtime before scheduler resources vanish.
@@ -2555,7 +2629,9 @@ class Scheduler(
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_inflight_queue=(
+                self.disagg_prefill_live_transfer_requests
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
@@ -4532,6 +4608,7 @@ class Scheduler(
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_terminal_requests) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -4539,7 +4616,7 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 prealloc_queue = self.disagg_decode_prealloc_queue
                 idle &= not prealloc_queue.has_live_preallocated_cohorts()
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                idle &= len(self.disagg_decode_transfer_queue.live_requests()) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
@@ -4717,6 +4794,9 @@ class Scheduler(
             ret["disaggregation_decode_poll_progress"] = (
                 self.get_decode_poll_progress_stats()
             )
+        packed_terminal_health = self.packed_terminal_health_by_tp_rank()
+        if packed_terminal_health is not None:
+            ret["packed_terminal_health_by_tp_rank"] = packed_terminal_health
 
         if self.server_args.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -4951,18 +5031,30 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
+            terminal_abort_count = self.abort_terminal_prefill_requests(
+                recv_req.rid,
+                recv_req.abort_all,
+            )
+            if terminal_abort_count > 0:
+                logger.debug(
+                    "Abort retained %d owner-managed request(s) through completion",
+                    terminal_abort_count,
+                )
+
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    if not decode_req.record_terminal_cancellation():
+                        decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
+            for decode_req in self.disagg_decode_transfer_queue.live_requests():
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+                    if not decode_req.record_terminal_cancellation():
+                        decode_req.kv_receiver.abort()
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:

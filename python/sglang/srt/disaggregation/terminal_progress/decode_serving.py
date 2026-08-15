@@ -238,6 +238,55 @@ class PackedTerminalDecodeServingInventory:
         if type(self.native_producers_retired) is not bool:
             raise TypeError("native_producers_retired must be bool")
 
+    @property
+    def retained_resource_count(self) -> int:
+        """Count every resource population consulted by clean closure.
+
+        The count may represent one request in several ownership domains. Zero
+        is exact: it is equivalent to no retained decode lifecycle authority.
+
+        :returns: Conservative retained resource population.
+        """
+
+        runtime = self.runtime
+        owner = runtime.owner
+        runtime_inboxes = (
+            runtime.scheduler,
+            runtime.coordinator,
+            runtime.lifecycle,
+            runtime.source_work,
+            runtime.decode_work,
+            runtime.publisher,
+        )
+        return sum(
+            (
+                owner.queued_input_count,
+                owner.queued_output_count,
+                owner.queued_fatal_output_count,
+                owner.pending_action_count,
+                owner.active_source_count,
+                owner.active_decode_count,
+                owner.quarantined_count,
+                owner.armed_deadline_count,
+                int(owner.output_drain_active),
+                runtime.scheduler_live_count,
+                runtime.scheduler_pending_count,
+                runtime.consumer_pending_count,
+                len(runtime.quarantined_binding_digests),
+                int(runtime.fatal_reason is not None),
+                sum(inbox.queued_count for inbox in runtime_inboxes),
+                len(self.actor.active_bindings),
+                len(self.actor.quarantined_bindings),
+                self.actor.in_flight_scatter_count,
+                self.actor.pending_adoption_count,
+                len(self.scheduler_consumer.active_binding_digests),
+                self.scheduler_serving.inbox.live_count,
+                len(self.scheduler_serving.retained_action_ids),
+                len(self.active_binding_digests),
+                len(self.active_coordinator_manifest_digests),
+            )
+        )
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _DecodeServingRequest:
@@ -1240,19 +1289,7 @@ class PackedTerminalDecodeServing:
         :returns: Whether exact-zero clean close must be rejected.
         """
 
-        runtime = inventory.runtime
-        return (
-            runtime.scheduler_live_count != 0
-            or runtime.scheduler_pending_count != 0
-            or runtime.consumer_pending_count != 0
-            or len(runtime.quarantined_binding_digests) != 0
-            or len(inventory.actor.active_bindings) != 0
-            or len(inventory.actor.quarantined_bindings) != 0
-            or len(inventory.scheduler_consumer.active_binding_digests) != 0
-            or inventory.scheduler_serving.inbox.live_count != 0
-            or len(inventory.active_binding_digests) != 0
-            or len(inventory.active_coordinator_manifest_digests) != 0
-        )
+        return inventory.retained_resource_count != 0
 
     @staticmethod
     def _validate_coordinator_authority(

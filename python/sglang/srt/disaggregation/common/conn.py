@@ -61,6 +61,24 @@ if TYPE_CHECKING:
     )
     from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
         DFlashBoundaryDeviceRowPool,
+        DFlashBoundaryPrefillSource,
+    )
+    from sglang.srt.disaggregation.common.packed_staging_protocol import (
+        PackedDFlashBoundaryCounters,
+    )
+    from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPlan
+    from sglang.srt.disaggregation.terminal_progress.source_plan import (
+        PackedTerminalSourceIdentityPlan,
+    )
+    from sglang.srt.disaggregation.terminal_progress.output_projection import (
+        TerminalGatewayResultSlot,
+    )
+    from sglang.srt.disaggregation.terminal_progress.identity import (
+        TerminalRequestBinding,
+    )
+    from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+        PackedTerminalSourceCancellationDisposition,
+        PackedTerminalSourceSubmission,
     )
 
 logger = logging.getLogger(__name__)
@@ -351,6 +369,129 @@ class CommonKVManager(BaseKVManager):
         """
 
         return None
+
+    def uses_terminal_source_publication(self) -> bool:
+        """Return whether source requests use owner-driven publication.
+
+        :returns: ``False`` outside an activated terminal source cohort.
+        """
+
+        return False
+
+    def terminal_source_is_canonical(self) -> bool:
+        """Return whether this manager owns source-rank-zero publication.
+
+        :returns: ``False`` outside an activated terminal source cohort.
+        """
+
+        return False
+
+    def lease_terminal_dflash_source(
+        self,
+        counters: "PackedDFlashBoundaryCounters",
+    ) -> "DFlashBoundaryPrefillSource":
+        """Lease the canonical terminal DFlash boundary row.
+
+        :param counters: Immutable scheduler-owned DFlash scalar counters.
+        :returns: Active source row and frozen counters.
+        """
+
+        del counters
+        raise RuntimeError("terminal DFlash source ownership is unavailable")
+
+    def cancel_unpublished_terminal_dflash_source(
+        self,
+        source: "DFlashBoundaryPrefillSource",
+    ) -> None:
+        """Release one terminal DFlash source that never published.
+
+        :param source: Exact unpublished source lease.
+        """
+
+        del source
+        raise RuntimeError("terminal DFlash source ownership is unavailable")
+
+    def quarantine_unpublished_terminal_source_submission(
+        self,
+        submission: "PackedTerminalSourceSubmission",
+    ) -> None:
+        """Retain a CUDA-touched submission outside lifecycle ownership.
+
+        :param submission: Exact transport and output projection to quarantine.
+        """
+
+        del submission
+        raise RuntimeError("terminal source quarantine ownership is unavailable")
+
+    def enqueue_terminal_dflash_source_projection(
+        self,
+        source: "DFlashBoundaryPrefillSource",
+        boundary_token_id: torch.Tensor,
+        gateway_result_slot: "TerminalGatewayResultSlot",
+        *,
+        stream: torch.cuda.Stream,
+        producer_event: torch.cuda.Event,
+    ) -> None:
+        """Stage one producer-complete boundary result on its CUDA stream.
+
+        :param source: Active canonical source row.
+        :param boundary_token_id: One device-resident sampled token.
+        :param gateway_result_slot: Stable pinned gateway result row.
+        :param stream: Exact model-producing CUDA stream.
+        :param producer_event: Event recorded after both copies.
+        """
+
+        del source, boundary_token_id, gateway_result_slot, stream, producer_event
+        raise RuntimeError("terminal DFlash source ownership is unavailable")
+
+    def build_terminal_source_launch_plan(
+        self,
+        *,
+        room: int,
+        source_main_pages: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+        dflash_source: "DFlashBoundaryPrefillSource | None",
+    ) -> tuple["PackedTerminalSourceIdentityPlan", "PackedPrefillLaunchPlan"]:
+        """Freeze one terminal source transport before model submission.
+
+        :param room: Decoder-minted bootstrap room.
+        :param source_main_pages: Complete source KV page projection.
+        :param state_indices: Complete source state projection.
+        :param dflash_source: Canonical DFlash boundary ownership, if local.
+        :returns: Rank-local lifecycle identity and immutable transport plan.
+        """
+
+        del room, source_main_pages, state_indices, dflash_source
+        raise RuntimeError("terminal source launch planning is unavailable")
+
+    def fail_terminal_source_process(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Enter fail-closed drain for an owner-managed source process.
+
+        :param reason: Stable process-fatal failure boundary.
+        :param formatted_traceback: Complete originating traceback, if any.
+        """
+
+        del reason, formatted_traceback
+        raise RuntimeError("terminal source process ownership is unavailable")
+
+    def cancel_terminal_source_request(
+        self,
+        binding: "TerminalRequestBinding",
+        reason: str,
+    ) -> "PackedTerminalSourceCancellationDisposition":
+        """Record source client intent after rollback has become illegal.
+
+        :param binding: Exact scheduler-retained source generation.
+        :param reason: Stable client-cancellation reason.
+        :returns: Completion-required or too-late-for-rollback disposition.
+        """
+
+        del binding, reason
+        raise RuntimeError("terminal source request ownership is unavailable")
 
     def prepared_grant_protocol(self) -> str | None:
         """Return the live prefill actor protocol for prepared decoder grants.

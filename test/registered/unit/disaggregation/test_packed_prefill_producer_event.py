@@ -59,10 +59,14 @@ def _base_scheduler() -> _Scheduler:
     """
 
     scheduler = _Scheduler()
-    manager = SimpleNamespace(kv_transfer_protocol=lambda: "packed-v4")
+    manager = SimpleNamespace(
+        kv_transfer_protocol=lambda: "packed-v4",
+        uses_terminal_source_publication=lambda: False,
+    )
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
         kv_manager=manager,
         pop_bootstrapped=lambda: [],
+        terminal_source=False,
     )
     scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
     scheduler.process_input_requests = lambda _requests: None
@@ -241,7 +245,10 @@ class TestPackedPrefillProducerEvent(unittest.TestCase):
         )
         scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=Mock())
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=[]),
+                uses_terminal_source_publication=lambda: False,
+            )
         )
 
         scheduler.send_kv_chunk(req, last_chunk=True)

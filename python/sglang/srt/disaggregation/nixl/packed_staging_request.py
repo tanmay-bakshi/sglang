@@ -543,6 +543,20 @@ class PackedDecodeRequestTransaction:
                 )
             return self._publication
 
+    @property
+    def terminal_binding_digest(self) -> bytes | None:
+        """Return the exact off-forward completion authority, when installed.
+
+        The binding is immutable once installed. Transfer queues use this
+        identity to hand terminal requests into a structurally separate owner
+        registry instead of the legacy polling queue.
+
+        :returns: Terminal lifecycle digest, otherwise ``None``.
+        """
+
+        with self._lock:
+            return self._terminal_binding_digest
+
     def bind_terminal_owner_authority(
         self,
         encoded_source_plan: bytes,

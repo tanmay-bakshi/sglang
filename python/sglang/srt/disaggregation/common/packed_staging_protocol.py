@@ -171,7 +171,7 @@ def _validate_positive_uint64(value: int, label: str) -> None:
 
 @dataclasses.dataclass(frozen=True, order=True)
 class PackedAuxiliaryDestinationSegment:
-    """One ordered decoder-owned auxiliary metadata destination.
+    """One ordered decoder-owned auxiliary destination segment.
 
     :ivar address: Exact process-local destination address for one metadata row.
     :ivar item_length: Exact byte count copied into that address.
@@ -181,7 +181,7 @@ class PackedAuxiliaryDestinationSegment:
     item_length: int
 
     def __post_init__(self) -> None:
-        """Validate one bounded native DRAM segment."""
+        """Validate one bounded native memory segment."""
 
         _validate_positive_uint64(
             self.address,

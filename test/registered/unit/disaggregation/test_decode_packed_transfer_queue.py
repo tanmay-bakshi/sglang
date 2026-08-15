@@ -184,7 +184,11 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         scheduler.metrics_reporter.enable_metrics = False
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        queue.queue = [decode_req]
+        terminal_digest = decode_req.terminal_binding_digest
+        queue.queue = [] if terminal_digest is not None else [decode_req]
+        queue._terminal_requests = (
+            {terminal_digest: decode_req} if terminal_digest is not None else {}
+        )
         queue.tp1_poll_progress_policy = MagicMock()
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = metadata_allocator
@@ -220,7 +224,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         room_id = 41
         metadata_buffer_index = 2
         allocation_lease = object()
-        packed_transaction = object()
+        packed_transaction = SimpleNamespace(terminal_binding_digest=None)
         receiver = _RecordingReceiver()
         metadata_buffers = _FakeMetadataBuffers(
             size=4,
@@ -327,7 +331,10 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         room_id = 47
         metadata_buffer_index = 1
         allocation_lease = object()
-        transaction = SimpleNamespace(request_owner=None)
+        transaction = SimpleNamespace(
+            request_owner=None,
+            terminal_binding_digest=b"t" * 32,
+        )
         receiver = _RecordingReceiver()
         metadata_buffers = _FakeMetadataBuffers(
             size=4,
@@ -428,7 +435,8 @@ class TestDecodePackedTransferQueue(CustomTestCase):
             metadata_buffers.bootstrap_room[metadata_buffer_index],
             room_id,
         )
-        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.live_requests(), (decode_req,))
         self.assertEqual(queue.scheduler.waiting_queue, [])
         self.assertIs(decode_req.allocation_lease, allocation_lease)
         self.assertIs(decode_req.packed_transaction, transaction)
@@ -440,6 +448,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         queue.finalize_terminal_request(decode_req, transaction)
 
         self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.live_requests(), ())
         self.assertEqual(queue.scheduler.waiting_queue, [decode_req.req])
         self.assertIsNone(decode_req.allocation_lease)
         self.assertIsNone(decode_req.packed_transaction)
@@ -467,7 +476,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
             metadata_buffer_index=metadata_buffer_index,
             receiver=receiver,
             allocation_lease=object(),
-            packed_transaction=object(),
+            packed_transaction=SimpleNamespace(terminal_binding_digest=None),
         )
         decode_req.is_rebootstrap = True
         decode_req.req.pd_rebootstrap_forced_output_id = forced_output_id
@@ -571,7 +580,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    def test_terminal_actor_failure_quarantines_without_legacy_cleanup(
+    def test_scheduler_polled_actor_failure_quarantines_without_legacy_cleanup(
         self,
         mock_prepare_abort: MagicMock,
         mock_release_kv_cache: MagicMock,
@@ -579,7 +588,7 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         room_id = 43
         metadata_buffer_index = 3
         allocation_lease = object()
-        packed_transaction = object()
+        packed_transaction = SimpleNamespace(terminal_binding_digest=None)
         receiver = _RecordingReceiver()
         metadata_buffers = _FakeMetadataBuffers(
             size=4,

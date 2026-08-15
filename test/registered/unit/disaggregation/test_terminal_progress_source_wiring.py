@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceMetric,
     PackedTerminalSourceSubmission,
     PackedTerminalSourceWiring,
@@ -444,7 +445,11 @@ def _submission(
 
     return PackedTerminalSourceSubmission(
         identity=identity,
-        output_projection=_Projection(payload=b"output"),
+        output_projection=(
+            _Projection(payload=b"output")
+            if identity.local_binding.owner.tp_rank == 0
+            else None
+        ),
         producer_event_generation=bytes.fromhex("81" * 16),
         transport_submission=_SubmissionPayload(label="transport"),
     )
@@ -780,6 +785,120 @@ def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
     assert wiring.inventory().active_binding_digests == ()
 
 
+def test_client_cancellation_records_completion_without_native_failure() -> None:
+    """Published ownership completes normally after client intent is recorded."""
+
+    harness = _harness()
+    binding = harness.identity.local_binding
+    operation_count = len(harness.runtime.operations)
+
+    assert harness.wiring.cancel_request(binding, "client disconnected") is (
+        PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
+    )
+    assert len(harness.runtime.operations) == operation_count
+    assert harness.wiring.inventory().completion_required_binding_digests == (
+        binding.digest,
+    )
+    assert harness.wiring.cancel_request(binding, "duplicate disconnect") is (
+        PackedTerminalSourceCancellationDisposition.ALREADY_RECORDED
+    )
+    assert len(harness.runtime.operations) == operation_count
+
+    _ready(harness)
+    assert harness.runtime.operations[-1][3] is (
+        NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY
+    )
+
+
+def test_request_ready_commits_before_late_client_cancellation() -> None:
+    """A ready receipt wins the cutover without manufacturing rollback."""
+
+    harness = _harness()
+    _ready(harness)
+    operation_count = len(harness.runtime.operations)
+
+    assert harness.wiring.cancel_request(
+        harness.identity.local_binding,
+        "client disconnected after ready",
+    ) is PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
+    assert len(harness.runtime.operations) == operation_count
+    assert harness.wiring.inventory().completion_required_binding_digests == ()
+
+
+@pytest.mark.parametrize(
+    "cancellation_stage",
+    ("accepted", "gathered", "outcomes_sent", "ack_sent"),
+)
+def test_completion_required_cancellation_retires_at_every_downstream_phase(
+    cancellation_stage: str,
+) -> None:
+    """Client intent never suppresses the ordinary successful retirement chain."""
+
+    harness = _harness()
+    binding = harness.identity.local_binding
+
+    def cancel_if(stage: str) -> None:
+        """Record cancellation at the selected lifecycle phase.
+
+        :param stage: Current synthetic source phase.
+        """
+
+        if cancellation_stage != stage:
+            return
+        assert harness.wiring.cancel_request(binding, "client disconnected") is (
+            PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
+        )
+
+    cancel_if("accepted")
+    harness.wiring.producer_completed(binding.digest)
+    harness.wiring.consume_gather_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 70),
+        lambda submission, action: None,
+    )
+    cancel_if("gathered")
+    harness.wiring.consume_outcome_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY, 71),
+        lambda submission, action: None,
+    )
+    cancel_if("outcomes_sent")
+    harness.wiring.teardown_received(binding.digest, harness.identity.request_ready_issuer)
+    harness.wiring.consume_ack_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 72),
+        lambda submission, action: None,
+    )
+    cancel_if("ack_sent")
+    _ready(harness)
+    harness.wiring.consume_reclaim_authorized(
+        _action(harness, NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED, 73),
+        lambda submission: None,
+    )
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        74,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(publication_action)
+    assert publication is not None
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=True)
+    )
+    retirement_callbacks: list[PackedTerminalSourceSubmission] = []
+    retired = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        75,
+    )
+    harness.wiring.consume_terminal_action(
+        retired,
+        lambda submission, action: retirement_callbacks.append(submission),
+    )
+
+    assert retirement_callbacks == [harness.submission]
+    inventory = harness.wiring.inventory()
+    assert inventory.active_binding_digests == ()
+    assert inventory.completion_required_binding_digests == ()
+
+
 def test_full_source_success_uses_runtime_completion_surfaces(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -831,7 +950,12 @@ def test_full_source_success_uses_runtime_completion_surfaces(
         NativeTerminalOwnerActionKind.REQUEST_RETIRED,
         6,
     )
-    assert harness.wiring.consume_terminal_action(retired) == harness.submission
+    retired_callbacks: list[PackedTerminalSourceSubmission] = []
+    assert harness.wiring.consume_terminal_action(
+        retired,
+        lambda submission, action: retired_callbacks.append(submission),
+    ) == harness.submission
+    assert retired_callbacks == [harness.submission]
     assert harness.wiring.inventory().active_binding_digests == ()
     assert any(operation[0] == "scheduler" for operation in harness.runtime.operations)
     assert any(operation[0] == "work" for operation in harness.runtime.operations)
@@ -845,6 +969,65 @@ def test_full_source_success_uses_runtime_completion_surfaces(
     assert len(samples) == 1
     assert samples[0].field.value == "gateway_publication_ms"
     assert samples[0].sample_key == "canonical-source-publisher"
+
+
+def test_retirement_side_effect_failure_retains_native_and_wiring_authority() -> None:
+    """External retirement must succeed before action acknowledgement or deletion."""
+
+    harness = _harness()
+    digest = harness.identity.local_binding.digest
+    harness.wiring.producer_completed(digest)
+    harness.wiring.consume_gather_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 10),
+        lambda submission, action: None,
+    )
+    harness.wiring.consume_outcome_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY, 11),
+        lambda submission, action: None,
+    )
+    harness.wiring.teardown_received(digest, harness.identity.request_ready_issuer)
+    harness.wiring.consume_ack_ready(
+        _action(harness, NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 12),
+        lambda submission, action: None,
+    )
+    _ready(harness)
+    harness.wiring.consume_reclaim_authorized(
+        _action(harness, NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED, 13),
+        lambda submission: None,
+    )
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        14,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(publication_action)
+    assert publication is not None
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=True)
+    )
+    retired = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        15,
+    )
+    operation_count = len(harness.runtime.operations)
+
+    def fail_retirement(
+        submission: PackedTerminalSourceSubmission,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Reject the external actor/control-state retirement boundary.
+
+        :param submission: Exact immutable source submission.
+        :param action: Exact joined retirement authority.
+        """
+
+        raise RuntimeError("synthetic retirement failure")
+
+    with pytest.raises(RuntimeError, match="synthetic retirement failure"):
+        harness.wiring.consume_terminal_action(retired, fail_retirement)
+    assert len(harness.runtime.operations) == operation_count
+    assert harness.wiring.inventory().active_binding_digests == (digest,)
 
 
 def test_reclaim_failure_enters_explicit_runtime_fatal_boundary() -> None:
@@ -973,7 +1156,10 @@ def test_publication_failure_quarantines_identity_after_safe_reclaim() -> None:
         NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         52,
     )
-    assert harness.wiring.consume_terminal_action(quarantine) is None
+    assert harness.wiring.consume_terminal_action(
+        quarantine,
+        lambda submission, action: None,
+    ) is None
     inventory = harness.wiring.inventory()
     assert inventory.active_binding_digests == (harness.identity.local_binding.digest,)
     assert inventory.quarantined_binding_digests == (

@@ -447,6 +447,28 @@ class TerminalWireReceiptImportNamespace:
         with self._lock:
             return len(self._imported)
 
+    @property
+    def active_binding_digests(self) -> tuple[bytes, ...]:
+        """Return exact live imported-receipt binding identities.
+
+        :returns: Digest-ordered active binding population.
+        """
+
+        with self._lock:
+            return tuple(sorted(self._active_bindings))
+
+    def require_active_binding(self, binding: TerminalRequestBinding) -> None:
+        """Validate one binding before a cross-component retirement commit.
+
+        :param binding: Exact live target binding.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        with self._lock:
+            if self._active_bindings.get(binding.digest) != binding:
+                raise TerminalWireReceiptError("request binding is not active")
+
     def register_binding(self, binding: TerminalRequestBinding) -> None:
         """Register one target request generation before network admission.
 

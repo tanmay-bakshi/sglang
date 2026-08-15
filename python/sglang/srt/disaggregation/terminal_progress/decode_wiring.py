@@ -21,6 +21,9 @@ from sglang.srt.disaggregation.terminal_progress.evidence import (
     TerminalProgressTimingRecorder,
     terminal_progress_timing_recorder,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -424,7 +427,7 @@ class PackedTerminalDecodeWiring:
     def consume_adoption_action(
         self,
         action: NativeTerminalOwnerAction,
-        adopt_request: Callable[[object], None],
+        adopt_request: Callable[[object], TerminalDFlashDecodeAdoption],
         finalize_request: Callable[[object], None],
     ) -> object:
         """Adopt pages and publish readiness under scheduler authority.
@@ -465,8 +468,16 @@ class PackedTerminalDecodeWiring:
                 NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
             )
             scheduler_action_completed = True
-            adopt_request(owner)
-            self._actor.complete_terminal_owner_metadata_consumption(transaction)
+            adoption = adopt_request(owner)
+            if type(adoption) is not TerminalDFlashDecodeAdoption:
+                raise RuntimeError(
+                    "decode adoption callback returned invalid DFlash authority"
+                )
+            dflash_adoption = adoption.await_device_copy_completion()
+            self._actor.complete_terminal_owner_metadata_consumption(
+                transaction,
+                dflash_adoption=dflash_adoption,
+            )
             self._runtime.submit(
                 self._local_producer_id,
                 action.binding.digest,

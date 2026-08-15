@@ -14,6 +14,9 @@ from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer impor
     PackedTerminalDecodeSchedulerRegistration,
     PackedTerminalDecodeServingComposition,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,
     TerminalProcessIdentity,
@@ -263,6 +266,15 @@ def _registration(
     )
 
 
+def _terminal_dflash_adoption() -> TerminalDFlashDecodeAdoption:
+    """Build a type-exact adoption envelope for scheduler-boundary tests.
+
+    :returns: Exact outer adoption authority consumed by the scheduler.
+    """
+
+    return object.__new__(TerminalDFlashDecodeAdoption)
+
+
 def _action(
     binding: TerminalRequestBinding,
     action_id: int = 1,
@@ -318,8 +330,19 @@ def test_composition_adopts_exact_request_before_local_ready() -> None:
     """Qualified inbox consumption preserves complete scheduler ordering."""
 
     scheduler_events: list[tuple[str, object]] = []
+
+    def adopt(owner: object) -> TerminalDFlashDecodeAdoption:
+        """Record adoption and return its exact typed authority.
+
+        :param owner: Exact retained scheduler request.
+        :returns: Exact DFlash adoption envelope.
+        """
+
+        scheduler_events.append(("adopt", owner))
+        return _terminal_dflash_adoption()
+
     registration = _registration(
-        adopt_request=lambda owner: scheduler_events.append(("adopt", owner)),
+        adopt_request=adopt,
         finalize_request=lambda owner: scheduler_events.append(("finalize", owner)),
         cancel_request=lambda owner: None,
         quarantine_request=lambda owner, reason: None,

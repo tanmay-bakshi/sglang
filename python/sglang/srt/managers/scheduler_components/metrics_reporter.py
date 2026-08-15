@@ -326,7 +326,7 @@ class SchedulerMetricsReporter:
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
                 decode_q.add(req.seqlen)
-            for req in self.scheduler.disagg_decode_transfer_queue.queue:
+            for req in self.scheduler.disagg_decode_transfer_queue.live_requests():
                 decode_q.add(req.seqlen)
         else:
             for req in self.scheduler.waiting_queue:
@@ -587,7 +587,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+                f"#inflight-req: {len(self.scheduler.disagg_prefill_live_transfer_requests())}, "
             )
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
@@ -686,7 +686,8 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_live_transfer_requests(),
+                    priority_enabled,
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -695,7 +696,8 @@ class SchedulerMetricsReporter:
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                    self.scheduler.disagg_decode_transfer_queue.live_requests(),
+                    priority_enabled,
                 )
 
             # Utilization / LoRA / HiCache
@@ -834,7 +836,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
+            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.live_requests())}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
@@ -915,14 +917,16 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_live_transfer_requests(),
+                    priority_enabled,
                 )
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                    self.scheduler.disagg_decode_transfer_queue.live_requests(),
+                    priority_enabled,
                 )
 
             # Streaming session metrics
@@ -1158,13 +1162,15 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_inflight_queue, priority_enabled
+                self.scheduler.disagg_prefill_live_transfer_requests(),
+                priority_enabled,
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
             )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
+                self.scheduler.disagg_decode_transfer_queue.live_requests(),
+                priority_enabled,
             )
         self.metrics_collector.log_stats(self.stats)

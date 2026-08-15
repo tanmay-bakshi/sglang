@@ -35,6 +35,9 @@ from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeWireDelivery,
     PackedTerminalDecodeWork,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.evidence import (
     parse_terminal_progress_timing_log_line,
 )
@@ -84,6 +87,37 @@ _REMOTE_RECEIPT_PRODUCER_ID = 3
 _REMOTE_CONTROL_PRODUCER_ID = 4
 _NATIVE_PRODUCER_ID = 5
 _WAIT_SECONDS = 5.0
+
+
+class _TerminalDeviceCopyEvent:
+    """Immediate terminal event used by CPU-only lifecycle composition tests."""
+
+    def synchronize(self) -> None:
+        """Model a completed device-copy synchronization boundary."""
+
+    def query(self) -> bool:
+        """Report terminal completion after synchronization.
+
+        :returns: Always ``True`` for this successful fixture.
+        """
+
+        return True
+
+
+def _terminal_dflash_adoption() -> TerminalDFlashDecodeAdoption:
+    """Build a type-exact adoption envelope without requiring CUDA.
+
+    :returns: Exact outer adoption authority consumed by decode wiring.
+    """
+
+    adoption = object.__new__(TerminalDFlashDecodeAdoption)
+    object.__setattr__(adoption, "transaction_adoption", object())
+    object.__setattr__(
+        adoption,
+        "device_value",
+        types.SimpleNamespace(completion_event=_TerminalDeviceCopyEvent()),
+    )
+    return adoption
 
 
 @dataclasses.dataclass(slots=True)
@@ -408,9 +442,12 @@ def _actor(
     def complete_terminal_owner_metadata_consumption(
         self: PackedDecodeRuntime,
         transaction: PackedDecodeRequestTransaction,
+        *,
+        dflash_adoption: object,
     ) -> None:
         del self
         assert id(transaction) in state.transaction_bindings
+        assert dflash_adoption is not None
         state.events.append("metadata")
 
     def retire_terminal_owner_request(
@@ -566,12 +603,23 @@ def _registration(
     """
 
     owner = object()
+
+    def adopt_request(request: object) -> TerminalDFlashDecodeAdoption:
+        """Record scheduler adoption and return exact DFlash authority.
+
+        :param request: Exact retained scheduler request.
+        :returns: Exact device-copy completion authority.
+        """
+
+        scheduler_events.append("adopt")
+        return _terminal_dflash_adoption()
+
     return PackedTerminalDecodeSchedulerRegistration(
         binding=binding,
         source_plan=source_plan,
         transaction=_transaction(binding.request_key, owner),
         request_owner=owner,
-        adopt_request=lambda request: scheduler_events.append("adopt"),
+        adopt_request=adopt_request,
         finalize_request=lambda request: scheduler_events.append("finalize"),
         cancel_request=lambda request: scheduler_events.append("cancel"),
         quarantine_request=lambda request, reason: scheduler_events.append(

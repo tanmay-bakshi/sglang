@@ -238,6 +238,15 @@ class _FakePackedTransaction:
             raise RuntimeError("injected packed publication failure")
         return self.publication
 
+    @property
+    def terminal_binding_digest(self) -> bytes | None:
+        """Return no owner-driven authority for the legacy fixture.
+
+        :returns: Always ``None``.
+        """
+
+        return None
+
     def cancel_unpublished(self) -> DecodeRequest:
         """Retire an unpublished fake lease and return its owner.
 

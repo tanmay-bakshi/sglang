@@ -709,6 +709,31 @@ def test_registration_is_one_exact_eight_byte_vram_allocation() -> None:
     )
 
 
+def test_source_owner_cancels_only_an_unpublished_row_once() -> None:
+    """Pre-publication rollback returns the exact row without actor state."""
+
+    agent, allocator = _allocator(row_capacity=1)
+    pool = _pool_without_cuda(allocator)
+    owner = DFlashBoundarySourceTransportOwner(
+        pool=pool,
+        agent=agent,
+        direct_owner=_DirectOwner(),
+        writer_id=_writer(),
+        post=lambda handle: handle,
+    )
+    lease = owner.lease_source_row()
+
+    assert pool.inventory() == (0, 1, 0)
+    assert owner.inventory().active_count == 0
+
+    owner.cancel_unpublished_source_row(lease)
+
+    assert pool.inventory() == (1, 0, 0)
+    assert owner.inventory().active_count == 0
+    with pytest.raises(RuntimeError, match="already terminal"):
+        owner.cancel_unpublished_source_row(lease)
+
+
 @pytest.mark.parametrize("handle", [None, []], ids=("none", "empty"))
 def test_registration_requires_owned_native_authority(handle: object) -> None:
     """An absent native registration cannot back reusable device rows."""

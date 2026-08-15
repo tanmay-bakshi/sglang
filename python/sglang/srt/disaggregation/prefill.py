@@ -19,9 +19,13 @@ Life cycle of a request in the prefill server
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import hashlib
 import logging
 import time
+import traceback
+import uuid
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -34,6 +38,26 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedDFlashBoundaryCounters,
+)
+from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPlan
+from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
+    DFlashBoundaryPrefillSource,
+)
+from sglang.srt.disaggregation.terminal_progress.output_projection import (
+    FrozenPrefillGatewayOutputShell,
+    PinnedTerminalGatewayResultSlot,
+    PrefillTerminalGatewayOutputProjection,
+    freeze_prefill_gateway_output_shell,
+)
+from sglang.srt.disaggregation.terminal_progress.source_plan import (
+    PackedTerminalSourceIdentityPlan,
+)
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalRequestBinding
+from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceSubmission,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -84,6 +108,205 @@ DISAGG_PREFILL_TRANSFER_PROGRESS_POLL_INTERVAL_SECONDS = 0.0005
 DISAGG_PREFILL_TRANSFER_PROGRESS_TIME_BUDGET_SECONDS = 0.032
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TerminalPrefillLaunch:
+    """One request's complete immutable pre-model terminal ownership.
+
+    :ivar req: Scheduler-owned request retained until native reclaim.
+    :ivar result_index: Token row within the submitted generation batch.
+    :ivar identity: Exact rank-local terminal lifecycle identity.
+    :ivar transport: Complete pre-launch packed transfer geometry.
+    :ivar dflash_source: Canonical DFlash row, absent off source rank zero.
+    :ivar output_shell: Canonical immutable gateway response shell.
+    :ivar result_slot: Canonical pinned token result row.
+    :ivar producer_event_generation: Exact generation binding the CUDA event.
+    """
+
+    req: Req
+    result_index: int
+    identity: PackedTerminalSourceIdentityPlan
+    transport: PackedPrefillLaunchPlan
+    dflash_source: DFlashBoundaryPrefillSource | None
+    output_shell: FrozenPrefillGatewayOutputShell | None
+    result_slot: PinnedTerminalGatewayResultSlot | None
+    producer_event_generation: bytes
+
+    def __post_init__(self) -> None:
+        """Validate rank-local ownership before model submission."""
+
+        if not isinstance(self.req, Req):
+            raise TypeError("req must be a Req")
+        if type(self.result_index) is not int or self.result_index < 0:
+            raise ValueError("result_index must be a non-negative integer")
+        if type(self.identity) is not PackedTerminalSourceIdentityPlan:
+            raise TypeError("identity must be PackedTerminalSourceIdentityPlan")
+        if type(self.transport) is not PackedPrefillLaunchPlan:
+            raise TypeError("transport must be PackedPrefillLaunchPlan")
+        canonical = self.identity.local_binding.owner.tp_rank == 0
+        canonical_values = (
+            self.dflash_source,
+            self.output_shell,
+            self.result_slot,
+        )
+        if canonical and any(value is None for value in canonical_values):
+            raise ValueError("canonical terminal launch is incomplete")
+        if not canonical and any(value is not None for value in canonical_values):
+            raise ValueError("noncanonical terminal launch owns canonical state")
+        if (
+            type(self.producer_event_generation) is not bytes
+            or len(self.producer_event_generation) != 16
+        ):
+            raise ValueError("producer_event_generation must contain 16 bytes")
+
+
+class _TerminalPrefillBatchLeaseLedger:
+    """Track pre-model, CUDA-touched, and manager-owned DFlash rows."""
+
+    _manager: CommonKVManager
+    _unbound: dict[int, DFlashBoundaryPrefillSource]
+    _cuda_touched: tuple[
+        DFlashBoundaryPrefillSource,
+        PackedTerminalSourceSubmission,
+    ] | None
+
+    def __init__(self, manager: CommonKVManager) -> None:
+        """Create an empty batch-scope ownership ledger.
+
+        :param manager: Sole source-row lifetime owner.
+        """
+
+        self._manager = manager
+        self._unbound = {}
+        self._cuda_touched = None
+
+    def retain(self, source: DFlashBoundaryPrefillSource) -> None:
+        """Retain one lease before any CUDA producer work touches it.
+
+        :param source: Exact active source lease.
+        """
+
+        key = id(source)
+        if key in self._unbound:
+            raise RuntimeError("terminal DFlash source was retained twice")
+        self._unbound[key] = source
+
+    def begin_cuda(
+        self,
+        source: DFlashBoundaryPrefillSource,
+        submission: PackedTerminalSourceSubmission,
+    ) -> None:
+        """Classify one retained lease as unsafe for synchronous release.
+
+        :param source: Exact lease about to receive producer work.
+        :param submission: Complete pinned transport and result-slot ownership.
+        """
+
+        if self._cuda_touched is not None:
+            raise RuntimeError("another terminal DFlash source is CUDA-touched")
+        if self._unbound.get(id(source)) is not source:
+            raise RuntimeError("CUDA work targets an unretained DFlash source")
+        self._cuda_touched = (source, submission)
+
+    def hand_to_manager(self, source: DFlashBoundaryPrefillSource) -> None:
+        """Transfer one CUDA-touched lease into manager lifecycle handling.
+
+        :param source: Exact lease entering the manager bind boundary.
+        """
+
+        touched = self._cuda_touched
+        if touched is None or touched[0] is not source:
+            raise RuntimeError("manager handoff targets another DFlash source")
+        owned = self._unbound.pop(id(source), None)
+        if owned is not source:
+            raise RuntimeError("terminal DFlash ownership changed before handoff")
+        self._cuda_touched = None
+
+    def settle_after_failure(self) -> tuple[str, ...]:
+        """Quarantine CUDA work and cancel every untouched lease once.
+
+        :returns: Complete cleanup tracebacks without masking the root failure.
+        """
+
+        failures: list[str] = []
+        touched = self._cuda_touched
+        if touched is not None:
+            source, submission = touched
+            self._unbound.pop(id(source), None)
+            self._cuda_touched = None
+            try:
+                self._manager.quarantine_unpublished_terminal_source_submission(
+                    submission
+                )
+            except Exception:  # noqa: BLE001
+                failures.append(traceback.format_exc())
+        sources = tuple(self._unbound.values())
+        self._unbound.clear()
+        for source in sources:
+            try:
+                self._manager.cancel_unpublished_terminal_dflash_source(source)
+            except Exception:  # noqa: BLE001
+                failures.append(traceback.format_exc())
+        return tuple(failures)
+
+
+class _TerminalPrefillPrelaunchBatchOwner:
+    """Own preleased rows until the model worker invokes terminal binding."""
+
+    _manager: CommonKVManager
+    _launches: tuple[_TerminalPrefillLaunch, ...]
+    _claimed: bool
+
+    def __init__(
+        self,
+        manager: CommonKVManager,
+        launches: tuple[_TerminalPrefillLaunch, ...],
+    ) -> None:
+        """Retain one immutable prelaunch batch.
+
+        :param manager: Sole source-row lifetime owner.
+        :param launches: Complete plans frozen before model submission.
+        """
+
+        if type(launches) is not tuple or any(
+            type(launch) is not _TerminalPrefillLaunch for launch in launches
+        ):
+            raise TypeError("launches must contain terminal prefill plans")
+        self._manager = manager
+        self._launches = launches
+        self._claimed = False
+
+    def claim_for_bind(self) -> tuple[_TerminalPrefillLaunch, ...]:
+        """Transfer the complete batch to post-submit lifecycle binding.
+
+        :returns: Exact immutable launch plans.
+        """
+
+        if self._claimed:
+            raise RuntimeError("terminal prelaunch batch was claimed twice")
+        self._claimed = True
+        return self._launches
+
+    def cancel_if_unclaimed(self) -> tuple[str, ...]:
+        """Release only rows never exposed to model-result CUDA work.
+
+        :returns: Complete cleanup tracebacks without masking submit failure.
+        """
+
+        if self._claimed:
+            return ()
+        self._claimed = True
+        failures: list[str] = []
+        for launch in self._launches:
+            source = launch.dflash_source
+            if source is None:
+                continue
+            try:
+                self._manager.cancel_unpublished_terminal_dflash_source(source)
+            except Exception:  # noqa: BLE001
+                failures.append(traceback.format_exc())
+        return tuple(failures)
+
+
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -96,7 +319,7 @@ def should_force_retry(req: Req) -> bool:
 
 
 def maybe_release_metadata_buffer(
-    req: Req, allocator: ReqToMetadataIdxAllocator
+    req: Req, allocator: ReqToMetadataIdxAllocator | None
 ) -> None:
     """
     Release the metadata buffer index allocated for a request in prefill disaggregation mode.
@@ -108,6 +331,8 @@ def maybe_release_metadata_buffer(
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
     if req.metadata_buffer_index >= 0:
+        if allocator is None:
+            raise RuntimeError("request retained a metadata row without an allocator")
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
 
@@ -121,8 +346,8 @@ class PrefillBootstrapQueue:
         self,
         token_to_kv_pool: KVCache,
         draft_token_to_kv_pool: Optional[KVCache],
-        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: MetadataBuffers,
+        req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator | None,
+        metadata_buffers: MetadataBuffers | None,
         tp_rank: int,
         tp_size: int,
         gpu_id: int,
@@ -152,6 +377,15 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        terminal_membership = self.scheduler.server_args.pd_terminal_local_membership
+        self.terminal_source = terminal_membership is not None
+        if (
+            self.terminal_source
+            and self.scheduler.server_args.optimistic_prefill_attempts != 0
+        ):
+            raise ValueError(
+                "terminal source requires optimistic prefill attempts disabled"
+            )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -250,9 +484,16 @@ class PrefillBootstrapQueue:
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
-        )
+        if self.metadata_buffers is None:
+            kv_args.aux_data_ptrs = []
+            kv_args.aux_data_lens = []
+            kv_args.aux_item_lens = []
+        else:
+            (
+                kv_args.aux_data_ptrs,
+                kv_args.aux_data_lens,
+                kv_args.aux_item_lens,
+            ) = self.metadata_buffers.get_buf_infos()
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
@@ -324,12 +565,17 @@ class PrefillBootstrapQueue:
         return True
 
     def ensure_metadata_buffer(self, req: Req) -> bool:
+        if self.terminal_source:
+            raise RuntimeError("terminal source cannot allocate legacy metadata rows")
+        allocator = self.req_to_metadata_buffer_idx_allocator
+        if allocator is None:
+            raise RuntimeError("legacy prefill metadata allocator is unavailable")
         if req.metadata_buffer_index >= 0:
             return True
 
-        if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+        if allocator.available_size() == 0:
             return False
-        req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        req.metadata_buffer_index = allocator.alloc()
         assert req.metadata_buffer_index is not None
         return True
 
@@ -337,7 +583,7 @@ class PrefillBootstrapQueue:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
         assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
-        if not self.ensure_metadata_buffer(req):
+        if not self.terminal_source and not self.ensure_metadata_buffer(req):
             return False
 
         req.time_stats.set_bootstrap_done_time()
@@ -348,7 +594,8 @@ class PrefillBootstrapQueue:
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
         )
-        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        metadata_index = None if self.terminal_source else req.metadata_buffer_index
+        req.disagg_kv_sender.init(num_pages, metadata_index)
         req.pending_bootstrap = False
         return True
 
@@ -471,6 +718,63 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def disagg_prefill_live_transfer_requests(
+        self: Scheduler,
+    ) -> tuple[Req, ...]:
+        """Return legacy and owner-managed prefill requests for accounting.
+
+        :returns: Complete live prefill transfer population without exposing
+            terminal requests to legacy polling.
+        """
+
+        return (
+            *self.disagg_prefill_inflight_queue,
+            *self.disagg_prefill_terminal_requests.values(),
+        )
+
+    def abort_terminal_prefill_requests(
+        self: Scheduler,
+        rid: str,
+        abort_all: bool,
+    ) -> int:
+        """Record client abort while owner-managed publication completes.
+
+        This registry is populated inside :meth:`bind_terminal_prefill_launches`
+        immediately before PREPARE publication. Both this method and that bind
+        run on the scheduler thread, and a request becomes visible here only
+        after native rollback has become unsafe. The source owner records client
+        intent while the immutable lifecycle completes its normal reclaim and
+        publication joins; the disconnected gateway client independently drops
+        the eventual response.
+
+        :param rid: Request identifier or prefix selected by the abort.
+        :param abort_all: Whether every owner-managed request is selected.
+        :returns: Number of matching owner-managed requests.
+        """
+
+        if type(rid) is not str:
+            raise TypeError("rid must be a string")
+        if type(abort_all) is not bool:
+            raise TypeError("abort_all must be bool")
+        matches = tuple(
+            req
+            for req in self.disagg_prefill_terminal_requests.values()
+            if abort_all or req.rid.startswith(rid)
+        )
+        if len(matches) == 0:
+            return 0
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        bindings = self.disagg_prefill_terminal_bindings
+        for req in matches:
+            binding = bindings.get(req.rid)
+            if binding is None:
+                raise RuntimeError("terminal request lost its source binding")
+            manager.cancel_terminal_source_request(
+                binding,
+                "client cancelled an owner-managed source request",
+            )
+        return len(matches)
+
     def bind_disagg_prefill_producer_event(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -500,7 +804,10 @@ class SchedulerDisaggregationPrefillMixin:
         :param stream: CUDA stream on which that forward was enqueued.
         """
 
-        protocol = self.disagg_prefill_bootstrap_queue.kv_manager.kv_transfer_protocol()
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if manager.uses_terminal_source_publication():
+            return
+        protocol = manager.kv_transfer_protocol()
         if protocol != "packed-v4":
             return
         event = torch.cuda.Event()
@@ -510,6 +817,8 @@ class SchedulerDisaggregationPrefillMixin:
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        if kv_mgr.uses_terminal_source_publication():
+            return
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
@@ -526,6 +835,8 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
+        if self.disagg_prefill_bootstrap_queue.terminal_source:
+            return
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
             return
@@ -585,6 +896,297 @@ class SchedulerDisaggregationPrefillMixin:
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
+    def build_terminal_prefill_launches(
+        self: Scheduler,
+        batch: ScheduleBatch,
+    ) -> tuple[_TerminalPrefillLaunch, ...]:
+        """Freeze every final terminal request before the model submission.
+
+        Intermediate chunks intentionally produce no transport plan. Their
+        pages remain owned by the request, so the final chunk projects the
+        complete remaining migration range in one immutable submission.
+
+        :param batch: Exact generation batch about to enter the model worker.
+        :returns: Rank-local final-request launch plans in result-row order.
+        """
+
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not manager.uses_terminal_source_publication():
+            return ()
+        if not self.spec_algorithm.is_dflash():
+            raise RuntimeError("terminal source requires the DFlash schema")
+
+        launches: list[_TerminalPrefillLaunch] = []
+        leased_sources: list[DFlashBoundaryPrefillSource] = []
+        try:
+            for result_index, req in enumerate(batch.reqs):
+                if req.inflight_middle_chunks > 0:
+                    continue
+                if req.pending_bootstrap:
+                    raise RuntimeError(
+                        "terminal source admission preceded bootstrap readiness"
+                    )
+                main_pages, state_indices = (
+                    self.freeze_disagg_prefill_final_geometry(req)
+                )
+                event_generation = uuid.uuid4().bytes
+                dflash_source: DFlashBoundaryPrefillSource | None = None
+                output_shell: FrozenPrefillGatewayOutputShell | None = None
+                result_slot: PinnedTerminalGatewayResultSlot | None = None
+                if manager.terminal_source_is_canonical():
+                    cached_details = self.output_streamer.get_cached_tokens_details(req)
+                    output_shell = freeze_prefill_gateway_output_shell(
+                        req,
+                        cached_tokens_details=cached_details,
+                        dp_rank=self.ps.dp_rank,
+                        speculative=self.spec_algorithm.is_some(),
+                    )
+                    result_slot = PinnedTerminalGatewayResultSlot(uuid.uuid4().bytes)
+                    dflash_source = manager.lease_terminal_dflash_source(
+                        PackedDFlashBoundaryCounters(
+                            cached_tokens=req.cached_tokens,
+                            cached_tokens_device=req.cached_tokens_device,
+                            cached_tokens_host=req.cached_tokens_host,
+                            cached_tokens_storage=req.cached_tokens_storage,
+                            image_tokens=output_shell.image_tokens,
+                            audio_tokens=output_shell.audio_tokens,
+                            video_tokens=output_shell.video_tokens,
+                        )
+                    )
+                    leased_sources.append(dflash_source)
+                identity, transport = manager.build_terminal_source_launch_plan(
+                    room=req.bootstrap_room,
+                    source_main_pages=main_pages,
+                    state_indices=state_indices,
+                    dflash_source=dflash_source,
+                )
+                launches.append(
+                    _TerminalPrefillLaunch(
+                        req=req,
+                        result_index=result_index,
+                        identity=identity,
+                        transport=transport,
+                        dflash_source=dflash_source,
+                        output_shell=output_shell,
+                        result_slot=result_slot,
+                        producer_event_generation=event_generation,
+                    )
+                )
+        except Exception as error:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            cleanup_failures: list[str] = []
+            for source in leased_sources:
+                try:
+                    manager.cancel_unpublished_terminal_dflash_source(source)
+                except Exception:  # noqa: BLE001
+                    cleanup_failures.append(traceback.format_exc())
+            if len(cleanup_failures) > 0:
+                error.add_note(
+                    "terminal source launch cleanup failed:\n"
+                    + "\n".join(cleanup_failures)
+                )
+            logger.error(
+                "Terminal source launch construction failed:\n%s",
+                formatted_traceback,
+            )
+            raise
+        return tuple(launches)
+
+    def bind_terminal_prefill_launches(
+        self: Scheduler,
+        prelaunch_owner: _TerminalPrefillPrelaunchBatchOwner,
+        result: GenerationBatchResult,
+    ) -> GenerationBatchResult:
+        """Bind exact producer events and owner lifecycles after submission.
+
+        :param prelaunch_owner: Batch owner retained across model submission.
+        :param result: Device-resident generation result from that submission.
+        :returns: The unchanged generation result for normal result handling.
+        """
+
+        if type(prelaunch_owner) is not _TerminalPrefillPrelaunchBatchOwner:
+            raise TypeError("prelaunch_owner must own terminal prefill plans")
+        launches = prelaunch_owner.claim_for_bind()
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        lease_ledger = _TerminalPrefillBatchLeaseLedger(manager)
+        for launch in launches:
+            if launch.dflash_source is not None:
+                lease_ledger.retain(launch.dflash_source)
+        try:
+            if not manager.uses_terminal_source_publication():
+                raise RuntimeError(
+                    "terminal source deactivated during model submission"
+                )
+            if type(result.next_token_ids) is not torch.Tensor:
+                raise TypeError("terminal source requires device-resident token ids")
+            stream = torch.cuda.current_stream(device=self.device)
+            for launch in launches:
+                req = launch.req
+                if req.rid in self.disagg_prefill_terminal_requests:
+                    raise RuntimeError("terminal prefill request identity was reused")
+                producer_event = torch.cuda.Event(
+                    enable_timing=False,
+                    blocking=False,
+                    interprocess=False,
+                )
+                projection: PrefillTerminalGatewayOutputProjection | None = None
+                if launch.dflash_source is not None:
+                    output_shell = launch.output_shell
+                    result_slot = launch.result_slot
+                    if output_shell is None or result_slot is None:
+                        raise RuntimeError(
+                            "canonical terminal output state disappeared"
+                        )
+                    projection = PrefillTerminalGatewayOutputProjection(
+                        shell=output_shell,
+                        result_slot=result_slot,
+                        producer_event_generation=launch.producer_event_generation,
+                    )
+                transport_submission = launch.transport.bind_producer_event(
+                    producer_event
+                )
+                submission = PackedTerminalSourceSubmission(
+                    identity=launch.identity,
+                    output_projection=projection,
+                    producer_event_generation=launch.producer_event_generation,
+                    transport_submission=transport_submission,
+                )
+                if launch.dflash_source is not None:
+                    lease_ledger.begin_cuda(launch.dflash_source, submission)
+                    manager.enqueue_terminal_dflash_source_projection(
+                        launch.dflash_source,
+                        result.next_token_ids[
+                            launch.result_index : launch.result_index + 1
+                        ],
+                        result_slot,
+                        stream=stream,
+                        producer_event=producer_event,
+                    )
+                else:
+                    producer_event.record(stream)
+
+                def release_resources(
+                    retired: PackedTerminalSourceSubmission,
+                    *,
+                    expected: PackedTerminalSourceSubmission = submission,
+                    retained_req: Req = req,
+                ) -> None:
+                    """Release state only under native reclaim authority."""
+
+                    if retired is not expected:
+                        raise RuntimeError(
+                            "terminal source reclaimed another submission"
+                        )
+                    current = self.disagg_prefill_terminal_requests.get(
+                        retained_req.rid
+                    )
+                    if current is not retained_req:
+                        raise RuntimeError("terminal source request registry changed")
+                    current_binding = self.disagg_prefill_terminal_bindings.get(
+                        retained_req.rid
+                    )
+                    if current_binding != expected.identity.local_binding:
+                        raise RuntimeError("terminal source binding registry changed")
+                    retained_req.disagg_kv_sender.clear()
+                    release_kv_cache(retained_req, self.tree_cache)
+                    retained_req.time_stats.set_prefill_kv_transfer_finish_time()
+                    retained_req.time_stats.set_completion_time()
+                    del self.disagg_prefill_terminal_requests[retained_req.rid]
+                    del self.disagg_prefill_terminal_bindings[retained_req.rid]
+
+                if launch.dflash_source is not None:
+                    lease_ledger.hand_to_manager(launch.dflash_source)
+
+                def commit_scheduler_retention(
+                    retained: PackedTerminalSourceSubmission,
+                    *,
+                    expected: PackedTerminalSourceSubmission = submission,
+                    retained_req: Req = req,
+                ) -> None:
+                    """Commit scheduler reachability before PREPARE publication.
+
+                    :param retained: Exact manager-bound source submission.
+                    """
+
+                    if retained is not expected:
+                        raise RuntimeError(
+                            "terminal source retained another submission"
+                        )
+                    if retained_req.rid in self.disagg_prefill_terminal_requests:
+                        raise RuntimeError(
+                            "terminal prefill request identity was reused"
+                        )
+                    if retained_req.rid in self.disagg_prefill_terminal_bindings:
+                        raise RuntimeError(
+                            "terminal prefill binding identity was reused"
+                        )
+                    maybe_cache_unfinished_req(retained_req, self.tree_cache)
+                    self.disagg_prefill_terminal_requests[retained_req.rid] = (
+                        retained_req
+                    )
+                    try:
+                        self.disagg_prefill_terminal_bindings[retained_req.rid] = (
+                            retained.identity.local_binding
+                        )
+                    except MemoryError:
+                        del self.disagg_prefill_terminal_requests[retained_req.rid]
+                        raise
+
+                manager.bind_terminal_source_submission(
+                    submission,
+                    release_resources,
+                    commit_scheduler_retention,
+                )
+        except Exception as error:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            cleanup_failures = list(lease_ledger.settle_after_failure())
+            try:
+                manager.fail_terminal_source_process(
+                    "terminal prefill batch bind failed after model submission",
+                    formatted_traceback,
+                )
+            except Exception:  # noqa: BLE001
+                cleanup_failures.append(traceback.format_exc())
+            if len(cleanup_failures) > 0:
+                error.add_note(
+                    "terminal source batch rollback failed:\n"
+                    + "\n".join(cleanup_failures)
+                )
+            logger.error(
+                "Terminal source batch binding failed:\n%s",
+                formatted_traceback,
+            )
+            raise
+        return result
+
+    def run_terminal_prefill_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+    ) -> GenerationBatchResult:
+        """Submit one terminal batch with exception-total prelaunch ownership.
+
+        :param batch: Exact scheduler batch entering the model worker.
+        :returns: Model result after immediate terminal lifecycle binding.
+        """
+
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        launches = self.build_terminal_prefill_launches(batch)
+        prelaunch_owner = _TerminalPrefillPrelaunchBatchOwner(manager, launches)
+        terminal_bind = functools.partial(
+            self.bind_terminal_prefill_launches,
+            prelaunch_owner,
+        )
+        try:
+            return self.run_batch(batch, terminal_bind=terminal_bind)
+        except Exception as error:  # noqa: BLE001
+            cleanup_failures = prelaunch_owner.cancel_if_unclaimed()
+            if len(cleanup_failures) > 0:
+                error.add_note(
+                    "terminal prelaunch cleanup failed:\n"
+                    + "\n".join(cleanup_failures)
+                )
+            raise
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -614,7 +1216,10 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                if self.disagg_prefill_bootstrap_queue.terminal_source:
+                    result = self.run_terminal_prefill_batch(batch)
+                else:
+                    result = self.run_batch(batch)
                 self.record_disagg_prefill_producer_event(
                     batch,
                     torch.cuda.current_stream(device=self.device),
@@ -658,7 +1263,10 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                if self.disagg_prefill_bootstrap_queue.terminal_source:
+                    batch_result = self.run_terminal_prefill_batch(batch)
+                else:
+                    batch_result = self.run_batch(batch)
                 self.record_disagg_prefill_producer_event(
                     batch,
                     self.forward_stream,
@@ -780,6 +1388,10 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if manager.uses_terminal_source_publication():
+            self.process_batch_result_terminal_disagg_prefill(batch, result)
+            return
         (
             logits_output,
             next_token_ids,
@@ -953,6 +1565,44 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
+            dp_cooperation_info=batch.dp_cooperation_info,
+        )
+
+    def process_batch_result_terminal_disagg_prefill(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """Resolve bookkeeping without touching owner-managed terminal state.
+
+        Final requests were already bound immediately after model submission.
+        This method therefore cannot mutate output state, enqueue transfers,
+        publish through the legacy streamer, or enter the polling queue.
+
+        :param batch: Exact prefill batch whose immutable plans were bound.
+        :param result: Model result retained only for metrics and cleanup.
+        """
+
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
+        for req in batch.reqs:
+            if req.inflight_middle_chunks <= 0:
+                if req.rid not in self.disagg_prefill_terminal_requests:
+                    raise RuntimeError("final terminal request was not launch-bound")
+                req.time_stats.set_prefill_finished_time()
+                req.time_stats.set_prefill_transfer_queue_entry_time()
+                continue
+            req.inflight_middle_chunks -= 1
+            req.time_stats.set_last_chunked_prefill_finish_time()
+
+        self.metrics_reporter.report_prefill_stats(
+            batch=batch,
+            prefill_stats=batch.prefill_stats,
+            can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
@@ -1195,6 +1845,8 @@ class SchedulerDisaggregationPrefillMixin:
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
+            elif self.disagg_prefill_bootstrap_queue.terminal_source:
+                pass
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
@@ -1224,6 +1876,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if self.disagg_prefill_bootstrap_queue.terminal_source:
+            return
         # Only bootstrap-finalized requests; staging excluded.
         if (
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
@@ -1254,6 +1908,118 @@ class SchedulerDisaggregationPrefillMixin:
             producer_event=producer_event,
         )
 
+    def freeze_disagg_prefill_final_geometry(
+        self: Scheduler,
+        req: Req,
+    ) -> tuple[np.ndarray, Optional[List]]:
+        """Freeze all remaining main and state pages for final migration.
+
+        This helper has no transport or metadata-buffer side effects. Terminal
+        source publication calls it before model submission, while the legacy
+        sender calls it immediately before enqueueing its final transfer.
+
+        :param req: Exact final prefill request retaining source cache pages.
+        :returns: Complete remaining main pages and final state projections.
+        """
+
+        if req.extend_range is None:
+            raise RuntimeError("final prefill request has no extend range")
+        page_size = self.token_to_kv_pool_allocator.page_size
+        transfer_input_len = len(req.origin_input_ids)
+        end_idx = min(req.extend_range.end, transfer_input_len)
+        if end_idx < req.start_send_idx:
+            raise RuntimeError("final prefill migration range is reversed")
+
+        seq_len = end_idx
+        c128_seq_len = transfer_input_len
+
+        def mamba_payload() -> list[np.ndarray]:
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def swa_payload() -> np.ndarray:
+            window_start = max(0, seq_len - self.sliding_window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa, page_size)
+
+        def dsa_payload() -> np.ndarray:
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ]
+            return kv_to_page_indices(kv_indices_full, page_size)
+
+        def swa_ring_payload() -> np.ndarray:
+            pool = self.token_to_kv_pool_allocator.get_kvcache()
+            ring_stride = pool.unified_swa_ring_size
+            window_start = max(0, seq_len - pool.unified_swa_window)
+            positions = np.arange(window_start, seq_len, dtype=np.int64)
+            state_slot = int(req.req_pool_idx)
+            ring_rows = state_slot * ring_stride + (positions % ring_stride)
+            return ring_rows.astype(np.int32)
+
+        def c128_state_payload() -> np.ndarray:
+            online = is_dsv4_c128_online_enabled()
+            ring_size = (
+                1
+                if online
+                else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(128)
+            )
+            return get_dsv4_c128_state_indices(
+                int(req.req_pool_idx),
+                c128_seq_len,
+                online=online,
+                ring_size=ring_size,
+            )
+
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        payloads = {
+            StateType.MAMBA: mamba_payload,
+            StateType.SWA: swa_payload,
+            StateType.DSA: dsa_payload,
+            StateType.MINIMAX_INDEX_K: dsa_payload,
+            StateType.SWA_RING: swa_ring_payload,
+            StateType.C128_STATE: c128_state_payload,
+        }
+        if _is_npu and isinstance(
+            self.token_to_kv_pool_allocator.get_kvcache(),
+            DeepSeekV4TokenToKVPool,
+        ):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                dsv4_state_payloads,
+            )
+
+            payloads.update(
+                dsv4_state_payloads(
+                    self.req_to_token_pool,
+                    req.req_pool_idx,
+                    seq_len,
+                    page_size,
+                    self.sliding_window_size,
+                    prefix_len=0,
+                )
+            )
+        state_indices = [
+            payloads[state_type]() if state_type in payloads else None
+            for state_type in state_types
+        ]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.start_send_idx:end_idx
+        ]
+        return kv_to_page_indices(kv_indices, page_size), state_indices
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1264,6 +2030,11 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if manager.uses_terminal_source_publication():
+            raise RuntimeError(
+                "terminal source request cannot enter the legacy transfer queue"
+            )
         if last_chunk:
             deferred_event = self.disagg_prefill_deferred_producer_events.pop(
                 req.rid,
@@ -1294,114 +2065,21 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        page_indices: np.ndarray
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
-
-            # Most state payloads read token-pool rows and should match the KV
-            # range actually materialized on prefill. C128 state is request
-            # scoped, so its transfer index must use the logical input length
-            # that decode used to register the destination row.
-            seq_len = min(req.extend_range.end, transfer_input_len)
-            c128_seq_len = transfer_input_len
-
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                return kv_to_page_indices(kv_indices_full, page_size)
-
-            def _swa_ring_payload():
-                # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
-                # for the last `window` positions, in ascending position order so
-                # decode (its own req_pool_idx) matches positionally.
-                _pool = self.token_to_kv_pool_allocator.get_kvcache()
-                ring_stride = _pool.unified_swa_ring_size
-                window_size = _pool.unified_swa_window
-                window_start = max(0, seq_len - window_size)
-                positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(req.req_pool_idx)
-                ring_rows = state_slot * ring_stride + (positions % ring_stride)
-                return ring_rows.astype(np.int32)
-
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = (
-                    1
-                    if online
-                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
-                        128
-                    )
-                )
-                return get_dsv4_c128_state_indices(
-                    int(req.req_pool_idx),
-                    c128_seq_len,
-                    online=online,
-                    ring_size=ring_size,
-                )
-
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+            metadata_buffers = self.disagg_metadata_buffers
+            if metadata_buffers is None:
+                raise RuntimeError("legacy transfer has no metadata buffers")
+            metadata_buffers.set_buf(req)
+            page_indices, state_indices = self.freeze_disagg_prefill_final_geometry(
+                req
             )
-            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
-            # as main KV on the same page_size.
-            payloads = {
-                StateType.MAMBA: _mamba_payload,
-                StateType.SWA: _swa_payload,
-                StateType.DSA: _dsa_payload,
-                StateType.MINIMAX_INDEX_K: _dsa_payload,
-                StateType.SWA_RING: _swa_ring_payload,
-                StateType.C128_STATE: _c128_state_payload,
-            }
-            if _is_npu and isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(),
-                DeepSeekV4TokenToKVPool,
-            ):
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                    dsv4_state_payloads,
-                )
-
-                payloads.update(
-                    dsv4_state_payloads(
-                        self.req_to_token_pool,
-                        req.req_pool_idx,
-                        seq_len,
-                        page_size,
-                        self.sliding_window_size,
-                        prefix_len=0,
-                    )
-                )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
+        else:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_idx:end_idx
             ]
-
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, start_idx:end_idx
-        ]
-        page_indices = kv_to_page_indices(kv_indices, page_size)
+            page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(

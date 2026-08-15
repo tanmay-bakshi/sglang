@@ -101,7 +101,9 @@ class SchedulerLoadInquirer:
             pending_token_queues.append(prefill_bootstrap_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
-            decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
+            decode_transfer_queue = (
+                self.get_disagg_decode_transfer_queue().live_requests()
+            )
             decode_retracted_queue = (
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )
@@ -172,7 +174,9 @@ class SchedulerLoadInquirer:
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
             decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
-            decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
+            decode_transfer = len(
+                self.get_disagg_decode_transfer_queue().live_requests()
+            )
             decode_retracted = len(
                 self.get_disagg_decode_prealloc_queue().retracted_queue
             )

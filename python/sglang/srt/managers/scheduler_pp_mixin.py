@@ -549,7 +549,7 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             queue_size = (
                 len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_transfer_queue.live_requests())
                 + len(self.disagg_decode_prealloc_queue.queue)
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:

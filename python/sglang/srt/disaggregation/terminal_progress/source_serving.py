@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.terminal_progress.source_scheduler_consumer impor
     PackedTerminalSourceSchedulerRelease,
 )
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
+    PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceInventory,
     PackedTerminalSourceMetricsSink,
     PackedTerminalSourcePublisher,
@@ -55,6 +56,143 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
 from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedTerminalSourceResourceInventory:
+    """Exact actor, DFlash, and pre-lifecycle quarantine ownership.
+
+    :ivar actor_active_binding_digests: Live packed source actor identities.
+    :ivar actor_quarantined_binding_digests: Actor identities held fail closed.
+    :ivar actor_waiting_for_ready_binding_digests: PREPARE state awaiting READY.
+    :ivar actor_main_handle_binding_digests: Live main NIXL handles.
+    :ivar actor_auxiliary_handle_binding_digests: Live auxiliary NIXL handles.
+    :ivar actor_lane_binding_digests: Live packed transfer lanes.
+    :ivar request_ready_import_binding_digests: Live decoder receipt replay routes.
+    :ivar publication_control_active_binding_digests: Live publisher routes.
+    :ivar publication_control_terminal_binding_digests: Routes retaining one
+        terminal publisher outcome.
+    :ivar source_transfer_info_room_ids: Bootstrap transfer metadata rooms.
+    :ivar source_prefix_length_room_ids: Decoder prefix-length metadata rooms.
+    :ivar source_prefetched_room_ids: Staging rooms retained as prefetched.
+    :ivar source_prefetch_requested_room_ids: Staging prefetch request rooms.
+    :ivar dflash_active_transfer_count: Retained DFlash transfer identities.
+    :ivar dflash_posted_transfer_count: DFlash transfers awaiting terminality.
+    :ivar dflash_settled_transfer_count: DFlash transfers retained through ACK.
+    :ivar dflash_released_transfer_count: Cumulative clean transfer releases.
+    :ivar dflash_quarantined_transfer_count: Ambiguous DFlash transfers.
+    :ivar dflash_unowned_native_handle_count: Handles retained after arm failure.
+    :ivar dflash_free_row_count: Reusable device-side boundary rows.
+    :ivar dflash_active_row_count: Leased device-side boundary rows.
+    :ivar dflash_quarantined_row_count: Permanently non-reusable boundary rows.
+    :ivar unpublished_quarantined_binding_digests: CUDA-touched submissions which
+        failed before native lifecycle publication, including result slots.
+    :ivar unpublished_quarantined_result_slot_binding_digests: Canonical pinned
+        result slots retained with pre-lifecycle submissions.
+    """
+
+    actor_active_binding_digests: tuple[bytes, ...]
+    actor_quarantined_binding_digests: tuple[bytes, ...]
+    actor_waiting_for_ready_binding_digests: tuple[bytes, ...]
+    actor_main_handle_binding_digests: tuple[bytes, ...]
+    actor_auxiliary_handle_binding_digests: tuple[bytes, ...]
+    actor_lane_binding_digests: tuple[bytes, ...]
+    request_ready_import_binding_digests: tuple[bytes, ...]
+    publication_control_active_binding_digests: tuple[bytes, ...]
+    publication_control_terminal_binding_digests: tuple[bytes, ...]
+    source_transfer_info_room_ids: tuple[int, ...]
+    source_prefix_length_room_ids: tuple[int, ...]
+    source_prefetched_room_ids: tuple[int, ...]
+    source_prefetch_requested_room_ids: tuple[int, ...]
+    dflash_active_transfer_count: int
+    dflash_posted_transfer_count: int
+    dflash_settled_transfer_count: int
+    dflash_released_transfer_count: int
+    dflash_quarantined_transfer_count: int
+    dflash_unowned_native_handle_count: int
+    dflash_free_row_count: int
+    dflash_active_row_count: int
+    dflash_quarantined_row_count: int
+    unpublished_quarantined_binding_digests: tuple[bytes, ...]
+    unpublished_quarantined_result_slot_binding_digests: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        """Validate conservation-complete source resource evidence."""
+
+        binding_collections = (
+            self.actor_active_binding_digests,
+            self.actor_quarantined_binding_digests,
+            self.actor_waiting_for_ready_binding_digests,
+            self.actor_main_handle_binding_digests,
+            self.actor_auxiliary_handle_binding_digests,
+            self.actor_lane_binding_digests,
+            self.request_ready_import_binding_digests,
+            self.publication_control_active_binding_digests,
+            self.publication_control_terminal_binding_digests,
+            self.unpublished_quarantined_binding_digests,
+            self.unpublished_quarantined_result_slot_binding_digests,
+        )
+        if any(type(values) is not tuple for values in binding_collections):
+            raise TypeError("source resource binding collections must be tuples")
+        if any(
+            type(value) is not bytes or len(value) != 32
+            for values in binding_collections
+            for value in values
+        ):
+            raise ValueError("source resource bindings must contain 32 bytes")
+        if any(values != tuple(sorted(values)) for values in binding_collections):
+            raise ValueError("source resource bindings must use digest order")
+        actor_active = set(self.actor_active_binding_digests)
+        if any(
+            not set(values).issubset(actor_active)
+            for values in binding_collections[1:6]
+        ):
+            raise ValueError("actor resource bindings must remain actor-active")
+        if not set(self.publication_control_terminal_binding_digests).issubset(
+            self.publication_control_active_binding_digests
+        ):
+            raise ValueError("terminal publisher routes must remain active")
+        if not set(
+            self.unpublished_quarantined_result_slot_binding_digests
+        ).issubset(self.unpublished_quarantined_binding_digests):
+            raise ValueError(
+                "unpublished result slots must remain submission-quarantined"
+            )
+        room_collections = (
+            self.source_transfer_info_room_ids,
+            self.source_prefix_length_room_ids,
+            self.source_prefetched_room_ids,
+            self.source_prefetch_requested_room_ids,
+        )
+        if any(type(values) is not tuple for values in room_collections):
+            raise TypeError("source room collections must be tuples")
+        if any(
+            type(value) is not int or value < 0
+            for values in room_collections
+            for value in values
+        ):
+            raise ValueError("source rooms must be non-negative integers")
+        if any(values != tuple(sorted(set(values))) for values in room_collections):
+            raise ValueError("source room collections must be sorted and unique")
+        counts = (
+            self.dflash_active_transfer_count,
+            self.dflash_posted_transfer_count,
+            self.dflash_settled_transfer_count,
+            self.dflash_released_transfer_count,
+            self.dflash_quarantined_transfer_count,
+            self.dflash_unowned_native_handle_count,
+            self.dflash_free_row_count,
+            self.dflash_active_row_count,
+            self.dflash_quarantined_row_count,
+        )
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("source resource counts must be non-negative integers")
+        if self.dflash_active_transfer_count != (
+            self.dflash_posted_transfer_count
+            + self.dflash_settled_transfer_count
+            + self.dflash_quarantined_transfer_count
+        ):
+            raise ValueError("DFlash transfer inventory does not conserve")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -103,6 +241,7 @@ class PackedTerminalSourceServingInventory:
     :ivar scheduler_consumer: Scheduler-affine resource inventory.
     :ivar scheduler_serving: Qualified scheduler receipt inventory.
     :ivar grouped_nixl: Request-level main and DFlash transfer inventory.
+    :ivar resources: Packed actor, DFlash, and pre-lifecycle quarantine inventory.
     :ivar owner_dead_marked: Whether scheduler failure wake was published.
     :ivar native_producers_retired: Whether native producer contexts joined.
     """
@@ -112,6 +251,7 @@ class PackedTerminalSourceServingInventory:
     scheduler_consumer: PackedTerminalSourceSchedulerInventory
     scheduler_serving: TerminalSchedulerServingInventory
     grouped_nixl: GroupedNixlTerminalOwnerInventory
+    resources: PackedTerminalSourceResourceInventory
     owner_dead_marked: bool
     native_producers_retired: bool
 
@@ -132,10 +272,107 @@ class PackedTerminalSourceServingInventory:
             )
         if type(self.grouped_nixl) is not GroupedNixlTerminalOwnerInventory:
             raise TypeError("grouped_nixl must be GroupedNixlTerminalOwnerInventory")
+        if type(self.resources) is not PackedTerminalSourceResourceInventory:
+            raise TypeError("resources must be PackedTerminalSourceResourceInventory")
         if type(self.owner_dead_marked) is not bool:
             raise TypeError("owner_dead_marked must be bool")
         if type(self.native_producers_retired) is not bool:
             raise TypeError("native_producers_retired must be bool")
+
+    @property
+    def retained_resource_count(self) -> int:
+        """Count every resource population consulted by clean closure.
+
+        The count is intentionally conservative and may count one request in
+        several ownership domains. Its contract is exact at zero: a zero value
+        is equivalent to the absence of all clean-close retention authority.
+
+        :returns: Conservative retained resource population.
+        """
+
+        runtime = self.runtime
+        owner = runtime.owner
+        native = self.grouped_nixl.native
+        backend_lifecycle = native.backend_lifecycle
+        runtime_inboxes = (
+            runtime.scheduler,
+            runtime.coordinator,
+            runtime.lifecycle,
+            runtime.source_work,
+            runtime.decode_work,
+            runtime.publisher,
+        )
+        return sum(
+            (
+                owner.queued_input_count,
+                owner.queued_output_count,
+                owner.queued_fatal_output_count,
+                owner.pending_action_count,
+                owner.active_source_count,
+                owner.active_decode_count,
+                owner.quarantined_count,
+                owner.armed_deadline_count,
+                int(owner.output_drain_active),
+                runtime.scheduler_live_count,
+                runtime.scheduler_pending_count,
+                runtime.consumer_pending_count,
+                len(runtime.quarantined_binding_digests),
+                int(runtime.fatal_reason is not None),
+                sum(inbox.queued_count for inbox in runtime_inboxes),
+                len(self.wiring.active_binding_digests),
+                len(self.wiring.active_result_slot_binding_digests),
+                self.wiring.pending_publication_action_count,
+                len(self.scheduler_consumer.active_binding_digests),
+                self.scheduler_serving.inbox.live_count,
+                len(self.scheduler_serving.retained_action_ids),
+                self.grouped_nixl.active_group_count,
+                self.grouped_nixl.active_transfer_count,
+                self.grouped_nixl.quarantined_transfer_count,
+                self.grouped_nixl.unowned_handle_count,
+                native.queued_channel_events,
+                native.active_channel_subscriptions,
+                native.retained_public_subscriptions,
+                native.active_callback_slots,
+                native.queued_owner_continuations,
+                backend_lifecycle.source_deliveries_outstanding,
+                backend_lifecycle.source_local_pending,
+                backend_lifecycle.source_receipt_pending,
+                backend_lifecycle.destination_pending,
+                backend_lifecycle.destination_admitting,
+                backend_lifecycle.destination_committed,
+                backend_lifecycle.destination_replaying,
+                backend_lifecycle.destination_quarantined,
+                backend_lifecycle.active_native_deadlines,
+                len(backend_lifecycle.source_deliveries),
+                len(backend_lifecycle.destination_deliveries),
+                len(backend_lifecycle.native_deadlines),
+                int(native.fatal != 0),
+                int(native.eventfd_error != 0),
+                len(self.resources.actor_active_binding_digests),
+                len(self.resources.request_ready_import_binding_digests),
+                len(
+                    self.resources.publication_control_active_binding_digests
+                ),
+                len(
+                    self.resources.publication_control_terminal_binding_digests
+                ),
+                len(self.resources.source_transfer_info_room_ids),
+                len(self.resources.source_prefix_length_room_ids),
+                len(self.resources.source_prefetched_room_ids),
+                len(self.resources.source_prefetch_requested_room_ids),
+                self.resources.dflash_active_transfer_count,
+                self.resources.dflash_quarantined_transfer_count,
+                self.resources.dflash_unowned_native_handle_count,
+                self.resources.dflash_active_row_count,
+                self.resources.dflash_quarantined_row_count,
+                len(
+                    self.resources.unpublished_quarantined_binding_digests
+                ),
+                len(
+                    self.resources.unpublished_quarantined_result_slot_binding_digests
+                ),
+            )
+        )
 
 
 class PackedTerminalSourceServing:
@@ -154,7 +391,10 @@ class PackedTerminalSourceServing:
     _grouped_nixl: GroupedNixlTerminalOwner
     _work: PackedTerminalSourceWork
     _retire_native_producers: Callable[[], None]
-    _retire_submission: Callable[[PackedTerminalSourceSubmission], None]
+    _resource_inventory: Callable[[], PackedTerminalSourceResourceInventory]
+    _retire_submission: Callable[
+        [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+    ]
     _owner_dead_marked: bool
     _native_producers_retired: bool
     _started: bool
@@ -174,7 +414,10 @@ class PackedTerminalSourceServing:
         grouped_nixl: GroupedNixlTerminalOwner,
         work: PackedTerminalSourceWork,
         retire_native_producers: Callable[[], None],
-        retire_submission: Callable[[PackedTerminalSourceSubmission], None],
+        resource_inventory: Callable[[], PackedTerminalSourceResourceInventory],
+        retire_submission: Callable[
+            [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+        ],
     ) -> None:
         """Construct a dormant source serving composition.
 
@@ -188,6 +431,7 @@ class PackedTerminalSourceServing:
         :param grouped_nixl: Sole request-grouped native completion owner.
         :param work: Algorithm-neutral source work callbacks.
         :param retire_native_producers: Native event-channel retirement fence.
+        :param resource_inventory: Exact external actor and DFlash ownership probe.
         :param retire_submission: Process-lifetime control-state retirement
             after native lifecycle retirement succeeds.
         """
@@ -208,6 +452,8 @@ class PackedTerminalSourceServing:
             raise TypeError("work must be PackedTerminalSourceWork")
         if not callable(retire_native_producers):
             raise TypeError("retire_native_producers must be callable")
+        if not callable(resource_inventory):
+            raise TypeError("resource_inventory must be callable")
         if not callable(retire_submission):
             raise TypeError("retire_submission must be callable")
         wiring = PackedTerminalSourceWiring(
@@ -233,6 +479,7 @@ class PackedTerminalSourceServing:
         self._grouped_nixl = grouped_nixl
         self._work = work
         self._retire_native_producers = retire_native_producers
+        self._resource_inventory = resource_inventory
         self._retire_submission = retire_submission
         self._owner_dead_marked = False
         self._native_producers_retired = False
@@ -388,6 +635,7 @@ class PackedTerminalSourceServing:
             scheduler_consumer=self._scheduler_consumer.inventory(),
             scheduler_serving=self._scheduler_serving.inventory(),
             grouped_nixl=self._grouped_nixl.inventory(),
+            resources=self._resource_inventory(),
             owner_dead_marked=owner_dead_marked,
             native_producers_retired=native_producers_retired,
         )
@@ -426,16 +674,7 @@ class PackedTerminalSourceServing:
         )
         self.drain_runtime_actions()
         inventory = self.inventory()
-        if (
-            inventory.runtime.scheduler_live_count != 0
-            or inventory.runtime.scheduler_pending_count != 0
-            or inventory.runtime.consumer_pending_count != 0
-            or len(inventory.wiring.active_binding_digests) != 0
-            or len(inventory.scheduler_consumer.active_binding_digests) != 0
-            or inventory.scheduler_serving.inbox.live_count != 0
-            or inventory.grouped_nixl.active_group_count != 0
-            or inventory.grouped_nixl.active_transfer_count != 0
-        ):
+        if inventory.retained_resource_count != 0:
             raise RuntimeError("clean source serving close retains lifecycle authority")
         self._grouped_nixl.close_clean()
         self._runtime.close_clean()
@@ -479,6 +718,18 @@ class PackedTerminalSourceServing:
         with self._lock:
             self._closed = True
         return inventory
+
+    def begin_fail_closed_abort(self) -> None:
+        """Stop functional side effects and wake scheduler-owned teardown.
+
+        This boundary is used when scheduler-local state can no longer be
+        reconciled with already-published native ownership. It deliberately
+        preserves every live request for process teardown quarantine.
+        """
+
+        self._require_open()
+        self._runtime.begin_abort()
+        self._mark_owner_dead()
 
     def publisher_result(self, result: TerminalGatewayPublicationResult) -> None:
         """Return one exactly-once publisher outcome to source authority.
@@ -539,6 +790,21 @@ class PackedTerminalSourceServing:
             authenticated_issuer=authenticated_issuer,
             reason=reason,
         )
+
+    def cancel_submission(
+        self,
+        binding: TerminalRequestBinding,
+        reason: str,
+    ) -> PackedTerminalSourceCancellationDisposition:
+        """Record scheduler cancellation after source publication cutover.
+
+        :param binding: Exact scheduler-retained source generation.
+        :param reason: Stable client-cancellation reason.
+        :returns: Completion-required or too-late-for-rollback disposition.
+        """
+
+        self._require_open()
+        return self._wiring.cancel_request(binding, reason)
 
     def publication_receipt(
         self,
@@ -680,9 +946,10 @@ class PackedTerminalSourceServing:
             try:
                 if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
                     self._work.quarantine(action)
-                retired = self._wiring.consume_terminal_action(action)
-                if retired is not None:
-                    self._retire_submission(retired)
+                self._wiring.consume_terminal_action(
+                    action,
+                    self._retire_submission,
+                )
             except (OSError, RuntimeError, TypeError, ValueError):
                 logger.error(
                     "Source lifecycle retirement failed:\n%s",
