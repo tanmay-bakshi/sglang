@@ -4,6 +4,9 @@ import threading
 import traceback
 from collections.abc import Callable
 
+from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    TerminalCudaCompletionProducer,
+)
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
@@ -405,6 +408,7 @@ class PackedTerminalSourceServing:
         self,
         *,
         runtime: NativeTerminalRuntime,
+        cuda_completion: TerminalCudaCompletionProducer,
         local_identity: TerminalProcessIdentity,
         publisher: PackedTerminalSourcePublisher | None,
         metrics_sink: PackedTerminalSourceMetricsSink,
@@ -422,6 +426,7 @@ class PackedTerminalSourceServing:
         """Construct a dormant source serving composition.
 
         :param runtime: Sole process-lifetime native lifecycle runtime.
+        :param cuda_completion: Direct source callback-to-owner producer.
         :param local_identity: Exact source process owned by the runtime.
         :param publisher: Canonical-rank publisher, otherwise ``None``.
         :param metrics_sink: Non-gating source metric projection.
@@ -458,6 +463,7 @@ class PackedTerminalSourceServing:
             raise TypeError("retire_submission must be callable")
         wiring = PackedTerminalSourceWiring(
             runtime=runtime,
+            cuda_completion=cuda_completion,
             local_identity=local_identity,
             publisher=publisher,
             metrics_sink=metrics_sink,
@@ -577,6 +583,18 @@ class PackedTerminalSourceServing:
             self._mark_owner_dead()
             self._runtime.begin_abort()
             raise
+
+    def attach_producer_completion(
+        self,
+        submission: PackedTerminalSourceSubmission,
+    ) -> None:
+        """Attach direct terminal delivery after PREPARE is published.
+
+        :param submission: Exact accepted source submission.
+        """
+
+        self._require_open()
+        self._wiring.attach_producer_completion(submission)
 
     def drain_runtime_actions(self) -> int:
         """Drain every currently readable runtime execution-context inbox.

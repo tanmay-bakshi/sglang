@@ -1863,6 +1863,7 @@ class NixlKVManager(CommonKVManager):
             publication_control.register_binding(identity.local_binding)
             commit_scheduler_retention(submission)
             runtime.publish_terminal_owner_prepare(transport)
+            serving.attach_producer_completion(submission)
         except Exception as error:  # noqa: BLE001
             formatted_traceback = traceback.format_exc()
             cleanup_failures: list[str] = []
@@ -2855,6 +2856,9 @@ class NixlKVManager(CommonKVManager):
         actor = self._packed_prefill_runtime
         if actor is None:
             raise RuntimeError("terminal source actor is unavailable")
+        cuda_source = enrollment.cuda_source
+        if cuda_source is None:
+            raise RuntimeError("terminal source native work boundary is unavailable")
         publication_control = self._terminal_source_publication_control
         if publication_control is None:
             raise RuntimeError("source publication control is unavailable")
@@ -3035,6 +3039,7 @@ class NixlKVManager(CommonKVManager):
 
         serving = PackedTerminalSourceServing(
             runtime=enrollment.runtime,
+            cuda_completion=cuda_source,
             local_identity=local_identity,
             publisher=publisher,
             metrics_sink=_NixlTerminalSourceMetrics(),

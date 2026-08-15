@@ -1052,6 +1052,7 @@ class SchedulerDisaggregationPrefillMixin:
                     identity=launch.identity,
                     output_projection=projection,
                     producer_event_generation=launch.producer_event_generation,
+                    producer_stream_handle=int(stream.cuda_stream),
                     transport_submission=transport_submission,
                 )
                 if launch.dflash_source is not None:

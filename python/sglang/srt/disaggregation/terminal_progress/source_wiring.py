@@ -6,6 +6,9 @@ import traceback
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
+from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    TerminalCudaCompletionProducer,
+)
 from sglang.srt.disaggregation.terminal_progress.evidence import (
     TerminalProgressTimingRecorder,
     terminal_progress_timing_recorder,
@@ -215,12 +218,14 @@ class PackedTerminalSourceSubmission:
     :ivar identity: Complete source binding and publication identity.
     :ivar output_projection: Pre-forward shell and stable producer result slot.
     :ivar producer_event_generation: Exact event generation covering the slot.
+    :ivar producer_stream_handle: Stream tail immediately following that event.
     :ivar transport_submission: Opaque immutable packed transport submission.
     """
 
     identity: PackedTerminalSourceIdentityPlan
     output_projection: FrozenTerminalGatewayOutputProjection | None
     producer_event_generation: bytes
+    producer_stream_handle: int
     transport_submission: object
 
     def __post_init__(self) -> None:
@@ -240,6 +245,11 @@ class PackedTerminalSourceSubmission:
             raise TypeError("producer_event_generation must be bytes")
         if len(self.producer_event_generation) != 16:
             raise ValueError("producer_event_generation must contain 16 bytes")
+        if (
+            type(self.producer_stream_handle) is not int
+            or self.producer_stream_handle < 0
+        ):
+            raise ValueError("producer_stream_handle must be a non-negative integer")
         if self.transport_submission is None:
             raise ValueError("transport_submission must not be None")
 
@@ -348,6 +358,8 @@ class _SourceRecord:
     publication_failed: bool = False
     quarantined: bool = False
     cancellation_reason: str | None = None
+    producer_completion_attachment_started: bool = False
+    producer_completion_attached: bool = False
     claimed_action_ids: set[int] = dataclasses.field(default_factory=set)
 
 
@@ -360,6 +372,7 @@ class PackedTerminalSourceWiring:
     """
 
     _runtime: NativeTerminalSourceRuntime
+    _cuda_completion: TerminalCudaCompletionProducer
     _local_identity: TerminalProcessIdentity
     _local_producer_id: int
     _local_receipt_producer_id: int
@@ -376,6 +389,7 @@ class PackedTerminalSourceWiring:
         self,
         *,
         runtime: NativeTerminalSourceRuntime,
+        cuda_completion: TerminalCudaCompletionProducer,
         local_identity: TerminalProcessIdentity,
         publisher: PackedTerminalSourcePublisher | None,
         metrics_sink: PackedTerminalSourceMetricsSink,
@@ -384,6 +398,7 @@ class PackedTerminalSourceWiring:
         """Construct source wiring over the sole process-lifetime runtime.
 
         :param runtime: Sole authoritative native lifecycle runtime.
+        :param cuda_completion: Direct source callback-to-owner producer.
         :param local_identity: Exact source process owned by this wiring.
         :param publisher: Canonical-rank publisher, otherwise ``None``.
         :param metrics_sink: Non-gating metric projection sink.
@@ -392,6 +407,10 @@ class PackedTerminalSourceWiring:
 
         if not isinstance(runtime, NativeTerminalSourceRuntime):
             raise TypeError("runtime must satisfy NativeTerminalSourceRuntime")
+        if not isinstance(cuda_completion, TerminalCudaCompletionProducer):
+            raise TypeError(
+                "cuda_completion must satisfy TerminalCudaCompletionProducer"
+            )
         if type(local_identity) is not TerminalProcessIdentity:
             raise TypeError("local_identity must be TerminalProcessIdentity")
         if local_identity.role is not TerminalOwnerRole.SOURCE:
@@ -411,6 +430,7 @@ class PackedTerminalSourceWiring:
             raise ValueError("only canonical source rank may own a gateway publisher")
         native_identity = NativeTerminalProcessIdentity.from_identity(local_identity)
         self._runtime = runtime
+        self._cuda_completion = cuda_completion
         self._local_identity = local_identity
         self._local_producer_id = runtime.python_producer_id(
             NativeTerminalProducerClass.LOCAL
@@ -474,6 +494,40 @@ class PackedTerminalSourceWiring:
             digest,
             NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
         )
+
+    def attach_producer_completion(
+        self,
+        submission: PackedTerminalSourceSubmission,
+    ) -> None:
+        """Attach one callback after the actor has published PREPARE.
+
+        The attachment attempt becomes irreversible before entering CUDA. A
+        partial arm or submit failure therefore cannot be retried against the
+        same lifecycle and must enter the caller's process-fatal path.
+
+        :param submission: Exact accepted source submission.
+        """
+
+        if type(submission) is not PackedTerminalSourceSubmission:
+            raise TypeError("submission must be PackedTerminalSourceSubmission")
+        digest = submission.identity.local_binding.digest
+        record = self._record(digest)
+        if record.submission is not submission:
+            raise RuntimeError("source completion targets another submission")
+        with self._lock:
+            current = self._records.get(digest)
+            if current is not record:
+                raise RuntimeError("source record changed before callback attachment")
+            if current.producer_completion_attachment_started:
+                raise RuntimeError("source completion callback was already attempted")
+            current.producer_completion_attachment_started = True
+        self._cuda_completion.arm(digest)
+        self._cuda_completion.submit(submission.producer_stream_handle, digest)
+        with self._lock:
+            current = self._records.get(digest)
+            if current is not record:
+                raise RuntimeError("source record changed during callback attachment")
+            current.producer_completion_attached = True
 
     def submission_committed(self, observation: NativeTerminalOwnerObservation) -> None:
         """Project one exact native submission commit into evidence.
@@ -544,6 +598,10 @@ class PackedTerminalSourceWiring:
         :param binding_digest: Exact accepted source binding.
         """
 
+        record = self._record(binding_digest)
+        with self._lock:
+            if not record.producer_completion_attached:
+                raise RuntimeError("source producer completed before callback attachment")
         self._submit_local(
             binding_digest,
             NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,

@@ -11,11 +11,13 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     PackedDecodeOwnerSignal,
     PackedDecodeRuntime,
     PackedDecodeScatterBatch,
-    PackedDecodeScatterCompletionProducer,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestPublication,
+)
+from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    TerminalCudaCompletionProducer,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
     TerminalDFlashDecodeAdoption,
@@ -212,7 +214,7 @@ class PackedTerminalDecodeWiring:
 
     _actor: PackedDecodeRuntime
     _runtime: NativeTerminalDecodeRuntime
-    _cuda_completion: PackedDecodeScatterCompletionProducer
+    _cuda_completion: TerminalCudaCompletionProducer
     _timing: TerminalProgressTimingRecorder
     _local_producer_id: int
     _local_receipt_producer_id: int
@@ -222,7 +224,7 @@ class PackedTerminalDecodeWiring:
         *,
         actor: PackedDecodeRuntime,
         runtime: NativeTerminalDecodeRuntime,
-        cuda_completion: PackedDecodeScatterCompletionProducer,
+        cuda_completion: TerminalCudaCompletionProducer,
         local_identity: TerminalProcessIdentity,
         clock_ns: Callable[[], int],
     ) -> None:
@@ -239,12 +241,9 @@ class PackedTerminalDecodeWiring:
             raise TypeError("actor must be PackedDecodeRuntime")
         if not isinstance(runtime, NativeTerminalDecodeRuntime):
             raise TypeError("runtime must satisfy NativeTerminalDecodeRuntime")
-        if not isinstance(
-            cuda_completion,
-            PackedDecodeScatterCompletionProducer,
-        ):
+        if not isinstance(cuda_completion, TerminalCudaCompletionProducer):
             raise TypeError(
-                "cuda_completion must satisfy PackedDecodeScatterCompletionProducer"
+                "cuda_completion must satisfy TerminalCudaCompletionProducer"
             )
         if type(local_identity) is not TerminalProcessIdentity:
             raise TypeError("local_identity must be TerminalProcessIdentity")

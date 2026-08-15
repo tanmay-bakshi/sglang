@@ -2864,24 +2864,6 @@ class PackedDecodeOwnerSignal:
             raise ValueError("decode control ingress requires a source issuer")
 
 
-@runtime_checkable
-class PackedDecodeScatterCompletionProducer(Protocol):
-    """Direct native CUDA-callback producer used by destination scatter."""
-
-    def arm(self, binding_digest: bytes) -> None:
-        """Arm one exact lifecycle before callback registration.
-
-        :param binding_digest: Exact local decode lifecycle identity.
-        """
-
-    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
-        """Attach terminal delivery after prior work on the CUDA stream.
-
-        :param stream_handle: Raw CUDA stream carrying the scatter tail.
-        :param binding_digest: Exact lifecycle armed for this callback.
-        """
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class PackedDecodeScatterBatch:
     """One request-level scatter batch submitted to the dedicated stream.

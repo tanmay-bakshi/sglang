@@ -163,6 +163,45 @@ class _Clock:
         return self.value
 
 
+class _CudaCompletion:
+    """Record exact source callback attachment ordering."""
+
+    operations: list[tuple[str, int | bytes, bytes | None]]
+    runtime_operations: list[tuple[object, ...]]
+
+    def __init__(self, runtime_operations: list[tuple[object, ...]]) -> None:
+        """Create a callback ledger sharing the runtime-order ledger.
+
+        :param runtime_operations: Cross-producer operation order.
+        """
+
+        self.operations = []
+        self.runtime_operations = runtime_operations
+
+    def arm(self, binding_digest: bytes) -> None:
+        """Record one armed lifecycle.
+
+        :param binding_digest: Exact source binding.
+        """
+
+        operation = ("arm", binding_digest, None)
+        self.operations.append(operation)
+        self.runtime_operations.append(("cuda-arm", binding_digest))
+
+    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
+        """Record one stream-tail callback attachment.
+
+        :param stream_handle: Exact source stream handle.
+        :param binding_digest: Exact armed binding.
+        """
+
+        operation = ("submit", stream_handle, binding_digest)
+        self.operations.append(operation)
+        self.runtime_operations.append(
+            ("cuda-submit", stream_handle, binding_digest)
+        )
+
+
 class _Runtime:
     """Strict process-runtime double with exact authority accounting."""
 
@@ -380,6 +419,7 @@ class _Harness:
     """Source wiring fixture with one process-lifetime runtime."""
 
     runtime: _Runtime
+    cuda_completion: _CudaCompletion
     wiring: PackedTerminalSourceWiring
     identity: PackedTerminalSourceIdentityPlan
     submission: PackedTerminalSourceSubmission
@@ -451,6 +491,7 @@ def _submission(
             else None
         ),
         producer_event_generation=bytes.fromhex("81" * 16),
+        producer_stream_handle=81,
         transport_submission=_SubmissionPayload(label="transport"),
     )
 
@@ -465,11 +506,13 @@ def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
 
     identity = _identities(local_rank=local_rank)
     runtime = _Runtime(identity)
+    cuda_completion = _CudaCompletion(runtime.operations)
     metrics = _Metrics(fail=failing_metrics)
     publisher = _Publisher() if local_rank == 0 else None
     clock = _Clock()
     wiring = PackedTerminalSourceWiring(
         runtime=runtime,
+        cuda_completion=cuda_completion,
         local_identity=identity.local_binding.owner,
         publisher=publisher,
         metrics_sink=metrics,
@@ -477,8 +520,10 @@ def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
     )
     submission = _submission(identity)
     wiring.accept_submission(submission)
+    wiring.attach_producer_completion(submission)
     return _Harness(
         runtime=runtime,
+        cuda_completion=cuda_completion,
         wiring=wiring,
         identity=identity,
         submission=submission,
@@ -665,6 +710,14 @@ def test_runtime_registration_precedes_first_source_event() -> None:
         harness.identity.local_binding.digest,
         NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
     )
+    assert operations[2:] == [
+        ("cuda-arm", harness.identity.local_binding.digest),
+        ("cuda-submit", 81, harness.identity.local_binding.digest),
+    ]
+    assert harness.cuda_completion.operations == [
+        ("arm", harness.identity.local_binding.digest, None),
+        ("submit", 81, harness.identity.local_binding.digest),
+    ]
     assert harness.wiring.lifecycle_published(harness.identity.local_binding.digest)
 
 
@@ -772,6 +825,7 @@ def test_unpublished_registration_failure_can_cancel_exact_submission() -> None:
     runtime.fail_registration = True
     wiring = PackedTerminalSourceWiring(
         runtime=runtime,
+        cuda_completion=_CudaCompletion(runtime.operations),
         local_identity=identity.local_binding.owner,
         publisher=_Publisher(),
         metrics_sink=_Metrics(),

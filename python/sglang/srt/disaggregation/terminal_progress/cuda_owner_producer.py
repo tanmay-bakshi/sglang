@@ -6,14 +6,13 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import Protocol, cast
-
-from torch.utils.cpp_extension import CUDA_HOME, load
+from typing import Protocol, cast, runtime_checkable
 
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalNativeProducerBinding,
     NativeTerminalRuntime,
 )
+from torch.utils.cpp_extension import CUDA_HOME, load
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -99,6 +98,24 @@ class CudaTerminalEventKind(enum.IntEnum):
 
     SOURCE_PRODUCER_COMPLETED = 11
     DECODE_SCATTER_TERMINAL = 44
+
+
+@runtime_checkable
+class TerminalCudaCompletionProducer(Protocol):
+    """Direct native CUDA-callback producer for one lifecycle boundary."""
+
+    def arm(self, binding_digest: bytes) -> None:
+        """Arm one exact lifecycle before callback registration.
+
+        :param binding_digest: Exact local lifecycle identity.
+        """
+
+    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
+        """Attach terminal delivery after prior work on a CUDA stream.
+
+        :param stream_handle: Raw CUDA stream carrying the completed work.
+        :param binding_digest: Exact lifecycle armed for this callback.
+        """
 
 
 class _NativeCudaTerminalProducer(Protocol):

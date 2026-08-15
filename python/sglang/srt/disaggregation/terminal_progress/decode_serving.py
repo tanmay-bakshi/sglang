@@ -14,7 +14,6 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     PackedDecodeOwnerInventory,
     PackedDecodeOwnerSignal,
     PackedDecodeRuntime,
-    PackedDecodeScatterCompletionProducer,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
@@ -27,6 +26,9 @@ from sglang.srt.disaggregation.terminal_progress.coordinator import (
     TerminalRequestCoordinatorEmission,
     TerminalRequestCoordinatorError,
     TerminalRequestCoordinatorManifest,
+)
+from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
+    TerminalCudaCompletionProducer,
 )
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
@@ -341,7 +343,7 @@ class PackedTerminalDecodeServing:
         *,
         actor: PackedDecodeRuntime,
         runtime: NativeTerminalRuntime,
-        cuda_completion: PackedDecodeScatterCompletionProducer,
+        cuda_completion: TerminalCudaCompletionProducer,
         local_identity: TerminalProcessIdentity,
         coordinator_issuer: TerminalWireReceiptIssuer | None,
         coordinator_importers: tuple[TerminalWireReceiptImportNamespace, ...],

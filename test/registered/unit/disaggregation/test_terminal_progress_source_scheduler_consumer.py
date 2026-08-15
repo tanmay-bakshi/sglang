@@ -184,6 +184,7 @@ def _submission(
             identity=identity,
             output_projection=_Projection(payload=b"output"),
             producer_event_generation=bytes((marker + 6,)) * 16,
+            producer_stream_handle=marker + 7,
             transport_submission=payload,
         ),
         payload,

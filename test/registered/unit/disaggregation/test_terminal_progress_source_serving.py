@@ -139,6 +139,23 @@ class _Publisher:
         return True
 
 
+class _CudaCompletion:
+    """No-op source callback producer for composition tests."""
+
+    def arm(self, binding_digest: bytes) -> None:
+        """Accept one source lifecycle.
+
+        :param binding_digest: Exact source binding.
+        """
+
+    def submit(self, stream_handle: int, binding_digest: bytes) -> None:
+        """Accept one stream-tail callback attachment.
+
+        :param stream_handle: Exact source stream handle.
+        :param binding_digest: Exact armed binding.
+        """
+
+
 class _EmptyGroupedNixlOwner(GroupedNixlTerminalOwner):
     """Nominal empty grouped owner for source-composition tests."""
 
@@ -379,6 +396,7 @@ def _submission(
             else None
         ),
         producer_event_generation=b"e" * 16,
+        producer_stream_handle=19,
         transport_submission=("packed", identity.local_binding.digest),
     )
 
@@ -440,6 +458,7 @@ def _serving(
 
     serving = PackedTerminalSourceServing(
         runtime=runtime,
+        cuda_completion=_CudaCompletion(),
         local_identity=identity.local_binding.owner,
         publisher=publisher,
         metrics_sink=metrics,
@@ -492,10 +511,12 @@ def test_composition_binds_both_scheduler_owners_before_lifecycle() -> None:
     serving.start()
     release_calls: list[int] = []
     try:
+        submission = _submission(identity)
         serving.bind_submission(
-            _submission(identity),
+            submission,
             lambda submission: release_calls.append(1),
         )
+        serving.attach_producer_completion(submission)
         inventory = serving.inventory()
         assert inventory.runtime.scheduler_live_count == 1
         assert inventory.scheduler_consumer.active_binding_digests == (
@@ -566,6 +587,7 @@ def test_full_source_composition_retires_exactly_once(
     serving.start()
     try:
         serving.bind_submission(submission, release_calls.append)
+        serving.attach_producer_completion(submission)
         digest = identity.local_binding.digest
         serving.wiring.producer_completed(digest)
         _pump(serving, runtime)
@@ -657,7 +679,9 @@ def test_runtime_fatal_marks_scheduler_and_quarantines_retained_release() -> Non
     serving, runtime, _, _, _, fatal_inventories = _serving(identity)
     serving.start()
     try:
-        serving.bind_submission(_submission(identity), lambda submission: None)
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda submission: None)
+        serving.attach_producer_completion(submission)
         runtime.begin_abort()
         _pump(serving, runtime)
         with pytest.raises(RuntimeError):

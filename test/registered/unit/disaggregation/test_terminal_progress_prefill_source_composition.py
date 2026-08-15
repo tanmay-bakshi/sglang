@@ -180,26 +180,32 @@ class _ManagerServing:
     """Model lifecycle commit and fail-closed source drain boundaries."""
 
     active: set[bytes]
+    completion_attachments: list[PackedTerminalSourceSubmission]
     abort_calls: int
     fail_before_commit: bool
     fail_after_commit: bool
+    fail_completion_attachment: bool
 
     def __init__(
         self,
         *,
         fail_before_commit: bool = False,
         fail_after_commit: bool = False,
+        fail_completion_attachment: bool = False,
     ) -> None:
         """Create one empty serving lifecycle fixture.
 
         :param fail_before_commit: Whether binding fails before lifecycle commit.
         :param fail_after_commit: Whether binding fails after lifecycle commit.
+        :param fail_completion_attachment: Whether callback attachment fails.
         """
 
         self.active = set()
+        self.completion_attachments = []
         self.abort_calls = 0
         self.fail_before_commit = fail_before_commit
         self.fail_after_commit = fail_after_commit
+        self.fail_completion_attachment = fail_completion_attachment
 
     def bind_submission(
         self,
@@ -218,6 +224,19 @@ class _ManagerServing:
         self.active.add(submission.identity.local_binding.digest)
         if self.fail_after_commit:
             raise RuntimeError("synthetic post-commit serving failure")
+
+    def attach_producer_completion(
+        self,
+        submission: PackedTerminalSourceSubmission,
+    ) -> None:
+        """Record callback attachment after PREPARE publication.
+
+        :param submission: Exact accepted source submission.
+        """
+
+        self.completion_attachments.append(submission)
+        if self.fail_completion_attachment:
+            raise RuntimeError("synthetic completion attachment failure")
 
     def inventory(self) -> SimpleNamespace:
         """Return the lifecycle fields consumed by manager recovery.
@@ -349,6 +368,7 @@ def _manager_submission(
         identity=identity,
         output_projection=projection,
         producer_event_generation=b"e" * 16,
+        producer_stream_handle=23,
         transport_submission=transport,
     )
     return submission, dflash_lease
@@ -380,6 +400,7 @@ def _manager_fixture(
     serving = _ManagerServing(
         fail_before_commit=fault_stage == "serving_before",
         fail_after_commit=fault_stage == "serving_after",
+        fail_completion_attachment=fault_stage == "completion",
     )
     publication = _ManagerBindingRegistry(fail=fault_stage == "publication")
     manager = object.__new__(NixlKVManager)
@@ -477,6 +498,7 @@ class _LeaseManager:
         ("publication", True),
         ("retention", True),
         ("prepare", True),
+        ("completion", True),
     ),
 )
 def test_real_manager_fault_boundary_retains_exact_owner_partition(
@@ -532,13 +554,21 @@ def test_real_manager_fault_boundary_retains_exact_owner_partition(
             "publication",
             "retention",
             "prepare",
+            "completion",
         )
         else 0
     )
     assert len(publication.bindings) == (
-        1 if fault_stage in ("publication", "retention", "prepare") else 0
+        1
+        if fault_stage in ("publication", "retention", "prepare", "completion")
+        else 0
     )
-    assert len(actor.prepare_calls) == (1 if fault_stage == "prepare" else 0)
+    assert len(actor.prepare_calls) == (
+        1 if fault_stage in ("prepare", "completion") else 0
+    )
+    assert len(serving.completion_attachments) == (
+        1 if fault_stage == "completion" else 0
+    )
     assert manager._terminal_process_fatal_reason == (
         "terminal source bind failed after producer submission"
     )
@@ -551,7 +581,7 @@ def test_real_manager_commits_scheduler_retention_before_prepare() -> None:
 
     identity = _manager_identity()
     submission, _ = _manager_submission(identity)
-    manager, _, actor, importer, _, _ = _manager_fixture()
+    manager, _, actor, importer, serving, _ = _manager_fixture()
     manager._terminal_source_receipt_importers = {
         identity.request_ready_issuer: importer
     }
@@ -578,13 +608,25 @@ def test_real_manager_commits_scheduler_retention_before_prepare() -> None:
 
     actor.publish_terminal_owner_prepare = publish_prepare  # type: ignore[method-assign]
 
+    def attach_completion(retained: PackedTerminalSourceSubmission) -> None:
+        """Reject callback attachment before PREPARE is visible.
+
+        :param retained: Exact accepted source submission.
+        """
+
+        assert retained is submission
+        assert order == ["scheduler_retention", "prepare"]
+        order.append("completion")
+
+    serving.attach_producer_completion = attach_completion  # type: ignore[method-assign]
+
     manager.bind_terminal_source_submission(
         submission,
         lambda retired: None,
         commit_retention,
     )
 
-    assert order == ["scheduler_retention", "prepare"]
+    assert order == ["scheduler_retention", "prepare", "completion"]
 
 
 def test_real_manager_rejects_nonprefill_projection_before_actor_publication() -> None:
