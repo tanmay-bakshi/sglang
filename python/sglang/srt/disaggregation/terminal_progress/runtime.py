@@ -1139,9 +1139,12 @@ class NativeTerminalRuntime:
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
         with self._condition:
-            if self._disposition is not NativeTerminalRuntimeDisposition.ABORT_DRAINING:
+            if self._disposition not in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+            ):
                 raise NativeTerminalRuntimeError(
-                    "aborted action acknowledgement requires fail-closed drain"
+                    "aborted action acknowledgement requires fail-closed state"
                 )
             pending = self._consumer_pending.get(action.action_id)
             if pending != action:
@@ -1684,7 +1687,11 @@ class NativeTerminalRuntime:
                 native_reason = "native owner did not expose a failure reason"
             reason = (
                 f"native terminal owner entered {output.fatal_code.name}: "
-                f"{native_reason}"
+                f"{native_reason}; event={output.event_kind.name}; "
+                f"previous_phase={output.previous_phase}; "
+                f"producer_id={output.producer_id}; "
+                f"producer_sequence={output.producer_sequence}; "
+                f"binding={output.binding.digest.hex()}"
             )
             logger.error("%s", reason)
             with self._condition:

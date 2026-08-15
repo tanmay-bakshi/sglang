@@ -1063,6 +1063,14 @@ def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
         with selectors.DefaultSelector() as selector:
             selector.register(runtime.lifecycle_actions.fileno(), selectors.EVENT_READ)
             assert len(selector.select(_WAIT_SECONDS)) > 0
+        actions = _drain_actions(runtime.lifecycle_actions)
+        assert len(actions) == len(registrations)
+        assert all(
+            action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+            for action in actions
+        )
+        for action in actions:
+            runtime.acknowledge_aborted_action(action)
         runtime.begin_abort()
         _retire_all_producers(runtime)
         runtime.join_producers()
