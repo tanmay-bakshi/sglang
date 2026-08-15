@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     PackedRegistrationAdvertisement,
     encode_packed_control_frames,
 )
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalOwnerRole
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -3792,6 +3793,101 @@ class TestNixlPackedControlRoutes(CustomTestCase):
                     controller.build_control_sender.call_count,
                     source_tp_size,
                 )
+
+
+class TestNixlPackedDecodePublication(CustomTestCase):
+    """Keep packed metadata visibility behind its lifecycle publication."""
+
+    @staticmethod
+    def _receiver(events: list[str]) -> NixlKVReceiver:
+        """Build a route-complete receiver with observable metadata delivery.
+
+        :param events: Ordered production-boundary observations.
+        :returns: Narrow packed receiver fixture.
+        """
+
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.build_packed_control_routes = MagicMock(return_value=(object(),))
+        receiver.send_metadata = MagicMock(
+            side_effect=lambda *args, **kwargs: events.append("metadata")
+        )
+        return receiver
+
+    def test_terminal_publication_enters_owner_before_metadata_visibility(self) -> None:
+        """Publish the allocation transition before source control can arrive."""
+
+        events: list[str] = []
+        controller = MagicMock(ready=True)
+        serving = MagicMock()
+        serving.allocation_published.side_effect = (
+            lambda *args: events.append("owner")
+        )
+        manager = object.__new__(NixlKVManager)
+        manager._packed_decode_controller = controller
+        manager._terminal_startup_binding = SimpleNamespace(
+            advertisement=SimpleNamespace(role=TerminalOwnerRole.DECODE)
+        )
+        manager._terminal_decode_serving = serving
+        receiver = self._receiver(events)
+        transaction = object()
+        publication = SimpleNamespace(
+            auxiliary_plan=SimpleNamespace(metadata_buffer_index=3),
+            terminal_source_plan=object(),
+        )
+
+        manager.send_packed_decode_request_metadata(
+            transaction=transaction,
+            publication=publication,
+            receiver=receiver,
+            page_indices=np.array([5, 8], dtype=np.int32),
+            metadata_buffer_index=3,
+            state_indices=None,
+            decode_prefix_len=0,
+        )
+
+        self.assertEqual(events, ["owner", "metadata"])
+        serving.allocation_published.assert_called_once_with(
+            transaction,
+            publication,
+            receiver.build_packed_control_routes.return_value,
+        )
+        controller.bind_publication.assert_not_called()
+
+    def test_nonterminal_publication_stays_with_packed_actor(self) -> None:
+        """Keep the legacy packed actor authoritative without terminal identity."""
+
+        events: list[str] = []
+        controller = MagicMock(ready=True)
+        controller.bind_publication.side_effect = (
+            lambda *args: events.append("actor")
+        )
+        manager = object.__new__(NixlKVManager)
+        manager._packed_decode_controller = controller
+        manager._terminal_startup_binding = None
+        manager._terminal_decode_serving = None
+        receiver = self._receiver(events)
+        transaction = object()
+        publication = SimpleNamespace(
+            auxiliary_plan=SimpleNamespace(metadata_buffer_index=3),
+            terminal_source_plan=None,
+        )
+
+        manager.send_packed_decode_request_metadata(
+            transaction=transaction,
+            publication=publication,
+            receiver=receiver,
+            page_indices=np.array([5, 8], dtype=np.int32),
+            metadata_buffer_index=3,
+            state_indices=None,
+            decode_prefix_len=0,
+        )
+
+        self.assertEqual(events, ["actor", "metadata"])
+        controller.bind_publication.assert_called_once_with(
+            transaction,
+            publication,
+            receiver.build_packed_control_routes.return_value,
+        )
 
 
 class TestNixlSliceTransferBounds(CustomTestCase):

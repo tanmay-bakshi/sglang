@@ -4516,7 +4516,17 @@ class NixlKVManager(CommonKVManager):
                 "non-terminal packed metadata carries terminal source authority"
             )
         routes = receiver.build_packed_control_routes(controller)
-        controller.bind_publication(transaction, publication, routes)
+        if terminal_payload is None:
+            controller.bind_publication(transaction, publication, routes)
+        else:
+            # Terminal serving is the sole lifecycle publisher. Entering the
+            # actor directly would expose writer control while the native owner
+            # still considers the allocation unpublished.
+            self.terminal_decode_serving.allocation_published(
+                transaction,
+                publication,
+                routes,
+            )
         receiver.send_metadata(
             page_indices,
             metadata_buffer_index,
