@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 from array import array
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
-
+from sglang.srt.disaggregation.utils import _is_fake_transfer
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -115,7 +115,51 @@ class ScheduleBatchDisaggregationDecodeMixin:
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
-        last_tokens: List[int] = []
+        terminal_boundary_tokens = tuple(
+            req.pd_dflash_boundary_token_id for req in self.reqs
+        )
+        terminal_boundary_events = tuple(
+            req.pd_dflash_boundary_completion_event for req in self.reqs
+        )
+        terminal_token_count = sum(
+            token is not None for token in terminal_boundary_tokens
+        )
+        if terminal_token_count > 0:
+            if not self.spec_algorithm.is_dflash():
+                raise RuntimeError(
+                    "request-owned terminal boundary tokens require DFlash"
+                )
+            for req, token, event in zip(
+                self.reqs,
+                terminal_boundary_tokens,
+                terminal_boundary_events,
+                strict=True,
+            ):
+                scheduler_local = _is_fake_transfer(req, server_args)
+                if token is None:
+                    if event is not None:
+                        raise RuntimeError(
+                            "terminal DFlash completion event lost its device token"
+                        )
+                    if not scheduler_local:
+                        raise RuntimeError(
+                            "terminal DFlash can compose only owner-published and "
+                            "scheduler-local fake requests"
+                        )
+                    continue
+                if scheduler_local:
+                    raise RuntimeError(
+                        "scheduler-local fake request retained terminal DFlash "
+                        "ownership"
+                    )
+                if event is None:
+                    raise RuntimeError(
+                        "terminal DFlash boundary token lost its completion event"
+                    )
+        elif any(event is not None for event in terminal_boundary_events):
+            raise RuntimeError("terminal DFlash completion event lost its device token")
+
+        last_tokens: list[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
             maybe_cache_unfinished_req(req, self.tree_cache)
@@ -138,44 +182,30 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        terminal_boundary_tokens = tuple(
-            req.pd_dflash_boundary_token_id for req in self.reqs
-        )
-        terminal_boundary_events = tuple(
-            req.pd_dflash_boundary_completion_event for req in self.reqs
-        )
-        terminal_token_count = sum(
-            token is not None for token in terminal_boundary_tokens
-        )
         if terminal_token_count > 0:
-            if terminal_token_count != len(self.reqs):
-                raise RuntimeError(
-                    "a prebuilt DFlash batch cannot mix terminal and legacy tokens"
-                )
-            if not self.spec_algorithm.is_dflash():
-                raise RuntimeError(
-                    "request-owned terminal boundary tokens require DFlash"
-                )
-            if any(event is None for event in terminal_boundary_events):
-                raise RuntimeError(
-                    "terminal DFlash boundary token lost its completion event"
-                )
             current_stream = torch.get_device_module(self.device).current_stream()
-            for token, event in zip(
+            boundary_rows: list[torch.Tensor] = []
+            for last_token, token, event in zip(
+                last_tokens,
                 terminal_boundary_tokens,
                 terminal_boundary_events,
                 strict=True,
             ):
-                assert token is not None
+                if token is None:
+                    boundary_rows.append(
+                        torch.tensor(
+                            [last_token],
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                    )
+                    continue
                 assert event is not None
                 current_stream.wait_event(event)
                 token.record_stream(current_stream)
-            last_tokens_tensor = torch.cat(terminal_boundary_tokens, dim=0)
+                boundary_rows.append(token)
+            last_tokens_tensor = torch.cat(tuple(boundary_rows), dim=0)
         else:
-            if any(event is not None for event in terminal_boundary_events):
-                raise RuntimeError(
-                    "terminal DFlash completion event lost its device token"
-                )
             last_tokens_tensor = torch.tensor(
                 last_tokens, dtype=torch.int64, device=self.device
             )

@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -920,6 +921,8 @@ class SchedulerDisaggregationPrefillMixin:
         leased_sources: list[DFlashBoundaryPrefillSource] = []
         try:
             for result_index, req in enumerate(batch.reqs):
+                if _is_fake_transfer(req, self.server_args):
+                    continue
                 if req.inflight_middle_chunks > 0:
                     continue
                 if req.pending_bootstrap:
@@ -1589,7 +1592,13 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
-        for req in batch.reqs:
+        scheduler_local = self.process_scheduler_local_fake_prefill_results(
+            batch,
+            result,
+        )
+        for index, req in enumerate(batch.reqs):
+            if scheduler_local[index]:
+                continue
             if req.inflight_middle_chunks <= 0:
                 if req.rid not in self.disagg_prefill_terminal_requests:
                     raise RuntimeError("final terminal request was not launch-bound")
@@ -1605,6 +1614,94 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def process_scheduler_local_fake_prefill_results(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> tuple[bool, ...]:
+        """Complete fake prefill warmups without publication state.
+
+        Fake requests exercise model execution, then return their sampled token
+        directly. They do not own a terminal identity, DFlash boundary row,
+        transfer route, or legacy metadata row.
+
+        :param batch: Exact prefill batch containing optional local warmups.
+        :param result: Model result providing sampled warmup tokens.
+        :returns: Per-row mask identifying scheduler-local fake requests.
+        """
+
+        scheduler_local = tuple(
+            _is_fake_transfer(req, self.server_args) for req in batch.reqs
+        )
+        final_indices = [
+            index
+            for index, req in enumerate(batch.reqs)
+            if scheduler_local[index] and req.inflight_middle_chunks <= 0
+        ]
+        if len(final_indices) == 0:
+            for index, req in enumerate(batch.reqs):
+                if not scheduler_local[index]:
+                    continue
+                req.inflight_middle_chunks -= 1
+                req.time_stats.set_last_chunked_prefill_finish_time()
+            return scheduler_local
+        if type(result.next_token_ids) is not torch.Tensor:
+            raise TypeError("fake prefill warmup requires device-resident token ids")
+        for index in final_indices:
+            req = batch.reqs[index]
+            if req.pending_bootstrap:
+                raise RuntimeError(
+                    "scheduler-local fake prefill completed before local bootstrap"
+                )
+            if req.metadata_buffer_index != -1:
+                raise RuntimeError(
+                    "scheduler-local fake prefill retained a metadata row"
+                )
+
+        next_token_ids = result.next_token_ids[final_indices].tolist()
+        completed: list[Req] = []
+        token_by_index = dict(zip(final_indices, next_token_ids, strict=True))
+        for index, req in enumerate(batch.reqs):
+            if not scheduler_local[index]:
+                continue
+            if req.inflight_middle_chunks > 0:
+                req.inflight_middle_chunks -= 1
+                req.time_stats.set_last_chunked_prefill_finish_time()
+                continue
+
+            next_token_id = int(token_by_index[index])
+            req.time_stats.set_prefill_finished_time()
+            req.output_ids.append(next_token_id)
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            release_kv_cache(req, self.tree_cache)
+            if not isinstance(req.finished_reason, FINISH_ABORT):
+                req.finished_reason = FINISH_LENGTH(length=0)
+            req.disagg_kv_sender.clear()
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+            req.time_stats.set_prefill_kv_transfer_finish_time()
+            req.time_stats.set_completion_time()
+            completed.append(req)
+
+            if req.grammar is not None:
+                try:
+                    req.grammar.accept_token(next_token_id)
+                except ValueError as error:
+                    prepare_abort(
+                        req,
+                        f"Grammar accept_token failed for req {req.rid} with "
+                        f"token {next_token_id}: {error}",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                req.grammar.finished = req.finished()
+
+        if len(completed) > 0:
+            self.output_streamer.stream_output(
+                completed,
+                any(req.return_logprob for req in completed),
+                None,
+            )
+        return scheduler_local
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None

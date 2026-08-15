@@ -73,7 +73,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
             retracted_queue=retracted_requests,
             has_live_preallocated_cohorts=(lambda: has_live_preallocated_cohorts),
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[],
+            live_requests=lambda: (),
+        )
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False

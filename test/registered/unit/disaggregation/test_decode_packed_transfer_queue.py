@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.decode_allocation_lease import (
+    DecodeAllocationLeaseError,
+)
 from sglang.srt.disaggregation.common.packed_auxiliary_allocation import (
     PackedAuxiliaryAllocationLeaseSnapshot,
     PackedAuxiliaryAllocationState,
@@ -28,6 +31,7 @@ from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryAdoptedValue,
     DFlashBoundaryDeviceRowPool,
 )
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,6 +112,151 @@ class _FakeMetadataBuffers:
 
 
 class TestDecodePackedTransferQueue(CustomTestCase):
+    @staticmethod
+    def _scheduler_local_queue(
+        *,
+        metadata_allocator: object | None = None,
+        metadata_buffers: object | None = None,
+    ) -> DecodeTransferQueue:
+        """Build a queue with observable local warmup completion.
+
+        :param metadata_allocator: Optional legacy row allocator.
+        :param metadata_buffers: Optional legacy metadata storage.
+        :returns: Minimally initialized transfer queue.
+        """
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = []
+        queue.req_to_metadata_buffer_idx_allocator = metadata_allocator
+        queue.metadata_buffers = metadata_buffers
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                disaggregation_transfer_backend="nixl",
+            )
+        )
+        queue._commit_hicache_local_restore_to_req = MagicMock()
+        return queue
+
+    @staticmethod
+    def _scheduler_local_request(
+        *,
+        rid: str,
+        bootstrap_host: str,
+        metadata_buffer_index: int = -1,
+        packed_transaction: object | None = None,
+    ) -> tuple[DecodeRequest, _RecordingReceiver]:
+        """Build one transfer-queue classification fixture.
+
+        :param rid: Stable request identity.
+        :param bootstrap_host: Host selecting fake or real transfer semantics.
+        :param metadata_buffer_index: Optional legacy metadata row.
+        :param packed_transaction: Optional packed ownership state.
+        :returns: Decode request and its observable receiver.
+        """
+
+        receiver = _RecordingReceiver()
+        req = SimpleNamespace(
+            rid=rid,
+            bootstrap_host=bootstrap_host,
+            output_ids=[],
+            cached_tokens=-1,
+            already_computed=-1,
+            cached_tokens_device=-1,
+            cached_tokens_host=-1,
+            cached_tokens_storage=-1,
+            mm_image_tokens=-1,
+            mm_audio_tokens=-1,
+            mm_video_tokens=-1,
+            time_stats=MagicMock(),
+        )
+        return (
+            DecodeRequest(
+                req=req,
+                kv_receiver=receiver,
+                metadata_buffer_index=metadata_buffer_index,
+                packed_transaction=packed_transaction,
+                hicache_restore_status=HiCacheRestoreResult.READY,
+            ),
+            receiver,
+        )
+
+    def test_scheduler_local_fake_needs_no_metadata_resources(self) -> None:
+        """Complete fake warmup without legacy or terminal handoff state."""
+
+        queue = self._scheduler_local_queue()
+        decode_req, receiver = self._scheduler_local_request(
+            rid="fake-warmup",
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        )
+
+        completed = queue.extend([decode_req])
+
+        self.assertEqual(completed, [decode_req.req])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(decode_req.req.output_ids, [0])
+        self.assertEqual(decode_req.req.cached_tokens, 0)
+        self.assertEqual(decode_req.req.already_computed, 0)
+        self.assertEqual(decode_req.req.cached_tokens_device, 0)
+        self.assertEqual(decode_req.req.cached_tokens_host, 0)
+        self.assertEqual(decode_req.req.cached_tokens_storage, 0)
+        self.assertEqual(decode_req.req.mm_image_tokens, 0)
+        self.assertEqual(decode_req.req.mm_audio_tokens, 0)
+        self.assertEqual(decode_req.req.mm_video_tokens, 0)
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertEqual(receiver.clear_count, 1)
+        queue._commit_hicache_local_restore_to_req.assert_called_once_with(decode_req)
+        (
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time.assert_called_once_with()
+        )
+        decode_req.req.time_stats.set_wait_queue_entry_time.assert_called_once_with()
+
+    def test_mixed_fake_and_legacy_transfer_classification_is_atomic(self) -> None:
+        """Validate a mixed cohort before completing or queueing any child."""
+
+        metadata_allocator = object()
+        metadata_buffers = object()
+        queue = self._scheduler_local_queue(
+            metadata_allocator=metadata_allocator,
+            metadata_buffers=metadata_buffers,
+        )
+        fake_req, fake_receiver = self._scheduler_local_request(
+            rid="fake-warmup",
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        )
+        legacy_req, _ = self._scheduler_local_request(
+            rid="legacy",
+            bootstrap_host="127.0.0.1",
+            metadata_buffer_index=3,
+        )
+
+        completed = queue.extend([fake_req, legacy_req])
+
+        self.assertEqual(completed, [fake_req.req])
+        self.assertEqual(queue.queue, [legacy_req])
+        self.assertEqual(fake_req.req.output_ids, [0])
+        self.assertEqual(fake_receiver.clear_count, 1)
+
+        queue.queue = []
+        fake_req, fake_receiver = self._scheduler_local_request(
+            rid="fake-before-invalid-terminal",
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        )
+        terminal_req, _ = self._scheduler_local_request(
+            rid="terminal",
+            bootstrap_host="127.0.0.1",
+            packed_transaction=SimpleNamespace(terminal_binding_digest=b"t" * 32),
+        )
+
+        with self.assertRaisesRegex(
+            DecodeAllocationLeaseError,
+            "terminal ownership handoff",
+        ):
+            queue.extend([fake_req, terminal_req])
+
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(fake_req.req.output_ids, [])
+        self.assertEqual(fake_receiver.clear_count, 0)
+
     @staticmethod
     def _request(
         *,

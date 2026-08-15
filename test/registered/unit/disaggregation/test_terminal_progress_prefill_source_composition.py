@@ -3,8 +3,10 @@ import hashlib
 import inspect
 import threading
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
@@ -39,7 +41,8 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceSubmission,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -703,6 +706,165 @@ def test_terminal_mode_skips_legacy_staging_and_waiting_collective() -> None:
         batch,
     )
     SchedulerDisaggregationPrefillMixin.resolve_waiting_queue_bootstrap(scheduler)
+
+
+def test_scheduler_local_fake_prefill_never_builds_terminal_state() -> None:
+    """Fake warmup cannot look up a route or allocate publication state."""
+
+    manager = MagicMock()
+    manager.uses_terminal_source_publication.return_value = True
+    manager.build_terminal_source_launch_plan.side_effect = AssertionError(
+        "fake warmup must not resolve terminal route zero"
+    )
+    manager.lease_terminal_dflash_source.side_effect = AssertionError(
+        "fake warmup must not allocate a DFlash boundary row"
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager),
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
+    )
+    request = SimpleNamespace(
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        inflight_middle_chunks=0,
+    )
+
+    launches = SchedulerDisaggregationPrefillMixin.build_terminal_prefill_launches(
+        scheduler,
+        SimpleNamespace(reqs=[request]),
+    )
+
+    assert launches == ()
+    manager.build_terminal_source_launch_plan.assert_not_called()
+    manager.lease_terminal_dflash_source.assert_not_called()
+
+
+def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
+    """Complete only fake rows locally while retaining real owner state."""
+
+    fake = SimpleNamespace(
+        rid="fake-warmup",
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        inflight_middle_chunks=0,
+        pending_bootstrap=False,
+        metadata_buffer_index=-1,
+        output_ids=[],
+        finished_reason=None,
+        disagg_kv_sender=MagicMock(),
+        time_stats=MagicMock(),
+        grammar=None,
+        return_logprob=False,
+    )
+    owned = SimpleNamespace(
+        rid="owned-request",
+        bootstrap_host="127.0.0.1",
+        inflight_middle_chunks=0,
+        time_stats=MagicMock(),
+    )
+    batch = SimpleNamespace(
+        reqs=[fake, owned],
+        prefill_stats=object(),
+        dp_cooperation_info=object(),
+    )
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([31, 47], dtype=torch.int64),
+        routed_experts_output=None,
+        indexer_topk_output=None,
+        can_run_cuda_graph=True,
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        tree_cache=MagicMock(),
+        output_streamer=MagicMock(),
+        disagg_prefill_terminal_requests={owned.rid: owned},
+        metrics_reporter=MagicMock(),
+    )
+
+    def process_scheduler_local(
+        active_batch: object,
+        active_result: object,
+    ) -> tuple[bool, ...]:
+        """Invoke the mixin helper on the scheduler fixture.
+
+        :param active_batch: Exact fixture batch.
+        :param active_result: Exact fixture model result.
+        :returns: Per-row scheduler-local classification.
+        """
+
+        return SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
+            scheduler,
+            active_batch,
+            active_result,
+        )
+
+    scheduler.process_scheduler_local_fake_prefill_results = process_scheduler_local
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
+        ) as cache_request,
+        patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release_request,
+    ):
+        SchedulerDisaggregationPrefillMixin.process_batch_result_terminal_disagg_prefill(
+            scheduler,
+            batch,
+            result,
+        )
+
+    assert fake.output_ids == [31]
+    assert isinstance(fake.finished_reason, FINISH_LENGTH)
+    fake.disagg_kv_sender.clear.assert_called_once_with()
+    cache_request.assert_called_once_with(fake, scheduler.tree_cache)
+    release_request.assert_called_once_with(fake, scheduler.tree_cache)
+    scheduler.output_streamer.stream_output.assert_called_once_with(
+        [fake],
+        False,
+        None,
+    )
+    assert scheduler.disagg_prefill_terminal_requests == {owned.rid: owned}
+    owned.time_stats.set_prefill_finished_time.assert_called_once_with()
+    owned.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
+
+
+def test_scheduler_local_fake_prefill_validates_cohort_before_release() -> None:
+    """Reject an invalid local row before completing any sibling request."""
+
+    valid = SimpleNamespace(
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        inflight_middle_chunks=0,
+        pending_bootstrap=False,
+        metadata_buffer_index=-1,
+    )
+    invalid = SimpleNamespace(
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        inflight_middle_chunks=0,
+        pending_bootstrap=False,
+        metadata_buffer_index=7,
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        tree_cache=MagicMock(),
+        output_streamer=MagicMock(),
+    )
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
+        ) as cache_request,
+        patch(
+            "sglang.srt.disaggregation.prefill.release_kv_cache"
+        ) as release_request,
+        pytest.raises(RuntimeError, match="retained a metadata row"),
+    ):
+        SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
+            scheduler,
+            SimpleNamespace(reqs=[valid, invalid]),
+            SimpleNamespace(next_token_ids=torch.tensor([31, 47], dtype=torch.int64)),
+        )
+
+    cache_request.assert_not_called()
+    release_request.assert_not_called()
+    scheduler.output_streamer.stream_output.assert_not_called()
 
 
 def test_owner_managed_abort_records_intent_and_retains_completion_owners() -> None:

@@ -157,6 +157,7 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 _PREPARED_COHORT_CONSTRUCTION_SEAL = object()
+_FAKE_TRANSFER_BOUNDARY_TOKEN_ID = 0
 
 
 def _create_singleton_poll_progress_policy(
@@ -2849,7 +2850,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            if self._require_legacy_metadata_allocator().available_size() <= 0:
+            scheduler_local_fake = _is_fake_transfer(
+                decode_req.req,
+                self.scheduler.server_args,
+            )
+            if (
+                not scheduler_local_fake
+                and self._require_legacy_metadata_allocator().available_size() <= 0
+            ):
                 break
 
             if hisparse_req_budget <= 0:
@@ -2864,6 +2872,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             use_decode_radix_cache = (
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
+                and not scheduler_local_fake
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
@@ -3014,6 +3023,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
+
+            if scheduler_local_fake:
+                preallocated_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
 
             metadata_submissions.append(
                 self._build_decode_metadata_submission(
@@ -4171,24 +4185,119 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             raise RuntimeError("terminal DFlash boundary pool ownership changed")
         self.terminal_dflash_boundary_pool = pool
 
-    def add(self, decode_req: DecodeRequest) -> None:
-        if decode_req.terminal_binding_digest is not None:
-            raise DecodeAllocationLeaseError(
-                "terminal request cannot enter the legacy transfer queue"
-            )
-        self._require_legacy_metadata_resources()
-        self.queue.append(decode_req)
+    def _partition_scheduler_local_fake_requests(
+        self,
+        decode_reqs: list[DecodeRequest],
+    ) -> tuple[list[DecodeRequest], list[DecodeRequest]]:
+        """Validate and partition one scheduler-owned transfer cohort.
 
-    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
-        if any(
-            decode_req.terminal_binding_digest is not None
-            for decode_req in decode_reqs
-        ):
-            raise DecodeAllocationLeaseError(
-                "terminal requests require the terminal ownership handoff"
-            )
-        self._require_legacy_metadata_resources()
-        self.queue.extend(decode_reqs)
+        Validation is complete before the queue or any request is mutated. A
+        fake warmup owns local preallocated KV only, whereas a real legacy
+        request requires the paired auxiliary metadata resources.
+
+        :param decode_reqs: Candidate requests entering transfer completion.
+        :returns: Scheduler-local fake requests and real legacy requests.
+        """
+
+        scheduler_local: list[DecodeRequest] = []
+        legacy: list[DecodeRequest] = []
+        for decode_req in decode_reqs:
+            if decode_req.terminal_binding_digest is not None:
+                raise DecodeAllocationLeaseError(
+                    "terminal requests require the terminal ownership handoff"
+                )
+            if not _is_fake_transfer(
+                decode_req.req,
+                self.scheduler.server_args,
+            ):
+                legacy.append(decode_req)
+                continue
+            if decode_req.metadata_buffer_index != -1:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer retained a metadata row"
+                )
+            if decode_req.allocation_lease is not None:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer retained a migration lease"
+                )
+            if decode_req.packed_transaction is not None:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer retained a packed transaction"
+                )
+            if decode_req.prefix_match is not None:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer entered decode cache reuse"
+                )
+            if decode_req.kv_receiver is None:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer lost its local receiver"
+                )
+            if len(decode_req.req.output_ids) != 0:
+                raise DecodeAllocationLeaseError(
+                    "scheduler-local fake transfer already owns output tokens"
+                )
+            scheduler_local.append(decode_req)
+
+        if len(legacy) > 0:
+            self._require_legacy_metadata_resources()
+        return scheduler_local, legacy
+
+    def _commit_scheduler_local_fake_request(
+        self,
+        decode_req: DecodeRequest,
+    ) -> Req:
+        """Make one fake warmup runnable without a handoff protocol.
+
+        Token zero is the fake transport's local boundary token. It exists only
+        to exercise the decode prebuilt path and is never publication state.
+
+        :param decode_req: Fully validated scheduler-local warmup request.
+        :returns: Canonical request ready for the decode waiting queue.
+        """
+
+        self._commit_hicache_local_restore_to_req(decode_req)
+        req = decode_req.req
+        req.output_ids.append(_FAKE_TRANSFER_BOUNDARY_TOKEN_ID)
+        req.cached_tokens = 0
+        req.already_computed = 0
+        req.cached_tokens_device = 0
+        req.cached_tokens_host = 0
+        req.cached_tokens_storage = 0
+        req.mm_image_tokens = 0
+        req.mm_audio_tokens = 0
+        req.mm_video_tokens = 0
+        req.time_stats.set_decode_transfer_queue_entry_time()
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+        req.time_stats.set_wait_queue_entry_time()
+        return req
+
+    def add(self, decode_req: DecodeRequest) -> Req | None:
+        """Accept one legacy transfer or complete one local warmup.
+
+        :param decode_req: Exact preallocated decode request.
+        :returns: Runnable local warmup request, otherwise ``None``.
+        """
+
+        completed = self.extend([decode_req])
+        return completed[0] if len(completed) == 1 else None
+
+    def extend(self, decode_reqs: list[DecodeRequest]) -> list[Req]:
+        """Accept a mixed scheduler-local and legacy transfer cohort.
+
+        :param decode_reqs: Exact preallocated decode requests.
+        :returns: Scheduler-local warmups completed without transfer polling.
+        """
+
+        scheduler_local, legacy = self._partition_scheduler_local_fake_requests(
+            decode_reqs
+        )
+        completed = [
+            self._commit_scheduler_local_fake_request(decode_req)
+            for decode_req in scheduler_local
+        ]
+        self.queue.extend(legacy)
+        return completed
 
     def register_terminal_requests(
         self,
@@ -5310,10 +5419,11 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
+            scheduler_local_reqs = self.disagg_decode_transfer_queue.extend(req_conns)
+            transferred_reqs = [
+                *scheduler_local_reqs,
+                *self.disagg_decode_transfer_queue.pop_transferred(),
+            ]
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
