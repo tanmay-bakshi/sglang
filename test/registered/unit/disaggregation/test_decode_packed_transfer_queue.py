@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDFlashBoundaryDecodeAdoption,
+    PackedRequestTransactionState,
 )
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryAdoptedValue,
@@ -605,6 +606,78 @@ class TestDecodePackedTransferQueue(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         self.assertEqual(receiver.clear_count, 1)
         metadata_allocator.free.assert_not_called()
+
+    def test_terminal_inference_attachment_validates_active_and_finalized_state(
+        self,
+    ) -> None:
+        """Accept only singular live ownership or fully retired completion."""
+
+        room_id = 59
+        metadata_buffer_index = 1
+        receiver = _RecordingReceiver()
+        transaction = SimpleNamespace(
+            request_owner=None,
+            terminal_binding_digest=b"v" * 32,
+            state=PackedRequestTransactionState.PUBLISHED,
+        )
+        decode_req = self._request(
+            room_id=room_id,
+            metadata_buffer_index=metadata_buffer_index,
+            receiver=receiver,
+            allocation_lease=object(),
+            packed_transaction=transaction,
+        )
+        transaction.request_owner = decode_req
+        queue = self._queue(
+            decode_req=decode_req,
+            metadata_buffers=_FakeMetadataBuffers(
+                size=4,
+                room_id=room_id,
+                row_index=metadata_buffer_index,
+            ),
+            metadata_allocator=MagicMock(),
+            lifecycle_authority=MagicMock(),
+            allocation_lease_authority=MagicMock(),
+        )
+
+        queue.validate_terminal_inference_attachment(
+            decode_req,
+            transaction,
+            receiver,
+        )
+
+        queue._terminal_requests.clear()
+        with self.assertRaisesRegex(
+            DecodeAllocationLeaseError,
+            "singular registry ownership",
+        ):
+            queue.validate_terminal_inference_attachment(
+                decode_req,
+                transaction,
+                receiver,
+            )
+
+        decode_req.packed_transaction = None
+        decode_req.allocation_lease = None
+        decode_req.kv_receiver = None
+        decode_req.metadata_buffer_index = -1
+        transaction.state = PackedRequestTransactionState.COMMITTED
+        queue.validate_terminal_inference_attachment(
+            decode_req,
+            transaction,
+            receiver,
+        )
+
+        transaction.state = PackedRequestTransactionState.QUARANTINED
+        with self.assertRaisesRegex(
+            DecodeAllocationLeaseError,
+            "incomplete finalized ownership",
+        ):
+            queue.validate_terminal_inference_attachment(
+                decode_req,
+                transaction,
+                receiver,
+            )
 
     def test_terminal_rebootstrap_replaces_device_token_after_clone_completion(
         self,
