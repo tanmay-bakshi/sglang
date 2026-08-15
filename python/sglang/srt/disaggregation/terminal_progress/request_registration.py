@@ -11,11 +11,11 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
 from sglang.srt.disaggregation.terminal_progress.coordinator import (
     TerminalRequestCoordinatorManifest,
 )
-from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
-    PackedTerminalDecodeSchedulerRegistration,
-)
 from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
     TerminalDFlashDecodeAdoption,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
+    PackedTerminalDecodeSchedulerRegistration,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,

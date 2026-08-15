@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 import zmq
 from aiohttp import web
-
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
     BaseKVManager,
@@ -55,6 +54,10 @@ from sglang.srt.utils.network import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.common.packed_staging_protocol import (
+        PackedDFlashBoundaryCounters,
+    )
+    from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPlan
     from sglang.srt.disaggregation.nixl.packed_staging_request import (
         PackedDecodeRequestTransaction,
         PackedRequestPublication,
@@ -63,18 +66,14 @@ if TYPE_CHECKING:
         DFlashBoundaryDeviceRowPool,
         DFlashBoundaryPrefillSource,
     )
-    from sglang.srt.disaggregation.common.packed_staging_protocol import (
-        PackedDFlashBoundaryCounters,
-    )
-    from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPlan
-    from sglang.srt.disaggregation.terminal_progress.source_plan import (
-        PackedTerminalSourceIdentityPlan,
+    from sglang.srt.disaggregation.terminal_progress.identity import (
+        TerminalRequestBinding,
     )
     from sglang.srt.disaggregation.terminal_progress.output_projection import (
         TerminalGatewayResultSlot,
     )
-    from sglang.srt.disaggregation.terminal_progress.identity import (
-        TerminalRequestBinding,
+    from sglang.srt.disaggregation.terminal_progress.source_plan import (
+        PackedTerminalSourceIdentityPlan,
     )
     from sglang.srt.disaggregation.terminal_progress.source_wiring import (
         PackedTerminalSourceCancellationDisposition,

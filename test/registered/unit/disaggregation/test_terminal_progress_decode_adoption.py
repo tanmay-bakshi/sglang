@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
     TerminalDFlashDecodeAdoption,
 )
@@ -158,9 +157,11 @@ def test_decode_row_release_waits_for_exact_device_copy_adoption() -> None:
         "metadata_row_release",
         "scheduler_finalize",
     ]
-    keyword_adoption = actor.complete_terminal_owner_metadata_consumption.call_args.kwargs[
-        "dflash_adoption"
-    ]
+    keyword_adoption = (
+        actor.complete_terminal_owner_metadata_consumption.call_args.kwargs[
+            "dflash_adoption"
+        ]
+    )
     assert keyword_adoption is transaction_adoption
 
 

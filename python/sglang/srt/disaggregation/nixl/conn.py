@@ -149,13 +149,13 @@ from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeServing,
     PackedTerminalDecodeWireDelivery,
     PackedTerminalDecodeWork,
-)
-from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
-    TerminalDFlashDecodeAdoption,
 )
 from sglang.srt.disaggregation.terminal_progress.deployment_cohort import (
     TerminalDeploymentCohort,

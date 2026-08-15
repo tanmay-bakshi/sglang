@@ -5,7 +5,6 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
@@ -334,9 +333,7 @@ def _manager_submission(
         if non_prefill_projection:
             projection = _NonPrefillProjection(payload=b"another protocol")
         else:
-            prefill_projection = object.__new__(
-                PrefillTerminalGatewayOutputProjection
-            )
+            prefill_projection = object.__new__(PrefillTerminalGatewayOutputProjection)
             object.__setattr__(prefill_projection, "shell", object())
             object.__setattr__(prefill_projection, "result_slot", object())
             object.__setattr__(
@@ -639,9 +636,7 @@ def test_real_manager_quarantines_dflash_submission_only_once() -> None:
         producer_event_generation=b"f" * 16,
     )
     with pytest.raises(RuntimeError, match="quarantine identity was reused"):
-        manager.quarantine_unpublished_terminal_source_submission(
-            changed_submission
-        )
+        manager.quarantine_unpublished_terminal_source_submission(changed_submission)
     assert dflash_owner.leases == [dflash_lease]
 
 

@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.managers.scheduler import Scheduler
 

@@ -9,13 +9,13 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestTransactionState,
 )
+from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
+    TerminalDFlashDecodeAdoption,
+)
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerConsumer,
     PackedTerminalDecodeSchedulerRegistration,
     PackedTerminalDecodeServingComposition,
-)
-from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
-    TerminalDFlashDecodeAdoption,
 )
 from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalOwnerRole,

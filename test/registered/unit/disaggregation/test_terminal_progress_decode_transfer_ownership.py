@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -105,9 +104,7 @@ def test_terminal_handoff_never_enters_legacy_polling_or_collectives() -> None:
 
     assert queue.queue == []
     assert queue.live_requests() == (decode_req,)
-    with patch(
-        "sglang.srt.disaggregation.decode.poll_and_all_reduce"
-    ) as collective:
+    with patch("sglang.srt.disaggregation.decode.poll_and_all_reduce") as collective:
         assert queue.pop_transferred() == []
     collective.assert_not_called()
     queue.tp1_poll_progress_policy.mark_idle.assert_called()
@@ -188,7 +185,9 @@ def test_terminal_client_abort_retires_through_owner_registry() -> None:
     assert isinstance(decode_req.req.to_finish, FINISH_ABORT)
 
 
-def test_terminal_handoff_rejects_duplicate_binding_without_partial_visibility() -> None:
+def test_terminal_handoff_rejects_duplicate_binding_without_partial_visibility() -> (
+    None
+):
     """A reused terminal identity leaves both ownership stores unchanged."""
 
     first_transaction = _transaction(binding_digest=b"t" * 32)
