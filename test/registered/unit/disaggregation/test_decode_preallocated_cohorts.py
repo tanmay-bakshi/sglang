@@ -75,8 +75,10 @@ from sglang.srt.disaggregation.terminal_progress.startup_cohort import (
 from sglang.srt.disaggregation.terminal_progress.startup_producers import (
     build_terminal_startup_python_producer_plan,
 )
-from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.utils.network import NetworkAddress
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1081,6 +1083,112 @@ def _install_terminal_transfer_publication(
     return transfer_queue
 
 
+def _install_canonical_scheduler_abort(
+    fixture: _QueueFixture,
+    transfer_queue: DecodeTransferQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> MagicMock:
+    """Bind the production scheduler abort path to the queue fixture.
+
+    :param fixture: Exact queue and observable fake resources.
+    :param transfer_queue: Production terminal registry owned by the fixture.
+    :param monkeypatch: Pytest mutation fixture.
+    :returns: Observable tokenizer-output sender.
+    """
+
+    scheduler = fixture.queue.scheduler
+    send_output = MagicMock()
+    scheduler.abort_request = Scheduler.abort_request.__get__(scheduler)
+    scheduler.chunked_req = None
+    scheduler.enable_hicache_storage = False
+    scheduler.tree_cache = fixture.queue.tree_cache
+    scheduler.ipc_channels = SimpleNamespace(
+        send_to_tokenizer=SimpleNamespace(send_output=send_output)
+    )
+    scheduler.dllm_config = None
+    scheduler.grammar_manager = MagicMock()
+    scheduler.disaggregation_mode = DisaggregationMode.DECODE
+    scheduler.disagg_decode_prealloc_queue = fixture.queue
+    scheduler.disagg_decode_transfer_queue = transfer_queue
+    scheduler.ps = SimpleNamespace(pp_size=1)
+    scheduler.last_batch = None
+    transfer_queue.scheduler = scheduler
+
+    def release_scheduler_request(
+        req: Req,
+        tree_cache: object,
+        is_insert: bool = True,
+    ) -> None:
+        """Release one scheduler-owned fake allocation.
+
+        :param req: Exact scheduler-owned request.
+        :param tree_cache: Exact fake tree owner.
+        :param is_insert: Whether canonical cleanup inserts cache state.
+        """
+
+        assert tree_cache is fixture.queue.tree_cache
+        assert is_insert
+        fixture.released_request_ids.append(req.rid)
+        req.req_pool_idx = None
+        req.kv = None
+
+    monkeypatch.setattr(
+        "sglang.srt.managers.scheduler.release_kv_cache",
+        release_scheduler_request,
+    )
+    return send_output
+
+
+def _capture_terminal_request_callbacks(
+    fixture: _QueueFixture,
+) -> dict[str, dict[str, object]]:
+    """Capture each production terminal authority callback set by request ID.
+
+    :param fixture: Exact queue fixture whose authority builder is wrapped.
+    :returns: Mutable callback map populated during promotion.
+    """
+
+    callbacks: dict[str, dict[str, object]] = {}
+    base_builder = fixture.packed_runtime.build_terminal_decode_request_authority
+
+    def capture_authority(**kwargs: object) -> object:
+        """Retain callbacks while preserving production fixture construction.
+
+        :param kwargs: Exact terminal authority construction inputs.
+        :returns: Opaque terminal authority.
+        """
+
+        transaction = kwargs["transaction"]
+        assert type(transaction) is _FakePackedTransaction
+        callbacks[transaction.request_owner.req.rid] = dict(kwargs)
+        return base_builder(**kwargs)
+
+    fixture.packed_runtime.build_terminal_decode_request_authority = MagicMock(
+        side_effect=capture_authority
+    )
+    return callbacks
+
+
+def _finalize_terminal_request(
+    callbacks: dict[str, dict[str, object]],
+    decode_req: DecodeRequest,
+    transaction: _FakePackedTransaction,
+) -> None:
+    """Drive one request through its real queue-owned finalization callback.
+
+    :param callbacks: Callback sets captured during terminal promotion.
+    :param decode_req: Exact adopted request becoming runnable.
+    :param transaction: Exact committed packed transaction.
+    """
+
+    decode_req.req.pd_dflash_boundary_token_id = torch.tensor([17])
+    decode_req.req.pd_dflash_boundary_completion_event = object()
+    transaction.state = PackedRequestTransactionState.COMMITTED
+    finalize_request = callbacks[decode_req.req.rid]["finalize_request"]
+    assert callable(finalize_request)
+    finalize_request(decode_req)
+
+
 def _assert_no_preparation_ownership(
     fixture: _QueueFixture,
     requests: tuple[Req, ...],
@@ -2009,6 +2117,109 @@ def test_terminal_abort_after_promotion_removes_callback_ownership(
     with pytest.raises(DecodeAllocationLeaseError, match="attached prepared cohort"):
         adopt_request(decode_req)
     assert fixture.queue.scheduler.waiting_queue == []
+
+
+def test_terminal_reservation_abort_after_finalization_uses_scheduler_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort a runnable terminal request through canonical scheduler cleanup."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    callbacks = _capture_terminal_request_callbacks(fixture)
+    send_output = _install_canonical_scheduler_abort(
+        fixture,
+        transfer_queue,
+        monkeypatch,
+    )
+    child_id = uuid.uuid4()
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt((child_id,), source_tp_size=2),
+        requests=(_request(child_id),),
+    )
+    fixture.queue.promote_preallocated(cohort)
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    decode_req = record.decode_reqs[0]
+    transaction = record.packed_transactions[0]
+
+    _finalize_terminal_request(callbacks, decode_req, transaction)
+
+    assert fixture.queue.scheduler.waiting_queue == [decode_req.req]
+    assert decode_req.allocation_lease is None
+    terminal = fixture.queue.abort_preallocated(
+        cohort,
+        "gateway_dispatch_failed",
+        None,
+    )
+
+    assert terminal is DecodeReservationState.ABORTED
+    assert record.state.value == "aborted"
+    assert fixture.queue.scheduler.waiting_queue == []
+    assert fixture.released_request_ids == [decode_req.req.rid]
+    assert transfer_queue.live_requests() == ()
+    assert fixture.queue._prepared_cohorts == {}
+    send_output.assert_called_once()
+    abort_request, output_req = send_output.call_args.args
+    assert type(abort_request) is AbortReq
+    assert abort_request.rid == decode_req.req.rid
+    assert abort_request.abort_message == (
+        "Decode reservation aborted: gateway_dispatch_failed"
+    )
+    assert output_req is decode_req.req
+
+
+def test_terminal_mixed_reservation_abort_cleans_finalized_child_before_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clean a finalized child while retaining its live sibling fail closed."""
+
+    fixture = _queue_fixture(monkeypatch)
+    _install_terminal_prefill_authority(fixture)
+    transfer_queue = _install_terminal_transfer_publication(fixture, monkeypatch)
+    callbacks = _capture_terminal_request_callbacks(fixture)
+    send_output = _install_canonical_scheduler_abort(
+        fixture,
+        transfer_queue,
+        monkeypatch,
+    )
+    child_ids = (uuid.uuid4(), uuid.uuid4())
+    _, cohort = fixture.queue.prepare_preallocated(
+        grant_id=uuid.uuid4(),
+        attempt=_attempt(child_ids, source_tp_size=2),
+        requests=tuple(_request(child_id) for child_id in child_ids),
+    )
+    fixture.queue.promote_preallocated(cohort)
+    record = fixture.queue._prepared_cohorts[cohort._token]
+    finalized_req, live_req = record.decode_reqs
+    finalized_transaction, live_transaction = record.packed_transactions
+
+    _finalize_terminal_request(
+        callbacks,
+        finalized_req,
+        finalized_transaction,
+    )
+
+    assert fixture.queue.scheduler.waiting_queue == [finalized_req.req]
+    assert transfer_queue.live_requests() == (live_req,)
+    terminal = fixture.queue.abort_preallocated(
+        cohort,
+        "gateway_dispatch_failed",
+        None,
+    )
+
+    assert terminal is DecodeReservationState.QUARANTINED
+    assert record.state.value == "quarantined"
+    assert fixture.queue.scheduler.waiting_queue == []
+    assert fixture.released_request_ids == [finalized_req.req.rid]
+    assert transfer_queue.live_requests() == ()
+    assert finalized_transaction.state is PackedRequestTransactionState.COMMITTED
+    assert live_transaction.state is PackedRequestTransactionState.QUARANTINED
+    assert live_req.allocation_lease is not None
+    assert live_req.allocation_lease.state is DecodeAllocationLeaseState.QUARANTINED
+    assert fixture.queue._prepared_cohorts[cohort._token] is record
+    send_output.assert_called_once()
 
 
 def test_terminal_explicit_quarantine_removes_callback_ownership(

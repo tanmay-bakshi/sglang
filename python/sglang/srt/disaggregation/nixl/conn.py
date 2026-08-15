@@ -3241,6 +3241,14 @@ class NixlKVManager(CommonKVManager):
                 return
             self._terminal_process_fatal_reason = reason
             self._terminal_process_fatal_traceback = formatted_traceback
+        if formatted_traceback is None:
+            logger.error("Terminal component failed: %s", reason)
+        else:
+            logger.error(
+                "Terminal component failed: %s\n%s",
+                reason,
+                formatted_traceback,
+            )
         reactor = self._terminal_process_reactor
         if reactor is not None:
             try:

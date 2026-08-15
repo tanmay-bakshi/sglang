@@ -1678,10 +1678,17 @@ class NativeTerminalRuntime:
         if type(output) is not NativeTerminalOwnerOutput:
             raise TypeError("output must be NativeTerminalOwnerOutput")
         if output.process_fatal:
+            owner_inventory = self._owner.inventory()
+            native_reason = owner_inventory.fatal_reason
+            if native_reason is None:
+                native_reason = "native owner did not expose a failure reason"
+            reason = (
+                f"native terminal owner entered {output.fatal_code.name}: "
+                f"{native_reason}"
+            )
+            logger.error("%s", reason)
             with self._condition:
-                self._enter_runtime_fatal_locked(
-                    f"native terminal owner entered {output.fatal_code.name}"
-                )
+                self._enter_runtime_fatal_locked(reason)
         delivered_actions: list[NativeTerminalOwnerAction] = []
         for action in output.actions:
             try:
@@ -1854,6 +1861,10 @@ class NativeTerminalRuntime:
                 )
         with self._condition:
             self._enter_runtime_fatal_locked(formatted_traceback)
+        logger.error(
+            "Native terminal output reactor failed:\n%s",
+            formatted_traceback,
+        )
 
     def _enter_runtime_fatal_locked(self, reason: str) -> None:
         """Record one sticky runtime fatal and wake every consumer.

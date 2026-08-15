@@ -112,6 +112,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -1860,6 +1861,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 raise DecodeAllocationLeaseError(
                     f"cohort abort is invalid in state {record.state.value}"
+                )
+            for decode_req in record.decode_reqs:
+                if decode_req.allocation_lease is not None:
+                    continue
+                # Relinquishing the migration lease makes Req scheduler-owned.
+                # Keep waiting/running cleanup and tokenizer notification on the
+                # scheduler's singular abort path.
+                self.scheduler.abort_request(
+                    AbortReq(
+                        rid=decode_req.req.rid,
+                        abort_message=f"Decode reservation aborted: {reason_code}",
+                    )
                 )
             if any(
                 decode_req.allocation_lease is not None

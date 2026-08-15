@@ -1057,6 +1057,7 @@ def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
         assert inventory.queued_output_count == 4
         assert inventory.queued_fatal_output_count == 3
         assert inventory.pending_action_count == 4
+        assert inventory.fatal_reason == "production action queue overflowed"
 
         release_drain.set()
         with selectors.DefaultSelector() as selector:

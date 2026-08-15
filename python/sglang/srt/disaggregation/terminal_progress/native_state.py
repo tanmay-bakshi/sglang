@@ -1488,6 +1488,7 @@ class NativeTerminalOwnerInventory:
     :ivar observation_eventfd_open: Whether the evidence descriptor remains open.
     :ivar output_drain_active: Whether the sole consumer owns a swapped batch.
     :ivar fatal_code: Sticky first process-fatal code.
+    :ivar fatal_reason: Sticky native failure evidence, when available.
     :ivar fatal_binding_digest: Exact triggering binding when request-local.
     :ivar deadline_table_digest: Hash-bound table retained by the reactor.
     """
@@ -1526,6 +1527,7 @@ class NativeTerminalOwnerInventory:
     observation_eventfd_open: bool
     output_drain_active: bool
     fatal_code: NativeTerminalOwnerFatalCode
+    fatal_reason: str | None
     fatal_binding_digest: bytes | None
     deadline_table_digest: bytes
 
@@ -1609,6 +1611,10 @@ class NativeTerminalOwnerInventory:
             raise TypeError("native inventory lifecycle flags must be bool values")
         if type(self.fatal_code) is not NativeTerminalOwnerFatalCode:
             raise TypeError("fatal_code must be NativeTerminalOwnerFatalCode")
+        if self.fatal_reason is not None and (
+            type(self.fatal_reason) is not str or len(self.fatal_reason) == 0
+        ):
+            raise ValueError("fatal_reason must be a non-empty string")
         if self.fatal_binding_digest is not None:
             _require_exact_bytes(
                 self.fatal_binding_digest, _DIGEST_BYTES, "fatal_binding_digest"
@@ -1654,6 +1660,7 @@ class NativeTerminalOwnerInventory:
         fatal_binding_digest: bytes | None = None
         if fatal_binding_value is not None:
             fatal_binding_digest = bytes(fatal_binding_value)
+        fatal_reason_value = str(value["fatal_reason"])
         return cls(
             input_capacity=int(value["input_capacity"]),
             output_capacity=int(value["output_capacity"]),
@@ -1693,6 +1700,9 @@ class NativeTerminalOwnerInventory:
             observation_eventfd_open=bool(value["observation_eventfd_open"]),
             output_drain_active=bool(value["output_drain_active"]),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
+            fatal_reason=(
+                None if len(fatal_reason_value) == 0 else fatal_reason_value
+            ),
             fatal_binding_digest=fatal_binding_digest,
             deadline_table_digest=bytes(value["deadline_table_digest"]),
         )
