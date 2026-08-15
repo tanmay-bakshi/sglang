@@ -455,6 +455,25 @@ def test_tp2_schema_has_two_main_transfers_and_one_canonical_boundary() -> None:
     assert flattened.count(GroupedNixlTransferMember.DFLASH_BOUNDARY) == 1
 
 
+def test_grouped_transfer_exposes_immutable_native_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Downstream receipt validation sees the exact subscribed generation."""
+
+    owner, _, _ = _owner(monkeypatch, (100,))
+    handle = _Handle(43, 7)
+    owner.begin_group(_DIGEST, (GroupedNixlTransferMember.MAIN,))
+
+    transfer = owner.main_endpoint.arm_transfer(handle, _DIGEST)
+
+    assert transfer.handle_identity == 43
+    assert transfer.generation == 7
+    with pytest.raises(AttributeError):
+        transfer.handle_identity = 44
+    with pytest.raises(AttributeError):
+        transfer.generation = 8
+
+
 def test_default_post_clock_reads_clock_monotonic_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

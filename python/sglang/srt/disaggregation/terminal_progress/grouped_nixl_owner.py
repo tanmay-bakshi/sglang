@@ -272,8 +272,10 @@ class GroupedNixlTerminalOwnerInventory:
 class GroupedNixlTerminalTransfer:
     """Opaque exact-generation transfer authority issued by one group owner."""
 
-    __slots__ = ("_owner_nonce", "_token")
+    __slots__ = ("_generation", "_handle_identity", "_owner_nonce", "_token")
 
+    _generation: int
+    _handle_identity: int
     _owner_nonce: object
     _token: object
 
@@ -281,19 +283,47 @@ class GroupedNixlTerminalTransfer:
         self,
         owner_nonce: object,
         token: object,
+        handle_identity: int,
+        generation: int,
         construction_seal: object,
     ) -> None:
         """Construct one owner-private transfer identity.
 
         :param owner_nonce: Exact issuing owner identity.
         :param token: Owner-private registry key.
+        :param handle_identity: Stable native transfer-handle identity.
+        :param generation: Exact subscribed native generation.
         :param construction_seal: Module-private construction authority.
         """
 
         if construction_seal is not _TRANSFER_CONSTRUCTION_SEAL:
             raise TypeError("grouped NIXL transfers are owner constructed")
+        if type(handle_identity) is not int or not 0 < handle_identity <= _UINT64_MAX:
+            raise ValueError("handle_identity must be a positive uint64")
+        if type(generation) is not int or not 0 < generation <= _UINT64_MAX:
+            raise ValueError("generation must be a positive uint64")
         self._owner_nonce = owner_nonce
         self._token = token
+        self._handle_identity = handle_identity
+        self._generation = generation
+
+    @property
+    def handle_identity(self) -> int:
+        """Return the immutable native transfer-handle identity.
+
+        :returns: Stable native handle identity.
+        """
+
+        return self._handle_identity
+
+    @property
+    def generation(self) -> int:
+        """Return the immutable subscribed native generation.
+
+        :returns: Exact native transfer generation.
+        """
+
+        return self._generation
 
 
 @dataclasses.dataclass(slots=True)
@@ -360,7 +390,11 @@ class GroupedNixlTerminalEndpoint(NixlTerminalOwnerBoundary):
         self._owner = owner
         self._member = member
 
-    def arm_transfer(self, handle: object, binding_digest: bytes) -> object:
+    def arm_transfer(
+        self,
+        handle: object,
+        binding_digest: bytes,
+    ) -> GroupedNixlTerminalTransfer:
         """Arm this endpoint's exact member before posting.
 
         :param handle: Initialized but unposted NIXL handle.
@@ -388,7 +422,7 @@ class GroupedNixlTerminalEndpoint(NixlTerminalOwnerBoundary):
         self,
         transfer: object,
         action: NativeTerminalOwnerAction,
-    ) -> object:
+    ) -> nixl_xfer_completion_receipt:
         """Take this member's receipt under aggregate success authority.
 
         :param transfer: Exact member authority.
@@ -657,13 +691,15 @@ class GroupedNixlTerminalOwner:
             except BaseException:
                 self._unowned_handles.append(handle)
                 raise
+            binding = subscription.binding
             token = object()
             public = GroupedNixlTerminalTransfer(
                 self._owner_nonce,
                 token,
+                binding.identity,
+                binding.generation,
                 _TRANSFER_CONSTRUCTION_SEAL,
             )
-            binding = subscription.binding
             record = _GroupedTransferRecord(
                 public=public,
                 binding_digest=binding_digest,

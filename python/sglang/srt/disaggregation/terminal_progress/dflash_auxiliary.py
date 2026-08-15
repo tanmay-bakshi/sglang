@@ -148,7 +148,6 @@ class DFlashBoundaryNativeReceipt(Protocol):
 class DFlashBoundaryDirectTransfer(Protocol):
     """Exact transfer generation armed through the native terminal owner."""
 
-    binding_digest: bytes
     generation: int
     handle_identity: int
 
