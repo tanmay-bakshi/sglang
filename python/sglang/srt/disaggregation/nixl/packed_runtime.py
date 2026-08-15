@@ -1363,9 +1363,6 @@ class PackedPrefillRuntime:
     def send_terminal_owner_outcomes(
         self,
         action: NativeTerminalOwnerAction,
-        settle_main: Callable[
-            [PackedTransferLane, NativeTerminalOwnerAction], PackedWriterOutcome
-        ],
         settle_auxiliary: (
             Callable[[object, NativeTerminalOwnerAction], PackedPrefillAuxiliaryOutcome]
             | None
@@ -1373,18 +1370,15 @@ class PackedPrefillRuntime:
     ) -> tuple[PackedWriterOutcome, PackedPrefillAuxiliaryOutcome | None]:
         """Construct and send outcomes under exact native terminal authority.
 
-        Settlement callbacks may consume take-once native completion receipts,
-        but must retain the native handles and packed lane. Teardown authority,
-        not transport completion, owns their release.
+        The actor settles its main lane directly so completion timing and native
+        ownership cannot diverge. The auxiliary callback may consume its
+        take-once completion receipt, but teardown authority still owns release.
 
         :param action: Exact ``SOURCE_OUTCOME_READY`` owner action.
-        :param settle_main: Main-lane terminal receipt settlement.
         :param settle_auxiliary: Canonical auxiliary receipt settlement.
         :returns: Main and optional canonical auxiliary outcomes sent on control.
         """
 
-        if not callable(settle_main):
-            raise TypeError("settle_main must be callable")
         record = self._terminal_record_for_action(
             action,
             NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
@@ -1399,14 +1393,13 @@ class PackedPrefillRuntime:
                 raise RuntimeError("terminal outcomes preceded transfer post")
             if record.main_outcome is not None or record.outcomes_sent:
                 raise RuntimeError("terminal outcomes were already constructed")
-            lane = record.main_lane
             auxiliary_handle = record.auxiliary_handle
-            if lane is None or record.main_handle is None:
+            if record.main_lane is None or record.main_handle is None:
                 raise RuntimeError("terminal outcome lost main native ownership")
             if canonical and auxiliary_handle is None:
                 raise RuntimeError("terminal outcome lost auxiliary ownership")
         try:
-            main_outcome = settle_main(lane, action)
+            main_outcome = self.settle_terminal_main_transfer(action)
             self._validate_terminal_main_outcome(record, main_outcome)
             auxiliary_outcome: PackedPrefillAuxiliaryOutcome | None = None
             if canonical:

@@ -1933,6 +1933,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
         status=PackedWriterOutcomeStatus.DONE,
         visibility=visibility,
     )
+    main_lane.settle_terminal_completion.return_value = main_outcome
     auxiliary_outcome = PackedAuxiliaryOutcome(
         plan=submission.plan,
         writer_id=runtime.writer_id,
@@ -1943,19 +1944,20 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
     settled: list[tuple[object, NativeTerminalOwnerAction]] = []
     monkeypatch.setattr(runtime, "_emit_transfer_stats", lambda exact: None)
 
+    outcome_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        3,
+    )
     outcomes = runtime.send_terminal_owner_outcomes(
-        _terminal_prefill_action(
-            identity,
-            NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
-            3,
-        ),
-        lambda lane, action: settled.append((lane, action)) or main_outcome,
+        outcome_action,
         lambda handle, action: settled.append((handle, action)) or auxiliary_outcome,
     )
 
     assert outcomes == (main_outcome, auxiliary_outcome)
     assert sent == [main_outcome, auxiliary_outcome]
-    assert tuple(value[0] for value in settled) == (main_lane, auxiliary_handle)
+    main_lane.settle_terminal_completion.assert_called_once_with(outcome_action)
+    assert tuple(value[0] for value in settled) == (auxiliary_handle,)
     assert manager.agent.released_handles == []
     before_teardown = runtime.terminal_owner_inventory()
     assert before_teardown.main_handle_bindings == (identity.local_binding.digest,)

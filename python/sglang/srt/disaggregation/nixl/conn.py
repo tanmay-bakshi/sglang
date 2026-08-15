@@ -2756,9 +2756,6 @@ class NixlKVManager(CommonKVManager):
 
             actor.send_terminal_owner_outcomes(
                 action,
-                lambda lane, exact_action: lane.settle_terminal_completion(
-                    exact_action
-                ),
                 settle_auxiliary,
             )
 
