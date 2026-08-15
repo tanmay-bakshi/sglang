@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
     _TerminalPrefillBatchLeaseLedger,
     _TerminalPrefillLaunch,
+    _TerminalPrefillResultBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryPrefillSource,
@@ -814,11 +815,16 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
         indexer_topk_output=None,
         can_run_cuda_graph=True,
     )
+    binding = object()
     scheduler = SimpleNamespace(
         server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
         tree_cache=MagicMock(),
         output_streamer=MagicMock(),
         disagg_prefill_terminal_requests={owned.rid: owned},
+        disagg_prefill_terminal_bindings={owned.rid: binding},
+        disagg_prefill_terminal_result_bindings={
+            owned.rid: _TerminalPrefillResultBinding(owned, binding),
+        },
         metrics_reporter=MagicMock(),
     )
 
@@ -864,8 +870,51 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
         None,
     )
     assert scheduler.disagg_prefill_terminal_requests == {owned.rid: owned}
+    assert scheduler.disagg_prefill_terminal_result_bindings == {}
     owned.time_stats.set_prefill_finished_time.assert_called_once_with()
     owned.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
+
+
+def test_terminal_result_binding_outlives_native_reclaim() -> None:
+    """Scheduler result bookkeeping survives a faster owner lifecycle."""
+
+    request = SimpleNamespace(
+        rid="retired-before-result",
+        inflight_middle_chunks=0,
+        time_stats=MagicMock(),
+    )
+    binding = object()
+    batch = SimpleNamespace(
+        reqs=[request],
+        prefill_stats=object(),
+        dp_cooperation_info=object(),
+    )
+    result = SimpleNamespace(
+        routed_experts_output=None,
+        indexer_topk_output=None,
+        can_run_cuda_graph=True,
+    )
+    scheduler = SimpleNamespace(
+        disagg_prefill_terminal_requests={},
+        disagg_prefill_terminal_bindings={},
+        disagg_prefill_terminal_result_bindings={
+            request.rid: _TerminalPrefillResultBinding(request, binding),
+        },
+        metrics_reporter=MagicMock(),
+        process_scheduler_local_fake_prefill_results=lambda active_batch, active_result: (
+            False,
+        ),
+    )
+
+    SchedulerDisaggregationPrefillMixin.process_batch_result_terminal_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
+
+    assert scheduler.disagg_prefill_terminal_result_bindings == {}
+    request.time_stats.set_prefill_finished_time.assert_called_once_with()
+    request.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
 
 
 def test_scheduler_local_fake_prefill_validates_cohort_before_release() -> None:
@@ -1001,7 +1050,7 @@ def test_terminal_result_path_cannot_reenter_legacy_completion() -> None:
     )
 
     assert all(value not in source for value in forbidden)
-    assert "disagg_prefill_terminal_requests" in source
+    assert "disagg_prefill_terminal_result_bindings" in source
 
 
 def test_model_submit_failure_cancels_every_prelaunch_row_once() -> None:

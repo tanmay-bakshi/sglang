@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.nixl.conn import (
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    _TerminalPrefillResultBinding,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.runtime_capabilities import (
@@ -1465,6 +1466,9 @@ class Scheduler(
             self.disagg_prefill_terminal_requests: dict[str, Req] = {}
             self.disagg_prefill_terminal_bindings: dict[
                 str, TerminalRequestBinding
+            ] = {}
+            self.disagg_prefill_terminal_result_bindings: dict[
+                str, _TerminalPrefillResultBinding
             ] = {}
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -4708,6 +4712,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_terminal_requests) == 0
+                idle &= len(self.disagg_prefill_terminal_result_bindings) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:

@@ -160,6 +160,18 @@ class _TerminalPrefillLaunch:
             raise ValueError("producer_event_generation must contain 16 bytes")
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TerminalPrefillResultBinding:
+    """Scheduler result authority retained independently of native lifetime.
+
+    :ivar request: Exact request submitted in the model batch.
+    :ivar lifecycle: Immutable terminal lifecycle bound to that submission.
+    """
+
+    request: Req
+    lifecycle: TerminalRequestBinding
+
+
 class _TerminalPrefillBatchLeaseLedger:
     """Track pre-model, CUDA-touched, and manager-owned DFlash rows."""
 
@@ -1107,7 +1119,7 @@ class SchedulerDisaggregationPrefillMixin:
                     expected: PackedTerminalSourceSubmission = submission,
                     retained_req: Req = req,
                 ) -> None:
-                    """Commit scheduler reachability before PREPARE publication.
+                    """Commit lifecycle and result authority before PREPARE.
 
                     :param retained: Exact manager-bound source submission.
                     """
@@ -1124,16 +1136,40 @@ class SchedulerDisaggregationPrefillMixin:
                         raise RuntimeError(
                             "terminal prefill binding identity was reused"
                         )
+                    if (
+                        retained_req.rid
+                        in self.disagg_prefill_terminal_result_bindings
+                    ):
+                        raise RuntimeError(
+                            "terminal prefill result identity was reused"
+                        )
                     maybe_cache_unfinished_req(retained_req, self.tree_cache)
-                    self.disagg_prefill_terminal_requests[retained_req.rid] = (
-                        retained_req
-                    )
                     try:
+                        self.disagg_prefill_terminal_requests[retained_req.rid] = (
+                            retained_req
+                        )
                         self.disagg_prefill_terminal_bindings[retained_req.rid] = (
                             retained.identity.local_binding
                         )
+                        self.disagg_prefill_terminal_result_bindings[
+                            retained_req.rid
+                        ] = _TerminalPrefillResultBinding(
+                            request=retained_req,
+                            lifecycle=retained.identity.local_binding,
+                        )
                     except MemoryError:
-                        del self.disagg_prefill_terminal_requests[retained_req.rid]
+                        self.disagg_prefill_terminal_requests.pop(
+                            retained_req.rid,
+                            None,
+                        )
+                        self.disagg_prefill_terminal_bindings.pop(
+                            retained_req.rid,
+                            None,
+                        )
+                        self.disagg_prefill_terminal_result_bindings.pop(
+                            retained_req.rid,
+                            None,
+                        )
                         raise
 
                 manager.bind_terminal_source_submission(
@@ -1580,8 +1616,10 @@ class SchedulerDisaggregationPrefillMixin:
         """Resolve bookkeeping without touching owner-managed terminal state.
 
         Final requests were already bound immediately after model submission.
-        This method therefore cannot mutate output state, enqueue transfers,
-        publish through the legacy streamer, or enter the polling queue.
+        Their result binding has scheduler-owned lifetime, so it remains valid
+        when native reclaim completes before an overlapped result is consumed.
+        This method cannot mutate output state, enqueue transfers, publish
+        through the legacy streamer, or enter the polling queue.
 
         :param batch: Exact prefill batch whose immutable plans were bound.
         :param result: Model result retained only for metrics and cleanup.
@@ -1601,8 +1639,20 @@ class SchedulerDisaggregationPrefillMixin:
             if scheduler_local[index]:
                 continue
             if req.inflight_middle_chunks <= 0:
-                if req.rid not in self.disagg_prefill_terminal_requests:
+                result_binding = self.disagg_prefill_terminal_result_bindings.pop(
+                    req.rid,
+                    None,
+                )
+                if result_binding is None or result_binding.request is not req:
                     raise RuntimeError("final terminal request was not launch-bound")
+                active_binding = self.disagg_prefill_terminal_bindings.get(req.rid)
+                if (
+                    active_binding is not None
+                    and active_binding != result_binding.lifecycle
+                ):
+                    raise RuntimeError(
+                        "final terminal result binding differs from lifecycle authority"
+                    )
                 req.time_stats.set_prefill_finished_time()
                 req.time_stats.set_prefill_transfer_queue_entry_time()
                 continue
