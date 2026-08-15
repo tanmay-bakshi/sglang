@@ -201,6 +201,18 @@ class _CudaCompletion:
             ("cuda-submit", stream_handle, binding_digest)
         )
 
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Record authenticated decoder allocation authorization.
+
+        :param binding_digest: Exact armed source binding.
+        :returns: ``False`` because this fixture retains no native callback.
+        """
+
+        operation = ("authorize", binding_digest, None)
+        self.operations.append(operation)
+        self.runtime_operations.append(("cuda-authorize", binding_digest))
+        return False
+
 
 class _Runtime:
     """Strict process-runtime double with exact authority accounting."""
@@ -496,11 +508,19 @@ def _submission(
     )
 
 
-def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
+def _harness(
+    *,
+    local_rank: int = 0,
+    failing_metrics: bool = False,
+    attach_completion: bool = True,
+    packed_ready: bool = True,
+) -> _Harness:
     """Construct source wiring and accept one immutable submission.
 
     :param local_rank: Exact source TP rank.
     :param failing_metrics: Whether metrics reject every projection.
+    :param attach_completion: Whether the source CUDA callback is attached.
+    :param packed_ready: Whether authenticated decoder allocation arrived.
     :returns: Complete source test fixture.
     """
 
@@ -520,7 +540,10 @@ def _harness(*, local_rank: int = 0, failing_metrics: bool = False) -> _Harness:
     )
     submission = _submission(identity)
     wiring.accept_submission(submission)
-    wiring.attach_producer_completion(submission)
+    if attach_completion:
+        wiring.attach_producer_completion(submission)
+    if packed_ready:
+        wiring.packed_ready(identity.local_binding.digest)
     return _Harness(
         runtime=runtime,
         cuda_completion=cuda_completion,
@@ -713,12 +736,46 @@ def test_runtime_registration_precedes_first_source_event() -> None:
     assert operations[2:] == [
         ("cuda-arm", harness.identity.local_binding.digest),
         ("cuda-submit", 81, harness.identity.local_binding.digest),
+        ("cuda-authorize", harness.identity.local_binding.digest),
     ]
     assert harness.cuda_completion.operations == [
         ("arm", harness.identity.local_binding.digest, None),
         ("submit", 81, harness.identity.local_binding.digest),
+        ("authorize", harness.identity.local_binding.digest, None),
     ]
     assert harness.wiring.lifecycle_published(harness.identity.local_binding.digest)
+
+
+def test_packed_ready_authorizes_attached_native_callback_once() -> None:
+    """Authenticated allocation releases the already-attached native callback."""
+
+    harness = _harness(packed_ready=False)
+    digest = harness.identity.local_binding.digest
+    operation_count = len(harness.runtime.operations)
+
+    assert not harness.wiring.packed_ready(digest)
+    assert harness.runtime.operations[-1] == ("cuda-authorize", digest)
+    assert len(harness.runtime.operations) == operation_count + 1
+    assert not harness.wiring.packed_ready(digest)
+    assert len(harness.runtime.operations) == operation_count + 1
+
+
+def test_packed_ready_before_attachment_is_released_after_submit() -> None:
+    """A fast READY response cannot outrun callback registration."""
+
+    harness = _harness(attach_completion=False, packed_ready=False)
+    digest = harness.identity.local_binding.digest
+    operation_count = len(harness.runtime.operations)
+
+    assert not harness.wiring.packed_ready(digest)
+    assert len(harness.runtime.operations) == operation_count
+    harness.wiring.attach_producer_completion(harness.submission)
+
+    assert harness.runtime.operations[-3:] == [
+        ("cuda-arm", digest),
+        ("cuda-submit", 81, digest),
+        ("cuda-authorize", digest),
+    ]
 
 
 def test_source_timing_projects_two_main_members_and_one_dflash_boundary(
@@ -904,7 +961,6 @@ def test_completion_required_cancellation_retires_at_every_downstream_phase(
         )
 
     cancel_if("accepted")
-    harness.wiring.producer_completed(binding.digest)
     harness.wiring.consume_gather_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 70),
         lambda submission, action: None,
@@ -964,7 +1020,6 @@ def test_full_source_success_uses_runtime_completion_surfaces(
     )
     harness = _harness()
     digest = harness.identity.local_binding.digest
-    harness.wiring.producer_completed(digest)
     harness.wiring.consume_gather_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 1),
         lambda submission, action: None,
@@ -1030,7 +1085,6 @@ def test_retirement_side_effect_failure_retains_native_and_wiring_authority() ->
 
     harness = _harness()
     digest = harness.identity.local_binding.digest
-    harness.wiring.producer_completed(digest)
     harness.wiring.consume_gather_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_GATHER_READY, 10),
         lambda submission, action: None,
@@ -1226,10 +1280,10 @@ def test_metrics_failure_never_gates_runtime_progress() -> None:
     """Keep observability failure outside lifecycle authority."""
 
     harness = _harness(failing_metrics=True)
-    harness.wiring.producer_completed(harness.identity.local_binding.digest)
+    _ready(harness)
     assert harness.metrics.values == []
     assert harness.runtime.operations[-1][3] is (
-        NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED
+        NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY
     )
 
 

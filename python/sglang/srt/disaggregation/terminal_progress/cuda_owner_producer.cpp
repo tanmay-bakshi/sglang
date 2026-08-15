@@ -43,6 +43,15 @@ using Digest = std::array<std::uint8_t, kDigestBytes>;
 enum class BindingPhase : std::uint8_t {
   kArmed = 1,
   kSubmitted = 2,
+  kCompleted = 3,
+  kPublishing = 4,
+};
+
+struct BindingState {
+  BindingPhase phase{BindingPhase::kArmed};
+  bool delivery_authorized{false};
+  bool has_pending_event{false};
+  sglang_terminal_owner_producer_event_v1 pending_event{};
 };
 
 enum class FatalCode : std::uint32_t {
@@ -131,7 +140,9 @@ class ProducerState {
 public:
   ProducerState(const sglang_terminal_owner_producer_api_v1 *api, void *context,
                 std::uint16_t event_kind)
-      : api_(api), context_(context), event_kind_(event_kind) {}
+      : api_(api), context_(context), event_kind_(event_kind),
+        requires_delivery_authorization_(event_kind ==
+                                         kSourceProducerCompletedEvent) {}
 
   void arm(const Digest &binding) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -141,7 +152,7 @@ public:
       throw_fatal_locked();
     }
     const auto [iterator, inserted] =
-        bindings_.emplace(binding, BindingPhase::kArmed);
+        bindings_.emplace(binding, BindingState{});
     static_cast<void>(iterator);
     if (!inserted) {
       set_fatal_locked(FatalCode::kDuplicateBinding, EEXIST, binding);
@@ -161,13 +172,50 @@ public:
       set_fatal_locked(FatalCode::kUnknownBinding, ENOENT, binding);
       throw_fatal_locked();
     }
-    if (iterator->second != BindingPhase::kArmed) {
+    if (iterator->second.phase != BindingPhase::kArmed) {
       set_fatal_locked(FatalCode::kInvalidBindingState, EALREADY, binding);
       throw_fatal_locked();
     }
-    iterator->second = BindingPhase::kSubmitted;
+    iterator->second.phase = BindingPhase::kSubmitted;
     active_callbacks_.fetch_add(1, std::memory_order_release);
     active_registrations_.fetch_add(1, std::memory_order_release);
+  }
+
+  bool authorize_delivery(const Digest &binding) {
+    if (!requires_delivery_authorization_) {
+      throw std::invalid_argument(
+          "delivery authorization is valid only for a source producer");
+    }
+    sglang_terminal_owner_producer_event_v1 event{};
+    bool publish = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      require_healthy_locked();
+      const auto iterator = bindings_.find(binding);
+      if (iterator == bindings_.end()) {
+        set_fatal_locked(FatalCode::kUnknownBinding, ENOENT, binding);
+        throw_fatal_locked();
+      }
+      BindingState &state = iterator->second;
+      if (state.delivery_authorized) {
+        return false;
+      }
+      state.delivery_authorized = true;
+      if (state.phase == BindingPhase::kCompleted) {
+        if (!state.has_pending_event) {
+          set_fatal_locked(FatalCode::kInvalidBindingState, EPROTO, binding);
+          throw_fatal_locked();
+        }
+        event = state.pending_event;
+        state.has_pending_event = false;
+        state.phase = BindingPhase::kPublishing;
+        publish = true;
+      }
+    }
+    if (publish) {
+      publish_authorized_event(event);
+    }
+    return publish;
   }
 
   void callback_registration_succeeded() noexcept {
@@ -199,22 +247,25 @@ public:
       return;
     }
     event.enqueued_ns = timestamp_ns;
-    const int status = api_->submit(context_, &event);
+    bool publish = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (status != 0) {
-        owner_submit_failure_count_.fetch_add(1, std::memory_order_relaxed);
-        set_fatal_locked(FatalCode::kOwnerSubmissionFailure, status, binding);
+      const auto iterator = bindings_.find(binding);
+      if (iterator == bindings_.end() ||
+          iterator->second.phase != BindingPhase::kSubmitted) {
+        set_fatal_locked(FatalCode::kInvalidBindingState, EPROTO, binding);
+      } else if (iterator->second.delivery_authorized ||
+                 !requires_delivery_authorization_) {
+        iterator->second.phase = BindingPhase::kPublishing;
+        publish = true;
       } else {
-        const auto iterator = bindings_.find(binding);
-        if (iterator == bindings_.end() ||
-            iterator->second != BindingPhase::kSubmitted) {
-          set_fatal_locked(FatalCode::kInvalidBindingState, EPROTO, binding);
-        } else {
-          bindings_.erase(iterator);
-          total_delivered_.fetch_add(1, std::memory_order_relaxed);
-        }
+        iterator->second.phase = BindingPhase::kCompleted;
+        iterator->second.pending_event = event;
+        iterator->second.has_pending_event = true;
       }
+    }
+    if (publish) {
+      publish_authorized_event(event);
     }
     finish_callback();
   }
@@ -299,17 +350,23 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     std::size_t armed_count = 0;
     std::size_t submitted_count = 0;
-    for (const auto &[binding, phase] : bindings_) {
+    std::size_t pending_authorization_count = 0;
+    for (const auto &[binding, state] : bindings_) {
       static_cast<void>(binding);
-      if (phase == BindingPhase::kArmed) {
+      if (state.phase == BindingPhase::kArmed) {
         ++armed_count;
       } else {
         ++submitted_count;
+      }
+      if (state.phase == BindingPhase::kCompleted &&
+          !state.delivery_authorized) {
+        ++pending_authorization_count;
       }
     }
     py::dict result;
     result["armed_count"] = armed_count;
     result["submitted_count"] = submitted_count;
+    result["pending_authorization_count"] = pending_authorization_count;
     result["active_callback_count"] =
         active_callbacks_.load(std::memory_order_acquire);
     result["active_registration_count"] =
@@ -368,6 +425,26 @@ public:
 #endif
 
 private:
+  void publish_authorized_event(
+      const sglang_terminal_owner_producer_event_v1 &event) noexcept {
+    const Digest binding = event_binding(event);
+    const int status = api_->submit(context_, &event);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (status != 0) {
+      owner_submit_failure_count_.fetch_add(1, std::memory_order_relaxed);
+      set_fatal_locked(FatalCode::kOwnerSubmissionFailure, status, binding);
+      return;
+    }
+    const auto iterator = bindings_.find(binding);
+    if (iterator == bindings_.end() ||
+        iterator->second.phase != BindingPhase::kPublishing) {
+      set_fatal_locked(FatalCode::kInvalidBindingState, EPROTO, binding);
+      return;
+    }
+    bindings_.erase(iterator);
+    total_delivered_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   static Digest
   event_binding(const sglang_terminal_owner_producer_event_v1 &event) noexcept {
     Digest binding{};
@@ -419,9 +496,10 @@ private:
   const sglang_terminal_owner_producer_api_v1 *api_;
   void *context_;
   std::uint16_t event_kind_;
+  bool requires_delivery_authorization_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
-  std::unordered_map<Digest, BindingPhase, DigestHash> bindings_;
+  std::unordered_map<Digest, BindingState, DigestHash> bindings_;
   bool admission_open_{true};
   bool retirement_requested_{false};
   bool joined_{false};
@@ -529,6 +607,10 @@ public:
     static_cast<void>(payload.release());
   }
 
+  bool authorize_delivery(const py::bytes &binding_digest) {
+    return state_->authorize_delivery(digest_from_python(binding_digest));
+  }
+
   void stop_admission() noexcept { state_->stop_admission(); }
 
   bool join(double timeout_seconds) { return state_->join(timeout_seconds); }
@@ -618,6 +700,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("arm", &NativeCudaTerminalProducer::arm, py::arg("binding_digest"))
       .def("submit", &NativeCudaTerminalProducer::submit,
            py::arg("stream_handle"), py::arg("binding_digest"))
+      .def("authorize_delivery",
+           &NativeCudaTerminalProducer::authorize_delivery,
+           py::arg("binding_digest"))
       .def("stop_admission", &NativeCudaTerminalProducer::stop_admission)
       .def("join", &NativeCudaTerminalProducer::join,
            py::arg("timeout_seconds"))

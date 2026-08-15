@@ -140,7 +140,17 @@ class _Publisher:
 
 
 class _CudaCompletion:
-    """No-op source callback producer for composition tests."""
+    """Release source completion into native state after authorization."""
+
+    _runtime: NativeTerminalRuntime
+
+    def __init__(self, runtime: NativeTerminalRuntime) -> None:
+        """Bind the fixture to its exact native runtime.
+
+        :param runtime: Source runtime receiving callback completion.
+        """
+
+        self._runtime = runtime
 
     def arm(self, binding_digest: bytes) -> None:
         """Accept one source lifecycle.
@@ -154,6 +164,23 @@ class _CudaCompletion:
         :param stream_handle: Exact source stream handle.
         :param binding_digest: Exact armed binding.
         """
+
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Deliver the retained callback after decoder allocation.
+
+        :param binding_digest: Exact armed source binding.
+        :returns: ``True`` after direct native delivery.
+        """
+
+        self._runtime._owner.submit(
+            NativeTerminalOwnerEvent(
+                producer_id=_NATIVE_PRODUCER_ID,
+                binding_digest=binding_digest,
+                kind=NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                enqueued_ns=1_000,
+            )
+        )
+        return True
 
 
 class _EmptyGroupedNixlOwner(GroupedNixlTerminalOwner):
@@ -458,7 +485,7 @@ def _serving(
 
     serving = PackedTerminalSourceServing(
         runtime=runtime,
-        cuda_completion=_CudaCompletion(),
+        cuda_completion=_CudaCompletion(runtime),
         local_identity=identity.local_binding.owner,
         publisher=publisher,
         metrics_sink=metrics,
@@ -589,7 +616,7 @@ def test_full_source_composition_retires_exactly_once(
         serving.bind_submission(submission, release_calls.append)
         serving.attach_producer_completion(submission)
         digest = identity.local_binding.digest
-        serving.wiring.producer_completed(digest)
+        assert serving.packed_ready(digest)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
         assert serving.cancel_submission(identity.local_binding, "client disconnected") is (

@@ -14,9 +14,12 @@ from sglang.srt.disaggregation.common.decode_allocation_lease import (
     DecodeWriterManifest,
 )
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
+    PackedChunkKey,
+    PackedReady,
     PackedRequestKey,
     PackedTerminalReceipt,
 )
+from sglang.srt.disaggregation.common.staging_layout import StagingWriterId
 from sglang.srt.disaggregation.nixl.conn import (
     NIXL_BOOTSTRAP_PEER_PROTOCOL,
     NixlKVManager,
@@ -997,6 +1000,73 @@ def test_terminal_control_dispatch_failure_kills_receiver_fail_closed() -> None:
     assert failures[0][0] == "terminal control receiver died"
     assert failures[0][1] is not None
     assert "authenticated lifecycle was invalid" in failures[0][1]
+
+
+def test_source_packed_ready_authenticates_transport_before_owner_join() -> None:
+    """Production control dispatch joins READY only after actor authentication."""
+
+    local_binding = _binding("prefill-a", 0)
+    local = local_binding.advertisement.terminal_identity
+    decoder_rank = local_binding.matrix.rank("decode-a", 0)
+    manager = _manager(local_binding, {})
+    source_binding = _request_binding(local)
+    order: list[str] = []
+    actor = MagicMock()
+    actor.deliver_terminal_owner_ready.side_effect = (
+        lambda peer, message: order.append("actor") or source_binding
+    )
+    serving = MagicMock()
+    serving.packed_ready.side_effect = lambda digest: order.append("owner_join")
+    manager._packed_prefill_runtime = actor
+    manager._terminal_source_serving = serving
+    manager._authenticated_terminal_control_rank = MagicMock(
+        return_value=decoder_rank
+    )
+    manager._require_terminal_startup_peer_enrollment = MagicMock(
+        return_value=SimpleNamespace(
+            decoder_peers={
+                decoder_rank.key: SimpleNamespace(
+                    agent_name=decoder_rank.nixl_agent_name,
+                    process_generation=str(
+                        uuid.UUID(bytes=decoder_rank.process_generation)
+                    ),
+                    remote_handle=object(),
+                )
+            }
+        )
+    )
+    ready = PackedReady(
+        key=PackedChunkKey(
+            room_id=47,
+            chunk_id=0,
+            request_generation=source_binding.request_key.request_generation,
+        ),
+        writer_id=StagingWriterId(
+            transfer_source_rank=0,
+            source_attn_tp_rank=0,
+            source_pp_rank=0,
+            source_cp_rank=0,
+        ),
+        digest=bytes((31,)) * 32,
+        visibility_policy_digest=bytes((37,)) * 32,
+        lease_id=1,
+        lease_base_address=0x1000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+
+    with patch(
+        "sglang.srt.disaggregation.nixl.conn.decode_packed_control_frames",
+        return_value=(
+            decoder_rank.nixl_agent_name,
+            str(uuid.UUID(bytes=decoder_rank.process_generation)),
+            ready,
+        ),
+    ):
+        manager._dispatch_terminal_source_control([b"authenticated-control"])
+
+    assert order == ["actor", "owner_join"]
+    serving.packed_ready.assert_called_once_with(source_binding.digest)
 
 
 def test_decode_rank_zero_accepts_authenticated_local_ready_from_peer_rank() -> None:

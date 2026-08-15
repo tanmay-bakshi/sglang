@@ -194,6 +194,16 @@ class _CudaCompletion:
             )
         )
 
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Reject source-only authorization on a decode producer.
+
+        :param binding_digest: Candidate decode binding.
+        :returns: This method does not return.
+        :raises RuntimeError: Always, because decode delivery is ungated.
+        """
+
+        raise RuntimeError("decode callback delivery is not source-authorized")
+
 
 def _identity(
     marker: int,

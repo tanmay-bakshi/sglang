@@ -360,6 +360,8 @@ class _SourceRecord:
     cancellation_reason: str | None = None
     producer_completion_attachment_started: bool = False
     producer_completion_attached: bool = False
+    packed_transfer_ready: bool = False
+    producer_delivery_authorized: bool = False
     claimed_action_ids: set[int] = dataclasses.field(default_factory=set)
 
 
@@ -528,6 +530,13 @@ class PackedTerminalSourceWiring:
             if current is not record:
                 raise RuntimeError("source record changed during callback attachment")
             current.producer_completion_attached = True
+            authorize = current.packed_transfer_ready
+            if authorize:
+                if current.producer_delivery_authorized:
+                    raise RuntimeError("source producer delivery was already authorized")
+                current.producer_delivery_authorized = True
+        if authorize:
+            self._cuda_completion.authorize_delivery(digest)
 
     def submission_committed(self, observation: NativeTerminalOwnerObservation) -> None:
         """Project one exact native submission commit into evidence.
@@ -592,20 +601,35 @@ class PackedTerminalSourceWiring:
             del self._records[binding_digest]
         return record.submission
 
-    def producer_completed(self, binding_digest: bytes) -> None:
-        """Commit completion of the exact producer event and stable slots.
+    def packed_ready(self, binding_digest: bytes) -> bool:
+        """Join authenticated decoder allocation with producer completion.
+
+        The native CUDA producer retains a completed callback until this
+        authorization arrives. Exact duplicate ``PackedReady`` delivery is
+        idempotent because the transport actor authenticates and de-duplicates
+        the message before this lifecycle join. A conflicting message never
+        reaches this boundary.
 
         :param binding_digest: Exact accepted source binding.
+        :returns: Whether this input published producer completion to native state.
         """
 
         record = self._record(binding_digest)
         with self._lock:
-            if not record.producer_completion_attached:
-                raise RuntimeError("source producer completed before callback attachment")
-        self._submit_local(
-            binding_digest,
-            NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
-        )
+            current = self._records.get(binding_digest)
+            if current is not record:
+                raise RuntimeError("source record changed during PackedReady delivery")
+            if current.packed_transfer_ready:
+                return False
+            current.packed_transfer_ready = True
+            authorize = current.producer_completion_attached
+            if authorize:
+                if current.producer_delivery_authorized:
+                    raise RuntimeError("source producer delivery was already authorized")
+                current.producer_delivery_authorized = True
+        if not authorize:
+            return False
+        return self._cuda_completion.authorize_delivery(binding_digest)
 
     def cancel_request(
         self,

@@ -20,7 +20,9 @@ class CudaTerminalProducerInventory:
     """Complete CUDA callback-to-owner producer inventory.
 
     :ivar armed_count: Bindings armed but not yet attached to a stream.
-    :ivar submitted_count: Bindings whose CUDA callbacks have not returned.
+    :ivar submitted_count: Bindings submitted to CUDA but not yet delivered.
+    :ivar pending_authorization_count: Completed source callbacks retained until
+        authenticated decoder allocation authorizes native delivery.
     :ivar active_callback_count: CUDA host callbacks still outstanding.
     :ivar active_registration_count: Callback registrations still returning.
     :ivar total_submissions: Successfully registered callbacks.
@@ -37,6 +39,7 @@ class CudaTerminalProducerInventory:
 
     armed_count: int
     submitted_count: int
+    pending_authorization_count: int
     active_callback_count: int
     active_registration_count: int
     total_submissions: int
@@ -69,6 +72,7 @@ class CudaTerminalProducerInventory:
         return cls(
             armed_count=int(value["armed_count"]),
             submitted_count=int(value["submitted_count"]),
+            pending_authorization_count=int(value["pending_authorization_count"]),
             active_callback_count=int(value["active_callback_count"]),
             active_registration_count=int(value["active_registration_count"]),
             total_submissions=int(value["total_submissions"]),
@@ -117,6 +121,13 @@ class TerminalCudaCompletionProducer(Protocol):
         :param binding_digest: Exact lifecycle armed for this callback.
         """
 
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Authorize a gated callback to enter the native owner.
+
+        :param binding_digest: Exact armed source lifecycle.
+        :returns: Whether a completed callback was released immediately.
+        """
+
 
 class _NativeCudaTerminalProducer(Protocol):
     """Typed boundary implemented by the CUDA producer extension."""
@@ -157,6 +168,13 @@ class _NativeCudaTerminalProducer(Protocol):
         """Deliver one armed binding without CUDA.
 
         :param binding_digest: Exact armed lifecycle digest.
+        """
+
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Authorize one gated source callback for native delivery.
+
+        :param binding_digest: Exact armed lifecycle digest.
+        :returns: Whether a completed callback was released immediately.
         """
 
     def _begin_held_callback_for_test(self, binding_digest: bytes) -> None:
@@ -361,6 +379,20 @@ class CudaTerminalProducer:
             raise ValueError("stream_handle must be a non-negative integer")
         self._require_binding(binding_digest)
         self._native.submit(stream_handle, binding_digest)
+
+    def authorize_delivery(self, binding_digest: bytes) -> bool:
+        """Authorize one source completion after authenticated allocation.
+
+        Decode scatter producers are ungated and reject this operation. Source
+        producers retain the original callback timestamp when authorization
+        arrives after CUDA completion.
+
+        :param binding_digest: Exact armed source lifecycle digest.
+        :returns: Whether a completed callback was released immediately.
+        """
+
+        self._require_binding(binding_digest)
+        return bool(self._native.authorize_delivery(binding_digest))
 
     def stop_admission(self) -> None:
         """Permanently stop new callback bindings."""

@@ -3546,7 +3546,8 @@ class NixlKVManager(CommonKVManager):
         if actor is None:
             raise RuntimeError("packed source actor is unavailable")
         if type(message) is PackedReady:
-            actor.deliver_terminal_owner_ready(peer, message)
+            binding = actor.deliver_terminal_owner_ready(peer, message)
+            self.terminal_source_serving.packed_ready(binding.digest)
             return
         if type(message) is PackedRequestTeardown:
             binding = actor.deliver_terminal_owner_teardown(peer, message)

@@ -397,8 +397,8 @@ def test_direct_callback_reaches_native_owner_without_python_drain() -> None:
     _retire_and_abort(owner, producer)
 
 
-def test_source_callback_reaches_producer_completed_without_python_drain() -> None:
-    """A source CUDA callback directly earns native gather authority."""
+def test_source_callback_waits_for_authenticated_delivery_authority() -> None:
+    """A completed source callback cannot outrun decoder allocation."""
 
     owner, binding = _make_waiting_source_owner()
     producer = CudaTerminalProducer(
@@ -416,6 +416,15 @@ def test_source_callback_reaches_producer_completed_without_python_drain() -> No
 
     producer.complete_synchronously_for_testing(binding.digest)
 
+    inventory = producer.inventory()
+    assert inventory.total_submissions == 1
+    assert inventory.total_delivered == 0
+    assert inventory.pending_authorization_count == 1
+    assert inventory.retained_count == 1
+    snapshot = owner.lifecycle_snapshot_for_testing(binding.digest)
+    assert snapshot.phase == int(NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER)
+    assert producer.authorize_delivery(binding.digest)
+
     _wait_for_source_phase(
         owner,
         binding.digest,
@@ -429,6 +438,34 @@ def test_source_callback_reaches_producer_completed_without_python_drain() -> No
     inventory = producer.inventory()
     assert inventory.total_submissions == 1
     assert inventory.total_delivered == 1
+    assert inventory.pending_authorization_count == 0
+    assert inventory.retained_count == 0
+    _retire_and_abort(owner, producer)
+
+
+def test_source_delivery_authority_can_arrive_before_callback() -> None:
+    """Early decoder allocation releases completion when CUDA later finishes."""
+
+    owner, binding = _make_waiting_source_owner()
+    producer = CudaTerminalProducer(
+        _cuda_binding(owner),
+        CudaTerminalEventKind.SOURCE_PRODUCER_COMPLETED,
+        testing=True,
+    )
+    producer.arm(binding.digest)
+    owner.start()
+
+    assert not producer.authorize_delivery(binding.digest)
+    producer.complete_synchronously_for_testing(binding.digest)
+
+    _wait_for_source_phase(
+        owner,
+        binding.digest,
+        NativeSourceLifecyclePhase.GATHERING,
+    )
+    inventory = producer.inventory()
+    assert inventory.total_delivered == 1
+    assert inventory.pending_authorization_count == 0
     assert inventory.retained_count == 0
     _retire_and_abort(owner, producer)
 

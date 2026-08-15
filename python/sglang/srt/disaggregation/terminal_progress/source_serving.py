@@ -596,6 +596,16 @@ class PackedTerminalSourceServing:
         self._require_open()
         self._wiring.attach_producer_completion(submission)
 
+    def packed_ready(self, binding_digest: bytes) -> bool:
+        """Deliver authenticated decoder allocation into the source join.
+
+        :param binding_digest: Exact source lifecycle made transport-ready.
+        :returns: Whether readiness released producer completion to native state.
+        """
+
+        self._require_open()
+        return self._wiring.packed_ready(binding_digest)
+
     def drain_runtime_actions(self) -> int:
         """Drain every currently readable runtime execution-context inbox.
 
