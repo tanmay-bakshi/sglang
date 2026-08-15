@@ -1012,6 +1012,7 @@ class _PrefillRequestRecord:
     terminal_identity: PackedTerminalSourceIdentityPlan | None = None
     terminal_prepare: PackedPrepare | None = None
     terminal_prepare_sent: bool = False
+    terminal_prepare_started_at: float | None = None
     terminal_ready: PackedReady | None = None
     terminal_gather_started: bool = False
     terminal_gather_posted: bool = False
@@ -1206,6 +1207,7 @@ class PackedPrefillRuntime:
                 raise RuntimeError("terminal PREPARE was not registered")
             if record.terminal_prepare_sent:
                 raise RuntimeError("terminal PREPARE was already published")
+            record.terminal_prepare_started_at = time.perf_counter()
             record.terminal_prepare_sent = True
         try:
             submission.control.send_message(prepare)
@@ -1261,6 +1263,9 @@ class PackedPrefillRuntime:
         with self._lock:
             if not record.terminal_prepare_sent:
                 raise RuntimeError("terminal READY preceded PREPARE publication")
+            prepare_started_at = record.terminal_prepare_started_at
+            if prepare_started_at is None:
+                raise RuntimeError("terminal READY lost PREPARE timing authority")
             if record.source_transfer is not None:
                 if record.terminal_ready == message:
                     return identity.local_binding
@@ -1280,6 +1285,9 @@ class PackedPrefillRuntime:
         with record.condition:
             if record.source_transfer is not None:
                 raise RuntimeError("terminal READY raced another delivery")
+            record.ready_wait_duration_ms = (
+                time.perf_counter() - prepare_started_at
+            ) * 1000.0
             record.source_transfer = transfer
             record.terminal_ready = message
             record.condition.notify_all()

@@ -1106,6 +1106,7 @@ def _terminal_prefill_record(
             runtime.writer_id,
         ),
         terminal_prepare_sent=True,
+        terminal_prepare_started_at=runtime_module.time.perf_counter(),
     )
     runtime._records[key] = record
     return record
@@ -1821,6 +1822,8 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     )
     source_transfer = object()
     runtime._ready = _ReadyCoordinator(source_transfer)
+    record.terminal_prepare_started_at = 100.0
+    monkeypatch.setattr(runtime_module.time, "perf_counter", lambda: 100.125)
     ready = PackedReady(
         key=record.chunk_key,
         writer_id=runtime.writer_id,
@@ -1834,6 +1837,7 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
 
     assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
     assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
+    assert record.ready_wait_duration_ms == pytest.approx(125.0)
 
     main_handle = object()
     auxiliary_handle = object()
