@@ -151,7 +151,8 @@ class FrozenPrefillGatewayOutputShell:
     :ivar audio_tokens: Expanded audio-token count.
     :ivar video_tokens: Expanded video-token count.
     :ivar retraction_count: Number of prior scheduler retractions.
-    :ivar dp_rank: Data-parallel rank which produced the request.
+    :ivar dp_rank: Data-parallel rank which produced the request, or ``None``
+        when the scheduler does not use data parallelism.
     :ivar speculative: Whether speculative counters are present in the active
         output schema.
     :ivar spec_verify_ct: Speculative verification count.
@@ -178,7 +179,7 @@ class FrozenPrefillGatewayOutputShell:
     audio_tokens: int
     video_tokens: int
     retraction_count: int
-    dp_rank: int
+    dp_rank: int | None
     speculative: bool
     spec_verify_ct: int
     spec_num_correct_drafts: int
@@ -224,7 +225,6 @@ class FrozenPrefillGatewayOutputShell:
             self.audio_tokens,
             self.video_tokens,
             self.retraction_count,
-            self.dp_rank,
             self.spec_verify_ct,
             self.spec_num_correct_drafts,
             self.spec_num_block_accept_tokens,
@@ -232,6 +232,11 @@ class FrozenPrefillGatewayOutputShell:
         )
         if any(type(value) is not int or value < 0 for value in counters):
             raise ValueError("output shell counters must be non-negative integers")
+        if self.dp_rank is not None:
+            if type(self.dp_rank) is not int:
+                raise TypeError("dp_rank must be an integer or None")
+            if self.dp_rank < 0:
+                raise ValueError("dp_rank must be non-negative")
         if self.cached_tokens_details is not None:
             if type(self.cached_tokens_details) is not tuple:
                 raise TypeError("cached_tokens_details must be a tuple or None")
@@ -255,7 +260,9 @@ class FrozenPrefillGatewayOutputShell:
             or any(type(value) is not int or value < 0 for value in histogram)
             for histogram in histograms
         ):
-            raise ValueError("speculative histograms must contain non-negative integers")
+            raise ValueError(
+                "speculative histograms must contain non-negative integers"
+            )
 
     @property
     def digest(self) -> bytes:
@@ -280,7 +287,7 @@ def freeze_prefill_gateway_output_shell(
     req: Req,
     *,
     cached_tokens_details: CachedTokensDetails | None,
-    dp_rank: int,
+    dp_rank: int | None,
     speculative: bool,
 ) -> FrozenPrefillGatewayOutputShell:
     """Freeze scheduler-owned response state without mutating the request.
@@ -293,7 +300,8 @@ def freeze_prefill_gateway_output_shell(
     :param req: Scheduler-owned prefill request before model submission.
     :param cached_tokens_details: Exact cache-tier breakdown reported for the
         request.
-    :param dp_rank: Data-parallel rank producing the response.
+    :param dp_rank: Data-parallel rank producing the response, or ``None``
+        when the scheduler does not use data parallelism.
     :param speculative: Whether the active scheduler emits speculative
         counters.
     :returns: Immutable non-logprob gateway response shell.
@@ -311,9 +319,7 @@ def freeze_prefill_gateway_output_shell(
         or req.return_sampling_mask
     )
     if unsupported_result_mode:
-        raise ValueError(
-            "terminal prefill publication requires plain token output"
-        )
+        raise ValueError("terminal prefill publication requires plain token output")
     if req.finished_reason is not None or req.finished_output is not None:
         raise ValueError("terminal prefill shell must be frozen before completion")
     if type(speculative) is not bool:
@@ -327,9 +333,7 @@ def freeze_prefill_gateway_output_shell(
         or req.surr_offset is not None
         or req.read_offset is not None
     ):
-        raise ValueError(
-            "terminal prefill shell requires the first output boundary"
-        )
+        raise ValueError("terminal prefill shell requires the first output boundary")
 
     absolute_read_offset = len(req.origin_input_ids_unpadded)
     surrounding_offset = max(
@@ -343,11 +347,7 @@ def freeze_prefill_gateway_output_shell(
     if cached_tokens_details is not None:
         frozen_cache_details = tuple(sorted(cached_tokens_details.items()))
 
-    if (
-        req.mm_image_tokens > 0
-        or req.mm_audio_tokens > 0
-        or req.mm_video_tokens > 0
-    ):
+    if req.mm_image_tokens > 0 or req.mm_audio_tokens > 0 or req.mm_video_tokens > 0:
         image_tokens = req.mm_image_tokens
         audio_tokens = req.mm_audio_tokens
         video_tokens = req.mm_video_tokens
@@ -467,13 +467,9 @@ class PrefillTerminalGatewayPayloadEncoder(TerminalGatewayPayloadEncoder):
         spec_num_block_accept_tokens = (
             [shell.spec_num_block_accept_tokens] if shell.speculative else []
         )
-        spec_num_cap_tokens = (
-            [shell.spec_num_cap_tokens] if shell.speculative else []
-        )
+        spec_num_cap_tokens = [shell.spec_num_cap_tokens] if shell.speculative else []
         spec_correct_drafts_histogram = (
-            [list(shell.spec_correct_drafts_histogram)]
-            if shell.speculative
-            else []
+            [list(shell.spec_correct_drafts_histogram)] if shell.speculative else []
         )
         spec_cap_lens_histogram = (
             [list(shell.spec_cap_lens_histogram)] if shell.speculative else []

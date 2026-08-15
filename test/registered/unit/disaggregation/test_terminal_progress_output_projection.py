@@ -11,9 +11,19 @@ from sglang.srt.disaggregation.terminal_progress.output_projection import (
     TerminalGatewayResultSlot,
     freeze_prefill_gateway_output_shell,
 )
-from sglang.srt.managers.io_struct import BatchTokenIDOutput, sock_recv
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.io_struct import (
+    BatchTokenIDOutput,
+    encode_ipc_payload,
+    sock_recv,
+)
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    _GenerationStreamAccumulator,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -206,6 +216,61 @@ def test_shell_builder_freezes_request_without_crossing_stream_boundary() -> Non
     assert tuple(request.output_ids) == before_output_ids
 
 
+def test_non_dp_rank_matches_the_established_wire_domain() -> None:
+    """Terminal publication preserves the established no-DP ``None`` rank."""
+
+    parallel_state = ParallelState.trivial(dp_rank=None)
+    terminal_shell = freeze_prefill_gateway_output_shell(
+        _request(),
+        cached_tokens_details=None,
+        dp_rank=parallel_state.dp_rank,
+        speculative=False,
+    )
+    terminal_projection = PrefillTerminalGatewayOutputProjection(
+        shell=terminal_shell,
+        result_slot=_StableResultSlot(bytes.fromhex("31" * 16), 42),
+        producer_event_generation=bytes.fromhex("52" * 16),
+    )
+    terminal_payload = _decode_payload(
+        PrefillTerminalGatewayPayloadEncoder()
+        .encode(terminal_projection)
+        .encoded_payload
+    )
+
+    legacy_request = _request()
+    legacy_request.output_ids.append(42)
+    legacy_accumulator = _GenerationStreamAccumulator(
+        return_logprob=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        return_indexer_topk=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.PREFILL,
+        default_stream_interval=1,
+        default_force_stream_interval=1,
+        get_cached_tokens_details=lambda req: None,
+    )
+    legacy_accumulator.accept(req=legacy_request)
+    legacy_payload = legacy_accumulator.to_payload(
+        dp_rank=parallel_state.dp_rank,
+        is_idle_batch=False,
+    )
+    assert legacy_payload is not None
+    decoded_legacy_payload = _decode_payload(encode_ipc_payload(legacy_payload))
+
+    assert terminal_shell.dp_rank is None
+    assert terminal_payload.dp_ranks == decoded_legacy_payload.dp_ranks == [None]
+
+
+def test_shell_validates_dp_rank_outside_counter_validation() -> None:
+    """Rank nullability cannot weaken the independent integer rank domain."""
+
+    with pytest.raises(TypeError, match="integer or None"):
+        dataclasses.replace(_shell(), dp_rank=True)
+    with pytest.raises(ValueError, match="dp_rank must be non-negative"):
+        dataclasses.replace(_shell(), dp_rank=-1)
+
+
 def test_shell_builder_rejects_result_modes_without_stable_slots() -> None:
     """Unsupported mutable result fields cannot fall back to scheduler reads."""
 
@@ -271,12 +336,17 @@ def test_projection_digest_binds_shell_slot_and_producer_generations() -> None:
         producer_event_generation=bytes.fromhex("53" * 16),
     )
 
-    assert len({
-        projection.digest,
-        changed_shell.digest,
-        changed_slot.digest,
-        changed_event.digest,
-    }) == 4
+    assert (
+        len(
+            {
+                projection.digest,
+                changed_shell.digest,
+                changed_slot.digest,
+                changed_event.digest,
+            }
+        )
+        == 4
+    )
 
 
 def test_projection_rejects_malformed_generations() -> None:
