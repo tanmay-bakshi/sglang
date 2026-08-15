@@ -970,6 +970,12 @@ class PackedTerminalSourceWiring:
                 output_projection=output_projection,
                 enqueued_ns=self._clock_ns(),
             )
+            self._timing.capture(
+                binding=identity.local_binding,
+                field=TerminalOwnerTimingField.GATEWAY_PUBLICATION,
+                sample_key="canonical-source-publisher",
+                started_ns=publication.enqueued_ns,
+            )
             with self._lock:
                 record.publication_submitted = True
             accepted = publisher.submit(publication)
@@ -1014,11 +1020,10 @@ class PackedTerminalSourceWiring:
             reason=reason,
         )
         if type(result) is TerminalGatewayPublicationSuccess:
-            self._timing.emit_interval(
+            self._timing.complete(
                 binding=publication.canonical_binding,
                 field=TerminalOwnerTimingField.GATEWAY_PUBLICATION,
                 sample_key="canonical-source-publisher",
-                started_ns=publication.enqueued_ns,
                 completed_ns=result.completed_ns,
             )
 
@@ -1058,6 +1063,16 @@ class PackedTerminalSourceWiring:
                 else None
             ),
         )
+        if (
+            self._local_identity.tp_rank == 0
+            and wire_receipt.kind is TerminalReceiptKind.GATEWAY_PUBLISHED
+        ):
+            self._timing.complete(
+                binding=wire_receipt.binding,
+                field=TerminalOwnerTimingField.GATEWAY_PUBLICATION,
+                sample_key="canonical-source-publisher",
+                completed_ns=wire_receipt.terminal_timestamp_ns,
+            )
 
     def publisher_died(self, binding_digest: bytes, reason: str) -> None:
         """Enter process-fatal source authority after publisher-thread death.

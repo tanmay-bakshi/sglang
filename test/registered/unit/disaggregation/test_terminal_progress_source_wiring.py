@@ -1051,8 +1051,16 @@ def test_full_source_success_uses_runtime_completion_surfaces(
         lambda submission: None,
     )
     assert reclaim_receipt.wire_receipt.kind is TerminalReceiptKind.RECLAIM_CONSUMED
-    harness.wiring.publisher_result(
-        _publication_result(harness, publication, success=True)
+    result = _publication_result(harness, publication, success=True)
+    local_receipt = next(
+        receipt
+        for receipt in result.source_receipts
+        if receipt.wire_receipt.binding == harness.identity.local_binding
+    )
+    harness.wiring.publication_receipt(
+        wire_receipt=local_receipt.wire_receipt,
+        local_receipt=local_receipt.local_receipt,
+        authenticated_issuer=harness.identity.publisher_issuer,
     )
     retired = _action(
         harness,
