@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerInventory,
     NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
@@ -1615,8 +1616,6 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
         "_wait_for_publication_intents",
         observe_scheduler_wait,
     )
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    launch: concurrent.futures.Future[str] | None = None
     reactor_started = False
     serving.start()
     try:
@@ -1627,53 +1626,77 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
         serving.attach_producer_completion(submission)
         assert serving.packed_ready(identity.local_binding.digest)
         assert leases_acquired.wait(timeout=_WAIT_SECONDS)
-        launch = executor.submit(
-            serving._scheduler_serving.launch_handoff,
-            lambda: launch_submitted.set() or "submitted",
-        )
-        assert scheduler_waiting.wait(timeout=_WAIT_SECONDS)
-        assert not launch_submitted.is_set()
 
-        release_acquisition.set()
-        _wait_for_phase(
-            lambda: runtime.snapshot().owner.source_batch_handoff_action_count == 1,
-            "native source batch did not claim while the scheduler waited",
-        )
-        _wait_for_phase(
-            gather_entered.is_set,
-            "source gather remained coupled to the blocked scheduler",
-        )
-        owner = runtime.snapshot().owner
-        assert owner.unclaimed_handoff_action_count == 0
-        assert owner.claimed_handoff_action_count == 1
-        assert owner.source_batch_handoff_count == 1
+        def complete_delivery_off_scheduler() -> NativeTerminalOwnerInventory:
+            """Drive delivery while the main interpreter owns the launch wait.
+
+            :returns: Native inventory captured before releasing the launch.
+            """
+
+            try:
+                assert scheduler_waiting.wait(timeout=_WAIT_SECONDS)
+                assert not launch_submitted.is_set()
+                release_acquisition.set()
+                _wait_for_phase(
+                    lambda: (
+                        runtime.snapshot().owner.source_batch_handoff_action_count
+                        == 1
+                    ),
+                    "native source batch did not claim while the scheduler waited",
+                )
+                _wait_for_phase(
+                    gather_entered.is_set,
+                    "source gather remained coupled to the blocked scheduler",
+                )
+                owner = runtime.snapshot().owner
+                assert owner.unclaimed_handoff_action_count == 0
+                assert owner.claimed_handoff_action_count == 1
+                assert owner.source_batch_handoff_count == 1
+                assert owner.source_batch_handoff_action_count == 1
+                assert owner.handoff_callback_count == 0
+                assert not owner.handoff_callback_scheduled
+                assert not owner.handoff_callback_active
+                assert not owner.handoff_callback_restoring
+                assert serving._delivery_leases.inventory().active_binding_digests == (
+                    identity.local_binding.digest,
+                )
+                assert not launch_submitted.is_set()
+
+                release_gather.set()
+                assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+                serving._delivery_leases.mark_outcomes_sent(identity.local_binding)
+                assert (
+                    serving._delivery_leases.inventory().active_binding_digests
+                    == (identity.local_binding.digest,)
+                )
+                assert not launch_submitted.is_set()
+                serving._delivery_leases.mark_publication_owned(identity.local_binding)
+                return owner
+            finally:
+                release_acquisition.set()
+                release_gather.set()
+                active = serving._delivery_leases.inventory().active_binding_digests
+                if identity.local_binding.digest in active:
+                    serving._delivery_leases.release_process_fatal()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            delivery = executor.submit(complete_delivery_off_scheduler)
+            launch_result = serving._scheduler_serving.launch_handoff(
+                lambda: launch_submitted.set() or "submitted"
+            )
+            owner = delivery.result(timeout=_WAIT_SECONDS)
+
+        assert launch_result == "submitted"
         assert owner.source_batch_handoff_action_count == 1
-        assert owner.handoff_callback_count == 0
-        assert not owner.handoff_callback_scheduled
-        assert not owner.handoff_callback_active
-        assert not owner.handoff_callback_restoring
-        assert serving._delivery_leases.inventory().active_binding_digests == (
-            identity.local_binding.digest,
-        )
-        assert not launch_submitted.is_set()
-
-        release_gather.set()
-        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
-        serving._delivery_leases.mark_outcomes_sent(identity.local_binding)
-        serving._delivery_leases.mark_publication_owned(identity.local_binding)
-        assert launch.result(timeout=_WAIT_SECONDS) == "submitted"
 
         assert launch_submitted.is_set()
         assert reactor_failures == []
     finally:
         release_acquisition.set()
         release_gather.set()
-        if launch is not None and not launch.done():
-            serving._delivery_leases.release_process_fatal()
         if reactor_started:
             reactor.close(_WAIT_SECONDS)
         serving.abort_and_close()
-        executor.shutdown(wait=True)
 
 
 def test_gather_worker_owns_direct_inbox_and_binds_device_once(

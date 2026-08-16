@@ -36,10 +36,10 @@ class _NativeTerminalOwnerBridge(Protocol):
     """Typed boundary implemented by the native terminal-owner extension."""
 
     def enable_forward_independent_handoff(self) -> None:
-        """Enable the process-lifetime CPython scheduler handoff."""
+        """Enable the process-lifetime forward-independent delivery mode."""
 
     def forward_independent_handoff_action_kinds(self) -> tuple[int, ...]:
-        """Return the native action kinds enrolled in scheduler handoff.
+        """Return the native action kinds enrolled in independent delivery.
 
         :returns: Complete native handoff classification.
         """

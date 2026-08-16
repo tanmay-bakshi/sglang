@@ -170,7 +170,7 @@ def _runtime(
     :param output_capacity: Native normal-action queue bound.
     :param maximum_live_lifecycles: Admission and fail-closed reserve bound.
     :param enable_forward_independent_handoff: Whether this runtime exercises
-        the CPython scheduler handoff.
+        role-specific forward-independent delivery.
     :param bind_source_delivery_authority: Whether an enabled source runtime
         receives its atomic fixture delivery owner before start.
     :param testing: Whether to expose deterministic native test controls.
