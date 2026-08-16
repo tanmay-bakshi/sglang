@@ -2399,6 +2399,7 @@ def test_preclaimed_batch_failure_reconciles_without_native_dequeue_claim(
             kind=NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
         ),
     )
+    settled_action_ids: list[int] = []
 
     def fail_publisher_population(
         claimed: tuple[NativeTerminalOwnerAction, ...],
@@ -2421,6 +2422,14 @@ def test_preclaimed_batch_failure_reconciles_without_native_dequeue_claim(
 
         raise AssertionError(f"action {action.action_id} was claimed twice")
 
+    def record_delivery_settlement(action: NativeTerminalOwnerAction) -> None:
+        """Record the delivery-seam settlement owned by the runtime fixture.
+
+        :param action: Exact action transferred to the publisher consumer.
+        """
+
+        settled_action_ids.append(action.action_id)
+
     serving.start()
     try:
         runtime._record_source_preclaims(actions)
@@ -2431,6 +2440,11 @@ def test_preclaimed_batch_failure_reconciles_without_native_dequeue_claim(
                 runtime._owner,
                 "claim_forward_independent_handoff",
                 reject_dequeue_reclaim,
+            )
+            scoped_patch.setattr(
+                runtime._owner,
+                "settle_forward_independent_handoff",
+                record_delivery_settlement,
             )
             scoped_patch.setattr(
                 serving,
@@ -2452,6 +2466,7 @@ def test_preclaimed_batch_failure_reconciles_without_native_dequeue_claim(
         snapshot = runtime.snapshot()
         assert snapshot.source_preclaimed_count == 0
         assert snapshot.source_preclaimed_consumer_count == 0
+        assert settled_action_ids == [501, 502]
         assert publisher.values == []
     finally:
         serving.abort_and_close()

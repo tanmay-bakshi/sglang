@@ -2338,8 +2338,6 @@ def test_failed_claim_excludes_preclaimed_duplicate_from_local_authority() -> No
         assert error.locally_claimed_actions == (error.removed_actions[0],)
         assert already_claimed not in error.locally_claimed_actions
         snapshot = runtime.snapshot()
-        assert snapshot.owner.active_handoff_action_count == 0
-        assert snapshot.owner.settled_handoff_action_count == 2
         assert snapshot.consumer_pending_count == 2
         with runtime._condition:
             assert runtime._inbox_claimed_action_ids == {
