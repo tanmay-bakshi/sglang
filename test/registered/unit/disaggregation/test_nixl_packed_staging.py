@@ -133,8 +133,8 @@ def test_packed_copy_executor_prioritizes_completion_progress() -> None:
     assert executor._scatter_stream is scatter_stream
     set_device.assert_called_once_with(3)
     assert stream.call_args_list == [
-        call(device="cuda-device", priority=-1),
-        call(device="cuda-device", priority=-1),
+        call(device="cuda-device", priority=-5),
+        call(device="cuda-device", priority=-5),
     ]
 
 

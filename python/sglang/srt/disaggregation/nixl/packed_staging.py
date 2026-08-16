@@ -3747,7 +3747,10 @@ class PackedScatterSubmission:
 class PackedCopyExecutor:
     """Component-aware raw-byte gather and scatter kernel dispatcher."""
 
-    _PROGRESS_STREAM_PRIORITY: ClassVar[int] = -1
+    # B300 exposes priorities 0 through -5. PyTorch clamps this value on
+    # devices with a narrower range, so the same construction still requests
+    # the device's highest available priority there.
+    _PROGRESS_STREAM_PRIORITY: ClassVar[int] = -5
 
     _device: torch.device
     _failed_scatter_resources: list[torch.Tensor]
