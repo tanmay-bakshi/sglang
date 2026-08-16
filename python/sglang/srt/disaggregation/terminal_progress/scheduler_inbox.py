@@ -31,6 +31,26 @@ class SchedulerReceiptPublishResult(enum.StrEnum):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class SchedulerDeliveryIntent:
+    """One exact launch exclusion owned by an external delivery path.
+
+    :ivar identity: Monotonic process-local intent identity.
+    :ivar binding: Exact request generation excluded from another host launch.
+    """
+
+    identity: int
+    binding: TerminalRequestBinding
+
+    def __post_init__(self) -> None:
+        """Validate one process-local delivery intent."""
+
+        if type(self.identity) is not int or self.identity < 0:
+            raise ValueError("delivery intent identity must be non-negative")
+        if type(self.binding) is not TerminalRequestBinding:
+            raise TypeError("delivery intent binding must be TerminalRequestBinding")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class SchedulerReceiptInboxInventory:
     """Immutable scheduler receipt-inbox inventory.
 
@@ -39,6 +59,7 @@ class SchedulerReceiptInboxInventory:
     :ivar pending_request_keys: FIFO request generations queued for handling.
     :ivar consuming_request_keys: Request generations inside the consumer call.
     :ivar outstanding_publications: Producer calls announced but not returned.
+    :ivar active_delivery_intents: Exact external launch exclusions.
     :ivar wake_armed: Whether the readable fd carries an unconsumed wake hint.
     :ivar fatal_cause: First process-fatal invariant violation, when present.
     :ivar closed: Whether the runtime descriptors are closed.
@@ -49,6 +70,7 @@ class SchedulerReceiptInboxInventory:
     pending_request_keys: tuple[PackedRequestKey, ...]
     consuming_request_keys: tuple[PackedRequestKey, ...]
     outstanding_publications: int
+    active_delivery_intents: tuple[SchedulerDeliveryIntent, ...]
     wake_armed: bool
     fatal_cause: SchedulerInboxFatalCause | None
     closed: bool
@@ -69,6 +91,13 @@ class SchedulerReceiptInboxInventory:
             or self.outstanding_publications < 0
         ):
             raise ValueError("outstanding_publications must be non-negative")
+        if type(self.active_delivery_intents) is not tuple or any(
+            type(intent) is not SchedulerDeliveryIntent
+            for intent in self.active_delivery_intents
+        ):
+            raise TypeError(
+                "active_delivery_intents must contain SchedulerDeliveryIntent values"
+            )
         if type(self.wake_armed) is not bool:
             raise TypeError("wake_armed must be bool")
         if (
@@ -95,6 +124,20 @@ class SchedulerReceiptInboxInventory:
             raise ValueError("pending receipts exceed live requests")
         if len(live_keys) > self.physical_capacity:
             raise ValueError("live requests exceed physical capacity")
+        delivery_identities = tuple(
+            intent.identity for intent in self.active_delivery_intents
+        )
+        delivery_keys = tuple(
+            intent.binding.request_key for intent in self.active_delivery_intents
+        )
+        if len(set(delivery_identities)) != len(delivery_identities):
+            raise ValueError("delivery intent identities must be unique")
+        if len(set(delivery_keys)) != len(delivery_keys):
+            raise ValueError("delivery request generations must be unique")
+        if not set(delivery_keys).issubset(set(live_keys)):
+            raise ValueError("every delivery request generation must be live")
+        if len(delivery_keys) > self.physical_capacity:
+            raise ValueError("delivery intents exceed physical capacity")
 
     @property
     def live_count(self) -> int:
@@ -197,6 +240,7 @@ class TerminalReceiptInbox:
     _intent_condition: threading.Condition
     _next_intent: int
     _active_intents: set[int]
+    _active_delivery_intents: dict[int, SchedulerDeliveryIntent]
 
     def __init__(self, physical_capacity: int) -> None:
         """Create one bounded runtime and its coalesced wake pipe.
@@ -226,6 +270,7 @@ class TerminalReceiptInbox:
         self._intent_condition = threading.Condition(threading.Lock())
         self._next_intent = 0
         self._active_intents = set()
+        self._active_delivery_intents = {}
 
     def fileno(self) -> int:
         """Return the scheduler's readable wake descriptor.
@@ -398,6 +443,60 @@ class TerminalReceiptInbox:
         if result is None:
             raise SchedulerInboxError("receipt publication produced no disposition")
         return result
+
+    def begin_delivery_intent(
+        self,
+        binding: TerminalRequestBinding,
+    ) -> SchedulerDeliveryIntent:
+        """Exclude a host launch while an external delivery remains causal.
+
+        This boundary deliberately touches only the publication-intent
+        condition. A delivery owner may call it while a native pending call
+        has interrupted the scheduler inside the receipt state lock; taking
+        that lock here would recreate the handoff deadlock this intent avoids.
+
+        :param binding: Exact request generation protected by the intent.
+        :returns: Take-once intent consumed after durable delivery.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        with self._intent_condition:
+            if len(self._active_delivery_intents) >= self._physical_capacity:
+                raise SchedulerInboxError(
+                    "delivery intents exceed scheduler physical capacity"
+                )
+            if any(
+                intent.binding.request_key == binding.request_key
+                for intent in self._active_delivery_intents.values()
+            ):
+                raise SchedulerInboxError(
+                    "request generation already owns a delivery intent"
+                )
+            identity = self._next_intent
+            self._next_intent += 1
+            intent = SchedulerDeliveryIntent(identity=identity, binding=binding)
+            self._active_intents.add(identity)
+            self._active_delivery_intents[identity] = intent
+            return intent
+
+    def complete_delivery_intent(self, intent: SchedulerDeliveryIntent) -> None:
+        """Release one external launch exclusion after durable delivery.
+
+        :param intent: Exact active delivery intent.
+        """
+
+        if type(intent) is not SchedulerDeliveryIntent:
+            raise TypeError("intent must be SchedulerDeliveryIntent")
+        with self._intent_condition:
+            active = self._active_delivery_intents.get(intent.identity)
+            if active != intent or intent.identity not in self._active_intents:
+                raise SchedulerInboxError(
+                    "delivery intent is absent, forged, or already completed"
+                )
+            del self._active_delivery_intents[intent.identity]
+            self._active_intents.remove(intent.identity)
+            self._intent_condition.notify_all()
 
     def drain_at_loop_entry(
         self,
@@ -582,7 +681,7 @@ class TerminalReceiptInbox:
                 with self._intent_condition:
                     if len(self._active_intents) > 0:
                         raise SchedulerInboxError(
-                            "cannot close scheduler inbox during receipt publication"
+                            "cannot close scheduler inbox with an active launch intent"
                         )
                 self._clear_wake_locked()
                 self._closed = True
@@ -612,6 +711,10 @@ class TerminalReceiptInbox:
         """
 
         with self._intent_condition:
+            if intent in self._active_delivery_intents:
+                raise SchedulerInboxError(
+                    "publication completion referenced a delivery intent"
+                )
             if intent not in self._active_intents:
                 raise SchedulerInboxError("publication intent completed twice")
             self._active_intents.remove(intent)
@@ -779,7 +882,15 @@ class TerminalReceiptInbox:
         """
 
         with self._intent_condition:
-            outstanding_publications = len(self._active_intents)
+            active_delivery_intents = tuple(
+                sorted(
+                    self._active_delivery_intents.values(),
+                    key=lambda intent: intent.identity,
+                )
+            )
+            outstanding_publications = len(self._active_intents) - len(
+                active_delivery_intents
+            )
         return SchedulerReceiptInboxInventory(
             physical_capacity=self._physical_capacity,
             live_bindings=tuple(self._live.values()),
@@ -788,6 +899,7 @@ class TerminalReceiptInbox:
             ),
             consuming_request_keys=tuple(self._consuming),
             outstanding_publications=outstanding_publications,
+            active_delivery_intents=active_delivery_intents,
             wake_armed=self._wake_armed,
             fatal_cause=self._fatal_cause,
             closed=self._closed,

@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptOutcome,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
+    SchedulerDeliveryIntent,
     SchedulerReceiptInboxFatalError,
     SchedulerReceiptPublishResult,
     TerminalReceiptInbox,
@@ -408,6 +409,103 @@ def test_announced_publication_wins_before_host_submission(
 
     assert ordering == ["consume", "submit"]
     inbox.close()
+
+
+def test_external_delivery_intent_blocks_launch_until_exact_completion() -> None:
+    """A causal delivery owns the next host-launch boundary until completion."""
+
+    inbox = TerminalReceiptInbox(physical_capacity=1)
+    binding = _binding(room_id=61, marker=21)
+    receipt = _receipt(binding, marker=31)
+    inbox.register_live(binding)
+    intent = inbox.begin_delivery_intent(binding)
+    launch_entered = threading.Event()
+    submitted = threading.Event()
+
+    def launch() -> str:
+        """Enter the launch gate and return its exact result."""
+
+        launch_entered.set()
+        return inbox.launch_handoff(
+            submit=lambda: submitted.set() or "submitted",
+            consume=lambda value: None,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(launch)
+        assert launch_entered.wait(timeout=5)
+        assert not submitted.wait(timeout=0.05)
+        inventory = inbox.inventory()
+        assert inventory.outstanding_publications == 0
+        assert inventory.active_delivery_intents == (intent,)
+        inbox.complete_delivery_intent(intent)
+        assert future.result(timeout=5) == "submitted"
+
+    assert submitted.is_set()
+    inbox.publish(receipt)
+    inbox.drain_at_loop_entry(lambda value: None)
+    inbox.close()
+
+
+def test_delivery_intent_uses_independent_lock_and_rejects_forgery() -> None:
+    """The exact token remains safe while scheduler-owned locks are unavailable."""
+
+    inbox = TerminalReceiptInbox(physical_capacity=2)
+    binding = _binding(room_id=62, marker=22)
+    conflicting = _binding(room_id=63, marker=23)
+    inbox.register_live(binding)
+    inbox.register_live(conflicting)
+
+    inbox._consumer_lock.acquire()
+    inbox._state_lock.acquire()
+    try:
+        intent = inbox.begin_delivery_intent(binding)
+    finally:
+        inbox._state_lock.release()
+        inbox._consumer_lock.release()
+
+    forged = SchedulerDeliveryIntent(identity=intent.identity, binding=conflicting)
+    with pytest.raises(SchedulerInboxError, match="forged"):
+        inbox.complete_delivery_intent(forged)
+    assert inbox.inventory().active_delivery_intents == (intent,)
+    inbox.complete_delivery_intent(intent)
+    with pytest.raises(SchedulerInboxError, match="already completed"):
+        inbox.complete_delivery_intent(intent)
+
+    inbox.mark_owner_dead()
+    inbox.close_fail_closed()
+
+
+def test_owner_death_releases_blocked_launch_into_fatal_without_submission() -> None:
+    """A fatal owner wakes an excluded launch into the sticky fatal path."""
+
+    inbox = TerminalReceiptInbox(physical_capacity=1)
+    binding = _binding(room_id=64, marker=24)
+    inbox.register_live(binding)
+    intent = inbox.begin_delivery_intent(binding)
+    launch_entered = threading.Event()
+    submitted = threading.Event()
+
+    def launch() -> None:
+        """Enter the excluded launch boundary."""
+
+        launch_entered.set()
+        inbox.launch_handoff(
+            submit=lambda: submitted.set(),
+            consume=lambda value: None,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(launch)
+        assert launch_entered.wait(timeout=5)
+        assert not submitted.wait(timeout=0.05)
+        inbox.mark_owner_dead()
+        inbox.complete_delivery_intent(intent)
+        with pytest.raises(SchedulerReceiptInboxFatalError):
+            future.result(timeout=5)
+
+    assert not submitted.is_set()
+    inbox.close_fail_closed()
 
 
 def test_consumer_failure_retains_exact_evidence_and_enters_fatal_state() -> None:

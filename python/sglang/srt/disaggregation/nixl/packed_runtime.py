@@ -992,6 +992,14 @@ class _TerminalGatherPhase(enum.Enum):
     STABLE = "stable"
 
 
+class _TerminalTransferSettlement(enum.Enum):
+    """Native terminal settlement retained by the source actor."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 @dataclasses.dataclass
 class _PrefillRequestRecord:
     """Source actor state retained until authenticated decoder teardown."""
@@ -1027,8 +1035,12 @@ class _PrefillRequestRecord:
     terminal_teardown: PackedRequestTeardown | None = None
     terminal_ack_sent: bool = False
     terminal_quarantined: bool = False
-    terminal_main_failure_settled: bool = False
-    terminal_auxiliary_failure_settled: bool = False
+    terminal_main_settlement: _TerminalTransferSettlement = (
+        _TerminalTransferSettlement.PENDING
+    )
+    terminal_auxiliary_settlement: _TerminalTransferSettlement = (
+        _TerminalTransferSettlement.PENDING
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1480,7 +1492,12 @@ class PackedPrefillRuntime:
         with self._lock:
             if not record.terminal_gather_posted:
                 raise RuntimeError("terminal outcomes preceded transfer post")
-            if record.main_outcome is not None or record.outcomes_sent:
+            if (
+                record.terminal_main_settlement
+                is not _TerminalTransferSettlement.PENDING
+                or record.main_outcome is not None
+                or record.outcomes_sent
+            ):
                 raise RuntimeError("terminal outcomes were already constructed")
             auxiliary_handle = record.auxiliary_handle
             if record.main_lane is None or record.main_handle is None:
@@ -1495,6 +1512,10 @@ class PackedPrefillRuntime:
                 if auxiliary_handle is None or settle_auxiliary is None:
                     raise RuntimeError("terminal auxiliary settlement disappeared")
                 auxiliary_outcome = settle_auxiliary(auxiliary_handle, action)
+                with record.condition:
+                    record.terminal_auxiliary_settlement = (
+                        _TerminalTransferSettlement.SUCCEEDED
+                    )
                 self._validate_terminal_auxiliary_outcome(record, auxiliary_outcome)
             with record.condition:
                 record.main_outcome = main_outcome
@@ -1666,8 +1687,8 @@ class PackedPrefillRuntime:
                 raise RuntimeError("terminal gather quarantine lacks stable ownership")
             lane = record.main_lane
             auxiliary_handle = record.auxiliary_handle
-            main_settled = record.terminal_main_failure_settled
-            auxiliary_settled = record.terminal_auxiliary_failure_settled
+            main_settlement = record.terminal_main_settlement
+            auxiliary_settlement = record.terminal_auxiliary_settlement
         if (
             canonical
             and auxiliary_handle is not None
@@ -1676,16 +1697,21 @@ class PackedPrefillRuntime:
             raise TypeError("canonical source failure requires auxiliary settlement")
         if not canonical and settle_auxiliary is not None:
             raise ValueError("noncanonical source has no auxiliary failure settlement")
-        if lane is not None and not main_settled:
+        if lane is not None and main_settlement is _TerminalTransferSettlement.PENDING:
             settle_main(lane, action)
             with record.condition:
-                record.terminal_main_failure_settled = True
-        if auxiliary_handle is not None and not auxiliary_settled:
+                record.terminal_main_settlement = _TerminalTransferSettlement.FAILED
+        if (
+            auxiliary_handle is not None
+            and auxiliary_settlement is _TerminalTransferSettlement.PENDING
+        ):
             if settle_auxiliary is None:
                 raise RuntimeError("auxiliary failure settlement disappeared")
             settle_auxiliary(auxiliary_handle, action)
             with record.condition:
-                record.terminal_auxiliary_failure_settled = True
+                record.terminal_auxiliary_settlement = (
+                    _TerminalTransferSettlement.FAILED
+                )
 
     def retire_terminal_owner_request(
         self,
@@ -2050,9 +2076,8 @@ class PackedPrefillRuntime:
         if self._writer_id == record.submission.plan.canonical_writer_id:
             if auxiliary_outcome is None:
                 raise RuntimeError("canonical terminal teardown lacks aux outcome")
-            if (
-                request.auxiliary_handle_generation
-                != self._auxiliary_handle_generation(auxiliary_outcome)
+            if request.auxiliary_handle_generation != self._auxiliary_handle_generation(
+                auxiliary_outcome
             ):
                 raise RuntimeError("terminal teardown names another aux handle")
         elif request.auxiliary_handle_generation is not None:
@@ -2509,10 +2534,15 @@ class PackedPrefillRuntime:
             lane = record.main_lane
             if lane is None:
                 raise RuntimeError("terminal main completion preceded transfer post")
-            if record.main_outcome is not None:
+            if (
+                record.terminal_main_settlement
+                is not _TerminalTransferSettlement.PENDING
+                or record.main_outcome is not None
+            ):
                 raise RuntimeError("terminal main completion was already settled")
         outcome = lane.settle_terminal_completion(action)
         with record.condition:
+            record.terminal_main_settlement = _TerminalTransferSettlement.SUCCEEDED
             started_at = record.main_transport_started_at
             if started_at is not None:
                 record.main_transport_duration_ms = (
@@ -2537,9 +2567,20 @@ class PackedPrefillRuntime:
         ):
             raise ValueError("terminal main failure requires a failure owner action")
         record = self._terminal_record_for_action(action, action.kind)
-        if record.main_lane is None:
-            raise RuntimeError("terminal main failure references an unknown transfer")
-        record.main_lane.settle_terminal_failure(action)
+        with record.condition:
+            lane = record.main_lane
+            if lane is None:
+                raise RuntimeError(
+                    "terminal main failure references an unknown transfer"
+                )
+            if (
+                record.terminal_main_settlement
+                is not _TerminalTransferSettlement.PENDING
+            ):
+                raise RuntimeError("terminal main transfer was already settled")
+        lane.settle_terminal_failure(action)
+        with record.condition:
+            record.terminal_main_settlement = _TerminalTransferSettlement.FAILED
 
     def cancel_terminal_main_transfer(self, binding: TerminalRequestBinding) -> None:
         """Request cancellation without releasing ambiguous transfer authority.
@@ -2796,9 +2837,8 @@ class PackedPrefillRuntime:
         if self._writer_id == record.submission.plan.canonical_writer_id:
             if auxiliary_outcome is None or auxiliary_handle is None:
                 raise RuntimeError("canonical teardown lacks auxiliary ownership")
-            if (
-                request.auxiliary_handle_generation
-                != self._auxiliary_handle_generation(auxiliary_outcome)
+            if request.auxiliary_handle_generation != self._auxiliary_handle_generation(
+                auxiliary_outcome
             ):
                 raise RuntimeError("canonical teardown names another auxiliary handle")
             if not record.auxiliary_handle_released:

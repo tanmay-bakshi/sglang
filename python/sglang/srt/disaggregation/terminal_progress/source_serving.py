@@ -4,6 +4,7 @@ import threading
 import traceback
 from collections.abc import Callable
 
+from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
     TerminalCudaCompletionProducer,
 )
@@ -41,6 +42,7 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerActionPublicationError,
+    TerminalSchedulerDeliveryLease,
     TerminalSchedulerFailClosedClosure,
     TerminalSchedulerServing,
     TerminalSchedulerServingInventory,
@@ -69,6 +71,14 @@ from sglang.srt.disaggregation.terminal_progress.source_wiring import (
 from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 logger = logging.getLogger(__name__)
+
+_SOURCE_CAUSAL_DELIVERY_ACTIONS = frozenset(
+    (
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+    )
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -246,6 +256,346 @@ class PackedTerminalSourceWork:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class PackedTerminalSourceDeliveryLeaseInventory:
+    """Exact request-scoped launch exclusions retained by source delivery.
+
+    :ivar active_binding_digests: Requests which still exclude another launch.
+    :ivar outcomes_sent_binding_digests: Active requests with durable outcomes.
+    :ivar publication_owned_binding_digests: Active requests whose publication
+        has a durable owner.
+    """
+
+    active_binding_digests: tuple[bytes, ...]
+    outcomes_sent_binding_digests: tuple[bytes, ...]
+    publication_owned_binding_digests: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        """Validate one exact causal-delivery inventory."""
+
+        populations = (
+            self.active_binding_digests,
+            self.outcomes_sent_binding_digests,
+            self.publication_owned_binding_digests,
+        )
+        if any(type(population) is not tuple for population in populations):
+            raise TypeError("delivery lease populations must be tuples")
+        if any(
+            type(digest) is not bytes or len(digest) != 32
+            for population in populations
+            for digest in population
+        ):
+            raise ValueError("delivery lease identities must contain 32 bytes")
+        if any(
+            population != tuple(sorted(set(population))) for population in populations
+        ):
+            raise ValueError("delivery lease identities must be sorted and unique")
+        active = set(self.active_binding_digests)
+        if not set(self.outcomes_sent_binding_digests).issubset(active):
+            raise ValueError("outcome milestones require active delivery leases")
+        if not set(self.publication_owned_binding_digests).issubset(active):
+            raise ValueError("publication milestones require active delivery leases")
+
+
+@dataclasses.dataclass(slots=True)
+class _PackedTerminalSourceDeliveryLeaseRecord:
+    """Mutable two-milestone state for one request launch exclusion.
+
+    :ivar binding: Exact source request generation.
+    :ivar lease: Take-once scheduler launch exclusion.
+    :ivar outcomes_sent: Whether ``SOURCE_OUTCOMES_SENT`` committed.
+    :ivar publication_owned: Whether gateway publication has a durable owner.
+    """
+
+    binding: TerminalRequestBinding
+    lease: TerminalSchedulerDeliveryLease
+    outcomes_sent: bool = False
+    publication_owned: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate one live source delivery record."""
+
+        if type(self.binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        if type(self.lease) is not TerminalSchedulerDeliveryLease:
+            raise TypeError("lease must be TerminalSchedulerDeliveryLease")
+        if self.lease.binding != self.binding:
+            raise ValueError("delivery lease belongs to another request generation")
+        if type(self.outcomes_sent) is not bool:
+            raise TypeError("outcomes_sent must be bool")
+        if type(self.publication_owned) is not bool:
+            raise TypeError("publication_owned must be bool")
+
+
+class _PackedTerminalSourceDeliveryLeases:
+    """Transfer native handoff authority into request-scoped launch intents."""
+
+    _scheduler_serving: TerminalSchedulerServing
+    _records: dict[PackedRequestKey, _PackedTerminalSourceDeliveryLeaseRecord]
+    _process_fatal: bool
+    _scheduler_fatal: bool
+    _lock: threading.Lock
+
+    def __init__(self, scheduler_serving: TerminalSchedulerServing) -> None:
+        """Create an empty source delivery registry.
+
+        :param scheduler_serving: Source launch gate owning external intents.
+        """
+
+        if type(scheduler_serving) is not TerminalSchedulerServing:
+            raise TypeError("scheduler_serving must be TerminalSchedulerServing")
+        if scheduler_serving.role is not TerminalSchedulerServingRole.SOURCE:
+            raise ValueError("source delivery leases require source scheduler serving")
+        self._scheduler_serving = scheduler_serving
+        self._records = {}
+        self._process_fatal = False
+        self._scheduler_fatal = False
+        self._lock = threading.Lock()
+
+    def acquire_for_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> None:
+        """Establish every request intent before native claims are released.
+
+        :param actions: Exact action population about to cross inbox delivery.
+        """
+
+        if type(actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction for action in actions
+        ):
+            raise TypeError("actions must contain native terminal actions")
+        try:
+            self._acquire_for_actions(actions)
+        except Exception as error:
+            formatted_traceback = traceback.format_exc()
+            try:
+                self._retain_failure_barrier(actions)
+            except Exception:  # noqa: BLE001
+                logger.critical(
+                    "Source delivery failure could not retain its launch barrier:\n%s",
+                    traceback.format_exc(),
+                )
+            raise RuntimeError(
+                f"source delivery lease acquisition failed:\n{formatted_traceback}"
+            ) from error
+
+    def _acquire_for_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> None:
+        """Allocate one prevalidated request batch under the registry lock.
+
+        :param actions: Exact action population about to cross inbox delivery.
+        """
+
+        bindings: dict[PackedRequestKey, TerminalRequestBinding] = {}
+        action_kinds: dict[
+            PackedRequestKey,
+            set[NativeTerminalOwnerActionKind],
+        ] = {}
+        for action in actions:
+            if action.kind not in _SOURCE_CAUSAL_DELIVERY_ACTIONS:
+                continue
+            binding = action.binding.to_binding()
+            request_key = binding.request_key
+            existing = bindings.get(request_key)
+            if existing is not None and existing != binding:
+                raise RuntimeError("delivery batch aliases a request generation")
+            bindings[request_key] = binding
+            action_kinds.setdefault(request_key, set()).add(action.kind)
+        if len(bindings) == 0:
+            return
+        with self._lock:
+            if self._process_fatal:
+                raise RuntimeError("source delivery lease owner is process-fatal")
+            for request_key, binding in bindings.items():
+                existing = self._records.get(request_key)
+                if existing is not None and existing.binding != binding:
+                    raise RuntimeError("delivery lease aliases a request generation")
+                if (
+                    existing is None
+                    and NativeTerminalOwnerActionKind.SOURCE_GATHER_READY
+                    not in action_kinds[request_key]
+                ):
+                    raise RuntimeError("source delivery began after its gather handoff")
+            new_records: dict[
+                PackedRequestKey,
+                _PackedTerminalSourceDeliveryLeaseRecord,
+            ] = {}
+            try:
+                for request_key, binding in bindings.items():
+                    if request_key in self._records:
+                        continue
+                    new_records[request_key] = _PackedTerminalSourceDeliveryLeaseRecord(
+                        binding=binding,
+                        lease=self._scheduler_serving.begin_delivery_lease(binding),
+                    )
+            except Exception as error:
+                formatted_traceback = traceback.format_exc()
+                self._records.update(new_records)
+                raise RuntimeError(
+                    "source delivery lease batch allocation failed:\n"
+                    f"{formatted_traceback}"
+                ) from error
+            for request_key, record in new_records.items():
+                if request_key in self._records:
+                    for allocated in new_records.values():
+                        if allocated.lease.active:
+                            allocated.lease.complete()
+                    raise RuntimeError("delivery lease changed during allocation")
+                self._records[request_key] = record
+
+    def _retain_failure_barrier(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> None:
+        """Keep launch exclusion active until outer owner-death is durable.
+
+        This boundary must not take scheduler state. It may run while the
+        pending-call handoff has interrupted that exact lock; the outer source
+        failure path marks scheduler death only after the native claim releases
+        the interrupted thread.
+
+        :param actions: Exact failed delivery population.
+        """
+
+        causal = tuple(
+            action
+            for action in actions
+            if action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS
+        )
+        if len(causal) == 0:
+            raise RuntimeError("delivery failure lacks a causal source action")
+        binding = causal[0].binding.to_binding()
+        with self._lock:
+            if self._scheduler_fatal:
+                return
+            self._process_fatal = True
+            if len(self._records) > 0:
+                return
+            self._records[binding.request_key] = (
+                _PackedTerminalSourceDeliveryLeaseRecord(
+                    binding=binding,
+                    lease=self._scheduler_serving.begin_delivery_lease(binding),
+                )
+            )
+
+    def mark_outcomes_sent(self, binding: TerminalRequestBinding) -> None:
+        """Commit the source-outcome milestone and release a complete join.
+
+        :param binding: Exact request whose outcome send committed natively.
+        """
+
+        with self._lock:
+            record = self._require_record_locked(binding)
+            if record.outcomes_sent:
+                raise RuntimeError("source delivery outcomes committed twice")
+            record.outcomes_sent = True
+            self._complete_ready_locked(record)
+
+    def mark_publication_owned(self, binding: TerminalRequestBinding) -> None:
+        """Commit durable gateway ownership and release a complete join.
+
+        :param binding: Exact request accepted by its publication owner.
+        """
+
+        with self._lock:
+            record = self._require_record_locked(binding)
+            if record.publication_owned:
+                raise RuntimeError("source publication ownership committed twice")
+            record.publication_owned = True
+            self._complete_ready_locked(record)
+
+    def release_quarantined(self, binding: TerminalRequestBinding) -> bool:
+        """Release one intent after request-local quarantine is durable.
+
+        :param binding: Exact quarantined source request generation.
+        :returns: Whether the request retained a delivery lease.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        with self._lock:
+            record = self._records.get(binding.request_key)
+            if record is None:
+                return False
+            if record.binding != binding:
+                raise RuntimeError("quarantine aliases a delivery lease generation")
+            record.lease.complete()
+            del self._records[binding.request_key]
+            return True
+
+    def release_process_fatal(self) -> None:
+        """Release every intent after scheduler process-fatal became sticky."""
+
+        with self._lock:
+            self._process_fatal = True
+            self._scheduler_fatal = True
+            records = tuple(self._records.values())
+            for record in records:
+                if record.lease.active:
+                    record.lease.complete()
+            self._records.clear()
+
+    def inventory(self) -> PackedTerminalSourceDeliveryLeaseInventory:
+        """Return every active request and committed join milestone.
+
+        :returns: Immutable causal-delivery inventory.
+        """
+
+        with self._lock:
+            records = tuple(self._records.values())
+        return PackedTerminalSourceDeliveryLeaseInventory(
+            active_binding_digests=tuple(
+                sorted(record.binding.digest for record in records)
+            ),
+            outcomes_sent_binding_digests=tuple(
+                sorted(
+                    record.binding.digest for record in records if record.outcomes_sent
+                )
+            ),
+            publication_owned_binding_digests=tuple(
+                sorted(
+                    record.binding.digest
+                    for record in records
+                    if record.publication_owned
+                )
+            ),
+        )
+
+    def _require_record_locked(
+        self,
+        binding: TerminalRequestBinding,
+    ) -> _PackedTerminalSourceDeliveryLeaseRecord:
+        """Return one exact record while the registry lock is held.
+
+        :param binding: Expected request generation.
+        :returns: Matching live delivery record.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        record = self._records.get(binding.request_key)
+        if record is None or record.binding != binding:
+            raise RuntimeError("source delivery milestone lacks an exact lease")
+        return record
+
+    def _complete_ready_locked(
+        self,
+        record: _PackedTerminalSourceDeliveryLeaseRecord,
+    ) -> None:
+        """Release a two-milestone join while the registry lock is held.
+
+        :param record: Exact active delivery record.
+        """
+
+        if not record.outcomes_sent or not record.publication_owned:
+            return
+        record.lease.complete()
+        del self._records[record.binding.request_key]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class _PackedTerminalSourceRuntimeActionBatch:
     """One process-reactor turn claimed before any downstream execution.
 
@@ -398,6 +748,7 @@ class PackedTerminalSourceServingInventory:
     :ivar wiring: Immutable source side-effect inventory.
     :ivar scheduler_consumer: Scheduler-affine resource inventory.
     :ivar scheduler_serving: Qualified scheduler receipt inventory.
+    :ivar delivery_leases: Request-scoped launch exclusions and join state.
     :ivar gather_worker: Dedicated blocking source gather execution context.
     :ivar grouped_nixl: Request-level main and DFlash transfer inventory.
     :ivar resources: Packed actor, DFlash, and pre-lifecycle quarantine inventory.
@@ -409,6 +760,7 @@ class PackedTerminalSourceServingInventory:
     wiring: PackedTerminalSourceInventory
     scheduler_consumer: PackedTerminalSourceSchedulerInventory
     scheduler_serving: TerminalSchedulerServingInventory
+    delivery_leases: PackedTerminalSourceDeliveryLeaseInventory
     gather_worker: PackedTerminalSourceGatherWorkerInventory
     grouped_nixl: GroupedNixlTerminalOwnerInventory
     resources: PackedTerminalSourceResourceInventory
@@ -429,6 +781,10 @@ class PackedTerminalSourceServingInventory:
         if type(self.scheduler_serving) is not TerminalSchedulerServingInventory:
             raise TypeError(
                 "scheduler_serving must be TerminalSchedulerServingInventory"
+            )
+        if type(self.delivery_leases) is not PackedTerminalSourceDeliveryLeaseInventory:
+            raise TypeError(
+                "delivery_leases must be PackedTerminalSourceDeliveryLeaseInventory"
             )
         if type(self.gather_worker) is not PackedTerminalSourceGatherWorkerInventory:
             raise TypeError(
@@ -492,6 +848,7 @@ class PackedTerminalSourceServingInventory:
                 len(self.scheduler_consumer.active_binding_digests),
                 self.scheduler_serving.inbox.live_count,
                 len(self.scheduler_serving.retained_action_ids),
+                len(self.delivery_leases.active_binding_digests),
                 self.gather_worker.retained_action_count,
                 int(self.gather_worker.fatal_reason is not None),
                 self.grouped_nixl.active_group_count,
@@ -549,6 +906,7 @@ class PackedTerminalSourceServing:
     _wiring: PackedTerminalSourceWiring
     _scheduler_consumer: PackedTerminalSourceSchedulerConsumer
     _scheduler_serving: TerminalSchedulerServing
+    _delivery_leases: _PackedTerminalSourceDeliveryLeases
     _gather_worker: PackedTerminalSourceGatherWorker
     _grouped_nixl: GroupedNixlTerminalOwner
     _work: PackedTerminalSourceWork
@@ -645,10 +1003,13 @@ class PackedTerminalSourceServing:
             physical_capacity=physical_capacity,
             source_consumer=scheduler_consumer,
         )
+        delivery_leases = _PackedTerminalSourceDeliveryLeases(scheduler_serving)
+        runtime.bind_source_delivery_lease_acquirer(delivery_leases.acquire_for_actions)
         self._runtime = runtime
         self._wiring = wiring
         self._scheduler_consumer = scheduler_consumer
         self._scheduler_serving = scheduler_serving
+        self._delivery_leases = delivery_leases
         self._grouped_nixl = grouped_nixl
         self._work = work
         self._retire_native_producers = retire_native_producers
@@ -963,6 +1324,7 @@ class PackedTerminalSourceServing:
             wiring=self._wiring.inventory(),
             scheduler_consumer=self._scheduler_consumer.inventory(),
             scheduler_serving=self._scheduler_serving.inventory(),
+            delivery_leases=self._delivery_leases.inventory(),
             gather_worker=self._gather_worker.inventory(),
             grouped_nixl=self._grouped_nixl.inventory(),
             resources=self._resource_inventory(),
@@ -1360,6 +1722,10 @@ class PackedTerminalSourceServing:
             try:
                 if action.kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
                     self._wiring.consume_outcome_ready(action, self._work.send_outcomes)
+                    if self._runtime.forward_independent_handoff_enabled:
+                        self._delivery_leases.mark_outcomes_sent(
+                            action.binding.to_binding()
+                        )
                 elif action.kind is NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
                     self._wiring.consume_ack_ready(action, self._work.send_ack)
                 else:
@@ -1443,6 +1809,11 @@ class PackedTerminalSourceServing:
                 continue
             try:
                 self._wiring.consume_gateway_publication_ready(action)
+                execution.transfer(action)
+                if self._runtime.forward_independent_handoff_enabled:
+                    self._delivery_leases.mark_publication_owned(
+                        action.binding.to_binding()
+                    )
             except PackedTerminalSourcePublicationRetentionError:
                 execution.transfer(action)
                 logger.error(
@@ -1459,7 +1830,6 @@ class PackedTerminalSourceServing:
                 self._mark_owner_dead()
                 self._runtime.begin_abort()
                 raise
-            execution.transfer(action)
 
     def _consume_lifecycle_actions(
         self,
@@ -1484,6 +1854,13 @@ class PackedTerminalSourceServing:
                         action,
                         self._work.quarantine,
                     )
+                    if (
+                        action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED
+                        and self._runtime.forward_independent_handoff_enabled
+                    ):
+                        self._delivery_leases.release_quarantined(
+                            action.binding.to_binding()
+                        )
                 except PackedTerminalSourceQuarantineRetentionError:
                     execution.transfer(action)
                     logger.error(
@@ -1560,8 +1937,10 @@ class PackedTerminalSourceServing:
         with self._lock:
             if self._owner_dead_marked:
                 return
+            self._scheduler_serving.mark_owner_dead()
+            if self._runtime.forward_independent_handoff_enabled:
+                self._delivery_leases.release_process_fatal()
             self._owner_dead_marked = True
-        self._scheduler_serving.mark_owner_dead()
 
     def _require_open(self) -> None:
         """Require one started, non-closed source serving composition."""

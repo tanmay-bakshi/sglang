@@ -89,6 +89,7 @@ def _runtime(
     output_capacity: int = 64,
     maximum_live_lifecycles: int = 16,
     enable_forward_independent_handoff: bool = False,
+    bind_source_delivery_lease_acquirer: bool = True,
 ) -> tuple[
     NativeTerminalRuntime,
     NativeTerminalProcessIdentity,
@@ -103,6 +104,8 @@ def _runtime(
     :param maximum_live_lifecycles: Admission and fail-closed reserve bound.
     :param enable_forward_independent_handoff: Whether this runtime exercises
         the CPython scheduler handoff.
+    :param bind_source_delivery_lease_acquirer: Whether an enabled source
+        runtime receives its fixture delivery boundary before start.
     :returns: Runtime, owner identity, and remote peer identity.
     """
 
@@ -186,6 +189,9 @@ def _runtime(
         observation_capacity=observation_capacity,
         enable_forward_independent_handoff=enable_forward_independent_handoff,
     )
+    if role is TerminalOwnerRole.SOURCE and enable_forward_independent_handoff:
+        if bind_source_delivery_lease_acquirer:
+            runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
     return runtime, owner, remote
 
 
@@ -592,6 +598,38 @@ def _emit_source_ready_actions(
     assert scheduler.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
     assert publisher.kind is (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY)
     return scheduler, publisher
+
+
+def test_source_handoff_requires_one_prestart_delivery_lease_owner() -> None:
+    """Source interrupt delivery cannot start without its causal launch gate."""
+
+    runtime, _, _ = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+        bind_source_delivery_lease_acquirer=False,
+    )
+    with pytest.raises(
+        NativeTerminalRuntimeError,
+        match="lacks a causal delivery lease owner",
+    ):
+        runtime.start()
+
+    runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+    with pytest.raises(NativeTerminalRuntimeError, match="already bound"):
+        runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+    runtime.start()
+    with pytest.raises(NativeTerminalRuntimeClosedError, match="before start"):
+        runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+    _finish_handoff_runtime(runtime)
+
+    decode, _, _ = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    with pytest.raises(NativeTerminalRuntimeError, match="require a source runtime"):
+        decode.bind_source_delivery_lease_acquirer(lambda actions: None)
+    decode.start()
+    _finish_handoff_runtime(decode)
 
 
 def test_pending_call_returns_at_inbox_claim_before_downstream_lock() -> None:

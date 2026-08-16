@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerActionKind,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalActionClaimError,
     NativeTerminalActionInbox,
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
@@ -409,7 +410,11 @@ class PackedTerminalSourceGatherWorker:
     def _consume_one_action(self) -> None:
         """Consume at most one direct-inbox action and preserve FIFO fairness."""
 
-        actions = self._inbox.drain(maximum_items=1)
+        try:
+            actions = self._inbox.drain(maximum_items=1)
+        except NativeTerminalActionClaimError as error:
+            self._reconcile_failed_claim(error)
+            raise
         if len(actions) == 0:
             return
         action = actions[0]
@@ -453,10 +458,29 @@ class PackedTerminalSourceGatherWorker:
             self._abort_requested = True
             self._condition.notify_all()
         while self._inbox.snapshot().queued_count > 0:
-            actions = self._inbox.drain(maximum_items=1)
+            try:
+                actions = self._inbox.drain(maximum_items=1)
+            except NativeTerminalActionClaimError as error:
+                self._reconcile_failed_claim(error)
+                raise
             if len(actions) == 0:
                 return
             action = actions[0]
+            if self._runtime.acknowledge_aborted_action_if_pending(action):
+                with self._condition:
+                    self._aborted_action_count += 1
+                    self._condition.notify_all()
+
+    def _reconcile_failed_claim(
+        self,
+        error: NativeTerminalActionClaimError,
+    ) -> None:
+        """Discard every action claimed before a direct-inbox failure.
+
+        :param error: Exact removed and locally claimed action populations.
+        """
+
+        for action in error.locally_claimed_actions:
             if self._runtime.acknowledge_aborted_action_if_pending(action):
                 with self._condition:
                     self._aborted_action_count += 1

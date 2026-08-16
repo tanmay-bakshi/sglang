@@ -320,6 +320,7 @@ def _fatal_inventory(
         pending_request_keys=(),
         consuming_request_keys=(),
         outstanding_publications=0,
+        active_delivery_intents=(),
         wake_armed=True,
         fatal_cause=SchedulerInboxFatalCause.OWNER_DEATH,
         closed=False,

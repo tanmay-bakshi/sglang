@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.terminal_progress.owner_events import (
     TerminalOwnerTimingField,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
+    SchedulerDeliveryIntent,
     SchedulerReceiptInboxFatalError,
     SchedulerReceiptInboxInventory,
     SchedulerReceiptPublishResult,
@@ -51,6 +52,69 @@ class TerminalSchedulerActionPublicationDisposition(enum.StrEnum):
 
     CALLER_RETAINS = "caller_retains"
     SCHEDULER_RETAINS = "scheduler_retains"
+
+
+class TerminalSchedulerDeliveryLease:
+    """Take-once launch exclusion for one request's causal delivery path."""
+
+    _binding: TerminalRequestBinding
+    _inbox: TerminalReceiptInbox
+    _intent: SchedulerDeliveryIntent
+    _active: bool
+    _lock: threading.Lock
+
+    def __init__(
+        self,
+        binding: TerminalRequestBinding,
+        inbox: TerminalReceiptInbox,
+        intent: SchedulerDeliveryIntent,
+    ) -> None:
+        """Retain one exact external delivery intent.
+
+        :param binding: Request generation protected from another host launch.
+        :param inbox: Scheduler launch gate owning the intent ledger.
+        :param intent: Exact active intent allocated by the inbox.
+        """
+
+        if type(binding) is not TerminalRequestBinding:
+            raise TypeError("binding must be TerminalRequestBinding")
+        if type(inbox) is not TerminalReceiptInbox:
+            raise TypeError("inbox must be TerminalReceiptInbox")
+        if type(intent) is not SchedulerDeliveryIntent:
+            raise TypeError("intent must be SchedulerDeliveryIntent")
+        self._binding = binding
+        self._inbox = inbox
+        self._intent = intent
+        self._active = True
+        self._lock = threading.Lock()
+
+    @property
+    def binding(self) -> TerminalRequestBinding:
+        """Return the exact protected request generation.
+
+        :returns: Immutable source binding.
+        """
+
+        return self._binding
+
+    @property
+    def active(self) -> bool:
+        """Return whether this lease still excludes a host launch.
+
+        :returns: Whether completion authority remains live.
+        """
+
+        with self._lock:
+            return self._active
+
+    def complete(self) -> None:
+        """Release the exact launch exclusion once."""
+
+        with self._lock:
+            if not self._active:
+                raise RuntimeError("scheduler delivery lease completed twice")
+            self._inbox.complete_delivery_intent(self._intent)
+            self._active = False
 
 
 @runtime_checkable
@@ -387,6 +451,29 @@ class TerminalSchedulerServing:
         """
 
         self.register_request(binding.to_binding())
+
+    def begin_delivery_lease(
+        self,
+        binding: TerminalRequestBinding,
+    ) -> TerminalSchedulerDeliveryLease:
+        """Exclude another host launch until causal source delivery completes.
+
+        Intent acquisition deliberately performs no live-request lookup. It
+        must remain independent of the receipt state lock because a native
+        pending call may have interrupted the scheduler while that lock is
+        held. Exact generation validation is owned by the source delivery
+        registry which calls this boundary.
+
+        :param binding: Exact source request generation being delivered.
+        :returns: Take-once launch exclusion for the generation.
+        """
+
+        self._require_binding_role(binding)
+        return TerminalSchedulerDeliveryLease(
+            binding,
+            self._inbox,
+            self._inbox.begin_delivery_intent(binding),
+        )
 
     def cancel_unpublished_request(self, binding: TerminalRequestBinding) -> None:
         """Remove one request which can no longer receive an owner action.

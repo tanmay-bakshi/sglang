@@ -2357,6 +2357,14 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
     )
 
     assert outcomes == (main_outcome, auxiliary_outcome)
+    assert (
+        record.terminal_main_settlement
+        is runtime_module._TerminalTransferSettlement.SUCCEEDED
+    )
+    assert (
+        record.terminal_auxiliary_settlement
+        is runtime_module._TerminalTransferSettlement.SUCCEEDED
+    )
     assert sent == [main_outcome, auxiliary_outcome]
     main_lane.settle_terminal_completion.assert_called_once_with(outcome_action)
     assert tuple(value[0] for value in settled) == (auxiliary_handle,)
@@ -2420,6 +2428,191 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
     assert runtime.terminal_owner_inventory().active_bindings == ()
 
 
+def test_prefill_terminal_quarantine_retains_successful_transfers() -> None:
+    """Quarantine request state without contradicting proven transport success."""
+
+    runtime, manager, _, sent, submission, identity, record = (
+        _terminal_prefill_actor_fixture()
+    )
+    record.source_transfer = Mock(layout=Mock(digest=b"d" * 32), lease_id=9)
+    record.terminal_gather_phase = runtime_module._TerminalGatherPhase.STABLE
+    record.terminal_gather_posted = True
+    record.main_transport_started_at = runtime_module.time.perf_counter()
+    main_handle = object()
+    auxiliary_handle = object()
+    main_lane = Mock()
+    record.main_handle = main_handle
+    record.auxiliary_handle = auxiliary_handle
+    record.main_lane = main_lane
+    visibility = PackedWriterVisibilityEvidence(
+        policy_digest=runtime._visibility_policy.digest,
+        transport_path=runtime._visibility_policy.transport_path,
+        lane_identifier=runtime._visibility_policy.lane_identifier,
+        completion_mechanism=runtime._visibility_policy.completion_mechanism,
+        writer_action=runtime._visibility_policy.expected_writer_action,
+        native_handle_generation=11,
+        native_descriptor_digest=b"d" * 32,
+        native_evidence_digest=b"e" * 32,
+    )
+    main_outcome = PackedWriterOutcome(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        lease_id=9,
+        status=PackedWriterOutcomeStatus.DONE,
+        visibility=visibility,
+    )
+    auxiliary_outcome = PackedAuxiliaryOutcome(
+        plan=submission.plan,
+        writer_id=runtime.writer_id,
+        native_dram_handle_generation=12,
+        descriptor_digest=b"a" * 32,
+        evidence_digest=b"b" * 32,
+    )
+    main_lane.settle_terminal_completion.return_value = main_outcome
+    outcome_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        3,
+    )
+
+    assert runtime.send_terminal_owner_outcomes(
+        outcome_action,
+        lambda handle, action: auxiliary_outcome,
+    ) == (main_outcome, auxiliary_outcome)
+
+    main_failure = Mock()
+    auxiliary_failure = Mock()
+    quarantine_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        4,
+    )
+    runtime.quarantine_terminal_owner_request(
+        quarantine_action,
+        "synthetic request-global failure",
+        main_failure,
+        auxiliary_failure,
+    )
+
+    assert record.terminal_quarantined
+    assert (
+        record.terminal_main_settlement
+        is runtime_module._TerminalTransferSettlement.SUCCEEDED
+    )
+    assert (
+        record.terminal_auxiliary_settlement
+        is runtime_module._TerminalTransferSettlement.SUCCEEDED
+    )
+    main_failure.assert_not_called()
+    auxiliary_failure.assert_not_called()
+    assert sent == [main_outcome, auxiliary_outcome]
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.quarantined_bindings == (identity.local_binding.digest,)
+    assert inventory.main_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.lane_bindings == (identity.local_binding.digest,)
+    assert manager.agent.released_handles == []
+    with pytest.raises(RuntimeError, match="cannot retire"):
+        runtime.retire_terminal_owner_request(
+            _terminal_prefill_action(
+                identity,
+                NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+                5,
+            )
+        )
+
+
+def test_prefill_terminal_quarantine_settles_only_ambiguous_auxiliary() -> None:
+    """Keep main success while settling an independently ambiguous auxiliary."""
+
+    runtime, _, _, sent, _, identity, record = _terminal_prefill_actor_fixture()
+    record.source_transfer = Mock(layout=Mock(digest=b"d" * 32), lease_id=9)
+    record.terminal_gather_phase = runtime_module._TerminalGatherPhase.STABLE
+    record.terminal_gather_posted = True
+    main_handle = object()
+    auxiliary_handle = object()
+    main_lane = Mock()
+    record.main_handle = main_handle
+    record.auxiliary_handle = auxiliary_handle
+    record.main_lane = main_lane
+    main_outcome = PackedWriterOutcome(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        lease_id=9,
+        status=PackedWriterOutcomeStatus.DONE,
+        visibility=PackedWriterVisibilityEvidence(
+            policy_digest=runtime._visibility_policy.digest,
+            transport_path=runtime._visibility_policy.transport_path,
+            lane_identifier=runtime._visibility_policy.lane_identifier,
+            completion_mechanism=runtime._visibility_policy.completion_mechanism,
+            writer_action=runtime._visibility_policy.expected_writer_action,
+            native_handle_generation=11,
+            native_descriptor_digest=b"d" * 32,
+            native_evidence_digest=b"e" * 32,
+        ),
+    )
+    main_lane.settle_terminal_completion.return_value = main_outcome
+
+    def fail_auxiliary(
+        handle: object,
+        action: NativeTerminalOwnerAction,
+    ) -> PackedAuxiliaryOutcome:
+        """Fail before native auxiliary success has been established.
+
+        :param handle: Exact retained auxiliary handle.
+        :param action: Matching source-outcome action.
+        :returns: This callback never returns.
+        :raises RuntimeError: Always, to preserve auxiliary ambiguity.
+        """
+
+        assert handle is auxiliary_handle
+        raise RuntimeError("synthetic auxiliary settlement failure")
+
+    with pytest.raises(RuntimeError, match="synthetic auxiliary settlement failure"):
+        runtime.send_terminal_owner_outcomes(
+            _terminal_prefill_action(
+                identity,
+                NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+                3,
+            ),
+            fail_auxiliary,
+        )
+
+    assert record.main_outcome is None
+    main_failure = Mock()
+    auxiliary_failure = Mock()
+    quarantine_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        4,
+    )
+    runtime.quarantine_terminal_owner_request(
+        quarantine_action,
+        "synthetic request-global failure",
+        main_failure,
+        auxiliary_failure,
+    )
+
+    assert record.terminal_quarantined
+    assert (
+        record.terminal_main_settlement
+        is runtime_module._TerminalTransferSettlement.SUCCEEDED
+    )
+    assert (
+        record.terminal_auxiliary_settlement
+        is runtime_module._TerminalTransferSettlement.FAILED
+    )
+    main_failure.assert_not_called()
+    auxiliary_failure.assert_called_once_with(auxiliary_handle, quarantine_action)
+    assert sent == []
+    inventory = runtime.terminal_owner_inventory()
+    assert inventory.main_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
+    assert inventory.lane_bindings == (identity.local_binding.digest,)
+
+
 def test_prefill_terminal_failure_keeps_exact_quarantine_inventory() -> None:
     """Retain every ambiguous handle and lane under one actor identity."""
 
@@ -2478,6 +2671,14 @@ def test_prefill_terminal_failure_keeps_exact_quarantine_inventory() -> None:
         ("main", record.main_lane, action),
         ("auxiliary", record.auxiliary_handle, action),
     ]
+    assert (
+        record.terminal_main_settlement
+        is runtime_module._TerminalTransferSettlement.FAILED
+    )
+    assert (
+        record.terminal_auxiliary_settlement
+        is runtime_module._TerminalTransferSettlement.FAILED
+    )
     assert manager.failures == [(record.chunk_key.room_id, "synthetic ambiguity")]
     with pytest.raises(RuntimeError, match="cannot retire"):
         runtime.retire_terminal_owner_request(

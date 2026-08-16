@@ -6,6 +6,7 @@ import os
 import select
 import sys
 import threading
+import time
 from collections.abc import Callable
 
 import pytest
@@ -58,6 +59,7 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerActionPublicationError,
+    TerminalSchedulerDeliveryLease,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
@@ -342,10 +344,16 @@ def _identity(*, local_rank: int = 0) -> PackedTerminalSourceIdentityPlan:
     )
 
 
-def _runtime(identity: PackedTerminalSourceIdentityPlan) -> NativeTerminalRuntime:
+def _runtime(
+    identity: PackedTerminalSourceIdentityPlan,
+    *,
+    enable_forward_independent_handoff: bool = False,
+) -> NativeTerminalRuntime:
     """Construct one source runtime with every authority pre-registered.
 
     :param identity: Exact source identity graph.
+    :param enable_forward_independent_handoff: Whether native action delivery
+        acquires request-scoped scheduler exclusion.
     :returns: Dormant process-lifetime runtime.
     """
 
@@ -420,7 +428,7 @@ def _runtime(identity: PackedTerminalSourceIdentityPlan) -> NativeTerminalRuntim
         decode_work_capacity=8,
         publisher_capacity=8,
         observation_capacity=64,
-        enable_forward_independent_handoff=False,
+        enable_forward_independent_handoff=enable_forward_independent_handoff,
     )
 
 
@@ -455,6 +463,7 @@ def _serving(
     ) = None,
     quarantine: Callable[[NativeTerminalOwnerAction], None] | None = None,
     bind_gather_cuda_device: Callable[[], None] | None = None,
+    enable_forward_independent_handoff: bool = False,
 ) -> tuple[
     PackedTerminalSourceServing,
     NativeTerminalRuntime,
@@ -469,10 +478,15 @@ def _serving(
     :param post_gather: Optional dedicated-worker gather callback.
     :param quarantine: Optional fail-closed resource-retention callback.
     :param bind_gather_cuda_device: Optional worker-thread device binder.
+    :param enable_forward_independent_handoff: Whether to exercise the native
+        scheduler-interrupt delivery path.
     :returns: Serving, runtime, publisher, metrics, work labels, and fatal inventories.
     """
 
-    runtime = _runtime(identity)
+    runtime = _runtime(
+        identity,
+        enable_forward_independent_handoff=enable_forward_independent_handoff,
+    )
     publisher = _Publisher()
     metrics = _Metrics()
     work_labels: list[str] = []
@@ -658,6 +672,190 @@ def _request_ready_receipt(
         outcome=TerminalReceiptOutcome.SUCCESS,
         terminal_timestamp_ns=3_000,
     )
+
+
+def test_delivery_join_is_order_independent_and_late_ack_does_not_reacquire() -> None:
+    """The two durable milestones release once and teardown cannot resurrect it."""
+
+    identity = _identity()
+    serving, _, _, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    serving.start()
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        gather = _action(
+            identity,
+            action_id=80,
+            kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        serving._delivery_leases.acquire_for_actions((gather,))
+        serving._delivery_leases.mark_publication_owned(identity.local_binding)
+        inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == (
+            identity.local_binding.digest,
+        )
+        assert inventory.scheduler_serving.inbox.active_delivery_intents != ()
+
+        serving._delivery_leases.mark_outcomes_sent(identity.local_binding)
+        inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == ()
+        assert inventory.scheduler_serving.inbox.active_delivery_intents == ()
+
+        late_ack = _action(
+            identity,
+            action_id=81,
+            kind=NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+        serving._delivery_leases.acquire_for_actions((late_ack,))
+        assert serving.inventory().delivery_leases.active_binding_digests == ()
+    finally:
+        serving.abort_and_close()
+
+
+def test_delivery_batch_rejects_generation_alias_before_allocating_intent() -> None:
+    """Conflicting bindings cannot split one request generation across leases."""
+
+    identity = _identity()
+    serving, _, _, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    serving.start()
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        first = _action(
+            identity,
+            action_id=82,
+            kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        conflicting_binding = dataclasses.replace(
+            identity.local_binding,
+            allocation_digest=b"x" * 32,
+        )
+        conflicting = dataclasses.replace(
+            first,
+            action_id=83,
+            binding=NativeTerminalRequestBinding.from_binding(conflicting_binding),
+        )
+
+        with pytest.raises(RuntimeError, match="aliases a request generation"):
+            serving._delivery_leases.acquire_for_actions((first, conflicting))
+
+        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents != ()
+        serving._mark_owner_dead()
+        inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == ()
+        assert inventory.scheduler_serving.inbox.active_delivery_intents == ()
+    finally:
+        serving.abort_and_close()
+
+
+def test_delivery_batch_allocation_rolls_back_every_earlier_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later allocation failure cannot leave a partial launch exclusion."""
+
+    identity = _identity()
+    serving, _, _, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    serving.start()
+    second_binding = dataclasses.replace(
+        identity.local_binding,
+        request_key=PackedRequestKey(
+            room_id=302,
+            request_generation=b"h" * 16,
+        ),
+        allocation_digest=b"b" * 32,
+    )
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        first = _action(
+            identity,
+            action_id=84,
+            kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        second = dataclasses.replace(
+            first,
+            action_id=85,
+            binding=NativeTerminalRequestBinding.from_binding(second_binding),
+        )
+        original_begin = serving._scheduler_serving.begin_delivery_lease
+        allocation_count = 0
+
+        def fail_second(
+            binding: TerminalRequestBinding,
+        ) -> TerminalSchedulerDeliveryLease:
+            """Fail after one real scheduler intent has been allocated.
+
+            :param binding: Exact request selected for allocation.
+            :returns: First request's real delivery lease.
+            """
+
+            nonlocal allocation_count
+            allocation_count += 1
+            if allocation_count == 2:
+                raise RuntimeError("synthetic second allocation failure")
+            return original_begin(binding)
+
+        monkeypatch.setattr(
+            serving._scheduler_serving,
+            "begin_delivery_lease",
+            fail_second,
+        )
+        with pytest.raises(RuntimeError, match="batch allocation failed"):
+            serving._delivery_leases.acquire_for_actions((first, second))
+
+        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents != ()
+        serving._mark_owner_dead()
+        inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == ()
+        assert inventory.scheduler_serving.inbox.active_delivery_intents == ()
+    finally:
+        serving.abort_and_close()
+
+
+def test_native_delivery_claims_while_scheduler_state_lock_is_held() -> None:
+    """The pending-call handoff never borrows the interrupted scheduler lock."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    scheduler_state_lock = serving._scheduler_serving._inbox._state_lock
+    state_lock_owned = False
+    serving.start()
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        serving.attach_producer_completion(submission)
+        scheduler_state_lock.acquire()
+        state_lock_owned = True
+        assert serving.packed_ready(identity.local_binding.digest)
+        deadline = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.snapshot().owner.claimed_handoff_action_count == 0
+            and time.monotonic() < deadline
+        ):
+            pass
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+        owner = runtime.snapshot().owner
+        assert owner.unclaimed_handoff_action_count == 0
+        assert owner.claimed_handoff_action_count == 1
+        assert serving.inventory().delivery_leases.active_binding_digests == (
+            identity.local_binding.digest,
+        )
+    finally:
+        if state_lock_owned:
+            scheduler_state_lock.release()
+        serving.abort_and_close()
 
 
 def test_gather_worker_owns_direct_inbox_and_binds_device_once(
@@ -1601,7 +1799,10 @@ def test_full_source_composition_retires_exactly_once(
         logger="sglang.srt.disaggregation.terminal_progress.source_wiring",
     )
     identity = _identity()
-    serving, runtime, publisher, _, work_labels, _ = _serving(identity)
+    serving, runtime, publisher, _, work_labels, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
     submission = _submission(identity)
     release_calls: list[PackedTerminalSourceSubmission] = []
     serving.start()
@@ -1614,6 +1815,10 @@ def test_full_source_composition_retires_exactly_once(
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
+        delivery = serving.inventory().delivery_leases
+        assert delivery.active_binding_digests == (digest,)
+        assert delivery.outcomes_sent_binding_digests == ()
+        assert delivery.publication_owned_binding_digests == ()
         cancellation = serving.cancel_submission(
             identity.local_binding,
             "client disconnected",
@@ -1648,6 +1853,10 @@ def test_full_source_composition_retires_exactly_once(
         )
         _pump(serving, runtime)
         assert work_labels == ["gather", "outcome"]
+        delivery = serving.inventory().delivery_leases
+        assert delivery.active_binding_digests == (digest,)
+        assert delivery.outcomes_sent_binding_digests == (digest,)
+        assert delivery.publication_owned_binding_digests == ()
 
         serving.wiring.teardown_received(digest, identity.request_ready_issuer)
         _pump(serving, runtime)
@@ -1667,6 +1876,8 @@ def test_full_source_composition_retires_exactly_once(
         )
         _pump(serving, runtime)
         assert len(publisher.values) == 1
+        assert serving.inventory().delivery_leases.active_binding_digests == ()
+        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents == ()
         serving.drain_scheduler_at_loop_entry()
         assert release_calls == [submission]
 

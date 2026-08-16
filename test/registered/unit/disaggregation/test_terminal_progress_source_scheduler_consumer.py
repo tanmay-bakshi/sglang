@@ -105,9 +105,7 @@ class _SourceWiring:
         """
 
         self.submission = submission
-        self.issuer = TerminalWireReceiptIssuer(
-            submission.identity.local_binding.owner
-        )
+        self.issuer = TerminalWireReceiptIssuer(submission.identity.local_binding.owner)
         self.fail_after_release = fail_after_release
         self.calls = 0
 
@@ -236,6 +234,7 @@ def _fatal_inventory(
         pending_request_keys=(),
         consuming_request_keys=(),
         outstanding_publications=0,
+        active_delivery_intents=(),
         wake_armed=True,
         fatal_cause=SchedulerInboxFatalCause.OWNER_DEATH,
         closed=False,
@@ -346,9 +345,7 @@ def test_post_release_failure_is_quarantined_without_double_release() -> None:
     assert release_calls == [1]
     assert inventory.active_binding_digests == (binding.digest,)
     assert inventory.quarantined_binding_digests == (binding.digest,)
-    assert inventory.resource_release_completed_binding_digests == (
-        binding.digest,
-    )
+    assert inventory.resource_release_completed_binding_digests == (binding.digest,)
     with pytest.raises(RuntimeError, match="quarantined source resources"):
         consumer.consume_reclaim_authorized(action)
     assert release_calls == [1]

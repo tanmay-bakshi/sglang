@@ -754,6 +754,9 @@ class NativeTerminalRuntime:
     _disposition: NativeTerminalRuntimeDisposition
     _fatal_reason: str | None
     _forward_independent_handoff_enabled: bool
+    _source_delivery_lease_acquirer: (
+        Callable[[tuple[NativeTerminalOwnerAction, ...]], None] | None
+    )
     _output_reactor_alive: bool
     _producers_joined: bool
     _native_observation_delivery_count: int
@@ -955,6 +958,7 @@ class NativeTerminalRuntime:
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
         self._forward_independent_handoff_enabled = enable_forward_independent_handoff
+        self._source_delivery_lease_acquirer = None
         self._output_reactor_alive = False
         self._producers_joined = False
         self._native_observation_delivery_count = 0
@@ -1123,12 +1127,56 @@ class NativeTerminalRuntime:
         with self._condition:
             return self._disposition
 
+    @property
+    def forward_independent_handoff_enabled(self) -> bool:
+        """Return whether native delivery may interrupt scheduler execution.
+
+        :returns: Whether source delivery leases are required.
+        """
+
+        return self._forward_independent_handoff_enabled
+
+    def bind_source_delivery_lease_acquirer(
+        self,
+        acquirer: Callable[[tuple[NativeTerminalOwnerAction, ...]], None],
+    ) -> None:
+        """Bind the source launch-exclusion owner before runtime start.
+
+        :param acquirer: Batch boundary which establishes every request lease
+            before the corresponding native handoff claims are released.
+        """
+
+        if not callable(acquirer):
+            raise TypeError("acquirer must be callable")
+        with self._condition:
+            if self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE:
+                raise NativeTerminalRuntimeError(
+                    "source delivery leases require a source runtime"
+                )
+            if self._disposition is not NativeTerminalRuntimeDisposition.CREATED:
+                raise NativeTerminalRuntimeClosedError(
+                    "source delivery lease owner must bind before start"
+                )
+            if self._source_delivery_lease_acquirer is not None:
+                raise NativeTerminalRuntimeError(
+                    "source delivery lease owner was already bound"
+                )
+            self._source_delivery_lease_acquirer = acquirer
+
     def start(self) -> None:
         """Start the native owner and its sole output consumer exactly once."""
 
         with self._condition:
             if self._disposition is not NativeTerminalRuntimeDisposition.CREATED:
                 raise NativeTerminalRuntimeClosedError("runtime cannot restart")
+            if (
+                self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+                and self._forward_independent_handoff_enabled
+                and self._source_delivery_lease_acquirer is None
+            ):
+                raise NativeTerminalRuntimeError(
+                    "source runtime lacks a causal delivery lease owner"
+                )
             self._owner.start()
             self._disposition = NativeTerminalRuntimeDisposition.RUNNING
             self._output_thread.start()
@@ -1806,6 +1854,32 @@ class NativeTerminalRuntime:
                 claimable_actions.append(action)
         claim_error: Exception | None = None
         claim_traceback: str | None = None
+        lease_actions = tuple(
+            action
+            for action in claimable_actions
+            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        )
+        if (
+            len(lease_actions) > 0
+            and self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+            and self._forward_independent_handoff_enabled
+        ):
+            acquirer = self._source_delivery_lease_acquirer
+            if acquirer is None:
+                claim_error = NativeTerminalRuntimeError(
+                    "source delivery lease owner disappeared after startup"
+                )
+                claim_traceback = str(claim_error)
+                with self._condition:
+                    self._enter_runtime_fatal_locked(claim_traceback)
+            else:
+                try:
+                    acquirer(lease_actions)
+                except Exception as error:  # noqa: BLE001
+                    claim_error = error
+                    claim_traceback = traceback.format_exc()
+                    with self._condition:
+                        self._enter_runtime_fatal_locked(claim_traceback)
         locally_claimed_actions: list[NativeTerminalOwnerAction] = []
         for action in claimable_actions:
             if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
