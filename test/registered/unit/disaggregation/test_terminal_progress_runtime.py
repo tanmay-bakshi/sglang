@@ -1538,6 +1538,8 @@ def test_native_abort_racing_decode_publication_preserves_exact_authority(
         )
         assert snapshot.owner.claimed_handoff_action_count == 1
         assert snapshot.decode_publication_preclaimed_count == 0
+        with pytest.raises(RuntimeError, match="absent, premature, or replayed"):
+            runtime._owner.settle_forward_independent_handoff(actions[0])
         runtime.begin_abort("reconcile native abort after publication")
         runtime.acknowledge_aborted_action(actions[0])
     finally:

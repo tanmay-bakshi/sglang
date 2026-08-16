@@ -709,6 +709,9 @@ struct SharedOwner {
   std::unordered_set<std::uint64_t> unclaimed_handoff_action_ids{};
   std::unordered_map<std::uint64_t, ActionKind> active_handoff_actions{};
   std::unordered_set<std::uint64_t> settled_handoff_action_ids{};
+  // Abort releases launch waiters before typed consumers finish draining.
+  // This ledger admits exactly one later delivery without making replay valid.
+  std::unordered_set<std::uint64_t> abort_settled_handoff_delivery_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -1498,6 +1501,17 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
       owner.handoff_registration_count ==
       owner.active_handoff_actions.size() +
           owner.settled_handoff_action_ids.size();
+  const bool abort_settlement_is_authorized =
+      (!owner.abort_started &&
+       owner.abort_settled_handoff_delivery_ids.empty()) ||
+      (owner.abort_started &&
+       std::all_of(owner.abort_settled_handoff_delivery_ids.begin(),
+                   owner.abort_settled_handoff_delivery_ids.end(),
+                   [&owner](std::uint64_t action_id) {
+                     return owner.active_handoff_actions.count(action_id) == 0 &&
+                            owner.settled_handoff_action_ids.count(action_id) ==
+                                1;
+                   }));
   const bool token_conservation =
       owner.scheduler_launch_handoff_acquisition_count ==
       owner.scheduler_launch_handoff_release_count +
@@ -1510,7 +1524,8 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
       !(owner.scheduler_launch_handoff_begin_active &&
         owner.active_scheduler_launch_handoff_token != 0);
   return unclaimed_is_authorized && active_is_authorized &&
-         action_conservation && token_conservation && token_state_consistent;
+         action_conservation && abort_settlement_is_authorized &&
+         token_conservation && token_state_consistent;
 }
 
 void enter_handoff_fatal_locked(SharedOwner &owner, FatalCode code,
@@ -1578,6 +1593,13 @@ void discard_forward_independent_handoff_locked(
 void settle_forward_independent_handoff_locked(
     SharedOwner &owner, std::uint64_t action_id) {
   const auto active = owner.active_handoff_actions.find(action_id);
+  if (owner.abort_started && active == owner.active_handoff_actions.end() &&
+      owner.unclaimed_handoff_action_ids.count(action_id) == 0 &&
+      owner.settled_handoff_action_ids.count(action_id) == 1 &&
+      owner.abort_settled_handoff_delivery_ids.erase(action_id) == 1) {
+    owner.condition.notify_all();
+    return;
+  }
   if (active == owner.active_handoff_actions.end() ||
       owner.unclaimed_handoff_action_ids.count(action_id) != 0 ||
       owner.settled_handoff_action_ids.count(action_id) != 0) {
@@ -1618,7 +1640,9 @@ void fail_forward_independent_handoff_locked(
     return;
   }
   if (owner.abort_started &&
-      owner.settled_handoff_action_ids.count(action_id) == 1) {
+      owner.settled_handoff_action_ids.count(action_id) == 1 &&
+      owner.abort_settled_handoff_delivery_ids.erase(action_id) == 1) {
+    owner.condition.notify_all();
     return;
   }
   enter_handoff_fatal_locked(
@@ -1631,6 +1655,7 @@ void fail_forward_independent_handoff_locked(
 void abort_forward_independent_handoffs_locked(SharedOwner &owner) {
   for (const auto &entry : owner.active_handoff_actions) {
     owner.settled_handoff_action_ids.insert(entry.first);
+    owner.abort_settled_handoff_delivery_ids.insert(entry.first);
   }
   owner.active_handoff_actions.clear();
   owner.condition.notify_all();
@@ -3587,6 +3612,7 @@ public:
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
                  owner_->active_handoff_actions.empty() &&
+                 owner_->abort_settled_handoff_delivery_ids.empty() &&
                  !owner_->scheduler_launch_handoff_begin_active &&
                  owner_->active_scheduler_launch_handoff_token == 0 &&
                  !owner_->output_drain_active &&
@@ -3617,6 +3643,7 @@ public:
                       !owner_->output_drain_action_ids.empty() ||
                       !owner_->unclaimed_handoff_action_ids.empty() ||
                       !owner_->active_handoff_actions.empty() ||
+                      !owner_->abort_settled_handoff_delivery_ids.empty() ||
                       owner_->scheduler_launch_handoff_begin_active ||
                       owner_->active_scheduler_launch_handoff_token != 0 ||
                       !owner_->producers_joined;
@@ -3711,6 +3738,7 @@ public:
         !owner_->output_drain_action_ids.empty() ||
         !owner_->unclaimed_handoff_action_ids.empty() ||
         !owner_->active_handoff_actions.empty() ||
+        !owner_->abort_settled_handoff_delivery_ids.empty() ||
         owner_->scheduler_launch_handoff_begin_active ||
         owner_->active_scheduler_launch_handoff_token != 0) {
       throw std::runtime_error(
@@ -3739,6 +3767,7 @@ public:
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
     owner_->unclaimed_handoff_action_ids.clear();
+    owner_->abort_settled_handoff_delivery_ids.clear();
     owner_->output_drain_active = false;
     close_owner_fds_locked(*owner_);
     owner_->closed = true;
@@ -3768,6 +3797,7 @@ private:
     } catch (...) {
       owner_->active_handoff_actions.clear();
     }
+    owner_->abort_settled_handoff_delivery_ids.clear();
     owner_->active_scheduler_launch_handoff_token = 0;
     owner_->active_scheduler_launch_handoff_watermark = 0;
     owner_->scheduler_launch_handoff_begin_active = false;

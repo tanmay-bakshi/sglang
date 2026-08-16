@@ -2082,11 +2082,7 @@ class NativeTerminalRuntime:
                     self._forward_independent_handoff_enabled
                     and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
                 )
-                runtime_owns_settlement = self._disposition in (
-                    NativeTerminalRuntimeDisposition.RUNNING,
-                    NativeTerminalRuntimeDisposition.DRAINING,
-                )
-                if forward_independent and runtime_owns_settlement:
+                if forward_independent:
                     try:
                         self._owner.settle_forward_independent_handoff(action)
                     except Exception:  # noqa: BLE001
