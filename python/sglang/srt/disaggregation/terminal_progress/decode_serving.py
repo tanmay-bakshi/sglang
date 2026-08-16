@@ -1228,8 +1228,9 @@ class PackedTerminalDecodeServing:
                     "decode scheduler action lacks durable quarantine ownership"
                 )
         surrender = self._runtime.surrender_decode_fail_closed_actions(actions)
-        if surrender.action_ids != tuple(action.action_id for action in actions):
-            raise RuntimeError("runtime surrender receipt differs from closure order")
+        closure_action_ids = frozenset(action.action_id for action in actions)
+        if not set(surrender.action_ids).issubset(closure_action_ids):
+            raise RuntimeError("runtime surrendered authority outside the closure")
 
     def begin_fail_closed_abort(self) -> None:
         """Stop functional side effects without closing live ingress owners."""

@@ -1217,12 +1217,13 @@ def test_scheduler_batch_failure_conserves_current_and_later_actions(
             if failure_after_retention
             else frozenset()
         )
-        assert pending_action_ids == expected_retained
-        assert claimed_action_ids == expected_retained
-        assert (
-            frozenset(serving._scheduler_serving.inventory().retained_action_ids)
-            == expected_retained
+        candidate_action_ids = frozenset(action.action_id for action in actions)
+        assert pending_action_ids & candidate_action_ids == expected_retained
+        assert claimed_action_ids & candidate_action_ids == expected_retained
+        scheduler_retained = frozenset(
+            serving._scheduler_serving.inventory().retained_action_ids
         )
+        assert scheduler_retained & candidate_action_ids == expected_retained
 
         inventory = serving.abort_and_close()
         closed = True

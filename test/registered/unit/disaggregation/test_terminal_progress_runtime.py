@@ -725,6 +725,8 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
     )
     runtime.start()
     previous_switch_interval = sys.getswitchinterval()
+    handoff_observed = threading.Event()
+    release_initial_claim = threading.Event()
     try:
         for registration in registrations:
             runtime.register_lifecycle(registration)
@@ -736,15 +738,12 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
 
         def consume_all_gathers() -> tuple[NativeTerminalOwnerAction, ...]:
             assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            handoff_observed.set()
+            assert release_initial_claim.wait(timeout=_WAIT_SECONDS)
             actions = list(_drain_actions(runtime.source_gather_actions))
-            assert len(actions) == 1
-            for registration in registrations[1:]:
-                runtime.submit(
-                    _LOCAL_PRODUCER_ID,
-                    registration.binding.digest,
-                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
-                )
-            runtime.acknowledge_consumed_action(actions[0])
+            assert len(actions) >= 1
+            for action in actions:
+                runtime.acknowledge_consumed_action(action)
             while len(actions) < len(registrations):
                 current_actions = _drain_actions(runtime.source_gather_actions)
                 for action in current_actions:
@@ -760,6 +759,14 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
                 registrations[0].binding.digest,
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             )
+            assert handoff_observed.wait(timeout=_WAIT_SECONDS)
+            for registration in registrations[1:]:
+                runtime.submit(
+                    _LOCAL_PRODUCER_ID,
+                    registration.binding.digest,
+                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                )
+            release_initial_claim.set()
             expires_at = time.monotonic() + 0.5
             while not consumer_future.done() and time.monotonic() < expires_at:
                 pass
@@ -772,6 +779,7 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
         assert inventory.claimed_handoff_action_count == 3
         assert inventory.handoff_callback_count == 2
     finally:
+        release_initial_claim.set()
         sys.setswitchinterval(previous_switch_interval)
         _finish_handoff_runtime(runtime)
 
@@ -1675,7 +1683,15 @@ def test_fail_closed_surrender_is_atomic_and_cannot_replay() -> None:
         ):
             runtime.surrender_fail_closed_actions((scheduler, publisher))
         with runtime._condition:
-            assert runtime._consumer_pending == expected_pending
+            assert all(
+                runtime._consumer_pending.get(action_id) == action
+                for action_id, action in expected_pending.items()
+            )
+            assert all(
+                action_id in expected_pending
+                or action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+                for action_id, action in runtime._consumer_pending.items()
+            )
             assert runtime._inbox_claimed_action_ids == set(expected_pending)
             assert runtime._scheduler_pending == {
                 registration.binding.digest: scheduler

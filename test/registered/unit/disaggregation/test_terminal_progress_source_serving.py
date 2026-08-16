@@ -1704,6 +1704,7 @@ def test_runtime_fatal_marks_scheduler_and_quarantines_retained_release() -> Non
         serving.bind_submission(submission, lambda submission: None)
         serving.attach_producer_completion(submission)
         runtime.begin_abort()
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         _pump(serving, runtime)
         with pytest.raises(RuntimeError):
             serving.drain_scheduler_at_loop_entry()

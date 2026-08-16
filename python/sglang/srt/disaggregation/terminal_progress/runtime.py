@@ -1635,13 +1635,15 @@ class NativeTerminalRuntime:
         self,
         actions: tuple[NativeTerminalOwnerAction, ...],
     ) -> NativeTerminalFailClosedSurrender:
-        """Atomically transfer retained decode adoption authority to quarantine.
+        """Atomically transfer pending decode adoption authority to quarantine.
 
         The decode scheduler closure is the durable owner after every retained
-        registration has entered scheduler-side quarantine. This operation
-        validates the complete runtime population under one lock before removing
-        any accounting, so an incomplete closure cannot strand or discard an
-        adoption generation.
+        registration has entered scheduler-side quarantine. An adoption callback
+        can fail after native scheduler completion, in which case the scheduler
+        closure still retains the action while runtime accounting has already
+        retired it. This operation validates the complete closure and requires it
+        to cover every still-pending runtime action before removing that exact
+        subset atomically.
 
         :param actions: Complete decode scheduler fail-closed closure population.
         :returns: Exact atomic surrender receipt.
@@ -1667,16 +1669,33 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "decode fail-closed surrender requires joined producers"
                 )
-            if set(actions_by_id) != set(self._consumer_pending):
+            pending_action_ids = set(self._consumer_pending)
+            if not pending_action_ids.issubset(actions_by_id):
                 raise NativeTerminalRuntimeError(
-                    "decode scheduler closure differs from pending consumer authority"
+                    "decode scheduler closure does not cover pending consumer authority"
                 )
             for action in actions:
                 if action.kind is not NativeTerminalOwnerActionKind.ADOPTION_READY:
                     raise NativeTerminalRuntimeError(
                         "decode scheduler closure contains another action kind"
                     )
-                if self._consumer_pending.get(action.action_id) != action:
+                binding_digest = action.binding.digest
+                if binding_digest not in self._quarantined_bindings:
+                    raise NativeTerminalRuntimeError(
+                        "decode scheduler action lacks runtime quarantine authority"
+                    )
+                pending = self._consumer_pending.get(action.action_id)
+                if pending is None:
+                    if action.action_id in self._inbox_claimed_action_ids:
+                        raise NativeTerminalRuntimeError(
+                            "retired decode action retains an inbox claim"
+                        )
+                    if binding_digest in self._scheduler_pending:
+                        raise NativeTerminalRuntimeError(
+                            "retired decode action retains scheduler authority"
+                        )
+                    continue
+                if pending != action:
                     raise NativeTerminalRuntimeError(
                         "decode scheduler closure aliases pending consumer authority"
                     )
@@ -1684,24 +1703,22 @@ class NativeTerminalRuntime:
                     raise NativeTerminalRuntimeError(
                         "decode fail-closed action lacks an exact inbox claim"
                     )
-                binding_digest = action.binding.digest
-                if binding_digest not in self._quarantined_bindings:
-                    raise NativeTerminalRuntimeError(
-                        "decode scheduler action lacks runtime quarantine authority"
-                    )
                 if self._scheduler_pending.get(binding_digest) != action:
                     raise NativeTerminalRuntimeError(
                         "decode scheduler closure differs from pending adoption authority"
                     )
-            for action in actions:
+            pending_actions = tuple(
+                action for action in actions if action.action_id in pending_action_ids
+            )
+            for action in pending_actions:
                 del self._consumer_pending[action.action_id]
                 self._inbox_claimed_action_ids.remove(action.action_id)
                 del self._scheduler_pending[action.binding.digest]
                 self._scheduler_live.pop(action.binding.digest, None)
             self._condition.notify_all()
         return NativeTerminalFailClosedSurrender(
-            action_ids=tuple(action.action_id for action in actions),
-            binding_digests=tuple(action.binding.digest for action in actions),
+            action_ids=tuple(action.action_id for action in pending_actions),
+            binding_digests=tuple(action.binding.digest for action in pending_actions),
         )
 
     def _discard_aborted_action_locked(
