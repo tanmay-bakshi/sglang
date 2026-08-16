@@ -710,12 +710,12 @@ def test_source_handoff_requires_one_atomic_prestart_delivery_authority() -> Non
         (NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN, True),
     ),
 )
-def test_delivery_disposition_precedes_native_handoff_claim(
+def test_delivery_disposition_precedes_action_visibility_and_native_claim(
     monkeypatch: pytest.MonkeyPatch,
     disposition: NativeTerminalDeliveryLeaseDisposition,
     expected_runtime_fatal: bool,
 ) -> None:
-    """Lease state is settled before each action crosses the native handoff."""
+    """Lease state is settled before publication or native handoff activation."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -735,6 +735,7 @@ def test_delivery_disposition_precedes_native_handoff_claim(
         """
 
         assert len(actions) == 1
+        assert runtime.source_gather_actions.snapshot().queued_count == 0
         ordering.append("acquire")
         return disposition
 
@@ -757,14 +758,21 @@ def test_delivery_disposition_precedes_native_handoff_claim(
         receipt=None,
     )
     try:
-        runtime._route_action(action)
-        assert runtime.source_gather_actions.drain() == (action,)
-        assert ordering == ["acquire", "claim"]
+        if disposition is NativeTerminalDeliveryLeaseDisposition.ACQUIRED:
+            runtime._prepare_forward_independent_delivery((action,))
+            runtime._route_action(action)
+            assert runtime.source_gather_actions.drain() == (action,)
+            assert ordering == ["acquire", "claim"]
+        else:
+            with pytest.raises(
+                NativeTerminalRuntimeError,
+                match="scheduler-fatal drain",
+            ):
+                runtime._prepare_forward_independent_delivery((action,))
+            assert ordering == ["acquire"]
         snapshot = runtime.snapshot()
         assert (snapshot.fatal_reason is not None) is expected_runtime_fatal
-        if expected_runtime_fatal:
-            runtime.acknowledge_aborted_action(action)
-        else:
+        if not expected_runtime_fatal:
             runtime.acknowledge_consumed_action(action)
     finally:
         _finish_handoff_runtime(runtime)

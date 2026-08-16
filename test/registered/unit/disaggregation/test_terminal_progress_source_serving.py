@@ -1020,17 +1020,24 @@ def test_acquired_delivery_racing_source_fatal_cannot_execute_functional_work(
         reactor_started = True
         submission = _submission(identity)
         serving.bind_submission(submission, lambda value: None)
-        runtime._route_action(
-            _action(
-                identity,
-                action_id=94,
-                kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-            )
+        action = _action(
+            identity,
+            action_id=94,
+            kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
         )
-        assert acquisition_returning.wait(timeout=_WAIT_SECONDS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            def prepare_and_route() -> None:
+                """Publish only after the pre-activation lease is durable."""
 
-        serving.begin_fail_closed_abort()
-        release_acquisition.set()
+                runtime._prepare_forward_independent_delivery((action,))
+                runtime._route_action(action)
+
+            publication = executor.submit(prepare_and_route)
+            assert acquisition_returning.wait(timeout=_WAIT_SECONDS)
+
+            serving.begin_fail_closed_abort()
+            release_acquisition.set()
+            publication.result(timeout=_WAIT_SECONDS)
 
         assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
@@ -1114,6 +1121,7 @@ def test_gather_fatal_winning_final_start_gate_aborts_without_side_effect(
     )
     serving.start()
     try:
+        runtime._prepare_forward_independent_delivery((action,))
         runtime._route_action(action)
         assert entered.wait(timeout=_WAIT_SECONDS)
 

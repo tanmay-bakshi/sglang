@@ -1893,46 +1893,6 @@ class NativeTerminalRuntime:
                 claimable_actions.append(action)
         claim_error: Exception | None = None
         claim_traceback: str | None = None
-        lease_actions = tuple(
-            action
-            for action in claimable_actions
-            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-        )
-        if (
-            len(lease_actions) > 0
-            and self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
-            and self._forward_independent_handoff_enabled
-        ):
-            authority = self._source_delivery_authority
-            if authority is None:
-                claim_error = NativeTerminalRuntimeError(
-                    "source delivery authority disappeared after startup"
-                )
-                claim_traceback = str(claim_error)
-                with self._condition:
-                    self._enter_runtime_fatal_locked(claim_traceback)
-            else:
-                try:
-                    lease_disposition = authority.acquire_for_actions(lease_actions)
-                    if type(lease_disposition) is not (
-                        NativeTerminalDeliveryLeaseDisposition
-                    ):
-                        raise TypeError(
-                            "source delivery lease owner returned an invalid "
-                            "disposition"
-                        )
-                    if lease_disposition is (
-                        NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
-                    ):
-                        with self._condition:
-                            self._enter_runtime_fatal_locked(
-                                "source delivery entered scheduler-fatal drain"
-                            )
-                except Exception as error:  # noqa: BLE001
-                    claim_error = error
-                    claim_traceback = traceback.format_exc()
-                    with self._condition:
-                        self._enter_runtime_fatal_locked(claim_traceback)
         locally_claimed_actions: list[NativeTerminalOwnerAction] = []
         for action in claimable_actions:
             if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
@@ -2621,7 +2581,7 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
 
     def _route_output(self, output: NativeTerminalOwnerOutput) -> None:
-        """Publish and activate every action before native acknowledgement.
+        """Prepare, publish, and activate one complete native output.
 
         :param output: One action-bearing native commit.
         """
@@ -2644,6 +2604,25 @@ class NativeTerminalRuntime:
             logger.error("%s", reason)
             with self._condition:
                 self._enter_runtime_fatal_locked(reason)
+        try:
+            self._prepare_forward_independent_delivery(output.actions)
+        except Exception:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            for action in output.actions:
+                try:
+                    self._owner.fail_action_delivery(
+                        action,
+                        "runtime could not establish pre-activation delivery authority",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.critical(
+                        "Native action %d could not enter fail-closed delivery:\n%s",
+                        action.action_id,
+                        traceback.format_exc(),
+                    )
+            with self._condition:
+                self._enter_runtime_fatal_locked(formatted_traceback)
+            return
         delivered_actions: list[NativeTerminalOwnerAction] = []
         for action in output.actions:
             try:
@@ -2667,6 +2646,58 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
         for action in delivered_actions:
             self._owner.acknowledge_action(action)
+
+    def _prepare_forward_independent_delivery(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> None:
+        """Establish source launch exclusion before any handoff activation.
+
+        The output reactor owns the only safe ordering point: all request-scoped
+        delivery intents are durable before an action becomes visible and before
+        ``Py_AddPendingCall`` can park the scheduler in an arbitrary lock. The
+        dedicated consumer therefore claims only native handoff authority and
+        never needs scheduler-owned state while the callback is active.
+
+        :param actions: Complete action population in one native output.
+        """
+
+        if (
+            not self._forward_independent_handoff_enabled
+            or self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE
+        ):
+            return
+        delivery_actions = tuple(
+            action
+            for action in actions
+            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        )
+        if len(delivery_actions) == 0:
+            return
+        authority = self._source_delivery_authority
+        if authority is None:
+            reason = "source delivery authority disappeared after startup"
+            with self._condition:
+                self._enter_runtime_fatal_locked(reason)
+            raise NativeTerminalRuntimeError(reason)
+        try:
+            disposition = authority.acquire_for_actions(delivery_actions)
+        except Exception:
+            formatted_traceback = traceback.format_exc()
+            with self._condition:
+                self._enter_runtime_fatal_locked(formatted_traceback)
+            raise
+        if type(disposition) is not NativeTerminalDeliveryLeaseDisposition:
+            reason = "source delivery authority returned an invalid disposition"
+            with self._condition:
+                self._enter_runtime_fatal_locked(reason)
+            raise TypeError(reason)
+        if disposition is NativeTerminalDeliveryLeaseDisposition.ACQUIRED:
+            return
+        reason = "source delivery entered scheduler-fatal drain"
+        with self._condition:
+            self._enter_runtime_fatal_locked(reason)
+        raise NativeTerminalRuntimeError(reason)
 
     def _route_observation(self, observation: NativeTerminalOwnerObservation) -> None:
         """Project actionless native evidence without changing authority.
