@@ -409,8 +409,6 @@ class PackedTerminalSourceGatherWorker:
     def _consume_one_action(self) -> None:
         """Consume at most one direct-inbox action and preserve FIFO fairness."""
 
-        if self._inbox.snapshot().queued_count == 0:
-            return
         actions = self._inbox.drain(maximum_items=1)
         if len(actions) == 0:
             return
