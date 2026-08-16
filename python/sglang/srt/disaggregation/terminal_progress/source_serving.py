@@ -725,7 +725,7 @@ class PackedTerminalSourceServing:
         shutdown_timeout: float = terminal_deadline_spec(
             TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
         ).seconds
-        if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
+        if not self._runtime.wait_for_output_projection(shutdown_timeout):
             self._runtime.begin_abort()
             raise RuntimeError(
                 "source shutdown retained native output before gather drain"
@@ -782,9 +782,7 @@ class PackedTerminalSourceServing:
                 self._retire_native_producers()
                 with self._lock:
                     self._native_producers_retired = True
-            if not self._runtime.wait_for_output_projection_quiescence(
-                shutdown_timeout
-            ):
+            if not self._runtime.wait_for_output_projection(shutdown_timeout):
                 raise RuntimeError("abort retained unrouted source terminal authority")
             self._gather_worker.stop_and_join(shutdown_timeout, abort=True)
             self._grouped_nixl.stop_admission()

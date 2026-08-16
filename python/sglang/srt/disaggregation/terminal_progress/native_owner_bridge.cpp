@@ -3071,6 +3071,23 @@ public:
            owner_->producers.at(producer_id).retired;
   }
 
+  bool wait_for_output_projection(double timeout_seconds) {
+    if (timeout_seconds <= 0.0) {
+      throw std::invalid_argument(
+          "output projection wait must be positive");
+    }
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    return owner_->condition.wait_for(
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return owner_->input_queue.empty() &&
+                 owner_->output_queue.empty() &&
+                 owner_->fatal_output_queue.empty() &&
+                 owner_->pending_actions.empty() &&
+                 !owner_->output_drain_active &&
+                 !owner_->qualification.running;
+        });
+  }
+
   bool wait_for_output_quiescence(double timeout_seconds) {
     if (timeout_seconds <= 0.0) {
       throw std::invalid_argument(
@@ -3511,6 +3528,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("wait_for_producer_retirement",
            &NativeTerminalOwnerBridge::wait_for_producer_retirement,
            py::arg("producer_id"), py::arg("timeout_seconds"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("wait_for_output_projection",
+           &NativeTerminalOwnerBridge::wait_for_output_projection,
+           py::arg("timeout_seconds"),
            py::call_guard<py::gil_scoped_release>())
       .def("wait_for_output_quiescence",
            &NativeTerminalOwnerBridge::wait_for_output_quiescence,

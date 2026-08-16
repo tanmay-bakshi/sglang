@@ -1423,6 +1423,33 @@ class NativeTerminalRuntime:
         self._output_projection_lock.release()
         return True
 
+    def wait_for_output_projection(self, timeout_seconds: float) -> bool:
+        """Fence accepted native input through its Python-owned inbox.
+
+        Unlike final quiescence, this fence does not require every producer to
+        retire. A source rank uses it after retiring the CUDA completion
+        producer, before draining the gather worker whose grouped-transfer
+        producers must remain live.
+
+        :param timeout_seconds: Positive bound shared by both ownership domains.
+        :returns: Whether native and already-swapped Python projection became
+            idle within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("output projection timeout must be a positive float")
+        deadline = time.monotonic() + timeout_seconds
+        if not self._owner.wait_for_output_projection(timeout_seconds):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        acquired = self._output_projection_lock.acquire(timeout=remaining)
+        if not acquired:
+            return False
+        self._output_projection_lock.release()
+        return True
+
     def close_clean(self) -> None:
         """Close only after exact-zero native and consumer inventories."""
 
@@ -1685,7 +1712,8 @@ class NativeTerminalRuntime:
                     except Exception:  # noqa: BLE001
                         formatted_traceback = traceback.format_exc()
                         logger.error(
-                            "Native observation drain failed without gating lifecycle: %s",
+                            "Native observation drain failed without gating "
+                            "lifecycle: %s",
                             formatted_traceback,
                         )
                         try:
