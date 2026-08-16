@@ -2724,7 +2724,7 @@ class NixlKVManager(CommonKVManager):
                 actor.post_terminal_owner_transfer(action, post_auxiliary)
                 grouped_nixl.seal_group(action.binding.digest)
                 failure_reason = None
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.error(
                     "Terminal grouped source post failed:\n%s",
                     traceback.format_exc(),
