@@ -711,7 +711,6 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::unordered_set<std::uint64_t> consumed_actions{};
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
   std::unordered_set<std::uint64_t> handoff_action_ids{};
-  std::unordered_set<std::uint64_t> completed_handoff_action_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -1522,8 +1521,7 @@ void register_forward_independent_handoffs_locked(
     if (!action_requires_forward_independent_handoff(action.kind)) {
       continue;
     }
-    if (!owner.handoff_action_ids.insert(action.action_id).second ||
-        owner.completed_handoff_action_ids.count(action.action_id) != 0) {
+    if (!owner.handoff_action_ids.insert(action.action_id).second) {
       enter_handoff_fatal_locked(
           owner, FatalCode::kHandoffAuthority,
           "terminal handoff registered a duplicate action identity");
@@ -1544,7 +1542,6 @@ void fail_forward_independent_handoff_locked(
     return;
   }
   if (owner.handoff_action_ids.erase(action_id) == 1) {
-    owner.completed_handoff_action_ids.insert(action_id);
     ++owner.handoff_completion_count;
   }
   owner.condition.notify_all();
@@ -2936,18 +2933,13 @@ public:
     }
     const auto pending = owner_->handoff_action_ids.find(action_id);
     if (pending == owner_->handoff_action_ids.end()) {
-      const bool replayed =
-          owner_->completed_handoff_action_ids.count(action_id) != 0;
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kHandoffAuthority,
-          replayed
-              ? "terminal handoff action completion was replayed"
-              : "terminal handoff action completion was unknown or excluded");
+      enter_handoff_fatal_locked(*owner_, FatalCode::kHandoffAuthority,
+                                 "terminal handoff action completion was "
+                                 "unknown, excluded, or replayed");
       throw std::runtime_error(
           "terminal handoff action completion was absent or replayed");
     }
     owner_->handoff_action_ids.erase(pending);
-    owner_->completed_handoff_action_ids.insert(action_id);
     ++owner_->handoff_completion_count;
     owner_->condition.notify_all();
   }

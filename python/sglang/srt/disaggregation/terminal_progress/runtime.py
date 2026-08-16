@@ -153,7 +153,6 @@ class _BoundedFdInbox[ValueT]:
     _wake_armed: bool
     _closed: bool
     _fatal_reason: str | None
-    _forward_independent_handoff_enabled: bool
     _lock: threading.Lock
 
     def __init__(self, name: str, capacity: int) -> None:
@@ -543,6 +542,7 @@ class NativeTerminalRuntime:
     _output_projection_lock: threading.Lock
     _disposition: NativeTerminalRuntimeDisposition
     _fatal_reason: str | None
+    _forward_independent_handoff_enabled: bool
     _output_reactor_alive: bool
     _producers_joined: bool
     _native_observation_delivery_count: int

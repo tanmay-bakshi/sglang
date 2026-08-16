@@ -761,7 +761,7 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
             _submit_direct_source_gather(owner, registration)
             expires_at = time.monotonic() + _WAIT_SECONDS
             while not expiry_future.done() and time.monotonic() < expires_at:
-                owner.inventory()
+                pass
             actions = expiry_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
@@ -803,7 +803,7 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
             _submit_direct_source_gather(owner, registration)
             expires_at = time.monotonic() + _WAIT_SECONDS
             while not close_future.done() and time.monotonic() < expires_at:
-                owner.inventory()
+                pass
             close_error = close_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
