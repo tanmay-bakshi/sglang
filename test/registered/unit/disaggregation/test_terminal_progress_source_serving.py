@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+    NativeTerminalReceipt,
     NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.nixl_adapter import (
@@ -770,6 +771,55 @@ def _request_ready_receipt(
         outcome=TerminalReceiptOutcome.SUCCESS,
         terminal_timestamp_ns=3_000,
     )
+
+
+def _publication_success(
+    identity: PackedTerminalSourceIdentityPlan,
+    publication: FrozenTerminalGatewayPublication,
+) -> TerminalGatewayPublicationSuccess:
+    """Build exact successful publication authority for every source rank.
+
+    :param identity: Rank-local request identity graph.
+    :param publication: Canonical gateway publication being completed.
+    :returns: Authenticated successful publication result.
+    """
+
+    completed_ns = 4_000
+    issuer = TerminalWireReceiptIssuer(identity.publisher_issuer)
+    return TerminalGatewayPublicationSuccess(
+        publication=publication,
+        completed_ns=completed_ns,
+        source_receipts=tuple(
+            issuer.issue(
+                binding=binding,
+                kind=TerminalReceiptKind.GATEWAY_PUBLISHED,
+                outcome=TerminalReceiptOutcome.SUCCESS,
+                terminal_timestamp_ns=completed_ns,
+            )
+            for binding in identity.source_bindings
+        ),
+    )
+
+
+def _assert_retirement_preclaimed_behind_fence(
+    runtime: NativeTerminalRuntime,
+) -> None:
+    """Require one real retirement to remain preclaimed behind projection.
+
+    :param runtime: Source runtime paused inside its final joined completion.
+    """
+
+    _wait_for_phase(
+        lambda: runtime.snapshot().source_preclaimed_count == 1,
+        "request retirement was not preclaimed behind the delivery fence",
+    )
+    assert runtime._output_projection_lock.locked()
+    with runtime._condition:
+        actions = tuple(runtime._source_preclaimed_actions.values())
+    assert tuple(action.kind for action in actions) == (
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+    )
+    assert runtime.lifecycle_actions.snapshot().queued_count == 0
 
 
 def test_delivery_join_is_order_independent_and_late_ack_does_not_reacquire() -> None:
@@ -1979,6 +2029,178 @@ def test_runtime_drain_claims_ready_siblings_before_scheduler_delivery(
         if scheduler_lock_owned_by_test:
             scheduler_state_lock.release()
         if runtime.disposition.value != "stopped":
+            serving.abort_and_close()
+
+
+def test_publication_last_retirement_waits_for_local_mirror_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real retirement projection cannot outrun the publication mirror."""
+
+    identity = _identity()
+    serving, runtime, publisher, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    completion_submitted = threading.Event()
+    release_completion = threading.Event()
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        _pump(serving, runtime)
+        assert len(publisher.values) == 1
+        serving.drain_scheduler_at_loop_entry()
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        result = _publication_success(identity, publisher.values[0])
+        original_completion = runtime.complete_work_action
+
+        def pause_after_native_completion(
+            producer_id: int,
+            action: NativeTerminalOwnerAction,
+            followup_kind: NativeTerminalOwnerEventKind,
+            *,
+            receipt: NativeTerminalReceipt | None = None,
+            reason: str | None = None,
+            enqueued_ns: int | None = None,
+        ) -> None:
+            """Expose native retirement before its publication mirror.
+
+            :param producer_id: Exact receipt producer identity.
+            :param action: Publication action being completed.
+            :param followup_kind: Earned publication event.
+            :param receipt: Exact publication receipt.
+            :param reason: Optional publication failure evidence.
+            :param enqueued_ns: Exact producer timestamp.
+            """
+
+            original_completion(
+                producer_id,
+                action,
+                followup_kind,
+                receipt=receipt,
+                reason=reason,
+                enqueued_ns=enqueued_ns,
+            )
+            completion_submitted.set()
+            if not release_completion.wait(timeout=_WAIT_SECONDS):
+                raise TimeoutError("publication completion release was not delivered")
+
+        monkeypatch.setattr(
+            runtime,
+            "complete_work_action",
+            pause_after_native_completion,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            completion = executor.submit(serving.publisher_result, result)
+            assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+            try:
+                _assert_retirement_preclaimed_behind_fence(runtime)
+            finally:
+                release_completion.set()
+            completion.result(timeout=_WAIT_SECONDS)
+
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        _pump(serving, runtime)
+        assert serving.wiring.inventory().active_binding_digests == ()
+        assert runtime.snapshot().source_preclaimed_count == 0
+        serving.stop_admission_and_retire_producers()
+        serving.close_clean(_WAIT_SECONDS)
+    finally:
+        release_completion.set()
+        if runtime.disposition is not NativeTerminalRuntimeDisposition.STOPPED:
+            serving.abort_and_close()
+
+
+def test_reclaim_last_retirement_waits_for_local_mirror_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real retirement projection cannot outrun the reclaim mirror."""
+
+    identity = _identity()
+    serving, runtime, publisher, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    completion_submitted = threading.Event()
+    release_completion = threading.Event()
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        _pump(serving, runtime)
+        assert len(publisher.values) == 1
+        serving.publisher_result(
+            _publication_success(identity, publisher.values[0])
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        original_completion = runtime.complete_scheduler_action
+
+        def pause_after_native_completion(
+            producer_id: int,
+            action: NativeTerminalOwnerAction,
+            followup_kind: NativeTerminalOwnerEventKind,
+            *,
+            completion_receipt: NativeTerminalReceipt | None = None,
+            enqueued_ns: int | None = None,
+        ) -> None:
+            """Expose native retirement before its reclaim mirror.
+
+            :param producer_id: Exact receipt producer identity.
+            :param action: Reclaim action being completed.
+            :param followup_kind: Earned reclaim event.
+            :param completion_receipt: Exact reclaim-consumed receipt.
+            :param enqueued_ns: Exact producer timestamp.
+            """
+
+            original_completion(
+                producer_id,
+                action,
+                followup_kind,
+                completion_receipt=completion_receipt,
+                enqueued_ns=enqueued_ns,
+            )
+            completion_submitted.set()
+            if not release_completion.wait(timeout=_WAIT_SECONDS):
+                raise TimeoutError("reclaim completion release was not delivered")
+
+        monkeypatch.setattr(
+            runtime,
+            "complete_scheduler_action",
+            pause_after_native_completion,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            completion = executor.submit(serving.drain_scheduler_at_loop_entry)
+            assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+            try:
+                _assert_retirement_preclaimed_behind_fence(runtime)
+            finally:
+                release_completion.set()
+            completion.result(timeout=_WAIT_SECONDS)
+
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        _pump(serving, runtime)
+        assert serving.wiring.inventory().active_binding_digests == ()
+        assert runtime.snapshot().source_preclaimed_count == 0
+        serving.stop_admission_and_retire_producers()
+        serving.close_clean(_WAIT_SECONDS)
+    finally:
+        release_completion.set()
+        if runtime.disposition is not NativeTerminalRuntimeDisposition.STOPPED:
             serving.abort_and_close()
 
 
