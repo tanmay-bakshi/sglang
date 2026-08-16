@@ -4,6 +4,8 @@ import logging
 import os
 import select
 import sys
+import threading
+from collections.abc import Callable
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -21,12 +23,15 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.nixl_adapter import (
     NixlTerminalBackendLifecycleInventory,
@@ -399,6 +404,7 @@ def _runtime(identity: PackedTerminalSourceIdentityPlan) -> NativeTerminalRuntim
         scheduler_capacity=8,
         coordinator_capacity=8,
         lifecycle_capacity=8,
+        source_gather_capacity=8,
         source_work_capacity=8,
         decode_work_capacity=8,
         publisher_capacity=8,
@@ -430,6 +436,12 @@ def _submission(
 
 def _serving(
     identity: PackedTerminalSourceIdentityPlan,
+    *,
+    post_gather: (
+        Callable[[PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None]
+        | None
+    ) = None,
+    bind_gather_cuda_device: Callable[[], None] | None = None,
 ) -> tuple[
     PackedTerminalSourceServing,
     NativeTerminalRuntime,
@@ -441,6 +453,8 @@ def _serving(
     """Construct one source composition and its observation ledgers.
 
     :param identity: Exact source identity graph.
+    :param post_gather: Optional dedicated-worker gather callback.
+    :param bind_gather_cuda_device: Optional worker-thread device binder.
     :returns: Serving, runtime, publisher, metrics, work labels, and fatal inventories.
     """
 
@@ -449,6 +463,24 @@ def _serving(
     metrics = _Metrics()
     work_labels: list[str] = []
     fatal_inventories: list[object] = []
+    if post_gather is None:
+
+        def post_gather(
+            submission: PackedTerminalSourceSubmission,
+            action: NativeTerminalOwnerAction,
+        ) -> None:
+            """Record one fixture gather action.
+
+            :param submission: Exact source submission.
+            :param action: Exact native gather action.
+            """
+
+            work_labels.append("gather")
+
+    if bind_gather_cuda_device is None:
+
+        def bind_gather_cuda_device() -> None:
+            """Provide a GPU-free worker affinity boundary for CPU tests."""
 
     def resource_inventory() -> PackedTerminalSourceResourceInventory:
         """Return exact-zero external ownership for the isolated fixture.
@@ -494,12 +526,13 @@ def _serving(
         process_fatal_handler=fatal_inventories.append,
         grouped_nixl=_EmptyGroupedNixlOwner(),
         work=PackedTerminalSourceWork(
-            post_gather=lambda submission, action: work_labels.append("gather"),
+            post_gather=post_gather,
             send_outcomes=lambda submission, action: work_labels.append("outcome"),
             send_ack=lambda submission, action: work_labels.append("ack"),
             quarantine=lambda action: work_labels.append("quarantine"),
             observe_output=lambda output: None,
         ),
+        bind_gather_cuda_device=bind_gather_cuda_device,
         retire_native_producers=lambda: runtime._owner.retire_python_producer(
             _NATIVE_PRODUCER_ID
         ),
@@ -528,6 +561,248 @@ def _pump(
     if len(readable) == 0:
         raise TimeoutError("source composition runtime inbox did not wake")
     serving.drain_runtime_actions()
+
+
+def _action(
+    identity: PackedTerminalSourceIdentityPlan,
+    *,
+    action_id: int,
+    kind: NativeTerminalOwnerActionKind,
+) -> NativeTerminalOwnerAction:
+    """Build one receipt-free native source work action.
+
+    :param identity: Exact source identity graph.
+    :param action_id: Unique action identifier.
+    :param kind: Receipt-free source work kind.
+    :returns: Immutable native owner action.
+    """
+
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=kind,
+        binding=NativeTerminalRequestBinding.from_binding(identity.local_binding),
+        commit_timestamp_ns=1_000 + action_id,
+        receipt=None,
+    )
+
+
+def test_gather_worker_owns_direct_inbox_and_binds_device_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocked gather work cannot delay ACK progress on the process reactor."""
+
+    identity = _identity()
+    gather_entered = threading.Event()
+    release_gather = threading.Event()
+    gather_threads: list[str] = []
+    device_threads: list[str] = []
+
+    def post_gather(
+        submission: PackedTerminalSourceSubmission,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Hold one gather while the process reactor consumes an ACK.
+
+        :param submission: Exact source submission.
+        :param action: Exact gather authority.
+        """
+
+        gather_threads.append(threading.current_thread().name)
+        gather_entered.set()
+        if not release_gather.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("test gather release was not delivered")
+
+    def bind_device() -> None:
+        """Record the thread which owns production device binding."""
+
+        device_threads.append(threading.current_thread().name)
+
+    serving, runtime, _, _, _, _ = _serving(
+        identity,
+        post_gather=post_gather,
+        bind_gather_cuda_device=bind_device,
+    )
+    serving.start()
+    try:
+        worker = serving.inventory().gather_worker
+        assert worker.cuda_device_bound
+        assert worker.thread_alive
+        assert runtime.snapshot().source_gather.capacity == 8
+        assert runtime.source_gather_actions.fileno() not in serving.runtime_filenos
+        assert device_threads == ["packed-terminal-source-gather-worker"]
+
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda submission: None)
+        serving.attach_producer_completion(submission)
+        assert serving.packed_ready(identity.local_binding.digest)
+        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert gather_entered.wait(timeout=_WAIT_SECONDS)
+
+        ack = _action(
+            identity,
+            action_id=90,
+            kind=NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        )
+        consumed: list[NativeTerminalOwnerActionKind] = []
+
+        def consume_ack(
+            action: NativeTerminalOwnerAction,
+            send_ack: Callable[
+                [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+            ],
+        ) -> None:
+            """Acknowledge one synthetic reactor-owned action.
+
+            :param action: Exact synthetic ACK action.
+            :param send_ack: Unused source ACK callback.
+            """
+
+            consumed.append(action.kind)
+            runtime.acknowledge_consumed_action(action)
+
+        monkeypatch.setattr(serving._wiring, "consume_ack_ready", consume_ack)
+        runtime._route_action(ack)
+        assert serving._drain_source_work_actions() == 1
+        assert consumed == [NativeTerminalOwnerActionKind.SOURCE_ACK_READY]
+        assert gather_threads == ["packed-terminal-source-gather-worker"]
+    finally:
+        release_gather.set()
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+        serving.abort_and_close()
+
+
+def test_source_work_drain_prioritizes_ack_and_preserves_kind_fifo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACK authority bypasses queued outcomes without reordering either kind."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    consumed: list[int] = []
+    try:
+        actions = (
+            _action(
+                identity,
+                action_id=101,
+                kind=NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+            ),
+            _action(
+                identity,
+                action_id=102,
+                kind=NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            ),
+            _action(
+                identity,
+                action_id=103,
+                kind=NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+            ),
+            _action(
+                identity,
+                action_id=104,
+                kind=NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+            ),
+        )
+
+        def consume(
+            action: NativeTerminalOwnerAction,
+            callback: Callable[
+                [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
+            ],
+        ) -> None:
+            """Record and retire one synthetic source-work action.
+
+            :param action: Exact synthetic source-work action.
+            :param callback: Unused serving callback.
+            """
+
+            consumed.append(action.action_id)
+            runtime.acknowledge_consumed_action(action)
+
+        monkeypatch.setattr(serving._wiring, "consume_ack_ready", consume)
+        monkeypatch.setattr(serving._wiring, "consume_outcome_ready", consume)
+        for action in actions:
+            runtime._route_action(action)
+
+        assert serving._drain_source_work_actions() == 4
+        assert consumed == [102, 104, 101, 103]
+    finally:
+        serving.abort_and_close()
+
+
+def test_gather_worker_failure_is_process_fatal() -> None:
+    """A failed dedicated gather action wakes fail-closed scheduler handling."""
+
+    identity = _identity()
+
+    def fail_gather(
+        submission: PackedTerminalSourceSubmission,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Raise from the worker-owned gather boundary.
+
+        :param submission: Exact source submission.
+        :param action: Exact gather authority.
+        """
+
+        raise RuntimeError("synthetic gather failure")
+
+    serving, runtime, _, _, _, fatal_inventories = _serving(
+        identity,
+        post_gather=fail_gather,
+    )
+    serving.start()
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda submission: None)
+        serving.attach_producer_completion(submission)
+        assert serving.packed_ready(identity.local_binding.digest)
+        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+        inventory = serving.inventory()
+        assert inventory.gather_worker.fatal_reason == "source gather action failed"
+        assert inventory.gather_worker.thread_alive
+        assert inventory.gather_worker.abort_requested
+        assert inventory.owner_dead_marked
+        assert len(fatal_inventories) == 1
+        assert runtime.disposition.value == "abort_draining"
+    finally:
+        serving.abort_and_close()
+
+
+def test_gather_worker_launch_failure_remains_abortable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve fail-closed teardown when the worker thread never launches."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, fatal_inventories = _serving(identity)
+
+    def fail_thread_start() -> None:
+        """Reject the process-lifetime thread launch deterministically.
+
+        :raises RuntimeError: Always, before the worker thread begins.
+        """
+
+        raise RuntimeError("synthetic gather thread launch failure")
+
+    monkeypatch.setattr(serving._gather_worker._thread, "start", fail_thread_start)
+
+    with pytest.raises(RuntimeError, match="synthetic gather thread launch failure"):
+        serving.start()
+
+    inventory = serving.inventory()
+    assert inventory.gather_worker.fatal_reason == (
+        "source gather worker thread failed to start"
+    )
+    assert not inventory.gather_worker.thread_alive
+    assert inventory.owner_dead_marked
+    assert len(fatal_inventories) == 1
+    assert runtime.disposition.value == "abort_draining"
+
+    final_inventory = serving.abort_and_close()
+    assert final_inventory.gather_worker.disposition.value == "process_fatal"
+    assert not final_inventory.gather_worker.thread_alive
 
 
 def test_composition_binds_both_scheduler_owners_before_lifecycle() -> None:
@@ -617,14 +892,20 @@ def test_full_source_composition_retires_exactly_once(
         serving.attach_producer_completion(submission)
         digest = identity.local_binding.digest
         assert serving.packed_ready(digest)
+        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
-        assert serving.cancel_submission(identity.local_binding, "client disconnected") is (
-            PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
+        cancellation = serving.cancel_submission(
+            identity.local_binding,
+            "client disconnected",
         )
         assert (
-            serving.inventory().wiring.completion_required_binding_digests
-            == (digest,)
+            cancellation
+            is PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
+        )
+        assert serving.inventory().wiring.completion_required_binding_digests == (
+            digest,
         )
         samples = tuple(
             sample

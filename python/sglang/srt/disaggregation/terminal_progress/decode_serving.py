@@ -256,6 +256,7 @@ class PackedTerminalDecodeServingInventory:
             runtime.scheduler,
             runtime.coordinator,
             runtime.lifecycle,
+            runtime.source_gather,
             runtime.source_work,
             runtime.decode_work,
             runtime.publisher,

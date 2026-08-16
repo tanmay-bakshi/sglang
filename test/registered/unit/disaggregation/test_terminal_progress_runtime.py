@@ -165,6 +165,7 @@ def _runtime(
         scheduler_capacity=scheduler_capacity,
         coordinator_capacity=16,
         lifecycle_capacity=16,
+        source_gather_capacity=16,
         source_work_capacity=16,
         decode_work_capacity=16,
         publisher_capacity=16,
@@ -316,6 +317,7 @@ def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
         runtime.scheduler_actions,
         runtime.coordinator_actions,
         runtime.lifecycle_actions,
+        runtime.source_gather_actions,
         runtime.source_work_actions,
         runtime.decode_work_actions,
         runtime.publisher_actions,
@@ -382,7 +384,7 @@ def _complete_source(
         binding_digest,
         NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
     )
-    gather = _drain_actions(runtime.source_work_actions)
+    gather = _drain_actions(runtime.source_gather_actions)
     assert tuple(action.kind for action in gather) == (
         NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
     )
@@ -763,7 +765,7 @@ def test_runtime_queue_overflow_enters_one_process_fatal_path() -> None:
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             ):
                 runtime.submit(_LOCAL_PRODUCER_ID, binding_digest, kind)
-            gather = _drain_actions(runtime.source_work_actions)[0]
+            gather = _drain_actions(runtime.source_gather_actions)[0]
             runtime.complete_work_action(
                 _LOCAL_PRODUCER_ID,
                 gather,
@@ -833,7 +835,7 @@ def test_scheduler_failure_releases_action_accounting_and_retains_quarantine() -
             binding_digest,
             NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
         )
-        gather = _drain_actions(runtime.source_work_actions)[0]
+        gather = _drain_actions(runtime.source_gather_actions)[0]
         runtime.complete_work_action(
             _LOCAL_PRODUCER_ID,
             gather,

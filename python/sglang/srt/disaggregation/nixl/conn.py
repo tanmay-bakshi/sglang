@@ -2583,7 +2583,8 @@ class NixlKVManager(CommonKVManager):
             scheduler_capacity=physical_capacity,
             coordinator_capacity=physical_capacity,
             lifecycle_capacity=physical_capacity * 2,
-            source_work_capacity=physical_capacity * 3,
+            source_gather_capacity=physical_capacity,
+            source_work_capacity=physical_capacity * 2,
             decode_work_capacity=physical_capacity,
             publisher_capacity=physical_capacity,
             observation_capacity=physical_capacity * event_population,
@@ -2692,7 +2693,6 @@ class NixlKVManager(CommonKVManager):
         ) -> None:
             transport = transport_submission(submission)
             expected_members = grouped_nixl_source_members(canonical)
-            grouped_nixl.begin_group(action.binding.digest, expected_members)
             post_auxiliary: Callable[[PackedPrefillSubmission], object] | None = None
             if dflash_owner is not None:
                 source = dflash_source(transport)
@@ -2713,19 +2713,33 @@ class NixlKVManager(CommonKVManager):
                         binding_digest=action.binding.digest,
                     )
 
+            actor.begin_terminal_owner_gather(action)
+            failure_reason: str | None = (
+                "terminal source gather did not reach stable grouped submission"
+            )
+            group_started = False
             try:
-                actor.begin_terminal_owner_transfer(action, post_auxiliary)
+                grouped_nixl.begin_group(action.binding.digest, expected_members)
+                group_started = True
+                actor.post_terminal_owner_transfer(action, post_auxiliary)
                 grouped_nixl.seal_group(action.binding.digest)
+                failure_reason = None
             except Exception:
                 logger.error(
                     "Terminal grouped source post failed:\n%s",
                     traceback.format_exc(),
                 )
-                grouped_nixl.quarantine_group(
-                    action.binding.digest,
-                    "terminal source gather or transfer post became ambiguous",
+                failure_reason = (
+                    "terminal source gather or transfer post became ambiguous"
                 )
+                if group_started:
+                    grouped_nixl.quarantine_group(
+                        action.binding.digest,
+                        failure_reason,
+                    )
                 raise
+            finally:
+                actor.finish_terminal_owner_gather(action, failure_reason)
 
         def send_outcomes(
             submission: PackedTerminalSourceSubmission,
@@ -3034,6 +3048,11 @@ class NixlKVManager(CommonKVManager):
                 ),
             )
 
+        def bind_gather_cuda_device() -> None:
+            """Bind the dedicated source gather worker to this rank's device."""
+
+            torch.cuda.set_device(self.kv_args.gpu_id)
+
         serving = PackedTerminalSourceServing(
             runtime=enrollment.runtime,
             cuda_completion=cuda_source,
@@ -3045,6 +3064,7 @@ class NixlKVManager(CommonKVManager):
             process_fatal_handler=(installation.scheduler_process_fatal_handler),
             grouped_nixl=grouped_nixl,
             work=source_work,
+            bind_gather_cuda_device=bind_gather_cuda_device,
             retire_native_producers=enrollment.retire_native_producers,
             resource_inventory=resource_inventory,
             retire_submission=retire_submission,

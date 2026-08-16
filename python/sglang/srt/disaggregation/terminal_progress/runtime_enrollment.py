@@ -57,7 +57,8 @@ class TerminalRankRuntimeConfig:
     :ivar scheduler_capacity: Scheduler action inbox capacity.
     :ivar coordinator_capacity: Request coordinator inbox capacity.
     :ivar lifecycle_capacity: Teardown and health inbox capacity.
-    :ivar source_work_capacity: Source continuation inbox capacity.
+    :ivar source_gather_capacity: Blocking source gather inbox capacity.
+    :ivar source_work_capacity: Source outcome and ACK inbox capacity.
     :ivar decode_work_capacity: Decode continuation inbox capacity.
     :ivar publisher_capacity: Gateway publication inbox capacity.
     :ivar observation_capacity: Non-gating observation inbox capacity.
@@ -71,6 +72,7 @@ class TerminalRankRuntimeConfig:
     scheduler_capacity: int
     coordinator_capacity: int
     lifecycle_capacity: int
+    source_gather_capacity: int
     source_work_capacity: int
     decode_work_capacity: int
     publisher_capacity: int
@@ -87,6 +89,7 @@ class TerminalRankRuntimeConfig:
             self.scheduler_capacity,
             self.coordinator_capacity,
             self.lifecycle_capacity,
+            self.source_gather_capacity,
             self.source_work_capacity,
             self.decode_work_capacity,
             self.publisher_capacity,
@@ -605,6 +608,7 @@ class TerminalRankRuntimeEnrollmentFactory:
                 scheduler_capacity=config.scheduler_capacity,
                 coordinator_capacity=config.coordinator_capacity,
                 lifecycle_capacity=config.lifecycle_capacity,
+                source_gather_capacity=config.source_gather_capacity,
                 source_work_capacity=config.source_work_capacity,
                 decode_work_capacity=config.decode_work_capacity,
                 publisher_capacity=config.publisher_capacity,

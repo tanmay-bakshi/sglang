@@ -592,6 +592,7 @@ def _runtime(
         scheduler_capacity=8,
         coordinator_capacity=8,
         lifecycle_capacity=8,
+        source_gather_capacity=8,
         source_work_capacity=8,
         decode_work_capacity=8,
         publisher_capacity=8,
@@ -823,9 +824,7 @@ def test_tp1_full_success_retires_every_authority_exactly_once(
                 "scheduler_inbox_delay_ms",
                 "metadata_consumption_ms",
             }
-            assert {sample.sample_key for sample in timing_samples} == {
-                "decode-rank-0"
-            }
+            assert {sample.sample_key for sample in timing_samples} == {"decode-rank-0"}
 
             serving.stop_admission_and_retire_producers()
             serving.close_clean(_WAIT_SECONDS)
