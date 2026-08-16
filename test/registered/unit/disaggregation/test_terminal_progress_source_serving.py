@@ -764,6 +764,8 @@ def test_gather_worker_failure_is_process_fatal() -> None:
         assert inventory.gather_worker.thread_alive
         assert inventory.gather_worker.abort_requested
         assert inventory.owner_dead_marked
+        with pytest.raises(RuntimeError):
+            serving.drain_scheduler_at_loop_entry()
         assert len(fatal_inventories) == 1
         assert runtime.disposition.value == "abort_draining"
     finally:
