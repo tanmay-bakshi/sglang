@@ -450,6 +450,9 @@ def _finish_handoff_runtime(runtime: NativeTerminalRuntime) -> None:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_finish_fail_closed, runtime)
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while not future.done() and time.monotonic() < expires_at:
+            pass
         future.result(timeout=_WAIT_SECONDS)
 
 
@@ -635,9 +638,13 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
         TerminalOwnerRole.SOURCE,
         enable_forward_independent_handoff=True,
     )
-    registrations = tuple(_registration(owner, remote, room_id) for room_id in (62, 63, 64))
+    registrations = tuple(
+        _registration(owner, remote, room_id) for room_id in (62, 63, 64)
+    )
     runtime.start()
     previous_switch_interval = sys.getswitchinterval()
+    first_action_drained = threading.Event()
+    later_actions_submitted = threading.Event()
     try:
         for registration in registrations:
             runtime.register_lifecycle(registration)
@@ -648,21 +655,28 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
             )
 
         def consume_all_gathers() -> tuple[NativeTerminalOwnerAction, ...]:
-            actions: list[NativeTerminalOwnerAction] = []
+            actions = list(_drain_actions(runtime.source_gather_actions))
+            assert len(actions) == 1
+            first_action_drained.set()
+            assert later_actions_submitted.wait(timeout=_WAIT_SECONDS)
+            runtime.acknowledge_consumed_action(actions[0])
             while len(actions) < len(registrations):
-                actions.extend(_drain_actions(runtime.source_gather_actions))
-            for action in actions:
-                runtime.acknowledge_consumed_action(action)
+                current_actions = _drain_actions(runtime.source_gather_actions)
+                for action in current_actions:
+                    runtime.acknowledge_consumed_action(action)
+                actions.extend(current_actions)
             return tuple(actions)
 
         def submit_later_watermark() -> None:
             assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            assert first_action_drained.wait(timeout=_WAIT_SECONDS)
             for registration in registrations[1:]:
                 runtime.submit(
                     _LOCAL_PRODUCER_ID,
                     registration.binding.digest,
                     NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
                 )
+            later_actions_submitted.set()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             consumer_future = executor.submit(consume_all_gathers)
@@ -713,9 +727,7 @@ def test_scheduler_actions_never_enter_the_forward_independent_handoff() -> None
             return snapshot
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            snapshot = executor.submit(complete_and_close).result(
-                timeout=_WAIT_SECONDS
-            )
+            snapshot = executor.submit(complete_and_close).result(timeout=_WAIT_SECONDS)
         assert snapshot.owner.action_count == 6
         assert snapshot.owner.completed_handoff_action_count == 5
         assert snapshot.owner.pending_handoff_action_count == 0
@@ -729,6 +741,7 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
     owner, registration = _direct_handoff_owner(66)
     previous_switch_interval = sys.getswitchinterval()
     try:
+
         def expire_active_handoff() -> None:
             assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
@@ -758,6 +771,7 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
     owner, registration = _direct_handoff_owner(67)
     previous_switch_interval = sys.getswitchinterval()
     try:
+
         def reject_close_and_resolve_actions() -> str:
             assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             with pytest.raises(RuntimeError) as error:
