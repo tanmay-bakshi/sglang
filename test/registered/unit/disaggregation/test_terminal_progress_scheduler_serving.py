@@ -7,11 +7,11 @@ import os
 import select
 import signal
 import threading
-from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import sglang.srt.disaggregation.terminal_progress.scheduler_inbox as scheduler_inbox_module
 import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.decode import (
@@ -50,6 +50,8 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalDecodeSchedulerConsumer,
+    TerminalSchedulerActionPublicationDisposition,
+    TerminalSchedulerActionPublicationError,
     TerminalSchedulerServing,
     TerminalSchedulerServingRole,
     TerminalSourceSchedulerConsumer,
@@ -672,9 +674,15 @@ def test_unregistered_action_enters_shared_fatal_path_and_wakes_scheduler() -> N
     serving = _source_serving(consumer, capacity=1)
     action = _action(_binding(30, 30, TerminalOwnerRole.SOURCE), 30)
 
-    with pytest.raises(SchedulerReceiptInboxFatalError):
+    with pytest.raises(TerminalSchedulerActionPublicationError) as raised:
         serving.publish_action(action)
 
+    assert raised.value.action is action
+    assert (
+        raised.value.disposition
+        is TerminalSchedulerActionPublicationDisposition.CALLER_RETAINS
+    )
+    assert not raised.value.scheduler_retains_action
     readable, _, _ = select.select([serving.fileno()], [], [], 0)
     assert readable == [serving.fileno()]
     with pytest.raises(SchedulerReceiptInboxFatalError):
@@ -682,6 +690,42 @@ def test_unregistered_action_enters_shared_fatal_path_and_wakes_scheduler() -> N
     assert len(consumer.fatal_inventories) == 1
     assert serving.inventory().retained_action_ids == ()
     serving.close_fail_closed()
+
+
+def test_wake_failure_surfaces_exact_scheduler_retained_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-insertion wake failure cannot return native action ownership."""
+
+    consumer = _SourceConsumer()
+    serving = _source_serving(consumer, capacity=1)
+    binding = _binding(32, 32, TerminalOwnerRole.SOURCE)
+    action = _action(binding, 33)
+    serving.register_request(binding)
+
+    def fail_wake(_file_descriptor: int, _payload: bytes) -> int:
+        """Fail the fd write after inbox insertion linearizes."""
+
+        raise OSError(errno.EBADF, "synthetic wake failure")
+
+    monkeypatch.setattr(scheduler_inbox_module.os, "write", fail_wake)
+
+    with pytest.raises(TerminalSchedulerActionPublicationError) as raised:
+        serving.publish_action(action)
+
+    failure = raised.value
+    assert failure.action is action
+    assert (
+        failure.disposition
+        is TerminalSchedulerActionPublicationDisposition.SCHEDULER_RETAINS
+    )
+    assert failure.scheduler_retains_action
+    assert failure.serving_inventory.inbox.pending_request_keys == (
+        binding.request_key,
+    )
+    assert failure.serving_inventory.retained_action_ids == (action.action_id,)
+    closure = serving.close_fail_closed()
+    assert closure.retained_actions == (action,)
 
 
 def test_conflicting_action_retains_only_canonical_native_authority() -> None:
@@ -755,26 +799,44 @@ def test_runtime_teardown_fence_failure_begins_abort_without_closing_consumer(
     serving.close()
 
 
-def test_fail_closed_teardown_closes_fd_and_retains_ambiguous_authority() -> None:
-    """Fatal closure preserves live evidence without leaving a wake fd open."""
+def test_fail_closed_closure_transfers_exact_authority_once() -> None:
+    """Fatal closure atomically transfers retained actions and closes its fd."""
 
     consumer = _SourceConsumer()
-    serving = _source_serving(consumer, capacity=1)
-    binding = _binding(40, 40, TerminalOwnerRole.SOURCE)
-    action = _action(binding, 40)
-    serving.register_request(binding)
-    serving.publish_action(action)
+    serving = _source_serving(consumer, capacity=2)
+    bindings = (
+        _binding(40, 40, TerminalOwnerRole.SOURCE),
+        _binding(41, 41, TerminalOwnerRole.SOURCE),
+    )
+    later_action = _action(bindings[0], 42)
+    earlier_action = _action(bindings[1], 40)
+    for binding in bindings:
+        serving.register_request(binding)
+    serving.publish_action(later_action)
+    serving.publish_action(earlier_action)
     file_descriptor = serving.fileno()
     serving.mark_owner_dead()
 
-    inventory = serving.close_fail_closed()
+    closure = serving.close_fail_closed()
+    inventory = closure.inventory
 
     assert inventory.inbox.closed
-    assert inventory.inbox.live_bindings == (binding,)
-    assert inventory.inbox.pending_request_keys == (binding.request_key,)
-    assert inventory.retained_action_ids == (action.action_id,)
+    assert set(inventory.inbox.live_bindings) == set(bindings)
+    assert set(inventory.inbox.pending_request_keys) == {
+        binding.request_key for binding in bindings
+    }
+    assert closure.retained_actions == (earlier_action, later_action)
+    assert inventory.retained_action_ids == tuple(
+        action.action_id for action in closure.retained_actions
+    )
     assert inventory.fatal_delivered
     assert len(consumer.fatal_inventories) == 1
+    assert serving.inventory().retained_action_ids == ()
+    with pytest.raises(
+        RuntimeError,
+        match="scheduler fail-closed closure was already taken",
+    ):
+        serving.close_fail_closed()
     with pytest.raises(OSError) as raised:
         os.fstat(file_descriptor)
     assert raised.value.errno == errno.EBADF

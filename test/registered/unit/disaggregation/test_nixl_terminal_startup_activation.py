@@ -666,9 +666,11 @@ def _ack_frames(
     """
 
     target = binding.matrix.rank(
-        binding.advertisement.service_id
-        if target_service_id is None
-        else target_service_id,
+        (
+            binding.advertisement.service_id
+            if target_service_id is None
+            else target_service_id
+        ),
         binding.advertisement.tensor_parallel_rank,
     )
     route_table = _decode_route_table(
@@ -876,9 +878,26 @@ def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
     publication_control = MagicMock()
     reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
     reactor.close.side_effect = lambda timeout: order.append("reactor-close")
-    serving.stop_admission_and_retire_producers.side_effect = lambda: order.append(
-        "producer-retirement"
+    serving.stop_admission_and_retire_native_producers.side_effect = (
+        lambda: order.append("native-producer-retirement")
     )
+    serving.retire_python_producers.side_effect = lambda: order.append(
+        "python-producer-retirement"
+    )
+    source_drain_count = 0
+
+    def drain_source_actions(timeout_seconds: float) -> None:
+        """Record the two projection-fenced source shutdown drains.
+
+        :param timeout_seconds: Frozen owner-shutdown bound.
+        """
+
+        nonlocal source_drain_count
+        del timeout_seconds
+        source_drain_count += 1
+        order.append(f"source-drain-{source_drain_count}")
+
+    serving.drain_shutdown_actions.side_effect = drain_source_actions
     serving.close_clean.side_effect = lambda timeout: order.append("serving-close")
     publisher.stop_admission_and_join.side_effect = lambda: (
         order.append("publisher-close") or True
@@ -900,13 +919,284 @@ def test_terminal_runtime_closes_in_dependency_reverse_order() -> None:
     assert order == [
         "reactor-admission",
         "receiver-close",
-        "producer-retirement",
+        "native-producer-retirement",
         "reactor-close",
-        "serving-close",
+        "source-drain-1",
         "publisher-close",
+        "source-drain-2",
+        "python-producer-retirement",
+        "serving-close",
         "publication-control-close",
     ]
     serving.abort_and_close.assert_not_called()
+    serving.begin_fail_closed_abort.assert_not_called()
+
+
+def test_process_fatal_teardown_aborts_before_any_source_or_publisher_drain() -> None:
+    """Fatal teardown forbids new functional publication and release effects."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    publisher = MagicMock()
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.stop_admission_and_retire_native_producers.side_effect = (
+        lambda: order.append("native-producer-retirement")
+    )
+    serving.begin_fail_closed_abort.side_effect = lambda: order.append(
+        "source-abort-entry"
+    )
+    serving.retire_python_producers.side_effect = lambda: order.append(
+        "python-producer-retirement"
+    )
+    serving.abort_and_close.side_effect = lambda: order.append("serving-surrender")
+    publisher.abort_and_join.side_effect = lambda reason: (
+        order.append("publisher-abort") or True
+    )
+    manager.stop_terminal_control_receiver = lambda timeout: order.append(
+        "receiver-close"
+    )
+    manager._terminal_process_reactor = reactor
+    manager._terminal_source_serving = serving
+    manager._terminal_output_publisher = publisher
+
+    manager.close_terminal_runtime(process_fatal=True)
+
+    assert order == [
+        "source-abort-entry",
+        "reactor-admission",
+        "receiver-close",
+        "reactor-close",
+        "publisher-abort",
+        "serving-surrender",
+    ]
+    serving.stop_admission_and_retire_native_producers.assert_not_called()
+    serving.retire_python_producers.assert_not_called()
+    serving.drain_shutdown_actions.assert_not_called()
+    serving.close_clean.assert_not_called()
+    publisher.stop_admission_and_join.assert_not_called()
+
+
+def test_source_drain_failure_still_executes_fail_closed_surrender() -> None:
+    """A consumer failure cannot masquerade as a live ingress context."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    publisher = MagicMock()
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.stop_admission_and_retire_native_producers.side_effect = (
+        lambda: order.append("native-producer-retirement")
+    )
+
+    def fail_source_drain(timeout_seconds: float) -> None:
+        """Fail after every pre-publisher producer context has joined.
+
+        :param timeout_seconds: Frozen owner-shutdown bound.
+        """
+
+        del timeout_seconds
+        order.append("source-drain")
+        raise RuntimeError("synthetic source drain failure")
+
+    serving.drain_shutdown_actions.side_effect = fail_source_drain
+    serving.begin_fail_closed_abort.side_effect = lambda: order.append(
+        "source-abort-entry"
+    )
+    serving.retire_python_producers.side_effect = lambda: order.append(
+        "python-producer-retirement"
+    )
+    serving.abort_and_close.side_effect = lambda: order.append("serving-surrender")
+    publisher.abort_and_join.side_effect = lambda reason: (
+        order.append("publisher-abort") or True
+    )
+    manager.stop_terminal_control_receiver = lambda timeout: order.append(
+        "receiver-close"
+    )
+    manager._terminal_process_reactor = reactor
+    manager._terminal_source_serving = serving
+    manager._terminal_output_publisher = publisher
+
+    with pytest.raises(RuntimeError, match="terminal runtime teardown failed"):
+        manager.close_terminal_runtime(process_fatal=False)
+
+    assert order == [
+        "reactor-admission",
+        "receiver-close",
+        "native-producer-retirement",
+        "reactor-close",
+        "source-drain",
+        "source-abort-entry",
+        "publisher-abort",
+        "python-producer-retirement",
+        "serving-surrender",
+    ]
+    serving.close_clean.assert_not_called()
+    publisher.stop_admission_and_join.assert_not_called()
+
+
+def test_publisher_join_failure_blocks_source_surrender() -> None:
+    """Publisher liveness remains authoritative over source action surrender."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    publisher = MagicMock()
+    publication_control = MagicMock()
+    reactor.inventory.return_value = SimpleNamespace(
+        started=True,
+        admission_open=False,
+    )
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.stop_admission_and_retire_native_producers.side_effect = (
+        lambda: order.append("native-producer-retirement")
+    )
+    serving.retire_python_producers.side_effect = lambda: order.append(
+        "python-producer-retirement"
+    )
+    serving.drain_shutdown_actions.side_effect = lambda timeout: order.append(
+        "source-drain"
+    )
+    serving.close_clean.side_effect = lambda timeout: order.append("serving-close")
+    serving.abort_and_close.side_effect = lambda: order.append("serving-surrender")
+    serving.begin_fail_closed_abort.side_effect = lambda: order.append(
+        "serving-abort-entry"
+    )
+    publisher.stop_admission_and_join.side_effect = lambda: (
+        order.append("publisher-close") or False
+    )
+    publication_control.close_clean.side_effect = lambda: order.append(
+        "publication-control-close"
+    )
+    manager.stop_terminal_control_receiver = lambda timeout: order.append(
+        "receiver-close"
+    )
+    manager._terminal_process_reactor = reactor
+    manager._terminal_source_serving = serving
+    manager._terminal_output_publisher = publisher
+    manager._terminal_source_publication_control = publication_control
+
+    with pytest.raises(RuntimeError, match="terminal runtime teardown failed"):
+        manager.close_terminal_runtime(process_fatal=False)
+
+    assert order == [
+        "reactor-admission",
+        "receiver-close",
+        "native-producer-retirement",
+        "reactor-close",
+        "source-drain",
+        "publisher-close",
+        "serving-abort-entry",
+    ]
+    assert manager._terminal_process_fatal_reason == (
+        "terminal gateway publisher close failed"
+    )
+    serving.retire_python_producers.assert_not_called()
+    serving.close_clean.assert_not_called()
+    serving.abort_and_close.assert_not_called()
+    publication_control.close_clean.assert_not_called()
+
+
+def test_control_receiver_join_failure_blocks_python_producer_retirement() -> None:
+    """A live control ingress cannot outlive its native producer authority."""
+
+    manager = _manager(_binding("prefill-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    publisher = MagicMock()
+    reactor.inventory.return_value = SimpleNamespace(
+        started=True,
+        admission_open=False,
+    )
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.stop_admission_and_retire_native_producers.side_effect = (
+        lambda: order.append("native-producer-retirement")
+    )
+    serving.retire_python_producers.side_effect = lambda: order.append(
+        "python-producer-retirement"
+    )
+    serving.begin_fail_closed_abort.side_effect = lambda: order.append(
+        "serving-abort-entry"
+    )
+    publisher.abort_and_join.side_effect = lambda reason: (
+        order.append("publisher-close") or True
+    )
+
+    def fail_receiver_close(timeout_seconds: float) -> None:
+        """Model a receiver whose join bound expires while it remains live.
+
+        :param timeout_seconds: Frozen owner-shutdown bound.
+        """
+
+        del timeout_seconds
+        order.append("receiver-close")
+        raise TimeoutError("terminal control receiver stop timed out")
+
+    manager.stop_terminal_control_receiver = fail_receiver_close
+    manager._terminal_process_reactor = reactor
+    manager._terminal_source_serving = serving
+    manager._terminal_output_publisher = publisher
+
+    with pytest.raises(RuntimeError, match="terminal runtime teardown failed"):
+        manager.close_terminal_runtime(process_fatal=False)
+
+    assert order == [
+        "reactor-admission",
+        "receiver-close",
+        "serving-abort-entry",
+        "reactor-close",
+        "publisher-close",
+    ]
+    serving.stop_admission_and_retire_native_producers.assert_not_called()
+    serving.retire_python_producers.assert_not_called()
+    serving.close_clean.assert_not_called()
+    serving.abort_and_close.assert_not_called()
+
+
+def test_process_fatal_decode_teardown_defers_native_retirement_to_abort() -> None:
+    """Fatal decode teardown retires native authority only after ingress joins."""
+
+    manager = _manager(_binding("decode-a", 0), {})
+    order: list[str] = []
+    reactor = MagicMock()
+    serving = MagicMock()
+    reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.close.side_effect = lambda timeout: order.append("reactor-close")
+    serving.begin_fail_closed_abort.side_effect = lambda: order.append(
+        "decode-abort-entry"
+    )
+    serving.abort_and_close.side_effect = lambda: order.append(
+        "decode-native-retirement-and-close"
+    )
+    manager.stop_terminal_control_receiver = lambda timeout: order.append(
+        "receiver-close"
+    )
+    manager._require_terminal_decode_dflash_teardown = (
+        lambda *, process_fatal: order.append("decode-dflash-teardown")
+    )
+    manager._terminal_process_reactor = reactor
+    manager._terminal_decode_serving = serving
+
+    manager.close_terminal_runtime(process_fatal=True)
+
+    assert order == [
+        "decode-abort-entry",
+        "reactor-admission",
+        "receiver-close",
+        "reactor-close",
+        "decode-native-retirement-and-close",
+        "decode-dflash-teardown",
+    ]
+    serving.stop_admission_and_retire_producers.assert_not_called()
+    serving.close_clean.assert_not_called()
 
 
 def test_terminal_control_receiver_stops_without_component_failure() -> None:
@@ -1020,9 +1310,7 @@ def test_source_packed_ready_authenticates_transport_before_owner_join() -> None
     serving.packed_ready.side_effect = lambda digest: order.append("owner_join")
     manager._packed_prefill_runtime = actor
     manager._terminal_source_serving = serving
-    manager._authenticated_terminal_control_rank = MagicMock(
-        return_value=decoder_rank
-    )
+    manager._authenticated_terminal_control_rank = MagicMock(return_value=decoder_rank)
     manager._require_terminal_startup_peer_enrollment = MagicMock(
         return_value=SimpleNamespace(
             decoder_peers={

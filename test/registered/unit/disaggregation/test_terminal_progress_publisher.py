@@ -364,6 +364,7 @@ def _publisher(
     capacity: int = 4,
     payload_encoder: TerminalGatewayPayloadEncoder | None = None,
     result_event: threading.Event | None = None,
+    fatal_event: threading.Event | None = None,
     fail_result_listener: bool = False,
 ) -> PackedTerminalOutputPublisher:
     """Construct one publisher with captured callbacks.
@@ -377,6 +378,7 @@ def _publisher(
     :param capacity: Maximum pending publication count.
     :param payload_encoder: Optional observable publisher-thread encoder.
     :param result_event: Optional result-delivery notification.
+    :param fatal_event: Optional process-fatal transition notification.
     :param fail_result_listener: Whether result delivery raises after notification.
     :returns: Unstarted publisher.
     """
@@ -393,6 +395,17 @@ def _publisher(
         if fail_result_listener:
             raise RuntimeError("synthetic publisher result listener failure")
 
+    def record_fatal(reason: str, formatted_traceback: str | None) -> None:
+        """Record one publisher-fatal transition and wake an optional waiter.
+
+        :param reason: Stable publisher failure reason.
+        :param formatted_traceback: Complete originating traceback, when present.
+        """
+
+        fatals.append((reason, formatted_traceback))
+        if fatal_event is not None:
+            fatal_event.set()
+
     return PackedTerminalOutputPublisher(
         capacity=capacity,
         sink_factory=factory,
@@ -402,7 +415,7 @@ def _publisher(
         wire_issuer=TerminalWireReceiptIssuer(bindings[0].owner),
         request_ready_authorities=frozenset((request_ready_issuer.authority,)),
         result_listener=record_result,
-        fatal_listener=lambda reason, formatted: fatals.append((reason, formatted)),
+        fatal_listener=record_fatal,
         clock_ns=clock.now_ns,
     )
 
@@ -709,6 +722,72 @@ def test_factory_death_fails_startup_before_publication_admission() -> None:
     assert len(fatals) == 1
     assert fatals[0][1] is not None
     assert "synthetic gateway factory failure" in fatals[0][1]
+
+
+def test_fail_closed_join_quarantines_queue_without_draining_publications() -> None:
+    """Fatal join sends no queued work and reports an in-flight send ambiguous."""
+
+    first_bindings = _source_bindings()
+    second_bindings = _source_bindings(
+        room_id=32,
+        request_generation_byte=0x32,
+    )
+    request_ready_issuer = TerminalReceiptIssuer()
+    send_release = threading.Event()
+    fatal_event = threading.Event()
+    factory = _RecordingSinkFactory(send_release=send_release)
+    results: list[TerminalGatewayPublicationResult] = []
+    fatals: list[tuple[str, str | None]] = []
+    publisher = _publisher(
+        factory,
+        first_bindings,
+        request_ready_issuer,
+        results,
+        fatals,
+        _Clock(),
+        fatal_event=fatal_event,
+    )
+    first = _publication(first_bindings, request_ready_issuer)
+    second = _publication(
+        second_bindings,
+        request_ready_issuer,
+        publication_generation_byte=0xC4,
+    )
+
+    publisher.start()
+    assert publisher.submit(first)
+    assert factory.created.wait(timeout=2.0)
+    sink = factory.sink
+    assert sink is not None
+    assert sink.send_entered.wait(timeout=2.0)
+    assert publisher.submit(second)
+
+    def release_send_after_abort() -> None:
+        """Release the ambiguous send only after fatal admission closes."""
+
+        if fatal_event.wait(timeout=2.0):
+            send_release.set()
+
+    release_thread = threading.Thread(
+        target=release_send_after_abort,
+        daemon=False,
+    )
+    release_thread.start()
+    assert publisher.abort_and_join("synthetic process-fatal teardown")
+    release_thread.join(timeout=2.0)
+    assert not release_thread.is_alive()
+
+    assert fatal_event.is_set()
+    assert sink.payloads == [b"frozen-output"]
+    assert len(results) == 1
+    assert type(results[0]) is TerminalGatewayPublicationFailure
+    assert results[0].publication is first
+    snapshot = publisher.snapshot()
+    assert snapshot.disposition is TerminalGatewayPublisherDisposition.PROCESS_FATAL
+    assert snapshot.pending_identities == ()
+    assert snapshot.completed_identities == ()
+    assert snapshot.failed_identities == (first.identity, second.identity)
+    assert fatals == [("synthetic process-fatal teardown", None)]
 
 
 def test_startup_opens_admission_only_after_sink_ownership() -> None:

@@ -77,6 +77,8 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxInventory,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
+    TerminalSchedulerActionPublicationError,
+    TerminalSchedulerFailClosedClosure,
     TerminalSchedulerServing,
     TerminalSchedulerServingInventory,
 )
@@ -319,6 +321,59 @@ class _DecodeCoordinatorRecord:
 
     manifest: TerminalRequestCoordinatorManifest
     coordinator: TerminalRequestCoordinator
+
+
+class _PackedTerminalDecodeSchedulerActionExecution:
+    """Track exact local ownership while one scheduler batch publishes."""
+
+    _actions: tuple[NativeTerminalOwnerAction, ...]
+    _locally_owned_by_id: dict[int, NativeTerminalOwnerAction]
+
+    def __init__(self, actions: tuple[NativeTerminalOwnerAction, ...]) -> None:
+        """Retain every claimed action until a downstream owner accepts it.
+
+        :param actions: Complete scheduler population removed in one drain.
+        """
+
+        if type(actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction for action in actions
+        ):
+            raise TypeError("actions must contain native terminal actions")
+        locally_owned_by_id = {action.action_id: action for action in actions}
+        if len(locally_owned_by_id) != len(actions):
+            raise ValueError(
+                "decode scheduler batch contains duplicate action identities"
+            )
+        self._actions = actions
+        self._locally_owned_by_id = locally_owned_by_id
+
+    def transfer(self, action: NativeTerminalOwnerAction) -> None:
+        """Transfer one exact action after downstream acceptance.
+
+        :param action: Action whose authority left this reactor turn.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be a native terminal action")
+        locally_owned = self._locally_owned_by_id.get(action.action_id)
+        if locally_owned != action:
+            raise RuntimeError(
+                "decode scheduler action is absent, aliased, or already transferred"
+            )
+        del self._locally_owned_by_id[action.action_id]
+
+    @property
+    def locally_owned_actions(self) -> tuple[NativeTerminalOwnerAction, ...]:
+        """Return actions still owned by the failed reactor turn.
+
+        :returns: Immutable local population in original drain order.
+        """
+
+        return tuple(
+            action
+            for action in self._actions
+            if action.action_id in self._locally_owned_by_id
+        )
 
 
 class PackedTerminalDecodeServing:
@@ -791,26 +846,63 @@ class PackedTerminalDecodeServing:
 
         self._require_open()
         actions = self._runtime.scheduler_actions.drain()
-        for action in actions:
-            if self._aborting:
-                self._runtime.acknowledge_aborted_action(action)
-                continue
-            try:
-                self._scheduler_serving.publish_action(action)
-            except Exception as error:
-                reason = (
-                    "decode scheduler action publication failed: "
-                    f"{type(error).__name__}: {error}"
-                )
+        execution = _PackedTerminalDecodeSchedulerActionExecution(actions)
+        failure_reason = "decode scheduler action batch execution failed"
+        try:
+            for action in actions:
+                if self._aborting:
+                    self._runtime.acknowledge_aborted_action(action)
+                    execution.transfer(action)
+                    continue
                 try:
-                    self._runtime.fail_scheduler_action(action, reason)
+                    self._scheduler_serving.publish_action(action)
+                except TerminalSchedulerActionPublicationError as error:
+                    failure_reason = (
+                        "decode scheduler action publication failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    if error.scheduler_retains_action:
+                        execution.transfer(action)
+                    else:
+                        try:
+                            self._runtime.fail_scheduler_action(action, failure_reason)
+                        except Exception:  # noqa: BLE001
+                            logger.error(
+                                "Decode scheduler failure publication also failed:\n%s",
+                                traceback.format_exc(),
+                            )
+                        else:
+                            execution.transfer(action)
+                    raise
+                except Exception as error:
+                    failure_reason = (
+                        "decode scheduler action publication failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    try:
+                        self._runtime.fail_scheduler_action(action, failure_reason)
+                    except Exception:  # noqa: BLE001
+                        logger.error(
+                            "Decode scheduler failure publication also failed:\n%s",
+                            traceback.format_exc(),
+                        )
+                    else:
+                        execution.transfer(action)
+                    raise
+                execution.transfer(action)
+        except Exception:
+            if not self._aborting:
+                self._component_failed(failure_reason)
+            for action in execution.locally_owned_actions:
+                try:
+                    self._runtime.acknowledge_aborted_action_if_pending(action)
                 except Exception:  # noqa: BLE001
-                    logger.error(
-                        "Decode scheduler failure publication also failed:\n%s",
+                    logger.critical(
+                        "Decode scheduler batch reconciliation failed for action %d:\n%s",
+                        action.action_id,
                         traceback.format_exc(),
                     )
-                self._component_failed(reason)
-                raise
+            raise
         self._propagate_runtime_fatal()
         return len(actions)
 
@@ -1101,12 +1193,50 @@ class PackedTerminalDecodeServing:
         if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
             raise RuntimeError("abort retained unrouted decode terminal authority")
         self.drain_runtime_actions()
-        self._scheduler_serving.close_fail_closed()
-        inventory = self.inventory()
+        scheduler_closure = self._scheduler_serving.close_fail_closed()
+        self._surrender_fail_closed_scheduler_actions(scheduler_closure)
+        inventory = dataclasses.replace(
+            self.inventory(),
+            scheduler_serving=scheduler_closure.inventory,
+        )
         self._runtime.finish_abort_close()
         with self._lock:
             self._closed = True
         return inventory
+
+    def _surrender_fail_closed_scheduler_actions(
+        self,
+        scheduler_closure: TerminalSchedulerFailClosedClosure,
+    ) -> None:
+        """Transfer quarantined decode scheduler authority out of the runtime.
+
+        :param scheduler_closure: Take-once scheduler quarantine authority.
+        """
+
+        if type(scheduler_closure) is not TerminalSchedulerFailClosedClosure:
+            raise TypeError(
+                "scheduler_closure must be TerminalSchedulerFailClosedClosure"
+            )
+        scheduler_inventory = self._decode_composition.consumer.inventory()
+        quarantined = frozenset(scheduler_inventory.quarantined_binding_digests)
+        actions = scheduler_closure.retained_actions
+        for action in actions:
+            if action.kind is not NativeTerminalOwnerActionKind.ADOPTION_READY:
+                raise RuntimeError("decode scheduler retained another action kind")
+            if action.binding.digest not in quarantined:
+                raise RuntimeError(
+                    "decode scheduler action lacks durable quarantine ownership"
+                )
+        surrender = self._runtime.surrender_decode_fail_closed_actions(actions)
+        if surrender.action_ids != tuple(action.action_id for action in actions):
+            raise RuntimeError("runtime surrender receipt differs from closure order")
+
+    def begin_fail_closed_abort(self) -> None:
+        """Stop functional side effects without closing live ingress owners."""
+
+        self._require_open()
+        self._runtime.begin_abort("decode serving ingress failed to quiesce")
+        self._mark_owner_dead()
 
     def _consume_local_ready_action(
         self,
@@ -1314,7 +1444,7 @@ class PackedTerminalDecodeServing:
         snapshot = self._runtime.snapshot()
         if snapshot.producers_joined:
             return
-        for producer_id in self._runtime.python_producer_ids:
+        for producer_id in self._runtime.unretired_python_producer_ids:
             self._runtime.retire_python_producer(producer_id)
         self._runtime.join_producers()
 

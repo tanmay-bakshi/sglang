@@ -1,4 +1,5 @@
 import concurrent.futures
+import dataclasses
 import selectors
 import sys
 import threading
@@ -37,6 +38,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalActionClaimError,
     NativeTerminalActionInbox,
     NativeTerminalObservationInbox,
     NativeTerminalProducerDelivery,
@@ -474,6 +476,55 @@ def _complete_source(
     :param remote: Decode peer identity.
     """
 
+    scheduler, publisher = _emit_source_ready_actions(
+        runtime,
+        registration,
+        remote,
+        nonce_value=1,
+    )
+    runtime.complete_scheduler_action(
+        _OWNER_RECEIPT_PRODUCER_ID,
+        scheduler,
+        NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+        completion_receipt=_receipt(
+            registration,
+            owner,
+            NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+            2,
+        ),
+    )
+    runtime.complete_work_action(
+        _OWNER_RECEIPT_PRODUCER_ID,
+        publisher,
+        NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+        receipt=_receipt(
+            registration,
+            owner,
+            NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+            3,
+        ),
+    )
+    lifecycle = _drain_actions(runtime.lifecycle_actions)
+    assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
+    runtime.acknowledge_consumed_action(lifecycle[0])
+
+
+def _emit_source_ready_actions(
+    runtime: NativeTerminalRuntime,
+    registration: NativeTerminalLifecycleRegistration,
+    remote: NativeTerminalProcessIdentity,
+    *,
+    nonce_value: int,
+) -> tuple[NativeTerminalOwnerAction, NativeTerminalOwnerAction]:
+    """Advance one source lifecycle to its scheduler and publisher actions.
+
+    :param runtime: Running source runtime.
+    :param registration: Exact source lifecycle.
+    :param remote: Decode peer identity.
+    :param nonce_value: Unique request-ready receipt nonce.
+    :returns: Claimed reclaim and gateway-publication actions.
+    """
+
     binding_digest = registration.binding.digest
     runtime.submit(
         _LOCAL_PRODUCER_ID,
@@ -528,41 +579,19 @@ def _complete_source(
             registration,
             remote,
             NativeTerminalReceiptKind.REQUEST_READY,
-            1,
+            nonce_value,
         ),
         NativeTerminalOwnerEventKind.SOURCE_REQUEST_READY,
     )
-    scheduler = _drain_actions(runtime.scheduler_actions)
-    publisher = _drain_actions(runtime.publisher_actions)
-    assert scheduler[0].kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
-    assert publisher[0].kind is (
-        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
-    )
-    runtime.complete_scheduler_action(
-        _OWNER_RECEIPT_PRODUCER_ID,
-        scheduler[0],
-        NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
-        completion_receipt=_receipt(
-            registration,
-            owner,
-            NativeTerminalReceiptKind.RECLAIM_CONSUMED,
-            2,
-        ),
-    )
-    runtime.complete_work_action(
-        _OWNER_RECEIPT_PRODUCER_ID,
-        publisher[0],
-        NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
-        receipt=_receipt(
-            registration,
-            owner,
-            NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
-            3,
-        ),
-    )
-    lifecycle = _drain_actions(runtime.lifecycle_actions)
-    assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
-    runtime.acknowledge_consumed_action(lifecycle[0])
+    scheduler_actions = _drain_actions(runtime.scheduler_actions)
+    publisher_actions = _drain_actions(runtime.publisher_actions)
+    assert len(scheduler_actions) == 1
+    assert len(publisher_actions) == 1
+    scheduler = scheduler_actions[0]
+    publisher = publisher_actions[0]
+    assert scheduler.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
+    assert publisher.kind is (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY)
+    return scheduler, publisher
 
 
 def test_pending_call_returns_at_inbox_claim_before_downstream_lock() -> None:
@@ -918,6 +947,59 @@ def test_post_claim_abort_preserves_downstream_authority_without_replay() -> Non
         _finish_handoff_runtime(runtime)
 
 
+def test_failed_claim_excludes_preclaimed_duplicate_from_local_authority() -> None:
+    """A stale replay cannot transfer another downstream owner's authority."""
+
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registrations = (
+        _registration(owner, remote, 70),
+        _registration(owner, remote, 71),
+    )
+    runtime.start()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while runtime.source_gather_actions.snapshot().queued_count != 2:
+            if time.monotonic() >= expires_at:
+                raise TimeoutError("source gather population did not settle")
+            time.sleep(0.001)
+
+        already_claimed = runtime.source_gather_actions.drain(maximum_items=1)[0]
+        runtime.source_gather_actions._enqueue(already_claimed)
+
+        with pytest.raises(NativeTerminalActionClaimError) as raised:
+            runtime.source_gather_actions.drain()
+
+        error = raised.value
+        assert len(error.removed_actions) == 2
+        assert error.removed_actions[-1] == already_claimed
+        assert error.locally_claimed_actions == (error.removed_actions[0],)
+        assert already_claimed not in error.locally_claimed_actions
+        snapshot = runtime.snapshot()
+        assert snapshot.consumer_pending_count == 2
+        with runtime._condition:
+            assert runtime._inbox_claimed_action_ids == {
+                action.action_id for action in error.removed_actions
+            }
+
+        runtime.acknowledge_consumed_action(already_claimed)
+        runtime.acknowledge_consumed_action(error.locally_claimed_actions[0])
+    finally:
+        _finish_fail_closed(runtime)
+
+
 def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
     """An unconsumed watermark expires into native process-fatal authority."""
 
@@ -1056,6 +1138,60 @@ def test_runtime_routes_source_continuations_and_drains_after_admission_close() 
         assert closed.observations.closed
         assert closed.observations.queued_count == 0
         assert closed.dropped_observation_count > 0
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_python_producer_retirement_resumes_after_mid_roster_failure() -> None:
+    """Completed retirements remain exact while the remaining roster resumes."""
+
+    runtime, _, _ = _runtime(TerminalOwnerRole.SOURCE)
+    runtime.start()
+    try:
+        runtime.stop_admission()
+        producer_ids = runtime.python_producer_ids
+        assert runtime.unretired_python_producer_ids == producer_ids
+        failed_producer_id = producer_ids[1]
+        original_retire = runtime._owner.retire_python_producer
+        attempted_ids: list[int] = []
+
+        def retire_until_failure(producer_id: int) -> None:
+            """Retire the first producer, then expose one synthetic boundary failure.
+
+            :param producer_id: Exact producer selected by the runtime roster.
+            """
+
+            attempted_ids.append(producer_id)
+            if producer_id == failed_producer_id:
+                raise RuntimeError("synthetic producer retirement failure")
+            original_retire(producer_id)
+
+        with mock.patch.object(
+            runtime._owner,
+            "retire_python_producer",
+            side_effect=retire_until_failure,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="synthetic producer retirement failure",
+            ):
+                for producer_id in runtime.unretired_python_producer_ids:
+                    runtime.retire_python_producer(producer_id)
+
+        assert attempted_ids == [producer_ids[0], failed_producer_id]
+        assert runtime.unretired_python_producer_ids == producer_ids[1:]
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="producer was already retired",
+        ):
+            runtime.retire_python_producer(producer_ids[0])
+
+        for producer_id in runtime.unretired_python_producer_ids:
+            runtime.retire_python_producer(producer_id)
+        assert runtime.unretired_python_producer_ids == ()
+        runtime._owner.retire_python_producer(_NATIVE_PRODUCER_ID)
+        runtime.join_producers()
+        runtime.close_clean()
     finally:
         _finish_fail_closed(runtime)
 
@@ -1510,6 +1646,99 @@ def test_abort_preserves_every_registration_and_quarantine_identity() -> None:
         assert closed.observations.closed
         assert closed.observations.queued_count == 0
         assert closed.dropped_observation_count > 0
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_fail_closed_surrender_is_atomic_and_cannot_replay() -> None:
+    """A closure mismatch removes no authority and a valid closure is take-once."""
+
+    runtime, owner, remote = _runtime(TerminalOwnerRole.SOURCE)
+    registration = _registration(owner, remote, 921)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=921,
+        )
+        runtime.begin_abort("synthetic downstream closure")
+        expected_pending = {
+            scheduler.action_id: scheduler,
+            publisher.action_id: publisher,
+        }
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="fail-closed surrender requires joined producers",
+        ):
+            runtime.surrender_fail_closed_actions((scheduler, publisher))
+        with runtime._condition:
+            assert runtime._consumer_pending == expected_pending
+            assert runtime._inbox_claimed_action_ids == set(expected_pending)
+            assert runtime._scheduler_pending == {
+                registration.binding.digest: scheduler
+            }
+
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        lifecycle_actions = _drain_actions(runtime.lifecycle_actions)
+        assert all(
+            action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+            for action in lifecycle_actions
+        )
+        for action in lifecycle_actions:
+            runtime.acknowledge_aborted_action(action)
+        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="closure differs from pending consumer authority",
+        ):
+            runtime.surrender_fail_closed_actions((scheduler,))
+        with runtime._condition:
+            assert runtime._consumer_pending == expected_pending
+            assert runtime._inbox_claimed_action_ids == set(expected_pending)
+            assert runtime._scheduler_pending == {
+                registration.binding.digest: scheduler
+            }
+
+        stale_publisher = dataclasses.replace(
+            publisher,
+            commit_timestamp_ns=publisher.commit_timestamp_ns + 1,
+        )
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="aliases pending consumer authority",
+        ):
+            runtime.surrender_fail_closed_actions((scheduler, stale_publisher))
+        with runtime._condition:
+            assert runtime._consumer_pending == expected_pending
+            assert runtime._inbox_claimed_action_ids == set(expected_pending)
+            assert runtime._scheduler_pending == {
+                registration.binding.digest: scheduler
+            }
+
+        surrender = runtime.surrender_fail_closed_actions((scheduler, publisher))
+        assert surrender.action_ids == (scheduler.action_id, publisher.action_id)
+        assert surrender.binding_digests == (
+            registration.binding.digest,
+            registration.binding.digest,
+        )
+        assert runtime.snapshot().consumer_pending_count == 0
+        assert runtime.snapshot().scheduler_pending_count == 0
+        assert runtime.snapshot().scheduler_live_count == 0
+
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="closure differs from pending consumer authority",
+        ):
+            runtime.surrender_fail_closed_actions((scheduler, publisher))
+        assert runtime.snapshot().consumer_pending_count == 0
+
+        _drain_observations(runtime)
+        runtime.finish_abort_close()
     finally:
         _finish_fail_closed(runtime)
 

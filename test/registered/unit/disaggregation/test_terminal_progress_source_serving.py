@@ -1,3 +1,4 @@
+import concurrent.futures
 import dataclasses
 import hashlib
 import logging
@@ -52,6 +53,12 @@ from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalRuntime,
     NativeTerminalRuntimeProducerSpec,
 )
+from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
+    SchedulerReceiptPublishResult,
+)
+from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
+    TerminalSchedulerActionPublicationError,
+)
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
@@ -63,9 +70,12 @@ from sglang.srt.disaggregation.terminal_progress.source_serving import (
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceMetric,
+    PackedTerminalSourcePublicationRetentionError,
+    PackedTerminalSourceQuarantineRetentionError,
     PackedTerminalSourceSubmission,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
+    IssuedTerminalWireReceipt,
     TerminalWireReceiptIssuer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -443,6 +453,7 @@ def _serving(
         Callable[[PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None]
         | None
     ) = None,
+    quarantine: Callable[[NativeTerminalOwnerAction], None] | None = None,
     bind_gather_cuda_device: Callable[[], None] | None = None,
 ) -> tuple[
     PackedTerminalSourceServing,
@@ -456,6 +467,7 @@ def _serving(
 
     :param identity: Exact source identity graph.
     :param post_gather: Optional dedicated-worker gather callback.
+    :param quarantine: Optional fail-closed resource-retention callback.
     :param bind_gather_cuda_device: Optional worker-thread device binder.
     :returns: Serving, runtime, publisher, metrics, work labels, and fatal inventories.
     """
@@ -483,6 +495,16 @@ def _serving(
 
         def bind_gather_cuda_device() -> None:
             """Provide a GPU-free worker affinity boundary for CPU tests."""
+
+    if quarantine is None:
+
+        def quarantine(action: NativeTerminalOwnerAction) -> None:
+            """Record one fixture quarantine action.
+
+            :param action: Exact native fail-closed authority.
+            """
+
+            work_labels.append("quarantine")
 
     def resource_inventory() -> PackedTerminalSourceResourceInventory:
         """Return exact-zero external ownership for the isolated fixture.
@@ -531,7 +553,7 @@ def _serving(
             post_gather=post_gather,
             send_outcomes=lambda submission, action: work_labels.append("outcome"),
             send_ack=lambda submission, action: work_labels.append("ack"),
-            quarantine=lambda action: work_labels.append("quarantine"),
+            quarantine=quarantine,
             observe_output=lambda output: None,
         ),
         bind_gather_cuda_device=bind_gather_cuda_device,
@@ -571,7 +593,7 @@ def _action(
     action_id: int,
     kind: NativeTerminalOwnerActionKind,
 ) -> NativeTerminalOwnerAction:
-    """Build one receipt-free native source work action.
+    """Build one receipt-free native source action.
 
     :param identity: Exact source identity graph.
     :param action_id: Unique action identifier.
@@ -585,6 +607,56 @@ def _action(
         binding=NativeTerminalRequestBinding.from_binding(identity.local_binding),
         commit_timestamp_ns=1_000 + action_id,
         receipt=None,
+    )
+
+
+def _advance_source_to_request_ready_join(
+    serving: PackedTerminalSourceServing,
+    runtime: NativeTerminalRuntime,
+    identity: PackedTerminalSourceIdentityPlan,
+) -> None:
+    """Advance one source lifecycle through its teardown ACK.
+
+    :param serving: Started source composition.
+    :param runtime: Exact native runtime owned by the composition.
+    :param identity: Rank-local request identity.
+    """
+
+    submission = _submission(identity)
+    serving.bind_submission(submission, lambda submission: None)
+    serving.attach_producer_completion(submission)
+    digest = identity.local_binding.digest
+    assert serving.packed_ready(digest)
+    assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+    assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+    _pump(serving, runtime)
+    runtime._owner.submit(
+        NativeTerminalOwnerEvent(
+            producer_id=_NATIVE_PRODUCER_ID,
+            binding_digest=digest,
+            kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+            enqueued_ns=2_000,
+        )
+    )
+    _pump(serving, runtime)
+    serving.wiring.teardown_received(digest, identity.request_ready_issuer)
+    _pump(serving, runtime)
+
+
+def _request_ready_receipt(
+    identity: PackedTerminalSourceIdentityPlan,
+) -> IssuedTerminalWireReceipt:
+    """Issue one authenticated request-global readiness receipt.
+
+    :param identity: Rank-local request identity.
+    :returns: Issuer-owned paired wire and local receipt authority.
+    """
+
+    return TerminalWireReceiptIssuer(identity.request_ready_issuer).issue(
+        binding=identity.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=3_000,
     )
 
 
@@ -728,6 +800,643 @@ def test_source_work_drain_prioritizes_ack_and_preserves_kind_fifo(
 
         assert serving._drain_source_work_actions() == 4
         assert consumed == [102, 104, 101, 103]
+    finally:
+        serving.abort_and_close()
+
+
+def test_runtime_drain_claims_ready_siblings_before_scheduler_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scheduler lock contention cannot strand its publication sibling."""
+
+    identity = _identity()
+    serving, runtime, publisher, _, _, _ = _serving(identity)
+    scheduler_routed = threading.Event()
+    release_split_projection = threading.Event()
+    publisher_routed = threading.Event()
+    scheduler_delivery_entered = threading.Event()
+    late_projection_started = threading.Event()
+    late_projection_entered = threading.Event()
+    scheduler_state_lock = serving._scheduler_serving._inbox._state_lock
+    scheduler_lock_owned_by_test = False
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        original_route_action = runtime._route_action
+
+        def route_with_split(action: NativeTerminalOwnerAction) -> None:
+            """Pause projection between the native sibling action routes.
+
+            :param action: Exact native action being projected.
+            """
+
+            original_route_action(action)
+            if action.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED:
+                scheduler_routed.set()
+                if not release_split_projection.wait(timeout=_WAIT_SECONDS):
+                    raise TimeoutError("sibling projection release was not delivered")
+            if action.kind is NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY:
+                publisher_routed.set()
+
+        original_publish_action = serving._scheduler_serving.publish_action
+
+        def observe_scheduler_delivery(
+            action: NativeTerminalOwnerAction,
+        ) -> SchedulerReceiptPublishResult:
+            """Expose entry into the scheduler-owned publication lock.
+
+            :param action: Exact reclaim authority being published.
+            :returns: Scheduler publication result.
+            """
+
+            scheduler_delivery_entered.set()
+            return original_publish_action(action)
+
+        def enter_late_projection() -> None:
+            """Model a second native output arriving during scheduler delivery."""
+
+            late_projection_started.set()
+            with runtime.source_action_delivery_fence():
+                late_projection_entered.set()
+
+        monkeypatch.setattr(runtime, "_route_action", route_with_split)
+        monkeypatch.setattr(
+            serving._scheduler_serving,
+            "publish_action",
+            observe_scheduler_delivery,
+        )
+        ready = _request_ready_receipt(identity)
+        scheduler_state_lock.acquire()
+        scheduler_lock_owned_by_test = True
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert scheduler_routed.wait(timeout=_WAIT_SECONDS)
+        assert not publisher_routed.is_set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                drain_future = executor.submit(serving.drain_runtime_actions)
+                assert not scheduler_delivery_entered.wait(timeout=0.05)
+                assert runtime.scheduler_actions.snapshot().queued_count == 1
+
+                release_split_projection.set()
+                assert publisher_routed.wait(timeout=_WAIT_SECONDS)
+                assert scheduler_delivery_entered.wait(timeout=_WAIT_SECONDS)
+                with runtime._condition:
+                    publisher_actions = tuple(
+                        action
+                        for action in runtime._consumer_pending.values()
+                        if action.kind
+                        is NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+                    )
+                    assert len(publisher_actions) == 1
+                    publisher_action = publisher_actions[0]
+                    assert (
+                        publisher_action.action_id in runtime._inbox_claimed_action_ids
+                    )
+                assert not drain_future.done()
+
+                late_projection_future = executor.submit(enter_late_projection)
+                assert late_projection_started.wait(timeout=_WAIT_SECONDS)
+                assert not late_projection_entered.is_set()
+                assert not late_projection_future.done()
+
+                scheduler_state_lock.release()
+                scheduler_lock_owned_by_test = False
+                assert drain_future.result(timeout=_WAIT_SECONDS) >= 2
+                late_projection_future.result(timeout=_WAIT_SECONDS)
+                assert late_projection_entered.is_set()
+            finally:
+                release_split_projection.set()
+                if scheduler_lock_owned_by_test:
+                    scheduler_state_lock.release()
+                    scheduler_lock_owned_by_test = False
+
+        assert len(publisher.values) == 1
+        serving.drain_scheduler_at_loop_entry()
+        publication = publisher.values[0]
+        gateway_issuer = TerminalWireReceiptIssuer(identity.publisher_issuer)
+        completed_ns = 4_000
+        serving.publisher_result(
+            TerminalGatewayPublicationSuccess(
+                publication=publication,
+                completed_ns=completed_ns,
+                source_receipts=tuple(
+                    gateway_issuer.issue(
+                        binding=binding,
+                        kind=TerminalReceiptKind.GATEWAY_PUBLISHED,
+                        outcome=TerminalReceiptOutcome.SUCCESS,
+                        terminal_timestamp_ns=completed_ns,
+                    )
+                    for binding in identity.source_bindings
+                ),
+            )
+        )
+        _pump(serving, runtime)
+        assert serving.inventory().retained_resource_count == 0
+        serving.stop_admission_and_retire_producers()
+        serving.close_clean(_WAIT_SECONDS)
+    finally:
+        release_split_projection.set()
+        if scheduler_lock_owned_by_test:
+            scheduler_state_lock.release()
+        if runtime.disposition.value != "stopped":
+            serving.abort_and_close()
+
+
+def test_claimed_runtime_batch_failure_reconciles_every_local_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed first consumer cannot orphan later claimed batch members."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        with runtime._condition:
+            sibling_action_ids = frozenset(
+                action.action_id
+                for action in runtime._consumer_pending.values()
+                if action.kind
+                in (
+                    NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+                    NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+                )
+            )
+        assert len(sibling_action_ids) == 2
+
+        def fail_scheduler_delivery(
+            actions: tuple[NativeTerminalOwnerAction, ...],
+            execution: object,
+        ) -> None:
+            """Fail only the non-empty authoritative scheduler population.
+
+            :param actions: Already-claimed scheduler action population.
+            :param execution: Exact process-reactor ownership ledger.
+            """
+
+            if len(actions) > 0:
+                raise RuntimeError("synthetic claimed-batch delivery failure")
+
+        monkeypatch.setattr(
+            serving,
+            "_consume_scheduler_actions",
+            fail_scheduler_delivery,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="synthetic claimed-batch delivery failure",
+        ):
+            serving.drain_runtime_actions()
+
+        with runtime._condition:
+            assert sibling_action_ids.isdisjoint(runtime._consumer_pending)
+            assert sibling_action_ids.isdisjoint(runtime._inbox_claimed_action_ids)
+        runtime.snapshot()
+    finally:
+        serving.abort_and_close()
+
+
+def test_later_failure_preserves_scheduler_accepted_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later work cannot reconcile authority retained by the scheduler."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        with runtime._condition:
+            siblings = {
+                action.kind: action
+                for action in runtime._consumer_pending.values()
+                if action.kind
+                in (
+                    NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+                    NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+                )
+            }
+        assert len(siblings) == 2
+
+        def fail_later_source_work(
+            actions: tuple[NativeTerminalOwnerAction, ...],
+            execution: object,
+        ) -> None:
+            """Fail after scheduler delivery, before publisher delivery.
+
+            :param actions: Already-claimed source-work population.
+            :param execution: Exact process-reactor ownership ledger.
+            """
+
+            raise RuntimeError("synthetic post-scheduler execution failure")
+
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(
+                serving,
+                "_consume_source_work_actions",
+                fail_later_source_work,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="synthetic post-scheduler execution failure",
+            ):
+                serving.drain_runtime_actions()
+
+        scheduler_action = siblings[NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED]
+        publisher_action = siblings[
+            NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+        ]
+        with runtime._condition:
+            assert scheduler_action.action_id in runtime._consumer_pending
+            assert publisher_action.action_id not in runtime._consumer_pending
+            assert publisher_action.action_id not in runtime._inbox_claimed_action_ids
+        assert scheduler_action.action_id in (
+            serving._scheduler_serving.inventory().retained_action_ids
+        )
+        runtime.snapshot()
+    finally:
+        serving.abort_and_close()
+
+
+def test_scheduler_wake_failure_preserves_retained_action_through_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-insertion wake failure cannot surrender scheduler authority."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    closed = False
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        scheduler_write_fd = serving._scheduler_serving._inbox._write_fd
+        real_write = os.write
+
+        def fail_scheduler_wake(file_descriptor: int, payload: bytes) -> int:
+            """Fail only the scheduler publication wake after insertion.
+
+            :param file_descriptor: Target descriptor.
+            :param payload: Exact wake payload.
+            :returns: Bytes written for every unrelated descriptor.
+            """
+
+            if file_descriptor == scheduler_write_fd:
+                raise BrokenPipeError("synthetic scheduler wake failure")
+            return real_write(file_descriptor, payload)
+
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(os, "write", fail_scheduler_wake)
+            with pytest.raises(TerminalSchedulerActionPublicationError) as raised:
+                serving.drain_runtime_actions()
+
+        action = raised.value.action
+        assert raised.value.scheduler_retains_action
+        with runtime._condition:
+            assert runtime._consumer_pending == {action.action_id: action}
+            assert runtime._inbox_claimed_action_ids == {action.action_id}
+        assert serving._scheduler_serving.inventory().retained_action_ids == (
+            action.action_id,
+        )
+
+        closed_inventory = serving.abort_and_close()
+        closed = True
+        assert closed_inventory.scheduler_serving.retained_action_ids == (
+            action.action_id,
+        )
+        assert runtime.disposition.value == "stopped"
+    finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_lifecycle_failure_preserves_publisher_accepted_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifecycle failure cannot reconcile publisher-retained authority."""
+
+    identity = _identity()
+    serving, runtime, publisher, _, _, _ = _serving(identity)
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        with runtime._condition:
+            publisher_actions = tuple(
+                action
+                for action in runtime._consumer_pending.values()
+                if action.kind
+                is NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+            )
+            maximum_action_id = max(runtime._consumer_pending)
+        assert len(publisher_actions) == 1
+        publisher_action = publisher_actions[0]
+        lifecycle_action = _action(
+            identity,
+            action_id=maximum_action_id + 1_000,
+            kind=NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        )
+        runtime._route_action(lifecycle_action)
+
+        def fail_lifecycle(
+            actions: tuple[NativeTerminalOwnerAction, ...],
+            execution: object,
+        ) -> None:
+            """Fail after the publisher accepts its asynchronous authority.
+
+            :param actions: Already-claimed lifecycle population.
+            :param execution: Exact process-reactor ownership ledger.
+            """
+
+            assert actions == (lifecycle_action,)
+            raise RuntimeError("synthetic post-publisher lifecycle failure")
+
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(
+                serving,
+                "_consume_lifecycle_actions",
+                fail_lifecycle,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="synthetic post-publisher lifecycle failure",
+            ):
+                serving.drain_runtime_actions()
+
+        assert len(publisher.values) == 1
+        with runtime._condition:
+            assert publisher_action.action_id in runtime._consumer_pending
+            assert lifecycle_action.action_id not in runtime._consumer_pending
+            assert publisher_action.action_id in runtime._inbox_claimed_action_ids
+            assert lifecycle_action.action_id not in runtime._inbox_claimed_action_ids
+        assert serving.wiring.inventory().pending_publication_action_count == 1
+        runtime.snapshot()
+    finally:
+        serving.abort_and_close()
+
+
+def test_publication_failure_after_retention_survives_abort_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-retention publisher failure transfers exact downstream ownership."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    closed = False
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+
+        def fail_retained_publication(*args: object) -> None:
+            """Fail after wiring stores the exact publication action.
+
+            :param args: Retained publication inputs.
+            """
+
+            del args
+            raise RuntimeError("synthetic post-retention publication failure")
+
+        monkeypatch.setattr(
+            serving.wiring,
+            "_consume_retained_gateway_publication",
+            fail_retained_publication,
+        )
+        with pytest.raises(PackedTerminalSourcePublicationRetentionError) as raised:
+            serving.drain_runtime_actions()
+
+        action = raised.value.action
+        with runtime._condition:
+            assert runtime._consumer_pending.get(action.action_id) == action
+            assert action.action_id in runtime._inbox_claimed_action_ids
+        assert serving.wiring.inventory().pending_publication_action_ids == (
+            action.action_id,
+        )
+
+        closed_inventory = serving.abort_and_close()
+        closed = True
+        assert closed_inventory.wiring.pending_publication_action_ids == (
+            action.action_id,
+        )
+        assert runtime.disposition.value == "stopped"
+    finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_later_inbox_claim_failure_reconciles_earlier_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later inbox failure cannot hide an earlier removed population."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        with runtime._condition:
+            siblings = {
+                action.kind: action
+                for action in runtime._consumer_pending.values()
+                if action.kind
+                in (
+                    NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+                    NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+                )
+            }
+        assert len(siblings) == 2
+        original_publisher_drain = runtime.publisher_actions.drain
+        publisher_drain_count = 0
+
+        def fail_first_publisher_drain(
+            maximum_items: int | None = None,
+        ) -> tuple[NativeTerminalOwnerAction, ...]:
+            """Fail before removing the later publisher population once.
+
+            :param maximum_items: Optional inbox drain bound.
+            :returns: Publisher actions after the one injected failure.
+            """
+
+            nonlocal publisher_drain_count
+            publisher_drain_count += 1
+            if publisher_drain_count == 1:
+                raise OSError("synthetic later-inbox claim failure")
+            return original_publisher_drain(maximum_items)
+
+        monkeypatch.setattr(
+            runtime.publisher_actions,
+            "drain",
+            fail_first_publisher_drain,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="source runtime action batch claim failed",
+        ):
+            serving.drain_runtime_actions()
+
+        scheduler_action = siblings[NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED]
+        publisher_action = siblings[
+            NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+        ]
+        with runtime._condition:
+            assert scheduler_action.action_id not in runtime._consumer_pending
+            assert publisher_action.action_id in runtime._consumer_pending
+        assert runtime.publisher_actions.snapshot().queued_count == 1
+        runtime.snapshot()
+    finally:
+        serving.abort_and_close()
+
+
+def test_mid_claim_failure_retains_and_reconciles_complete_population(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed member claim cannot strand its later dequeued siblings."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    actions = (
+        _action(
+            identity,
+            action_id=501,
+            kind=NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        ),
+        _action(
+            identity,
+            action_id=502,
+            kind=NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        ),
+    )
+    claim_count = 0
+
+    def fail_first_native_claim(action: NativeTerminalOwnerAction) -> None:
+        """Fail one member while allowing the later member to be retained.
+
+        :param action: Exact forward-independent action being claimed.
+        """
+
+        nonlocal claim_count
+        claim_count += 1
+        if claim_count == 1:
+            raise RuntimeError("synthetic mid-population claim failure")
+
+    serving.start()
+    try:
+        for action in actions:
+            runtime._route_action(action)
+        monkeypatch.setattr(
+            runtime,
+            "_claim_forward_independent_handoff",
+            fail_first_native_claim,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="source runtime action batch claim failed",
+        ):
+            serving.drain_runtime_actions()
+
+        assert claim_count == 2
+        action_ids = frozenset(action.action_id for action in actions)
+        with runtime._condition:
+            assert action_ids.isdisjoint(runtime._consumer_pending)
+            assert action_ids.isdisjoint(runtime._inbox_claimed_action_ids)
+        runtime.snapshot()
+    finally:
+        serving.abort_and_close()
+
+
+def test_replayed_publisher_action_keeps_original_downstream_owner() -> None:
+    """A stale queue entry cannot surrender an already accepted publication."""
+
+    identity = _identity()
+    serving, runtime, publisher, _, _, _ = _serving(identity)
+    serving.start()
+    try:
+        _advance_source_to_request_ready_join(serving, runtime, identity)
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        serving.drain_runtime_actions()
+        assert len(publisher.values) == 1
+        with runtime._condition:
+            publisher_actions = tuple(
+                action
+                for action in runtime._consumer_pending.values()
+                if action.kind
+                is NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+            )
+        assert len(publisher_actions) == 1
+        action = publisher_actions[0]
+        assert action.action_id in runtime._inbox_claimed_action_ids
+
+        runtime.publisher_actions._enqueue(action)
+        with pytest.raises(
+            RuntimeError,
+            match="source runtime action batch claim failed",
+        ):
+            serving.drain_runtime_actions()
+
+        with runtime._condition:
+            assert runtime._consumer_pending.get(action.action_id) == action
+            assert action.action_id in runtime._inbox_claimed_action_ids
+        assert serving.wiring.inventory().pending_publication_action_ids == (
+            action.action_id,
+        )
     finally:
         serving.abort_and_close()
 
@@ -1004,5 +1713,103 @@ def test_runtime_fatal_marks_scheduler_and_quarantines_retained_release() -> Non
         assert inventory.scheduler_consumer.quarantined_binding_digests == (
             identity.local_binding.digest,
         )
+        assert inventory.wiring.quarantined_binding_digests == (
+            identity.local_binding.digest,
+        )
     finally:
         serving.abort_and_close()
+
+
+def test_quarantine_callback_failure_retains_exact_action_until_abort_closure() -> None:
+    """Post-claim quarantine failure cannot discard lifecycle authority."""
+
+    identity = _identity()
+
+    def fail_quarantine(action: NativeTerminalOwnerAction) -> None:
+        """Fail after the source wiring has claimed exact authority.
+
+        :param action: Exact native fail-closed authority.
+        """
+
+        raise RuntimeError(f"synthetic quarantine failure for {action.action_id}")
+
+    serving, runtime, _, _, _, _ = _serving(
+        identity,
+        quarantine=fail_quarantine,
+    )
+    serving.start()
+    closed = False
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda submission: None)
+        serving.attach_producer_completion(submission)
+        runtime.begin_abort()
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+
+        with pytest.raises(PackedTerminalSourceQuarantineRetentionError) as raised:
+            serving.drain_runtime_actions()
+
+        action = raised.value.action
+        with runtime._condition:
+            assert runtime._consumer_pending.get(action.action_id) == action
+            assert action.action_id in runtime._inbox_claimed_action_ids
+        inventory = serving.wiring.inventory()
+        assert inventory.quarantined_binding_digests == (identity.local_binding.digest,)
+        assert inventory.retained_quarantine_action_ids == (action.action_id,)
+
+        closed_inventory = serving.abort_and_close()
+        closed = True
+        assert closed_inventory.wiring.retained_quarantine_action_ids == (
+            action.action_id,
+        )
+        assert runtime.disposition.value == "stopped"
+    finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_source_python_producer_retirement_resumes_after_mid_roster_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source teardown skips already-retired producers when a later retry resumes."""
+
+    identity = _identity()
+    serving, runtime, _, _, _, _ = _serving(identity)
+    serving.start()
+    closed = False
+    try:
+        serving.stop_admission_and_retire_native_producers()
+        producer_ids = runtime.python_producer_ids
+        failed_producer_id = producer_ids[1]
+        original_retire = runtime.retire_python_producer
+
+        def fail_second_producer(producer_id: int) -> None:
+            """Retire the first namespace and fail at the next boundary.
+
+            :param producer_id: Exact Python producer namespace.
+            """
+
+            if producer_id == failed_producer_id:
+                raise RuntimeError("synthetic mid-roster retirement failure")
+            original_retire(producer_id)
+
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(
+                runtime,
+                "retire_python_producer",
+                fail_second_producer,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="synthetic mid-roster retirement failure",
+            ):
+                serving.retire_python_producers()
+
+        assert runtime.unretired_python_producer_ids == producer_ids[1:]
+        serving.retire_python_producers()
+        assert runtime.unretired_python_producer_ids == ()
+        serving.close_clean(_WAIT_SECONDS)
+        closed = True
+    finally:
+        if not closed:
+            serving.abort_and_close()

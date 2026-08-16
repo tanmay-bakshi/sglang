@@ -46,6 +46,13 @@ class TerminalSchedulerServingRole(enum.StrEnum):
     DECODE = "decode"
 
 
+class TerminalSchedulerActionPublicationDisposition(enum.StrEnum):
+    """Exact native-action owner after a failed scheduler publication."""
+
+    CALLER_RETAINS = "caller_retains"
+    SCHEDULER_RETAINS = "scheduler_retains"
+
+
 @runtime_checkable
 class TerminalSourceSchedulerConsumer(Protocol):
     """Scheduler-affine source resource and lifecycle boundary.
@@ -158,6 +165,94 @@ class TerminalSchedulerServingInventory:
             raise TypeError("fatal_delivered must be bool")
 
 
+class TerminalSchedulerActionPublicationError(SchedulerReceiptInboxFatalError):
+    """Typed failed publication with an unambiguous action disposition."""
+
+    action: NativeTerminalOwnerAction
+    disposition: TerminalSchedulerActionPublicationDisposition
+    serving_inventory: TerminalSchedulerServingInventory
+
+    def __init__(
+        self,
+        *,
+        action: NativeTerminalOwnerAction,
+        disposition: TerminalSchedulerActionPublicationDisposition,
+        inventory: TerminalSchedulerServingInventory,
+    ) -> None:
+        """Create one exact failed-publication disposition.
+
+        :param action: Native action whose publication failed.
+        :param disposition: Component retaining the exact action after failure.
+        :param inventory: Complete serving inventory after reconciliation.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(disposition) is not TerminalSchedulerActionPublicationDisposition:
+            raise TypeError(
+                "disposition must be TerminalSchedulerActionPublicationDisposition"
+            )
+        if type(inventory) is not TerminalSchedulerServingInventory:
+            raise TypeError("inventory must be TerminalSchedulerServingInventory")
+        cause = inventory.inbox.fatal_cause
+        if cause is None:
+            raise ValueError("failed scheduler publication must be process-fatal")
+        scheduler_retains = action.action_id in inventory.retained_action_ids
+        if scheduler_retains != (
+            disposition
+            is TerminalSchedulerActionPublicationDisposition.SCHEDULER_RETAINS
+        ):
+            raise ValueError("publication disposition differs from retained inventory")
+        super().__init__(cause, inventory.inbox)
+        self.action = action
+        self.disposition = disposition
+        self.serving_inventory = inventory
+        self.args = (
+            "terminal scheduler action publication failed: "
+            f"{disposition.value} (cause={cause.value})",
+        )
+
+    @property
+    def scheduler_retains_action(self) -> bool:
+        """Return whether scheduler ownership linearized before failure.
+
+        :returns: Whether the scheduler retains the exact native action.
+        """
+
+        return (
+            self.disposition
+            is TerminalSchedulerActionPublicationDisposition.SCHEDULER_RETAINS
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TerminalSchedulerFailClosedClosure:
+    """Take-once scheduler authority retained by fail-closed teardown.
+
+    :ivar inventory: Final closed scheduler serving inventory.
+    :ivar retained_actions: Exact actions transferred out of the adapter.
+    """
+
+    inventory: TerminalSchedulerServingInventory
+    retained_actions: tuple[NativeTerminalOwnerAction, ...]
+
+    def __post_init__(self) -> None:
+        """Validate exact closure action conservation."""
+
+        if type(self.inventory) is not TerminalSchedulerServingInventory:
+            raise TypeError("inventory must be TerminalSchedulerServingInventory")
+        if type(self.retained_actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction
+            for action in self.retained_actions
+        ):
+            raise TypeError("retained_actions must contain native actions")
+        action_ids = tuple(action.action_id for action in self.retained_actions)
+        if action_ids != tuple(sorted(action_ids)):
+            raise ValueError("retained actions must use native identity order")
+        if action_ids != self.inventory.retained_action_ids:
+            raise ValueError("closure actions differ from retained inventory")
+
+
 def _terminal_wire_receipt(receipt: NativeTerminalReceipt) -> TerminalWireReceipt:
     """Project one owner-minted receipt into the qualified inbox wire value.
 
@@ -188,6 +283,7 @@ class TerminalSchedulerServing:
     _actions_by_receipt: dict[bytes, NativeTerminalOwnerAction]
     _receipt_by_request: dict[PackedRequestKey, bytes]
     _fatal_delivered: bool
+    _fail_closed_closure_taken: bool
     _lock: threading.Lock
 
     def __init__(
@@ -233,6 +329,7 @@ class TerminalSchedulerServing:
         self._actions_by_receipt = {}
         self._receipt_by_request = {}
         self._fatal_delivered = False
+        self._fail_closed_closure_taken = False
         self._lock = threading.Lock()
 
     @property
@@ -313,74 +410,69 @@ class TerminalSchedulerServing:
 
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
-        expected_kind = NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
-        if self._role is TerminalSchedulerServingRole.DECODE:
-            expected_kind = NativeTerminalOwnerActionKind.ADOPTION_READY
-        if action.kind is not expected_kind or action.receipt is None:
-            self._enter_process_fatal()
-            raise self._fatal_error()
-        wire_receipt = _terminal_wire_receipt(action.receipt)
-        try:
-            self._require_binding_role(wire_receipt.binding)
-        except ValueError as error:
-            self._enter_process_fatal()
-            raise self._fatal_error() from error
-        encoded = wire_receipt.encode()
+        wire_receipt: TerminalWireReceipt | None = None
+        encoded: bytes | None = None
+        request_key: PackedRequestKey | None = None
         inserted = False
-
-        def retain_action() -> None:
-            """Retain authority after announcement and before receipt visibility."""
-
-            nonlocal inserted
-            with self._lock:
-                request_key = wire_receipt.binding.request_key
-                retained_receipt = self._receipt_by_request.get(request_key)
-                if retained_receipt is not None and retained_receipt != encoded:
-                    raise SchedulerInboxError(
-                        "request generation maps to conflicting native actions"
-                    )
-                existing = self._actions_by_receipt.get(encoded)
-                if existing is not None and existing != action:
-                    raise SchedulerInboxError(
-                        "scheduler receipt maps to conflicting native actions"
-                    )
-                if existing is None:
-                    self._actions_by_receipt[encoded] = action
-                    self._receipt_by_request[request_key] = encoded
-                    inserted = True
-
-        if self._role is TerminalSchedulerServingRole.DECODE:
-            self._timing.capture(
-                binding=wire_receipt.binding,
-                field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
-                sample_key=f"decode-rank-{wire_receipt.binding.owner.tp_rank}",
-            )
         try:
+            expected_kind = NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
+            if self._role is TerminalSchedulerServingRole.DECODE:
+                expected_kind = NativeTerminalOwnerActionKind.ADOPTION_READY
+            if action.kind is not expected_kind or action.receipt is None:
+                raise ValueError("native action does not match scheduler serving role")
+            wire_receipt = _terminal_wire_receipt(action.receipt)
+            self._require_binding_role(wire_receipt.binding)
+            encoded = wire_receipt.encode()
+            request_key = wire_receipt.binding.request_key
+
+            def retain_action() -> None:
+                """Retain authority before making its receipt visible."""
+
+                nonlocal inserted
+                with self._lock:
+                    retained_receipt = self._receipt_by_request.get(request_key)
+                    if retained_receipt is not None and retained_receipt != encoded:
+                        raise SchedulerInboxError(
+                            "request generation maps to conflicting native actions"
+                        )
+                    existing = self._actions_by_receipt.get(encoded)
+                    if existing is not None and existing != action:
+                        raise SchedulerInboxError(
+                            "scheduler receipt maps to conflicting native actions"
+                        )
+                    if existing is None:
+                        self._actions_by_receipt[encoded] = action
+                        self._receipt_by_request[request_key] = encoded
+                        inserted = True
+
+            if self._role is TerminalSchedulerServingRole.DECODE:
+                self._timing.capture(
+                    binding=wire_receipt.binding,
+                    field=TerminalOwnerTimingField.SCHEDULER_INBOX_DELAY,
+                    sample_key=f"decode-rank-{wire_receipt.binding.owner.tp_rank}",
+                )
             return self._inbox.publish_after_retention(
                 wire_receipt,
                 retain_action,
             )
-        except SchedulerReceiptInboxFatalError as error:
-            self._timing.discard_binding(wire_receipt.binding.digest)
-            self._discard_unpublished_action(
-                encoded=encoded,
-                action=action,
-                inserted=inserted,
-                request_key=wire_receipt.binding.request_key,
-                inventory=error.inventory,
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "Terminal scheduler action publication failed:\n%s",
+                traceback.format_exc(),
             )
-            raise
-        except SchedulerInboxError as error:
-            self._timing.discard_binding(wire_receipt.binding.digest)
-            self._discard_unpublished_action(
-                encoded=encoded,
-                action=action,
-                inserted=inserted,
-                request_key=wire_receipt.binding.request_key,
-                inventory=self._inbox.inventory(),
-            )
+            if wire_receipt is not None:
+                self._timing.discard_binding(wire_receipt.binding.digest)
+            inventory = self._inbox.inventory()
+            if encoded is not None and request_key is not None:
+                self._discard_unpublished_action(
+                    encoded=encoded,
+                    action=action,
+                    inserted=inserted,
+                    request_key=request_key,
+                    inventory=inventory,
+                )
             self._enter_process_fatal()
-            raise self._fatal_error() from error
+            raise self._action_publication_error(action) from error
 
     def drain_at_loop_entry(self) -> tuple[NativeTerminalOwnerAction, ...]:
         """Consume every ready authority before scheduler batch selection.
@@ -531,12 +623,16 @@ class TerminalSchedulerServing:
                 raise RuntimeError("scheduler serving retains native actions")
         self._inbox.close()
 
-    def close_fail_closed(self) -> TerminalSchedulerServingInventory:
-        """Close wake descriptors after preserving process-fatal evidence.
+    def close_fail_closed(self) -> TerminalSchedulerFailClosedClosure:
+        """Close and transfer retained scheduler authority exactly once.
 
-        :returns: Final retained fail-closed inventory.
+        :returns: Immutable final inventory and retained action authority.
         """
 
+        with self._lock:
+            if self._fail_closed_closure_taken:
+                raise RuntimeError("scheduler fail-closed closure was already taken")
+            self._fail_closed_closure_taken = True
         inventory = self._inbox.inventory()
         if inventory.fatal_cause is None:
             inventory = self._inbox.mark_owner_dead()
@@ -544,7 +640,27 @@ class TerminalSchedulerServing:
             self._deliver_process_fatal(inventory)
         finally:
             self._inbox.close_fail_closed()
-        return self.inventory()
+        inbox_inventory = self._inbox.inventory()
+        with self._lock:
+            retained_actions = tuple(
+                sorted(
+                    self._actions_by_receipt.values(),
+                    key=lambda action: action.action_id,
+                )
+            )
+            retained_action_ids = tuple(action.action_id for action in retained_actions)
+            closure_inventory = TerminalSchedulerServingInventory(
+                role=self._role,
+                inbox=inbox_inventory,
+                retained_action_ids=retained_action_ids,
+                fatal_delivered=self._fatal_delivered,
+            )
+            self._actions_by_receipt.clear()
+            self._receipt_by_request.clear()
+        return TerminalSchedulerFailClosedClosure(
+            inventory=closure_inventory,
+            retained_actions=retained_actions,
+        )
 
     def _consume_receipt(
         self,
@@ -671,6 +787,32 @@ class TerminalSchedulerServing:
         if cause is None:
             raise RuntimeError("scheduler serving has no process-fatal cause")
         return SchedulerReceiptInboxFatalError(cause, inventory)
+
+    def _action_publication_error(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> TerminalSchedulerActionPublicationError:
+        """Build one exact post-reconciliation publication disposition.
+
+        :param action: Native action supplied to the failed publication.
+        :returns: Typed failure naming its current authority owner.
+        """
+
+        with self._lock:
+            scheduler_retains = any(
+                retained_action == action
+                for retained_action in self._actions_by_receipt.values()
+            )
+        disposition = TerminalSchedulerActionPublicationDisposition.CALLER_RETAINS
+        if scheduler_retains:
+            disposition = (
+                TerminalSchedulerActionPublicationDisposition.SCHEDULER_RETAINS
+            )
+        return TerminalSchedulerActionPublicationError(
+            action=action,
+            disposition=disposition,
+            inventory=self.inventory(),
+        )
 
     def _require_binding_role(self, binding: TerminalRequestBinding) -> None:
         """Require one binding to belong to this scheduler process role.

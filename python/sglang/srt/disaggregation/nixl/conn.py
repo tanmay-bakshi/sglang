@@ -3863,11 +3863,12 @@ class NixlKVManager(CommonKVManager):
     def close_terminal_runtime(self, *, process_fatal: bool) -> None:
         """Close every terminal owner in dependency-reverse order.
 
-        Admission closes before the control receiver, then native producers
-        retire while the reactor can still drain their final actions. The
-        reactor closes before serving descriptors, and the canonical gateway
-        publisher drains last because serving may still earn publication work
-        during its terminal drain.
+        Admission closes before every external ingress owner joins. A clean
+        source close drains publication work on both sides of the publisher
+        join, then retires Python producer namespaces. Fatal intent instead
+        disables functional source effects and aborts publisher admission before
+        either owner drains. Serving can transfer fail-closed authority only
+        after every producer execution context has joined.
 
         :param process_fatal: Whether retained authority must be quarantined.
         """
@@ -3890,10 +3891,17 @@ class NixlKVManager(CommonKVManager):
         publisher = self._terminal_output_publisher
         if reactor is None or serving is None:
             raise RuntimeError("terminal runtime composition is incomplete")
+        source_serving = self._terminal_source_serving
         timeout_seconds = terminal_deadline_spec(
             TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
         ).seconds
         first_error: Exception | None = None
+        control_receiver_quiescent = False
+        native_producers_quiescent = False
+        reactor_quiescent = False
+        publisher_quiescent = publisher is None
+        native_retirement_deferred_to_abort = False
+        serving_abort_entered = False
 
         def retain_failure(
             reason: str,
@@ -3907,6 +3915,33 @@ class NixlKVManager(CommonKVManager):
                 first_error = error
             self._record_terminal_component_failure(reason, formatted_traceback)
 
+        def fail_closed_intent() -> bool:
+            """Return whether functional teardown side effects are forbidden."""
+
+            return (
+                process_fatal
+                or first_error is not None
+                or self._terminal_process_fatal_reason is not None
+            )
+
+        def enter_serving_abort() -> None:
+            """Stop role-specific functional effects before any remaining work."""
+
+            nonlocal serving_abort_entered
+            if serving_abort_entered:
+                return
+            try:
+                serving.begin_fail_closed_abort()
+                serving_abort_entered = True
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal serving abort entry failed",
+                    error,
+                    traceback.format_exc(),
+                )
+
+        if fail_closed_intent():
+            enter_serving_abort()
         try:
             reactor.stop_admission()
         except Exception as error:  # noqa: BLE001
@@ -3915,48 +3950,153 @@ class NixlKVManager(CommonKVManager):
                 error,
                 traceback.format_exc(),
             )
+        if fail_closed_intent():
+            enter_serving_abort()
         try:
             self.stop_terminal_control_receiver(timeout_seconds)
+            control_receiver_quiescent = True
         except Exception as error:  # noqa: BLE001
             retain_failure(
                 "terminal control receiver close failed",
                 error,
                 traceback.format_exc(),
             )
-        try:
-            serving.stop_admission_and_retire_producers()
-        except Exception as error:  # noqa: BLE001
-            retain_failure(
-                "terminal native producer retirement failed",
-                error,
-                traceback.format_exc(),
-            )
+        if fail_closed_intent():
+            enter_serving_abort()
+            native_retirement_deferred_to_abort = True
+        else:
+            try:
+                if source_serving is not None:
+                    source_serving.stop_admission_and_retire_native_producers()
+                else:
+                    serving.stop_admission_and_retire_producers()
+                native_producers_quiescent = True
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal native producer retirement failed",
+                    error,
+                    traceback.format_exc(),
+                )
+                enter_serving_abort()
         try:
             reactor.close(timeout_seconds)
+            reactor_quiescent = True
         except Exception as error:  # noqa: BLE001
             retain_failure(
                 "terminal process reactor close failed",
                 error,
                 traceback.format_exc(),
             )
+        if fail_closed_intent():
+            enter_serving_abort()
+
+        producer_contexts_before_publisher_quiescent = (
+            control_receiver_quiescent
+            and native_producers_quiescent
+            and reactor_quiescent
+        )
+        if fail_closed_intent():
+            enter_serving_abort()
+
+        source_pre_publisher_drain_complete = False
+        if (
+            source_serving is not None
+            and producer_contexts_before_publisher_quiescent
+            and not fail_closed_intent()
+        ):
+            try:
+                source_serving.drain_shutdown_actions(timeout_seconds)
+                source_pre_publisher_drain_complete = True
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal pre-publisher action drain failed",
+                    error,
+                    traceback.format_exc(),
+                )
+                enter_serving_abort()
+
+        if publisher is not None:
+            try:
+                if fail_closed_intent():
+                    enter_serving_abort()
+                    fatal_reason = self._terminal_process_fatal_reason
+                    if fatal_reason is None:
+                        fatal_reason = "terminal runtime entered fail-closed teardown"
+                    publisher_stopped = publisher.abort_and_join(fatal_reason)
+                else:
+                    publisher_stopped = publisher.stop_admission_and_join()
+                if not publisher_stopped:
+                    raise RuntimeError("terminal gateway publisher close timed out")
+                publisher_quiescent = True
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal gateway publisher close failed",
+                    error,
+                    traceback.format_exc(),
+                )
+        if fail_closed_intent():
+            enter_serving_abort()
+        if (
+            source_serving is not None
+            and producer_contexts_before_publisher_quiescent
+            and publisher_quiescent
+            and source_pre_publisher_drain_complete
+            and not fail_closed_intent()
+        ):
+            try:
+                source_serving.drain_shutdown_actions(timeout_seconds)
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal post-publisher action drain failed",
+                    error,
+                    traceback.format_exc(),
+                )
+                enter_serving_abort()
+        external_ingress_contexts_quiescent = (
+            control_receiver_quiescent and reactor_quiescent and publisher_quiescent
+        )
+        if (
+            source_serving is not None
+            and external_ingress_contexts_quiescent
+            and native_producers_quiescent
+        ):
+            try:
+                source_serving.retire_python_producers()
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal Python producer retirement failed",
+                    error,
+                    traceback.format_exc(),
+                )
 
         must_abort = (
             process_fatal
             or first_error is not None
             or self._terminal_process_fatal_reason is not None
         )
-        try:
-            if must_abort:
-                serving.abort_and_close()
-            else:
-                serving.close_clean(timeout_seconds)
-        except Exception as error:  # noqa: BLE001
-            retain_failure(
-                "terminal serving close failed",
-                error,
-                traceback.format_exc(),
-            )
-        if self._terminal_decode_serving is not None:
+        if must_abort:
+            enter_serving_abort()
+        serving_closed = False
+        serving_close_permitted = external_ingress_contexts_quiescent and (
+            native_producers_quiescent
+            or (must_abort and native_retirement_deferred_to_abort)
+        )
+        if serving_close_permitted:
+            try:
+                if must_abort:
+                    serving.abort_and_close()
+                else:
+                    serving.close_clean(timeout_seconds)
+                serving_closed = True
+            except Exception as error:  # noqa: BLE001
+                retain_failure(
+                    "terminal serving close failed",
+                    error,
+                    traceback.format_exc(),
+                )
+        else:
+            enter_serving_abort()
+        if self._terminal_decode_serving is not None and serving_closed:
             try:
                 self._require_terminal_decode_dflash_teardown(
                     process_fatal=must_abort or first_error is not None,
@@ -3967,18 +4107,8 @@ class NixlKVManager(CommonKVManager):
                     error,
                     traceback.format_exc(),
                 )
-        if publisher is not None:
-            try:
-                if not publisher.stop_admission_and_join():
-                    raise RuntimeError("terminal gateway publisher close timed out")
-            except Exception as error:  # noqa: BLE001
-                retain_failure(
-                    "terminal gateway publisher close failed",
-                    error,
-                    traceback.format_exc(),
-                )
         publication_control = self._terminal_source_publication_control
-        if publication_control is not None and not must_abort:
+        if publication_control is not None and not must_abort and serving_closed:
             try:
                 publication_control.close_clean()
             except Exception as error:  # noqa: BLE001

@@ -3,6 +3,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
 import select
 import sys
 import threading
@@ -69,6 +70,9 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+    NativeTerminalReceipt,
+    NativeTerminalReceiptKind,
+    NativeTerminalReceiptOutcome,
     NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
@@ -81,6 +85,9 @@ from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalRuntimeDisposition,
     NativeTerminalRuntimeOverflowError,
     NativeTerminalRuntimeProducerSpec,
+)
+from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
+    TerminalSchedulerActionPublicationError,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourcePlan,
@@ -369,7 +376,8 @@ def _actor(
         plan: PackedTerminalSourcePlan,
     ) -> PackedDecodeTerminalRegistration:
         del self
-        assert plan == state.source_plan
+        assert plan.writers == state.source_plan.writers
+        assert plan.request_ready_issuer == state.source_plan.request_ready_issuer
         state.bindings[binding.digest] = transaction
         state.transaction_bindings[id(transaction)] = binding
         state.events.append("bound")
@@ -683,6 +691,82 @@ def _scatter_action(
         commit_timestamp_ns=commit_timestamp_ns,
         receipt=None,
     )
+
+
+def _adoption_action(
+    binding: TerminalRequestBinding,
+    *,
+    action_id: int,
+) -> NativeTerminalOwnerAction:
+    """Build one exact scheduler adoption authority.
+
+    :param binding: Exact decode lifecycle targeted by the action.
+    :param action_id: Globally unique native action identity.
+    :returns: Immutable owner-minted adoption action.
+    """
+
+    native_binding = NativeTerminalRequestBinding.from_binding(binding)
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=NativeTerminalOwnerActionKind.ADOPTION_READY,
+        binding=native_binding,
+        commit_timestamp_ns=action_id,
+        receipt=NativeTerminalReceipt(
+            binding=native_binding,
+            issuer=NativeTerminalProcessIdentity.from_identity(binding.owner),
+            kind=NativeTerminalReceiptKind.ADOPTION_READY,
+            outcome=NativeTerminalReceiptOutcome.SUCCESS,
+            terminal_timestamp_ns=action_id,
+            nonce=action_id.to_bytes(16, "big"),
+        ),
+    )
+
+
+def _additional_decode_request(
+    registration: PackedTerminalDecodeSchedulerRegistration,
+    scheduler_events: list[str],
+) -> tuple[
+    PackedTerminalDecodeSchedulerRegistration,
+    TerminalRequestCoordinatorManifest,
+]:
+    """Build another generation owned by the same decode process.
+
+    :param registration: Existing request supplying the frozen process topology.
+    :param scheduler_events: Mutable callback evidence ledger.
+    :returns: Additional scheduler registration and coordinator manifest.
+    """
+
+    request_key = PackedRequestKey(
+        room_id=402,
+        request_generation=b"h" * 16,
+    )
+    binding = TerminalRequestBinding(
+        request_key=request_key,
+        owner=registration.binding.owner,
+        rank_manifest_digest=b"n" * 32,
+        allocation_digest=b"b" * 32,
+    )
+    original_plan = registration.source_plan
+    source_plan = PackedTerminalSourcePlan(
+        request_key=request_key,
+        writers=original_plan.writers,
+        rank_manifest_digest=b"n" * 32,
+        allocation_digest=b"b" * 32,
+        publication_identity=TerminalPublicationIdentity(
+            request_key=request_key,
+            publisher_process_generation=(
+                original_plan.publication_identity.publisher_process_generation
+            ),
+            publication_generation=b"q" * 16,
+        ),
+        request_ready_issuer=original_plan.request_ready_issuer,
+    )
+    manifest = TerminalRequestCoordinatorManifest(
+        request_key=request_key,
+        destination_bindings=(binding,),
+        recipient_bindings=(binding, *source_plan.source_bindings),
+    )
+    return _registration(binding, source_plan, scheduler_events), manifest
 
 
 def _enqueue_scatter_action(
@@ -1033,6 +1117,122 @@ def test_runtime_fds_and_launch_binding_are_stable() -> None:
     finally:
         serving.abort_and_close()
         assert runtime.disposition.value == "stopped"
+
+
+@pytest.mark.parametrize(
+    "failure_after_retention",
+    (False, True),
+    ids=("caller-retains", "scheduler-retains"),
+)
+def test_scheduler_batch_failure_conserves_current_and_later_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_after_retention: bool,
+) -> None:
+    """A failed first publication cannot orphan its already-claimed sibling.
+
+    :param monkeypatch: Scoped publication-failure injection.
+    :param failure_after_retention: Whether scheduler ownership linearizes first.
+    """
+
+    (
+        serving,
+        runtime,
+        _,
+        _,
+        registration,
+        manifest,
+        _,
+        scheduler_events,
+        _,
+    ) = _serving(1)
+    second_registration, second_manifest = _additional_decode_request(
+        registration,
+        scheduler_events,
+    )
+    actions = (
+        _adoption_action(registration.binding, action_id=1_001),
+        _adoption_action(second_registration.binding, action_id=1_002),
+    )
+    serving.start()
+    closed = False
+    try:
+        serving.register_request(registration, manifest)
+        serving.register_request(second_registration, second_manifest)
+        for action in actions:
+            runtime._route_action(action)
+
+        with monkeypatch.context() as scoped_patch:
+            if failure_after_retention:
+                scheduler_write_fd = serving._scheduler_serving._inbox._write_fd
+                real_write = os.write
+
+                def fail_scheduler_wake(
+                    file_descriptor: int,
+                    payload: bytes,
+                ) -> int:
+                    """Fail only the scheduler wake after action retention.
+
+                    :param file_descriptor: Target wake descriptor.
+                    :param payload: Exact wake payload.
+                    :returns: Bytes written for unrelated descriptors.
+                    """
+
+                    if file_descriptor == scheduler_write_fd:
+                        raise BrokenPipeError("synthetic scheduler wake failure")
+                    return real_write(file_descriptor, payload)
+
+                scoped_patch.setattr(os, "write", fail_scheduler_wake)
+            else:
+
+                def fail_before_retention(
+                    receipt: object,
+                    retain: Callable[[], None],
+                ) -> None:
+                    """Reject publication before scheduler authority transfers.
+
+                    :param receipt: Candidate scheduler receipt.
+                    :param retain: Uncalled action-retention boundary.
+                    """
+
+                    del receipt, retain
+                    raise OSError("synthetic pre-retention publication failure")
+
+                scoped_patch.setattr(
+                    serving._scheduler_serving._inbox,
+                    "publish_after_retention",
+                    fail_before_retention,
+                )
+
+            with pytest.raises(TerminalSchedulerActionPublicationError) as raised:
+                serving.drain_scheduler_actions()
+
+        assert raised.value.scheduler_retains_action is failure_after_retention
+        with runtime._condition:
+            pending_action_ids = frozenset(runtime._consumer_pending)
+            claimed_action_ids = frozenset(runtime._inbox_claimed_action_ids)
+        assert actions[1].action_id not in pending_action_ids
+        assert actions[1].action_id not in claimed_action_ids
+        expected_retained = (
+            frozenset((actions[0].action_id,))
+            if failure_after_retention
+            else frozenset()
+        )
+        assert pending_action_ids == expected_retained
+        assert claimed_action_ids == expected_retained
+        assert (
+            frozenset(serving._scheduler_serving.inventory().retained_action_ids)
+            == expected_retained
+        )
+
+        inventory = serving.abort_and_close()
+        closed = True
+        assert runtime.disposition is NativeTerminalRuntimeDisposition.STOPPED
+        assert frozenset(inventory.scheduler_serving.retained_action_ids) == (
+            expected_retained
+        )
+    finally:
+        if not closed:
+            serving.abort_and_close()
 
 
 def test_scatter_submission_isolated_and_drains_before_cuda_retirement() -> None:

@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceCancellationDisposition,
     PackedTerminalSourceMetric,
+    PackedTerminalSourceQuarantineRetentionError,
     PackedTerminalSourceSubmission,
     PackedTerminalSourceWiring,
 )
@@ -197,9 +198,7 @@ class _CudaCompletion:
 
         operation = ("submit", stream_handle, binding_digest)
         self.operations.append(operation)
-        self.runtime_operations.append(
-            ("cuda-submit", stream_handle, binding_digest)
-        )
+        self.runtime_operations.append(("cuda-submit", stream_handle, binding_digest))
 
     def authorize_delivery(self, binding_digest: bytes) -> bool:
         """Record authenticated decoder allocation authorization.
@@ -440,14 +439,22 @@ class _Harness:
     clock: _Clock
 
 
-def _identities(*, local_rank: int = 0) -> PackedTerminalSourceIdentityPlan:
+def _identities(
+    *,
+    local_rank: int = 0,
+    request_seed: int = 0x71,
+) -> PackedTerminalSourceIdentityPlan:
     """Build one TP2 source and TP1 decode identity graph.
 
     :param local_rank: Source rank selected as local.
+    :param request_seed: Byte distinguishing one request lifecycle.
     :returns: Exact rank-local source identity plan.
     """
 
-    key = PackedRequestKey(room_id=71, request_generation=bytes.fromhex("71" * 16))
+    key = PackedRequestKey(
+        room_id=request_seed,
+        request_generation=bytes((request_seed,)) * 16,
+    )
     sources = tuple(
         TerminalProcessIdentity(
             process_generation=bytes((0x10 + rank,)) * 16,
@@ -475,7 +482,7 @@ def _identities(*, local_rank: int = 0) -> PackedTerminalSourceIdentityPlan:
     publication = TerminalPublicationIdentity(
         request_key=key,
         publisher_process_generation=sources[0].process_generation,
-        publication_generation=bytes.fromhex("61" * 16),
+        publication_generation=bytes((request_seed - 0x10,)) * 16,
     )
     return PackedTerminalSourceIdentityPlan(
         local_binding=bindings[local_rank],
@@ -595,25 +602,25 @@ def _action(
     harness: _Harness,
     kind: NativeTerminalOwnerActionKind,
     action_id: int,
+    *,
+    binding: TerminalRequestBinding | None = None,
 ) -> NativeTerminalOwnerAction:
     """Build one exact owner action for the local lifecycle.
 
     :param harness: Source lifecycle fixture.
     :param kind: Exact action kind.
     :param action_id: Stable one-shot identity.
+    :param binding: Source binding override for multi-request tests.
     :returns: Native action matching the local binding.
     """
 
-    native_binding = NativeTerminalRequestBinding.from_binding(
-        harness.identity.local_binding
-    )
+    source_binding = harness.identity.local_binding if binding is None else binding
+    native_binding = NativeTerminalRequestBinding.from_binding(source_binding)
     receipt = None
     if kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED:
         receipt = NativeTerminalReceipt(
             binding=native_binding,
-            issuer=NativeTerminalProcessIdentity.from_identity(
-                harness.identity.local_binding.owner
-            ),
+            issuer=NativeTerminalProcessIdentity.from_identity(source_binding.owner),
             kind=NativeTerminalReceiptKind.RECLAIM_AUTHORIZED,
             outcome=NativeTerminalReceiptOutcome.SUCCESS,
             terminal_timestamp_ns=action_id,
@@ -628,23 +635,29 @@ def _action(
     )
 
 
-def _ready(harness: _Harness) -> None:
+def _ready(
+    harness: _Harness,
+    *,
+    identity: PackedTerminalSourceIdentityPlan | None = None,
+) -> None:
     """Deliver one authenticated request-ready receipt.
 
     :param harness: Source lifecycle fixture.
+    :param identity: Source identity override for multi-request tests.
     """
 
-    issued = TerminalWireReceiptIssuer(harness.identity.request_ready_issuer).issue(
-        binding=harness.identity.local_binding,
+    source_identity = harness.identity if identity is None else identity
+    issued = TerminalWireReceiptIssuer(source_identity.request_ready_issuer).issue(
+        binding=source_identity.local_binding,
         kind=TerminalReceiptKind.REQUEST_READY,
         outcome=TerminalReceiptOutcome.SUCCESS,
         terminal_timestamp_ns=harness.clock.now_ns(),
     )
     harness.wiring.request_ready(
-        binding_digest=harness.identity.local_binding.digest,
+        binding_digest=source_identity.local_binding.digest,
         wire_receipt=issued.wire_receipt,
         local_receipt=issued.local_receipt,
-        authenticated_issuer=harness.identity.request_ready_issuer,
+        authenticated_issuer=source_identity.request_ready_issuer,
     )
 
 
@@ -928,10 +941,13 @@ def test_request_ready_commits_before_late_client_cancellation() -> None:
     _ready(harness)
     operation_count = len(harness.runtime.operations)
 
-    assert harness.wiring.cancel_request(
-        harness.identity.local_binding,
-        "client disconnected after ready",
-    ) is PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
+    assert (
+        harness.wiring.cancel_request(
+            harness.identity.local_binding,
+            "client disconnected after ready",
+        )
+        is PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
+    )
     assert len(harness.runtime.operations) == operation_count
     assert harness.wiring.inventory().completion_required_binding_digests == ()
 
@@ -971,7 +987,9 @@ def test_completion_required_cancellation_retires_at_every_downstream_phase(
         lambda submission, action: None,
     )
     cancel_if("outcomes_sent")
-    harness.wiring.teardown_received(binding.digest, harness.identity.request_ready_issuer)
+    harness.wiring.teardown_received(
+        binding.digest, harness.identity.request_ready_issuer
+    )
     harness.wiring.consume_ack_ready(
         _action(harness, NativeTerminalOwnerActionKind.SOURCE_ACK_READY, 72),
         lambda submission, action: None,
@@ -1068,10 +1086,13 @@ def test_full_source_success_uses_runtime_completion_surfaces(
         6,
     )
     retired_callbacks: list[PackedTerminalSourceSubmission] = []
-    assert harness.wiring.consume_terminal_action(
-        retired,
-        lambda submission, action: retired_callbacks.append(submission),
-    ) == harness.submission
+    assert (
+        harness.wiring.consume_terminal_action(
+            retired,
+            lambda submission, action: retired_callbacks.append(submission),
+        )
+        == harness.submission
+    )
     assert retired_callbacks == [harness.submission]
     assert harness.wiring.inventory().active_binding_digests == ()
     assert any(operation[0] == "scheduler" for operation in harness.runtime.operations)
@@ -1331,16 +1352,195 @@ def test_publication_failure_quarantines_identity_after_safe_reclaim() -> None:
         NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
         52,
     )
-    assert harness.wiring.consume_terminal_action(
+    retained_actions: list[NativeTerminalOwnerAction] = []
+    harness.wiring.consume_quarantine(
         quarantine,
-        lambda submission, action: None,
-    ) is None
+        retained_actions.append,
+    )
+    assert retained_actions == [quarantine]
     inventory = harness.wiring.inventory()
     assert inventory.active_binding_digests == (harness.identity.local_binding.digest,)
     assert inventory.quarantined_binding_digests == (
         harness.identity.local_binding.digest,
     )
     assert harness.runtime.operations[-1] == ("ack", quarantine)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+    ),
+)
+def test_quarantine_marks_before_external_retention_and_acknowledgement(
+    kind: NativeTerminalOwnerActionKind,
+) -> None:
+    """Wiring quarantine precedes external retention and native acknowledgement."""
+
+    harness = _harness()
+    digest = harness.identity.local_binding.digest
+    action = _action(harness, kind, 53)
+    callback_observations: list[tuple[NativeTerminalOwnerAction, bool, bool]] = []
+
+    def retain_resources(candidate: NativeTerminalOwnerAction) -> None:
+        """Capture ownership state at the external retention boundary.
+
+        :param candidate: Exact fail-closed action being retained.
+        """
+
+        inventory = harness.wiring.inventory()
+        callback_observations.append(
+            (
+                candidate,
+                digest in inventory.quarantined_binding_digests,
+                ("ack", candidate) in harness.runtime.operations,
+            )
+        )
+
+    harness.wiring.consume_quarantine(action, retain_resources)
+
+    assert callback_observations == [(action, True, False)]
+    inventory = harness.wiring.inventory()
+    assert inventory.active_binding_digests == (digest,)
+    assert inventory.quarantined_binding_digests == (digest,)
+    assert harness.runtime.operations[-1] == ("ack", action)
+
+
+def test_quarantine_callback_failure_retains_record_and_claimed_action() -> None:
+    """A failed external retention cannot acknowledge or redeliver authority."""
+
+    harness = _harness()
+    digest = harness.identity.local_binding.digest
+    action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        54,
+    )
+    operation_count = len(harness.runtime.operations)
+
+    def fail_retention(candidate: NativeTerminalOwnerAction) -> None:
+        """Reject the external resource-retention boundary.
+
+        :param candidate: Exact fail-closed action being retained.
+        """
+
+        assert candidate is action
+        raise RuntimeError("synthetic resource retention failure")
+
+    with pytest.raises(
+        PackedTerminalSourceQuarantineRetentionError,
+        match="source quarantine retained exact action authority",
+    ):
+        harness.wiring.consume_quarantine(action, fail_retention)
+
+    inventory = harness.wiring.inventory()
+    assert inventory.active_binding_digests == (digest,)
+    assert inventory.quarantined_binding_digests == (digest,)
+    assert inventory.retained_quarantine_action_ids == (action.action_id,)
+    assert len(harness.runtime.operations) == operation_count
+    with pytest.raises(RuntimeError, match="native source action was delivered twice"):
+        harness.wiring.consume_quarantine(action, lambda candidate: None)
+
+
+def test_distinct_quarantine_actions_idempotently_retain_one_record() -> None:
+    """Distinct fail-closed authorities preserve one exact quarantined record."""
+
+    harness = _harness()
+    digest = harness.identity.local_binding.digest
+    request_quarantine = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        55,
+    )
+    process_fatal = _action(
+        harness,
+        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        56,
+    )
+    retained_actions: list[NativeTerminalOwnerAction] = []
+
+    harness.wiring.consume_quarantine(request_quarantine, retained_actions.append)
+    harness.wiring.consume_quarantine(process_fatal, retained_actions.append)
+
+    inventory = harness.wiring.inventory()
+    assert retained_actions == [request_quarantine, process_fatal]
+    assert inventory.active_binding_digests == (digest,)
+    assert inventory.quarantined_binding_digests == (digest,)
+    assert harness.runtime.operations[-2:] == [
+        ("ack", request_quarantine),
+        ("ack", process_fatal),
+    ]
+
+
+def test_fail_closed_closure_transfers_exact_quarantined_actions_once() -> None:
+    """Fail-closed closure transfers sorted publication authority exactly once."""
+
+    harness = _harness()
+    second_identity = _identities(request_seed=0x72)
+    second_submission = _submission(second_identity)
+    harness.wiring.accept_submission(second_submission)
+    _ready(harness)
+    _ready(harness, identity=second_identity)
+    first_publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        72,
+    )
+    second_publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        62,
+        binding=second_identity.local_binding,
+    )
+    assert (
+        harness.wiring.consume_gateway_publication_ready(first_publication_action)
+        is not None
+    )
+    assert (
+        harness.wiring.consume_gateway_publication_ready(second_publication_action)
+        is not None
+    )
+    harness.wiring.consume_quarantine(
+        _action(
+            harness,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+            73,
+        ),
+        lambda candidate: None,
+    )
+    harness.wiring.consume_quarantine(
+        _action(
+            harness,
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            63,
+            binding=second_identity.local_binding,
+        ),
+        lambda candidate: None,
+    )
+
+    closure = harness.wiring.take_fail_closed_closure()
+
+    expected_digests = tuple(
+        sorted(
+            (
+                harness.identity.local_binding.digest,
+                second_identity.local_binding.digest,
+            )
+        )
+    )
+    assert closure.inventory.active_binding_digests == expected_digests
+    assert closure.inventory.quarantined_binding_digests == expected_digests
+    assert closure.inventory.pending_publication_action_ids == (62, 72)
+    assert closure.retained_publication_actions == (
+        second_publication_action,
+        first_publication_action,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="source wiring fail-closed closure was already taken",
+    ):
+        harness.wiring.take_fail_closed_closure()
 
 
 def test_metrics_failure_never_gates_runtime_progress() -> None:

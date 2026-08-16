@@ -289,9 +289,11 @@ class PackedTerminalSourceInventory:
     :ivar active_result_slot_binding_digests: Canonical live pinned result slots.
     :ivar quarantined_result_slot_binding_digests: Pinned slots retained under
         request quarantine.
-    :ivar pending_publication_action_count: Native actions held during publication.
+    :ivar pending_publication_action_ids: Native actions held during publication.
     :ivar pending_publication_receipt_count: Authenticated publisher outcomes
         awaiting their rank-local native action.
+    :ivar retained_quarantine_action_ids: Exact lifecycle actions whose
+        fail-closed side effect claimed ownership but did not return cleanly.
     """
 
     active_binding_digests: tuple[bytes, ...]
@@ -299,8 +301,9 @@ class PackedTerminalSourceInventory:
     completion_required_binding_digests: tuple[bytes, ...]
     active_result_slot_binding_digests: tuple[bytes, ...]
     quarantined_result_slot_binding_digests: tuple[bytes, ...]
-    pending_publication_action_count: int
+    pending_publication_action_ids: tuple[int, ...]
     pending_publication_receipt_count: int
+    retained_quarantine_action_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
         """Validate deterministic identity and action counts."""
@@ -338,16 +341,167 @@ class PackedTerminalSourceInventory:
             self.active_result_slot_binding_digests
         ):
             raise ValueError("quarantined result slots must remain slot-active")
-        if (
-            type(self.pending_publication_action_count) is not int
-            or self.pending_publication_action_count < 0
+        if type(self.pending_publication_action_ids) is not tuple or any(
+            type(action_id) is not int or action_id < 0
+            for action_id in self.pending_publication_action_ids
         ):
-            raise ValueError("pending publication action count must be non-negative")
+            raise ValueError(
+                "pending publication action identities must be unsigned integers"
+            )
+        if self.pending_publication_action_ids != tuple(
+            sorted(set(self.pending_publication_action_ids))
+        ):
+            raise ValueError(
+                "pending publication action identities must be sorted and unique"
+            )
         if (
             type(self.pending_publication_receipt_count) is not int
             or self.pending_publication_receipt_count < 0
         ):
             raise ValueError("pending publication receipt count must be non-negative")
+        if type(self.retained_quarantine_action_ids) is not tuple or any(
+            type(action_id) is not int or action_id < 0
+            for action_id in self.retained_quarantine_action_ids
+        ):
+            raise ValueError(
+                "retained quarantine action identities must be unsigned integers"
+            )
+        if self.retained_quarantine_action_ids != tuple(
+            sorted(set(self.retained_quarantine_action_ids))
+        ):
+            raise ValueError(
+                "retained quarantine action identities must be sorted and unique"
+            )
+
+    @property
+    def pending_publication_action_count(self) -> int:
+        """Return the retained publication action population.
+
+        :returns: Number of exact native publication actions.
+        """
+
+        return len(self.pending_publication_action_ids)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PackedTerminalSourceFailClosedClosure:
+    """Take-once source publication authority retained by fail-closed close.
+
+    :ivar inventory: Frozen source wiring inventory at the closure boundary.
+    :ivar retained_publication_actions: Exact publication actions transferred
+        from the mutable wiring owner.
+    :ivar retained_quarantine_actions: Exact fail-closed lifecycle actions
+        transferred after their side-effect boundary became ambiguous.
+    """
+
+    inventory: PackedTerminalSourceInventory
+    retained_publication_actions: tuple[NativeTerminalOwnerAction, ...]
+    retained_quarantine_actions: tuple[NativeTerminalOwnerAction, ...]
+
+    def __post_init__(self) -> None:
+        """Validate exact publication action conservation."""
+
+        if type(self.inventory) is not PackedTerminalSourceInventory:
+            raise TypeError("inventory must be PackedTerminalSourceInventory")
+        populations = (
+            self.retained_publication_actions,
+            self.retained_quarantine_actions,
+        )
+        if any(type(actions) is not tuple for actions in populations) or any(
+            type(action) is not NativeTerminalOwnerAction
+            for actions in populations
+            for action in actions
+        ):
+            raise TypeError("closure populations must contain native actions")
+        action_ids = tuple(
+            action.action_id for action in self.retained_publication_actions
+        )
+        if action_ids != self.inventory.pending_publication_action_ids:
+            raise ValueError("closure actions differ from source wiring inventory")
+        if any(
+            action.kind is not NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY
+            for action in self.retained_publication_actions
+        ):
+            raise ValueError("source wiring closure retained another action kind")
+        quarantine_action_ids = tuple(
+            action.action_id for action in self.retained_quarantine_actions
+        )
+        if quarantine_action_ids != self.inventory.retained_quarantine_action_ids:
+            raise ValueError(
+                "quarantine closure actions differ from source wiring inventory"
+            )
+        if any(
+            action.kind
+            not in (
+                NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+                NativeTerminalOwnerActionKind.PROCESS_FATAL,
+            )
+            for action in self.retained_quarantine_actions
+        ):
+            raise ValueError("source wiring retained a non-quarantine action")
+        if len(set((*action_ids, *quarantine_action_ids))) != (
+            len(action_ids) + len(quarantine_action_ids)
+        ):
+            raise ValueError("source wiring closure action identities overlap")
+        quarantined = frozenset(self.inventory.quarantined_binding_digests)
+        if any(
+            action.binding.digest not in quarantined
+            for actions in populations
+            for action in actions
+        ):
+            raise ValueError("source wiring closure retained unquarantined authority")
+
+
+class PackedTerminalSourceQuarantineRetentionError(RuntimeError):
+    """A claimed quarantine action retained ownership after side-effect failure."""
+
+    action: NativeTerminalOwnerAction
+    formatted_traceback: str
+
+    def __init__(
+        self,
+        action: NativeTerminalOwnerAction,
+        formatted_traceback: str,
+    ) -> None:
+        """Retain exact downstream ownership across a failed quarantine call.
+
+        :param action: Claimed action retained by source wiring.
+        :param formatted_traceback: Original side-effect failure traceback.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(formatted_traceback) is not str or len(formatted_traceback) == 0:
+            raise ValueError("formatted_traceback must be a non-empty string")
+        self.action = action
+        self.formatted_traceback = formatted_traceback
+        super().__init__("source quarantine retained exact action authority")
+
+
+class PackedTerminalSourcePublicationRetentionError(RuntimeError):
+    """A failed publication call retained its exact action downstream."""
+
+    action: NativeTerminalOwnerAction
+    formatted_traceback: str
+
+    def __init__(
+        self,
+        action: NativeTerminalOwnerAction,
+        formatted_traceback: str,
+    ) -> None:
+        """Expose the publication ownership linearization point to serving.
+
+        :param action: Exact action retained by source wiring.
+        :param formatted_traceback: Original publication failure traceback.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(formatted_traceback) is not str or len(formatted_traceback) == 0:
+            raise ValueError("formatted_traceback must be a non-empty string")
+        self.action = action
+        self.formatted_traceback = formatted_traceback
+        super().__init__("source publication retained exact action authority")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -402,6 +556,9 @@ class _SourceRecord:
     packed_transfer_ready: bool = False
     producer_delivery_authorized: bool = False
     claimed_action_ids: set[int] = dataclasses.field(default_factory=set)
+    retained_quarantine_actions: dict[int, NativeTerminalOwnerAction] = (
+        dataclasses.field(default_factory=dict)
+    )
 
 
 class PackedTerminalSourceWiring:
@@ -424,6 +581,7 @@ class PackedTerminalSourceWiring:
     _timing: TerminalProgressTimingRecorder
     _records: dict[bytes, _SourceRecord]
     _emitted_metrics: set[tuple[bytes, NativeTerminalOwnerEventKind]]
+    _fail_closed_closure_taken: bool
     _lock: threading.Lock
 
     def __init__(
@@ -487,6 +645,7 @@ class PackedTerminalSourceWiring:
         self._timing = terminal_progress_timing_recorder(logger, clock_ns)
         self._records = {}
         self._emitted_metrics = set()
+        self._fail_closed_closure_taken = False
         self._lock = threading.Lock()
 
     def accept_submission(self, submission: PackedTerminalSourceSubmission) -> None:
@@ -504,6 +663,10 @@ class PackedTerminalSourceWiring:
         digest = binding.digest
         record = _SourceRecord(submission=submission)
         with self._lock:
+            if self._fail_closed_closure_taken:
+                raise RuntimeError(
+                    "source wiring fail-closed closure was already taken"
+                )
             if digest in self._records:
                 raise RuntimeError("source submission identity was reused")
             # Once accepted, this record is retained on every downstream error;
@@ -572,7 +735,9 @@ class PackedTerminalSourceWiring:
             authorize = current.packed_transfer_ready
             if authorize:
                 if current.producer_delivery_authorized:
-                    raise RuntimeError("source producer delivery was already authorized")
+                    raise RuntimeError(
+                        "source producer delivery was already authorized"
+                    )
                 current.producer_delivery_authorized = True
         if authorize:
             self._cuda_completion.authorize_delivery(digest)
@@ -664,7 +829,9 @@ class PackedTerminalSourceWiring:
             authorize = current.producer_completion_attached
             if authorize:
                 if current.producer_delivery_authorized:
-                    raise RuntimeError("source producer delivery was already authorized")
+                    raise RuntimeError(
+                        "source producer delivery was already authorized"
+                    )
                 current.producer_delivery_authorized = True
         if not authorize:
             return False
@@ -704,9 +871,7 @@ class PackedTerminalSourceWiring:
             if current.cancellation_reason is not None:
                 return PackedTerminalSourceCancellationDisposition.ALREADY_RECORDED
             if current.request_ready_receipt is not None:
-                return (
-                    PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
-                )
+                return PackedTerminalSourceCancellationDisposition.TOO_LATE_FOR_ROLLBACK
             current.cancellation_reason = reason
         return PackedTerminalSourceCancellationDisposition.COMPLETION_REQUIRED
 
@@ -984,6 +1149,40 @@ class PackedTerminalSourceWiring:
             pending_receipt = record.pending_publication_receipt
             if pending_receipt is not None:
                 record.pending_publication_receipt = None
+        try:
+            return self._consume_retained_gateway_publication(
+                record,
+                action,
+                ready_receipt,
+                pending_receipt,
+            )
+        except Exception as error:
+            with self._lock:
+                current = self._records.get(action.binding.digest)
+                retained = current is record and current.publication_action == action
+            if retained:
+                raise PackedTerminalSourcePublicationRetentionError(
+                    action,
+                    traceback.format_exc(),
+                ) from error
+            raise
+
+    def _consume_retained_gateway_publication(
+        self,
+        record: _SourceRecord,
+        action: NativeTerminalOwnerAction,
+        ready_receipt: TerminalReceipt,
+        pending_receipt: _AuthenticatedPublicationReceipt | None,
+    ) -> FrozenTerminalGatewayPublication | None:
+        """Complete publication after wiring has retained exact authority.
+
+        :param record: Exact source record retaining the native action.
+        :param action: Retained gateway-publication authority.
+        :param ready_receipt: Request-global readiness authority.
+        :param pending_receipt: Publisher result which raced action delivery.
+        :returns: Canonical immutable publication, otherwise ``None``.
+        """
+
         if self._local_identity.tp_rank != 0:
             if pending_receipt is not None:
                 self._complete_publication_receipt(record, pending_receipt)
@@ -1155,29 +1354,24 @@ class PackedTerminalSourceWiring:
             [PackedTerminalSourceSubmission, NativeTerminalOwnerAction], None
         ],
     ) -> PackedTerminalSourceSubmission | None:
-        """Commit retirement side effects or retain quarantined authority.
+        """Commit successful retirement side effects exactly once.
 
-        :param action: Exact ``REQUEST_RETIRED`` or ``REQUEST_QUARANTINED`` action.
+        :param action: Exact ``REQUEST_RETIRED`` action.
         :param retire_submission: Transactional external retirement boundary run
             before native acknowledgement and wiring-record deletion.
-        :returns: Retired immutable submission, otherwise ``None`` for quarantine.
+        :returns: Retired immutable submission.
         """
 
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
-        if action.kind not in (
-            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
-            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
-        ):
-            raise ValueError("source terminal consumption requires a terminal action")
+        if action.kind is not NativeTerminalOwnerActionKind.REQUEST_RETIRED:
+            raise ValueError("source retirement requires REQUEST_RETIRED")
         if not callable(retire_submission):
             raise TypeError("retire_submission must be callable")
-        record = self._claim_action(action, action.kind)
-        if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
-            with self._lock:
-                record.quarantined = True
-            self._runtime.acknowledge_consumed_action(action)
-            return None
+        record = self._claim_action(
+            action,
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
         with self._lock:
             if (
                 not record.reclaim_consumed
@@ -1198,6 +1392,53 @@ class PackedTerminalSourceWiring:
             del self._records[action.binding.digest]
         return record.submission
 
+    def consume_quarantine(
+        self,
+        action: NativeTerminalOwnerAction,
+        retain_resources: Callable[[NativeTerminalOwnerAction], None],
+    ) -> None:
+        """Retain every source owner under exact fail-closed authority.
+
+        The wiring claims the lifecycle action first, then the external actor
+        and transport owners retain their resources. Only after both ownership
+        domains are durable does the runtime release its consumer accounting.
+
+        :param action: Exact request-quarantine or process-fatal action.
+        :param retain_resources: Actor and transport quarantine boundary.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        ):
+            raise ValueError("source quarantine requires fail-closed authority")
+        if not callable(retain_resources):
+            raise TypeError("retain_resources must be callable")
+        record = self._claim_action(action, action.kind)
+        with self._lock:
+            current = self._records.get(action.binding.digest)
+            if current is not record:
+                raise RuntimeError("source request registry changed during quarantine")
+            record.quarantined = True
+            record.retained_quarantine_actions[action.action_id] = action
+        try:
+            retain_resources(action)
+            self._runtime.acknowledge_consumed_action(action)
+        except Exception as error:
+            raise PackedTerminalSourceQuarantineRetentionError(
+                action,
+                traceback.format_exc(),
+            ) from error
+        with self._lock:
+            current = self._records.get(action.binding.digest)
+            if current is not record:
+                raise RuntimeError("source request registry changed during quarantine")
+            retained = record.retained_quarantine_actions.pop(action.action_id, None)
+            if retained != action:
+                raise RuntimeError("source quarantine action changed during completion")
+
     def inventory(self) -> PackedTerminalSourceInventory:
         """Return exact live and quarantined source side-effect identities.
 
@@ -1205,52 +1446,118 @@ class PackedTerminalSourceWiring:
         """
 
         with self._lock:
-            active = tuple(sorted(self._records))
-            quarantined = tuple(
+            return self._inventory_locked()
+
+    def take_fail_closed_closure(self) -> PackedTerminalSourceFailClosedClosure:
+        """Freeze and transfer retained publication authority exactly once.
+
+        :returns: Immutable source wiring inventory and publication actions.
+        """
+
+        with self._lock:
+            if self._fail_closed_closure_taken:
+                raise RuntimeError(
+                    "source wiring fail-closed closure was already taken"
+                )
+            inventory = self._inventory_locked()
+            actions = tuple(
                 sorted(
-                    digest
-                    for digest, record in self._records.items()
-                    if record.quarantined
+                    (
+                        record.publication_action
+                        for record in self._records.values()
+                        if record.publication_action is not None
+                    ),
+                    key=lambda action: action.action_id,
                 )
             )
-            pending_publication_count = sum(
-                record.publication_action is not None
-                for record in self._records.values()
+            closure = PackedTerminalSourceFailClosedClosure(
+                inventory=inventory,
+                retained_publication_actions=actions,
+                retained_quarantine_actions=tuple(
+                    sorted(
+                        (
+                            action
+                            for record in self._records.values()
+                            for action in record.retained_quarantine_actions.values()
+                        ),
+                        key=lambda action: action.action_id,
+                    )
+                ),
             )
-            pending_publication_receipt_count = sum(
-                record.pending_publication_receipt is not None
-                for record in self._records.values()
+            self._fail_closed_closure_taken = True
+            return closure
+
+    def _inventory_locked(self) -> PackedTerminalSourceInventory:
+        """Build source wiring inventory while the wiring lock is held.
+
+        :returns: Immutable source-side ownership snapshot.
+        """
+
+        active = tuple(sorted(self._records))
+        quarantined = tuple(
+            sorted(
+                digest for digest, record in self._records.items() if record.quarantined
             )
-            completion_required = tuple(
-                sorted(
-                    digest
-                    for digest, record in self._records.items()
-                    if record.cancellation_reason is not None
-                )
+        )
+        pending_publication_actions = tuple(
+            sorted(
+                (
+                    record.publication_action
+                    for record in self._records.values()
+                    if record.publication_action is not None
+                ),
+                key=lambda action: action.action_id,
             )
-            active_result_slots = tuple(
-                sorted(
-                    digest
-                    for digest, record in self._records.items()
-                    if record.submission.output_projection is not None
-                )
+        )
+        pending_publication_receipt_count = sum(
+            record.pending_publication_receipt is not None
+            for record in self._records.values()
+        )
+        retained_quarantine_actions = tuple(
+            sorted(
+                (
+                    action
+                    for record in self._records.values()
+                    for action in record.retained_quarantine_actions.values()
+                ),
+                key=lambda action: action.action_id,
             )
-            quarantined_result_slots = tuple(
-                sorted(
-                    digest
-                    for digest, record in self._records.items()
-                    if record.quarantined
-                    and record.submission.output_projection is not None
-                )
+        )
+        completion_required = tuple(
+            sorted(
+                digest
+                for digest, record in self._records.items()
+                if record.cancellation_reason is not None
             )
+        )
+        active_result_slots = tuple(
+            sorted(
+                digest
+                for digest, record in self._records.items()
+                if record.submission.output_projection is not None
+            )
+        )
+        quarantined_result_slots = tuple(
+            sorted(
+                digest
+                for digest, record in self._records.items()
+                if record.quarantined
+                and record.submission.output_projection is not None
+            )
+        )
         return PackedTerminalSourceInventory(
             active_binding_digests=active,
             quarantined_binding_digests=quarantined,
             completion_required_binding_digests=completion_required,
             active_result_slot_binding_digests=active_result_slots,
             quarantined_result_slot_binding_digests=quarantined_result_slots,
-            pending_publication_action_count=pending_publication_count,
+            pending_publication_action_ids=tuple(
+                action.action_id for action in pending_publication_actions
+            ),
             pending_publication_receipt_count=pending_publication_receipt_count,
+            retained_quarantine_action_ids=tuple(
+                action.action_id for action in retained_quarantine_actions
+            ),
         )
 
     def _submit_request_terminal_receipt(
@@ -1518,7 +1825,9 @@ class PackedTerminalSourceWiring:
             if record.publication_terminal:
                 raise RuntimeError("publication result was delivered twice")
             if record.pending_publication_receipt is not None:
-                raise RuntimeError("publication receipt remained staged during completion")
+                raise RuntimeError(
+                    "publication receipt remained staged during completion"
+                )
             if self._local_identity.tp_rank == 0 and not record.publication_submitted:
                 raise RuntimeError(
                     "canonical publication result preceded publisher submission"
@@ -1552,7 +1861,9 @@ class PackedTerminalSourceWiring:
             if current is not record:
                 raise RuntimeError("source request registry changed during publication")
             if record.publication_action != action:
-                raise RuntimeError("publication action changed during result completion")
+                raise RuntimeError(
+                    "publication action changed during result completion"
+                )
             record.publication_action = None
             record.publication_terminal = True
             record.publication_failed = publication_failed
@@ -1680,6 +1991,10 @@ class PackedTerminalSourceWiring:
         if type(binding_digest) is not bytes or len(binding_digest) != 32:
             raise ValueError("binding_digest must contain 32 bytes")
         with self._lock:
+            if self._fail_closed_closure_taken:
+                raise RuntimeError(
+                    "source wiring fail-closed closure was already taken"
+                )
             record = self._records.get(binding_digest)
         if record is None:
             raise RuntimeError("source operation targets an unknown binding")

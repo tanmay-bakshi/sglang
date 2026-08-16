@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Sequence
+from types import TracebackType
 
 from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
@@ -44,6 +45,55 @@ class NativeTerminalRuntimeClosedError(NativeTerminalRuntimeError):
 
 class NativeTerminalRuntimeOverflowError(NativeTerminalRuntimeError):
     """A bounded runtime-owned action queue crossed its frozen capacity."""
+
+
+class NativeTerminalActionClaimError(NativeTerminalRuntimeError):
+    """An inbox removed actions whose runtime claim did not fully succeed."""
+
+    removed_actions: tuple[NativeTerminalOwnerAction, ...]
+    locally_claimed_actions: tuple[NativeTerminalOwnerAction, ...]
+    formatted_traceback: str
+
+    def __init__(
+        self,
+        removed_actions: tuple[NativeTerminalOwnerAction, ...],
+        locally_claimed_actions: tuple[NativeTerminalOwnerAction, ...],
+        formatted_traceback: str,
+    ) -> None:
+        """Retain removed and newly claimed authority across a failed boundary.
+
+        :param removed_actions: Complete FIFO population removed from the inbox.
+        :param locally_claimed_actions: Exact subset newly claimed by this drain.
+        :param formatted_traceback: Original claim failure traceback.
+        """
+
+        populations = (removed_actions, locally_claimed_actions)
+        if any(type(actions) is not tuple for actions in populations) or any(
+            type(action) is not NativeTerminalOwnerAction
+            for actions in populations
+            for action in actions
+        ):
+            raise TypeError(
+                "claim populations must contain NativeTerminalOwnerAction values"
+            )
+        removed_by_id = {action.action_id: action for action in removed_actions}
+        if len(removed_by_id) != len(removed_actions):
+            raise ValueError("removed action identities must be unique")
+        if any(
+            removed_by_id.get(action.action_id) != action
+            for action in locally_claimed_actions
+        ):
+            raise ValueError("locally claimed actions must be an exact removed subset")
+        if len({action.action_id for action in locally_claimed_actions}) != len(
+            locally_claimed_actions
+        ):
+            raise ValueError("locally claimed action identities must be unique")
+        if type(formatted_traceback) is not str or len(formatted_traceback) == 0:
+            raise ValueError("formatted_traceback must be a non-empty string")
+        self.removed_actions = removed_actions
+        self.locally_claimed_actions = locally_claimed_actions
+        self.formatted_traceback = formatted_traceback
+        super().__init__("runtime inbox action claim failed")
 
 
 class NativeTerminalProducerDelivery(enum.StrEnum):
@@ -324,13 +374,19 @@ class _BoundedFdInbox[ValueT]:
 class NativeTerminalActionInbox(_BoundedFdInbox[NativeTerminalOwnerAction]):
     """Fd-signalled immutable action queue for one execution context."""
 
-    _claim: Callable[[tuple[NativeTerminalOwnerAction, ...]], None]
+    _claim: Callable[
+        [tuple[NativeTerminalOwnerAction, ...]],
+        tuple[NativeTerminalOwnerAction, ...],
+    ]
 
     def __init__(
         self,
         name: str,
         capacity: int,
-        claim: Callable[[tuple[NativeTerminalOwnerAction, ...]], None],
+        claim: Callable[
+            [tuple[NativeTerminalOwnerAction, ...]],
+            tuple[NativeTerminalOwnerAction, ...],
+        ],
     ) -> None:
         """Construct one queue with its mandatory runtime claim boundary.
 
@@ -354,12 +410,69 @@ class NativeTerminalActionInbox(_BoundedFdInbox[NativeTerminalOwnerAction]):
         """
 
         actions = super().drain(maximum_items)
-        self._claim(actions)
+        try:
+            locally_claimed_actions = self._claim(actions)
+        except NativeTerminalActionClaimError:
+            raise
+        except Exception as error:
+            raise NativeTerminalActionClaimError(
+                actions,
+                (),
+                traceback.format_exc(),
+            ) from error
+        if locally_claimed_actions != actions:
+            raise NativeTerminalActionClaimError(
+                actions,
+                locally_claimed_actions,
+                "runtime action claim returned an incomplete population",
+            )
         return actions
 
 
 class NativeTerminalObservationInbox(_BoundedFdInbox[NativeTerminalObservation]):
     """Non-authoritative output-observation queue for metrics and evidence."""
+
+
+class NativeTerminalSourceActionDeliveryFence:
+    """Fence source action claiming and scheduler delivery against projection."""
+
+    _projection_lock: threading.Lock
+    _entered: bool
+
+    def __init__(self, projection_lock: threading.Lock) -> None:
+        """Bind one non-reentrant source delivery fence.
+
+        :param projection_lock: Process-lifetime native output projection lock.
+        """
+
+        self._projection_lock = projection_lock
+        self._entered = False
+
+    def __enter__(self) -> None:
+        """Exclude output routing until the scheduler delivery seam clears."""
+
+        if self._entered:
+            raise RuntimeError("source action delivery fence cannot re-enter")
+        self._projection_lock.acquire()
+        self._entered = True
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        exception_traceback: TracebackType | None,
+    ) -> None:
+        """Release the output projection fence.
+
+        :param exception_type: Active exception type, when present.
+        :param exception: Active exception, when present.
+        :param exception_traceback: Active traceback, when present.
+        """
+
+        if not self._entered:
+            raise RuntimeError("source action delivery fence is not entered")
+        self._entered = False
+        self._projection_lock.release()
 
 
 class _RuntimeProducer:
@@ -483,6 +596,35 @@ class NativeTerminalRuntimeSnapshot:
             raise ValueError("fatal_reason must be a non-empty string")
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class NativeTerminalFailClosedSurrender:
+    """Atomic transfer of quarantined downstream action authority.
+
+    :ivar action_ids: Exact native actions removed from runtime accounting.
+    :ivar binding_digests: Corresponding quarantined request identities.
+    """
+
+    action_ids: tuple[int, ...]
+    binding_digests: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        """Validate one immutable surrender receipt."""
+
+        if type(self.action_ids) is not tuple or any(
+            type(action_id) is not int or action_id < 0 for action_id in self.action_ids
+        ):
+            raise ValueError("action_ids must contain unsigned integers")
+        if len(set(self.action_ids)) != len(self.action_ids):
+            raise ValueError("surrendered action identities must be unique")
+        if type(self.binding_digests) is not tuple or any(
+            type(digest) is not bytes or len(digest) != 32
+            for digest in self.binding_digests
+        ):
+            raise ValueError("binding_digests must contain 32-byte identities")
+        if len(self.action_ids) != len(self.binding_digests):
+            raise ValueError("surrender action and binding populations differ")
+
+
 _SCHEDULER_ACTIONS = frozenset(
     (
         NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
@@ -510,6 +652,14 @@ _DECODE_SCATTER_ACTIONS = frozenset(
 _DECODE_WORK_ACTIONS = frozenset((NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,))
 _PUBLISHER_ACTIONS = frozenset(
     (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,)
+)
+_SOURCE_FAIL_CLOSED_DOWNSTREAM_ACTIONS = frozenset(
+    (
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+    )
 )
 _FORWARD_INDEPENDENT_HANDOFF_ACTIONS = frozenset(
     (
@@ -599,6 +749,7 @@ class NativeTerminalRuntime:
     _known_bindings: dict[bytes, NativeTerminalLifecycleRegistration]
     _quarantined_bindings: set[bytes]
     _condition: threading.Condition
+    _producer_retirement_lock: threading.Lock
     _output_projection_lock: threading.Lock
     _disposition: NativeTerminalRuntimeDisposition
     _fatal_reason: str | None
@@ -731,8 +882,7 @@ class NativeTerminalRuntime:
         if native_handoff_actions != _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
             owner.abort_and_close()
             raise RuntimeError(
-                "native and Python forward-independent action classifications "
-                "disagree"
+                "native and Python forward-independent action classifications disagree"
             )
         for spec in producer_specs:
             owner.register_producer(spec.registration)
@@ -800,6 +950,7 @@ class NativeTerminalRuntime:
         self._known_bindings = {}
         self._quarantined_bindings = set()
         self._condition = threading.Condition()
+        self._producer_retirement_lock = threading.Lock()
         self._output_projection_lock = threading.Lock()
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
@@ -912,6 +1063,25 @@ class NativeTerminalRuntime:
 
         return self._publisher_actions
 
+    def source_action_delivery_fence(
+        self,
+    ) -> NativeTerminalSourceActionDeliveryFence:
+        """Create a one-turn source claim and scheduler-delivery fence.
+
+        The source process reactor must claim every action sibling before it
+        can wait on scheduler-owned state. Keeping output projection excluded
+        through that scheduler publication also prevents a later native output
+        from activating a handoff which the blocked reactor cannot yet claim.
+
+        :returns: Single-use fence over native output projection.
+        """
+
+        if self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE:
+            raise NativeTerminalRuntimeError(
+                "source action delivery fence requires a source runtime"
+            )
+        return NativeTerminalSourceActionDeliveryFence(self._output_projection_lock)
+
     @property
     def python_producer_ids(self) -> tuple[int, ...]:
         """Return every Python-owned producer in registration order.
@@ -924,6 +1094,24 @@ class NativeTerminalRuntime:
             for producer_id, producer in self._producers.items()
             if producer.delivery is NativeTerminalProducerDelivery.PYTHON
         )
+
+    @property
+    def unretired_python_producer_ids(self) -> tuple[int, ...]:
+        """Return the exact Python producer roster still requiring retirement.
+
+        Roster reads serialize with retirement commits, so recovery after a
+        mid-roster failure can resume without replaying a completed namespace.
+
+        :returns: Stable unretired identities in registration order.
+        """
+
+        with self._producer_retirement_lock:
+            return tuple(
+                producer_id
+                for producer_id, producer in self._producers.items()
+                if producer.delivery is NativeTerminalProducerDelivery.PYTHON
+                and not producer._retirement_requested
+            )
 
     @property
     def disposition(self) -> NativeTerminalRuntimeDisposition:
@@ -1114,6 +1302,10 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "scheduler action is absent, stale, or already completed"
                 )
+            if action.action_id not in self._inbox_claimed_action_ids:
+                raise NativeTerminalRuntimeError(
+                    "scheduler action was completed before inbox claim"
+                )
         self.submit(
             producer_id=producer_id,
             binding_digest=binding_digest,
@@ -1132,6 +1324,7 @@ class NativeTerminalRuntime:
                 )
             del self._scheduler_pending[binding_digest]
             self._consumer_pending.pop(action.action_id)
+            self._inbox_claimed_action_ids.remove(action.action_id)
             self._scheduler_live.pop(binding_digest, None)
             self._condition.notify_all()
 
@@ -1194,6 +1387,10 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "scheduler action is absent, stale, or already completed"
                 )
+            if action.action_id not in self._inbox_claimed_action_ids:
+                raise NativeTerminalRuntimeError(
+                    "scheduler action failed before inbox claim"
+                )
         failure_kind = NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED
         if action.kind is NativeTerminalOwnerActionKind.ADOPTION_READY:
             failure_kind = NativeTerminalOwnerEventKind.DECODE_REQUEST_FAILED
@@ -1225,6 +1422,7 @@ class NativeTerminalRuntime:
                 )
             del self._scheduler_pending[binding_digest]
             self._consumer_pending.pop(action.action_id)
+            self._inbox_claimed_action_ids.remove(action.action_id)
             self._enter_runtime_fatal_locked(reason)
 
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
@@ -1344,6 +1542,168 @@ class NativeTerminalRuntime:
         with self._condition:
             return self._discard_aborted_action_locked(action)
 
+    def surrender_fail_closed_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalFailClosedSurrender:
+        """Atomically transfer every remaining source action to quarantine.
+
+        The scheduler and source-wiring closures are immutable downstream
+        owners. This operation validates their complete joined population under
+        one runtime lock, then removes all runtime accounting or none of it.
+
+        :param actions: Complete downstream fail-closed closure population.
+        :returns: Exact atomic surrender receipt.
+        """
+
+        if type(actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction for action in actions
+        ):
+            raise TypeError("actions must contain NativeTerminalOwnerAction values")
+        actions_by_id = {action.action_id: action for action in actions}
+        if len(actions_by_id) != len(actions):
+            raise ValueError("fail-closed action identities must be unique")
+        with self._condition:
+            if self._disposition is not NativeTerminalRuntimeDisposition.ABORT_DRAINING:
+                raise NativeTerminalRuntimeError(
+                    "fail-closed surrender requires abort-draining state"
+                )
+            if self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE:
+                raise NativeTerminalRuntimeError(
+                    "fail-closed downstream surrender requires a source runtime"
+                )
+            if not self._producers_joined:
+                raise NativeTerminalRuntimeError(
+                    "fail-closed surrender requires joined producers"
+                )
+            if set(actions_by_id) != set(self._consumer_pending):
+                raise NativeTerminalRuntimeError(
+                    "fail-closed closure differs from pending consumer authority"
+                )
+            for action in actions:
+                if action.kind not in _SOURCE_FAIL_CLOSED_DOWNSTREAM_ACTIONS:
+                    raise NativeTerminalRuntimeError(
+                        "fail-closed closure contains another action kind"
+                    )
+                if self._consumer_pending.get(action.action_id) != action:
+                    raise NativeTerminalRuntimeError(
+                        "fail-closed closure aliases pending consumer authority"
+                    )
+                if action.action_id not in self._inbox_claimed_action_ids:
+                    raise NativeTerminalRuntimeError(
+                        "fail-closed action lacks an exact inbox claim"
+                    )
+                binding_digest = action.binding.digest
+                if (
+                    action.kind
+                    not in (
+                        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+                        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+                    )
+                    and binding_digest not in self._quarantined_bindings
+                ):
+                    raise NativeTerminalRuntimeError(
+                        "fail-closed action lacks runtime quarantine authority"
+                    )
+                if (
+                    action.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
+                    and self._scheduler_pending.get(binding_digest) != action
+                ):
+                    raise NativeTerminalRuntimeError(
+                        "scheduler closure differs from pending reclaim authority"
+                    )
+            for action in actions:
+                del self._consumer_pending[action.action_id]
+                self._inbox_claimed_action_ids.remove(action.action_id)
+                if action.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED:
+                    del self._scheduler_pending[action.binding.digest]
+                if action.kind in (
+                    NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+                    NativeTerminalOwnerActionKind.PROCESS_FATAL,
+                ):
+                    self._quarantined_bindings.add(action.binding.digest)
+            for binding_digest in {action.binding.digest for action in actions}:
+                if binding_digest not in self._scheduler_pending:
+                    self._scheduler_live.pop(binding_digest, None)
+            self._condition.notify_all()
+        return NativeTerminalFailClosedSurrender(
+            action_ids=tuple(action.action_id for action in actions),
+            binding_digests=tuple(action.binding.digest for action in actions),
+        )
+
+    def surrender_decode_fail_closed_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalFailClosedSurrender:
+        """Atomically transfer retained decode adoption authority to quarantine.
+
+        The decode scheduler closure is the durable owner after every retained
+        registration has entered scheduler-side quarantine. This operation
+        validates the complete runtime population under one lock before removing
+        any accounting, so an incomplete closure cannot strand or discard an
+        adoption generation.
+
+        :param actions: Complete decode scheduler fail-closed closure population.
+        :returns: Exact atomic surrender receipt.
+        """
+
+        if type(actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction for action in actions
+        ):
+            raise TypeError("actions must contain NativeTerminalOwnerAction values")
+        actions_by_id = {action.action_id: action for action in actions}
+        if len(actions_by_id) != len(actions):
+            raise ValueError("fail-closed action identities must be unique")
+        with self._condition:
+            if self._disposition is not NativeTerminalRuntimeDisposition.ABORT_DRAINING:
+                raise NativeTerminalRuntimeError(
+                    "decode fail-closed surrender requires abort-draining state"
+                )
+            if self._owner_identity.role is not NativeTerminalOwnerRole.DECODE:
+                raise NativeTerminalRuntimeError(
+                    "decode fail-closed surrender requires a decode runtime"
+                )
+            if not self._producers_joined:
+                raise NativeTerminalRuntimeError(
+                    "decode fail-closed surrender requires joined producers"
+                )
+            if set(actions_by_id) != set(self._consumer_pending):
+                raise NativeTerminalRuntimeError(
+                    "decode scheduler closure differs from pending consumer authority"
+                )
+            for action in actions:
+                if action.kind is not NativeTerminalOwnerActionKind.ADOPTION_READY:
+                    raise NativeTerminalRuntimeError(
+                        "decode scheduler closure contains another action kind"
+                    )
+                if self._consumer_pending.get(action.action_id) != action:
+                    raise NativeTerminalRuntimeError(
+                        "decode scheduler closure aliases pending consumer authority"
+                    )
+                if action.action_id not in self._inbox_claimed_action_ids:
+                    raise NativeTerminalRuntimeError(
+                        "decode fail-closed action lacks an exact inbox claim"
+                    )
+                binding_digest = action.binding.digest
+                if binding_digest not in self._quarantined_bindings:
+                    raise NativeTerminalRuntimeError(
+                        "decode scheduler action lacks runtime quarantine authority"
+                    )
+                if self._scheduler_pending.get(binding_digest) != action:
+                    raise NativeTerminalRuntimeError(
+                        "decode scheduler closure differs from pending adoption authority"
+                    )
+            for action in actions:
+                del self._consumer_pending[action.action_id]
+                self._inbox_claimed_action_ids.remove(action.action_id)
+                del self._scheduler_pending[action.binding.digest]
+                self._scheduler_live.pop(action.binding.digest, None)
+            self._condition.notify_all()
+        return NativeTerminalFailClosedSurrender(
+            action_ids=tuple(action.action_id for action in actions),
+            binding_digests=tuple(action.binding.digest for action in actions),
+        )
+
     def _discard_aborted_action_locked(
         self,
         action: NativeTerminalOwnerAction,
@@ -1391,7 +1751,7 @@ class NativeTerminalRuntime:
 
     def _claim_consumer_actions(
         self, actions: tuple[NativeTerminalOwnerAction, ...]
-    ) -> None:
+    ) -> tuple[NativeTerminalOwnerAction, ...]:
         """End scheduler handoffs at the isolated inbox-dequeue boundary.
 
         Claiming proves only that the dedicated consumer owns the immutable
@@ -1400,31 +1760,77 @@ class NativeTerminalRuntime:
         authority across consumer work and recursive native submissions.
 
         :param actions: Exact FIFO prefix removed from one runtime-owned inbox.
+        :returns: Exact population newly claimed by this drain.
+        :raises NativeTerminalActionClaimError: If any removed action cannot be
+            newly claimed without aliasing an existing downstream owner.
         """
 
         if type(actions) is not tuple or any(
             type(action) is not NativeTerminalOwnerAction for action in actions
         ):
             raise TypeError("actions must contain NativeTerminalOwnerAction values")
-        for action in actions:
-            if action.kind in _SCHEDULER_ACTIONS:
-                continue
+        claimable_actions: list[NativeTerminalOwnerAction] = []
+        claim_failure: str | None = None
+        with self._condition:
+            for action in actions:
+                pending = self._consumer_pending.get(action.action_id)
+                if (
+                    pending != action
+                    or action.action_id in self._inbox_claimed_action_ids
+                ):
+                    if claim_failure is None:
+                        claim_failure = (
+                            "consumer action changed during exact inbox claim"
+                        )
+                    self._enter_runtime_fatal_locked(
+                        "consumer action changed during exact inbox claim"
+                    )
+                    continue
+                claimable_actions.append(action)
+        claim_error: Exception | None = None
+        claim_traceback: str | None = None
+        locally_claimed_actions: list[NativeTerminalOwnerAction] = []
+        for action in claimable_actions:
             if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
-                self._claim_forward_independent_handoff(action)
+                try:
+                    self._claim_forward_independent_handoff(action)
+                except Exception as error:  # noqa: BLE001
+                    if claim_error is None:
+                        claim_error = error
+                        claim_traceback = traceback.format_exc()
             with self._condition:
                 pending = self._consumer_pending.get(action.action_id)
                 if (
                     pending != action
                     or action.action_id in self._inbox_claimed_action_ids
                 ):
+                    if claim_failure is None:
+                        claim_failure = (
+                            "consumer action changed while inbox claim completed"
+                        )
                     self._enter_runtime_fatal_locked(
-                        "consumer action changed during exact inbox claim"
+                        "consumer action changed while inbox claim completed"
                     )
-                    raise NativeTerminalRuntimeError(
-                        "consumer action changed during exact inbox claim"
-                    )
+                    continue
                 self._inbox_claimed_action_ids.add(action.action_id)
+                locally_claimed_actions.append(action)
                 self._condition.notify_all()
+        claimed = tuple(locally_claimed_actions)
+        if claim_error is not None:
+            if claim_traceback is None:
+                raise RuntimeError("native handoff claim lost its traceback")
+            raise NativeTerminalActionClaimError(
+                actions,
+                claimed,
+                claim_traceback,
+            ) from claim_error
+        if claim_failure is not None:
+            raise NativeTerminalActionClaimError(
+                actions,
+                claimed,
+                claim_failure,
+            )
+        return claimed
 
     def _claim_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
@@ -1609,11 +2015,12 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "producer retirement requires closed lifecycle admission"
                 )
-        with producer._lock:
-            if producer._retirement_requested:
-                raise NativeTerminalRuntimeError("producer was already retired")
-            self._owner.retire_python_producer(producer_id)
-            producer._retirement_requested = True
+        with self._producer_retirement_lock:
+            with producer._lock:
+                if producer._retirement_requested:
+                    raise NativeTerminalRuntimeError("producer was already retired")
+                self._owner.retire_python_producer(producer_id)
+                producer._retirement_requested = True
 
     def join_producers(self) -> None:
         """Verify every registered producer retired and close event admission."""

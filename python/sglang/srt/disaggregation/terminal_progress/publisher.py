@@ -761,6 +761,55 @@ class PackedTerminalOutputPublisher:
         self._enter_fatal(reason, None)
         return False
 
+    def abort_and_join(self, reason: str) -> bool:
+        """Quarantine accepted publications and join without draining them.
+
+        A publication already inside the sink may have crossed its external
+        side-effect boundary. Marking the publisher fatal before joining makes
+        that outcome ambiguous and prevents success delivery. Publications
+        which have not entered the sink remain unsent and retained in the
+        failed-identity inventory.
+
+        :param reason: Stable process-fatal teardown reason.
+        :returns: Whether the publisher stopped within the hash-bound deadline.
+        """
+
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        with self._transition_lock, self._lock:
+            if not self._started:
+                raise TerminalGatewayPublisherError("publisher was never started")
+            if self._disposition is TerminalGatewayPublisherDisposition.CREATED:
+                raise TerminalGatewayPublisherError(
+                    "publisher startup has not completed"
+                )
+            if self._disposition is TerminalGatewayPublisherDisposition.STOPPED:
+                return True
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = start_terminal_deadline(
+                    TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN,
+                    self._clock_ns(),
+                )
+            shutdown_deadline = self._shutdown_deadline
+            should_notify, should_wake = self._record_fatal_locked(
+                reason,
+                None,
+                (),
+            )
+            thread_launched = self._thread_launched
+        self._finish_fatal_transition(
+            should_notify,
+            should_wake,
+            reason,
+            None,
+        )
+        if not thread_launched:
+            return True
+        timeout_seconds = self._remaining_deadline_seconds(shutdown_deadline)
+        if timeout_seconds > 0.0:
+            self._thread.join(timeout=timeout_seconds)
+        return not self._thread.is_alive()
+
     def snapshot(self) -> TerminalGatewayPublisherSnapshot:
         """Return exact publisher liveness and retained identity inventory.
 
