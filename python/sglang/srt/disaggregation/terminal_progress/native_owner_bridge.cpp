@@ -710,7 +710,8 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::unordered_map<std::uint64_t, Action> pending_actions{};
   std::unordered_set<std::uint64_t> consumed_actions{};
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
-  std::unordered_set<std::uint64_t> handoff_action_ids{};
+  std::unordered_set<std::uint64_t> unclaimed_handoff_action_ids{};
+  std::unordered_set<std::uint64_t> activated_handoff_action_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -732,7 +733,8 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::uint64_t active_handoff_callback_id{0};
   std::uint64_t active_handoff_watermark{0};
   std::uint64_t handoff_callback_count{0};
-  std::uint64_t handoff_completion_count{0};
+  std::uint64_t handoff_claim_count{0};
+  std::uint64_t handoff_discard_count{0};
   bool started{false};
   bool admission_open{true};
   bool event_admission_open{true};
@@ -772,7 +774,7 @@ int terminal_handoff_pending_call(void *opaque) noexcept;
 void register_forward_independent_handoffs_locked(
     SharedOwner &owner, const Output &output) noexcept;
 
-void fail_forward_independent_handoff_locked(
+void discard_forward_independent_handoff_locked(
     SharedOwner &owner, std::uint64_t action_id) noexcept;
 
 std::uint64_t owner_now_ns_locked(const SharedOwner &owner) {
@@ -1454,15 +1456,38 @@ void quarantine_all_locked(SharedOwner &owner, FatalCode code,
 }
 
 bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
-  return kind != ActionKind::kReclaimAuthorized &&
-         kind != ActionKind::kAdoptionReady;
+  switch (kind) {
+  case ActionKind::kLocalDecodeReady:
+  case ActionKind::kRequestRetired:
+  case ActionKind::kSourceGatherReady:
+  case ActionKind::kSourceOutcomeReady:
+  case ActionKind::kSourceAckReady:
+  case ActionKind::kDecodeScatterReady:
+  case ActionKind::kDecodeTeardownReady:
+  case ActionKind::kGatewayPublicationReady: return true;
+  case ActionKind::kReclaimAuthorized:
+  case ActionKind::kAdoptionReady:
+  case ActionKind::kRequestQuarantined:
+  case ActionKind::kProcessFatal: return false;
+  }
+  return false;
 }
 
-bool handoff_pending_through_locked(const SharedOwner &owner,
-                                    std::uint64_t watermark) noexcept {
+bool handoff_unclaimed_through_locked(const SharedOwner &owner,
+                                      std::uint64_t watermark) noexcept {
   return std::any_of(
-      owner.handoff_action_ids.begin(), owner.handoff_action_ids.end(),
+      owner.activated_handoff_action_ids.begin(),
+      owner.activated_handoff_action_ids.end(),
       [watermark](std::uint64_t action_id) { return action_id <= watermark; });
+}
+
+bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
+  return std::all_of(
+      owner.activated_handoff_action_ids.begin(),
+      owner.activated_handoff_action_ids.end(),
+      [&owner](std::uint64_t action_id) {
+        return owner.unclaimed_handoff_action_ids.count(action_id) == 1;
+      });
 }
 
 void enter_handoff_fatal_locked(SharedOwner &owner, FatalCode code,
@@ -1516,33 +1541,27 @@ void register_forward_independent_handoffs_locked(
   if (!owner.handoff_enabled) {
     return;
   }
-  std::uint64_t watermark = 0;
   for (const Action &action : output.actions) {
     if (!action_requires_forward_independent_handoff(action.kind)) {
       continue;
     }
-    if (!owner.handoff_action_ids.insert(action.action_id).second) {
+    if (!owner.unclaimed_handoff_action_ids.insert(action.action_id).second) {
       enter_handoff_fatal_locked(
           owner, FatalCode::kHandoffAuthority,
           "terminal handoff registered a duplicate action identity");
       return;
     }
-    watermark = std::max(watermark, action.action_id);
   }
-  if (watermark == 0 ||
-      owner.fatal_code == FatalCode::kPendingCallQueueFailure) {
-    return;
-  }
-  schedule_handoff_pending_call_locked(owner, watermark);
 }
 
-void fail_forward_independent_handoff_locked(
+void discard_forward_independent_handoff_locked(
     SharedOwner &owner, std::uint64_t action_id) noexcept {
   if (!owner.handoff_enabled) {
     return;
   }
-  if (owner.handoff_action_ids.erase(action_id) == 1) {
-    ++owner.handoff_completion_count;
+  owner.activated_handoff_action_ids.erase(action_id);
+  if (owner.unclaimed_handoff_action_ids.erase(action_id) == 1) {
+    ++owner.handoff_discard_count;
   }
   owner.condition.notify_all();
 }
@@ -1587,7 +1606,7 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
   try {
     completed = owner.condition.wait_for(
         lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          if (!handoff_pending_through_locked(owner, watermark) ||
+          if (!handoff_unclaimed_through_locked(owner, watermark) ||
               owner.closed) {
             return true;
           }
@@ -1599,7 +1618,7 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
 #endif
         });
     deadline_expired =
-        handoff_pending_through_locked(owner, watermark) && !owner.closed &&
+        handoff_unclaimed_through_locked(owner, watermark) && !owner.closed &&
         owner_now_ns_locked(owner) >= deadline_ns;
   } catch (...) {
     wait_failed = true;
@@ -2681,6 +2700,28 @@ public:
   NativeTerminalOwnerBridge &
   operator=(const NativeTerminalOwnerBridge &) = delete;
 
+  py::tuple forward_independent_handoff_action_kinds() const {
+    constexpr std::array<ActionKind, 8> kinds{
+        ActionKind::kLocalDecodeReady,
+        ActionKind::kRequestRetired,
+        ActionKind::kSourceGatherReady,
+        ActionKind::kSourceOutcomeReady,
+        ActionKind::kSourceAckReady,
+        ActionKind::kDecodeScatterReady,
+        ActionKind::kDecodeTeardownReady,
+        ActionKind::kGatewayPublicationReady,
+    };
+    py::tuple result(kinds.size());
+    for (std::size_t index = 0; index < kinds.size(); ++index) {
+      if (!action_requires_forward_independent_handoff(kinds[index])) {
+        throw std::logic_error(
+            "native forward-independent action classification is inconsistent");
+      }
+      result[index] = static_cast<std::uint8_t>(kinds[index]);
+    }
+    return result;
+  }
+
   void enable_forward_independent_handoff() {
     std::lock_guard<std::mutex> lock(owner_->mutex);
     if (owner_->started || owner_->closed) {
@@ -2926,22 +2967,62 @@ public:
     owner_->condition.notify_all();
   }
 
-  void complete_forward_independent_handoff(std::uint64_t action_id) {
+  void claim_forward_independent_handoff(std::uint64_t action_id) {
     std::lock_guard<std::mutex> lock(owner_->mutex);
     if (!owner_->handoff_enabled) {
       throw std::runtime_error("terminal handoff is not enabled");
     }
-    const auto pending = owner_->handoff_action_ids.find(action_id);
-    if (pending == owner_->handoff_action_ids.end()) {
+    const auto unclaimed = owner_->unclaimed_handoff_action_ids.find(action_id);
+    if (unclaimed == owner_->unclaimed_handoff_action_ids.end()) {
       enter_handoff_fatal_locked(*owner_, FatalCode::kHandoffAuthority,
-                                 "terminal handoff action completion was "
+                                 "terminal handoff action claim was "
                                  "unknown, excluded, or replayed");
       throw std::runtime_error(
-          "terminal handoff action completion was absent or replayed");
+          "terminal handoff action claim was absent or replayed");
     }
-    owner_->handoff_action_ids.erase(pending);
-    ++owner_->handoff_completion_count;
+    owner_->activated_handoff_action_ids.erase(action_id);
+    owner_->unclaimed_handoff_action_ids.erase(unclaimed);
+    ++owner_->handoff_claim_count;
     owner_->condition.notify_all();
+  }
+
+  bool activate_forward_independent_handoff(std::uint64_t action_id) {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->handoff_enabled) {
+      throw std::runtime_error("terminal handoff is not enabled");
+    }
+    const auto action = owner_->pending_actions.find(action_id);
+    if (action == owner_->pending_actions.end()) {
+      enter_handoff_fatal_locked(
+          *owner_, FatalCode::kHandoffAuthority,
+          "terminal handoff activation targeted an unknown action");
+      throw std::runtime_error(
+          "terminal handoff activation targeted an unknown action");
+    }
+    if (!action_requires_forward_independent_handoff(action->second.kind)) {
+      if (owner_->unclaimed_handoff_action_ids.count(action_id) != 0 ||
+          owner_->activated_handoff_action_ids.count(action_id) != 0) {
+        enter_handoff_fatal_locked(
+            *owner_, FatalCode::kHandoffAuthority,
+            "excluded terminal action retained handoff authority");
+        throw std::runtime_error(
+            "excluded terminal action retained handoff authority");
+      }
+      return false;
+    }
+    if (owner_->unclaimed_handoff_action_ids.count(action_id) == 0) {
+      return false;
+    }
+    if (!owner_->activated_handoff_action_ids.insert(action_id).second) {
+      enter_handoff_fatal_locked(
+          *owner_, FatalCode::kHandoffAuthority,
+          "terminal handoff activation was replayed");
+      throw std::runtime_error("terminal handoff activation was replayed");
+    }
+    if (!schedule_handoff_pending_call_locked(*owner_, action_id)) {
+      return false;
+    }
+    return true;
   }
 
   void fail_action_delivery(std::uint64_t action_id,
@@ -2958,7 +3039,7 @@ public:
     trigger.kind = action->second.binding.owner.role == OwnerRole::kSource
                        ? EventKind::kSourceInboxOverflow
                        : EventKind::kDecodeInboxOverflow;
-    fail_forward_independent_handoff_locked(*owner_, action_id);
+    discard_forward_independent_handoff_locked(*owner_, action_id);
     owner_->pending_actions.erase(action);
     owner_->output_drain_action_ids.erase(action_id);
     if (owner_->output_drain_action_ids.empty()) {
@@ -3391,7 +3472,8 @@ public:
                       !owner_->pending_actions.empty() ||
                       owner_->output_drain_active ||
                       !owner_->output_drain_action_ids.empty() ||
-                      !owner_->handoff_action_ids.empty() ||
+                      !owner_->unclaimed_handoff_action_ids.empty() ||
+                      !owner_->activated_handoff_action_ids.empty() ||
                       !owner_->producers_joined;
       for (const auto &entry : owner_->lifecycles) {
         retained = retained || entry.second.live_resources != 0;
@@ -3481,7 +3563,8 @@ public:
         !owner_->fatal_output_queue.empty() ||
         owner_->output_drain_active ||
         !owner_->output_drain_action_ids.empty() ||
-        !owner_->handoff_action_ids.empty()) {
+        !owner_->unclaimed_handoff_action_ids.empty() ||
+        !owner_->activated_handoff_action_ids.empty()) {
       throw std::runtime_error(
           "aborted close retained unrouted terminal authority");
     }
@@ -3505,7 +3588,8 @@ public:
     owner_->fatal_output_queue.clear();
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
-    owner_->handoff_action_ids.clear();
+    owner_->unclaimed_handoff_action_ids.clear();
+    owner_->activated_handoff_action_ids.clear();
     owner_->output_drain_active = false;
     close_fds_locked();
     owner_->closed = true;
@@ -3526,6 +3610,10 @@ private:
   }
 
   py::dict inventory_locked() const {
+    if (!handoff_authority_is_consistent_locked(*owner_)) {
+      throw std::runtime_error(
+          "activated terminal handoffs exceed unclaimed authority");
+    }
     py::dict result;
     std::size_t active_source_count = 0;
     std::size_t active_decode_count = 0;
@@ -3622,10 +3710,10 @@ private:
     result["output_queue_count"] = owner_->output_queue.size();
     result["fatal_output_queue_count"] = owner_->fatal_output_queue.size();
     result["pending_action_count"] = owner_->pending_actions.size();
-    result["pending_handoff_action_count"] =
-        owner_->handoff_action_ids.size();
-    result["completed_handoff_action_count"] =
-        owner_->handoff_completion_count;
+    result["unclaimed_handoff_action_count"] =
+        owner_->unclaimed_handoff_action_ids.size();
+    result["claimed_handoff_action_count"] = owner_->handoff_claim_count;
+    result["discarded_handoff_action_count"] = owner_->handoff_discard_count;
     result["handoff_callback_count"] = owner_->handoff_callback_count;
     result["handoff_enabled"] = owner_->handoff_enabled;
     result["handoff_callback_scheduled"] =
@@ -3747,6 +3835,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("deadline_table_digest"))
       .def("enable_forward_independent_handoff",
            &NativeTerminalOwnerBridge::enable_forward_independent_handoff)
+      .def("forward_independent_handoff_action_kinds",
+           &NativeTerminalOwnerBridge::forward_independent_handoff_action_kinds)
       .def("register_producer",
            &NativeTerminalOwnerBridge::register_producer,
            py::arg("producer_id"), py::arg("name"),
@@ -3772,9 +3862,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("acknowledge_action",
            &NativeTerminalOwnerBridge::acknowledge_action,
            py::arg("action_id"), py::call_guard<py::gil_scoped_release>())
-      .def("complete_forward_independent_handoff",
-           &NativeTerminalOwnerBridge::complete_forward_independent_handoff,
-           py::arg("action_id"), py::call_guard<py::gil_scoped_release>())
+      .def("claim_forward_independent_handoff",
+           &NativeTerminalOwnerBridge::claim_forward_independent_handoff,
+           py::arg("action_id"))
+      .def("activate_forward_independent_handoff",
+           &NativeTerminalOwnerBridge::activate_forward_independent_handoff,
+           py::arg("action_id"))
       .def("fail_action_delivery",
            &NativeTerminalOwnerBridge::fail_action_delivery,
            py::arg("action_id"), py::arg("reason"),

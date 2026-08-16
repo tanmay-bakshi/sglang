@@ -8,7 +8,7 @@ import selectors
 import threading
 import time
 import traceback
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
@@ -324,6 +324,39 @@ class _BoundedFdInbox[ValueT]:
 class NativeTerminalActionInbox(_BoundedFdInbox[NativeTerminalOwnerAction]):
     """Fd-signalled immutable action queue for one execution context."""
 
+    _claim: Callable[[tuple[NativeTerminalOwnerAction, ...]], None]
+
+    def __init__(
+        self,
+        name: str,
+        capacity: int,
+        claim: Callable[[tuple[NativeTerminalOwnerAction, ...]], None],
+    ) -> None:
+        """Construct one queue with its mandatory runtime claim boundary.
+
+        :param name: Stable consumer identity.
+        :param capacity: Maximum queued immutable actions.
+        :param claim: Runtime operation which claims dequeued actions before
+            they become observable to their dedicated consumer.
+        """
+
+        super().__init__(name, capacity)
+        self._claim = claim
+
+    def drain(
+        self, maximum_items: int | None = None
+    ) -> tuple[NativeTerminalOwnerAction, ...]:
+        """Claim and return one FIFO prefix to its dedicated consumer.
+
+        :param maximum_items: Optional positive action-count bound.
+        :returns: Immutable FIFO population already claimed from the native
+            scheduler handoff.
+        """
+
+        actions = super().drain(maximum_items)
+        self._claim(actions)
+        return actions
+
 
 class NativeTerminalObservationInbox(_BoundedFdInbox[NativeTerminalObservation]):
     """Non-authoritative output-observation queue for metrics and evidence."""
@@ -478,6 +511,32 @@ _DECODE_WORK_ACTIONS = frozenset((NativeTerminalOwnerActionKind.DECODE_TEARDOWN_
 _PUBLISHER_ACTIONS = frozenset(
     (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,)
 )
+_FORWARD_INDEPENDENT_HANDOFF_ACTIONS = frozenset(
+    (
+        NativeTerminalOwnerActionKind.LOCAL_DECODE_READY,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
+        NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
+        NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,
+        NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+    )
+)
+_FORWARD_INDEPENDENT_HANDOFF_EXCLUSIONS = frozenset(
+    (
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        NativeTerminalOwnerActionKind.ADOPTION_READY,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        NativeTerminalOwnerActionKind.PROCESS_FATAL,
+    )
+)
+if _FORWARD_INDEPENDENT_HANDOFF_ACTIONS & _FORWARD_INDEPENDENT_HANDOFF_EXCLUSIONS:
+    raise RuntimeError("terminal handoff action partitions overlap")
+if frozenset(NativeTerminalOwnerActionKind) != (
+    _FORWARD_INDEPENDENT_HANDOFF_ACTIONS | _FORWARD_INDEPENDENT_HANDOFF_EXCLUSIONS
+):
+    raise RuntimeError("terminal handoff action partitions are incomplete")
 _LOCAL_FAILURE_EVENTS = frozenset(
     (
         NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
@@ -536,6 +595,7 @@ class NativeTerminalRuntime:
     _scheduler_live: dict[bytes, NativeTerminalLifecycleRegistration]
     _scheduler_pending: dict[bytes, NativeTerminalOwnerAction]
     _consumer_pending: dict[int, NativeTerminalOwnerAction]
+    _inbox_claimed_action_ids: set[int]
     _known_bindings: dict[bytes, NativeTerminalLifecycleRegistration]
     _quarantined_bindings: set[bytes]
     _condition: threading.Condition
@@ -592,7 +652,7 @@ class NativeTerminalRuntime:
         :param publisher_capacity: Gateway publication inbox capacity.
         :param observation_capacity: Non-gating metrics queue capacity.
         :param enable_forward_independent_handoff: Whether forward-independent
-            actions may park the scheduler while their Python owners run.
+            actions park the scheduler until their dedicated inbox claims them.
         """
 
         if type(owner_identity) is not NativeTerminalProcessIdentity:
@@ -667,6 +727,13 @@ class NativeTerminalRuntime:
             owner_identity=owner_identity,
             maximum_live_lifecycles=maximum_live_lifecycles,
         )
+        native_handoff_actions = owner.forward_independent_handoff_action_kinds()
+        if native_handoff_actions != _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
+            owner.abort_and_close()
+            raise RuntimeError(
+                "native and Python forward-independent action classifications "
+                "disagree"
+            )
         for spec in producer_specs:
             owner.register_producer(spec.registration)
         if enable_forward_independent_handoff:
@@ -684,28 +751,44 @@ class NativeTerminalRuntime:
         self._python_producer_ids_by_authority = python_producer_ids_by_authority
         self._fatal_producer_id = fatal_producer_id
         self._scheduler_actions = NativeTerminalActionInbox(
-            "packed-terminal-scheduler-actions", scheduler_capacity
+            "packed-terminal-scheduler-actions",
+            scheduler_capacity,
+            self._claim_consumer_actions,
         )
         self._coordinator_actions = NativeTerminalActionInbox(
-            "packed-terminal-coordinator-actions", coordinator_capacity
+            "packed-terminal-coordinator-actions",
+            coordinator_capacity,
+            self._claim_consumer_actions,
         )
         self._lifecycle_actions = NativeTerminalActionInbox(
-            "packed-terminal-lifecycle-actions", lifecycle_capacity
+            "packed-terminal-lifecycle-actions",
+            lifecycle_capacity,
+            self._claim_consumer_actions,
         )
         self._source_gather_actions = NativeTerminalActionInbox(
-            "packed-terminal-source-gather-actions", source_gather_capacity
+            "packed-terminal-source-gather-actions",
+            source_gather_capacity,
+            self._claim_consumer_actions,
         )
         self._source_work_actions = NativeTerminalActionInbox(
-            "packed-terminal-source-work-actions", source_work_capacity
+            "packed-terminal-source-work-actions",
+            source_work_capacity,
+            self._claim_consumer_actions,
         )
         self._decode_scatter_actions = NativeTerminalActionInbox(
-            "packed-terminal-decode-scatter-actions", decode_scatter_capacity
+            "packed-terminal-decode-scatter-actions",
+            decode_scatter_capacity,
+            self._claim_consumer_actions,
         )
         self._decode_work_actions = NativeTerminalActionInbox(
-            "packed-terminal-decode-work-actions", decode_work_capacity
+            "packed-terminal-decode-work-actions",
+            decode_work_capacity,
+            self._claim_consumer_actions,
         )
         self._publisher_actions = NativeTerminalActionInbox(
-            "packed-terminal-publisher-actions", publisher_capacity
+            "packed-terminal-publisher-actions",
+            publisher_capacity,
+            self._claim_consumer_actions,
         )
         self._observations = NativeTerminalObservationInbox(
             "packed-terminal-observations", observation_capacity
@@ -713,15 +796,14 @@ class NativeTerminalRuntime:
         self._scheduler_live = {}
         self._scheduler_pending = {}
         self._consumer_pending = {}
+        self._inbox_claimed_action_ids = set()
         self._known_bindings = {}
         self._quarantined_bindings = set()
         self._condition = threading.Condition()
         self._output_projection_lock = threading.Lock()
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
-        self._forward_independent_handoff_enabled = (
-            enable_forward_independent_handoff
-        )
+        self._forward_independent_handoff_enabled = enable_forward_independent_handoff
         self._output_reactor_alive = False
         self._producers_joined = False
         self._native_observation_delivery_count = 0
@@ -1148,10 +1230,10 @@ class NativeTerminalRuntime:
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Retire one non-scheduler action after downstream acceptance.
 
-        The native action ledger is acknowledged immediately after bounded
-        inbox admission. This method releases the runtime's consumer-side
-        generation accounting only after the receiving component accepted the
-        immutable action.
+        The dedicated consumer claims the scheduler handoff while dequeuing
+        the action. This method releases the runtime's consumer-side generation
+        accounting only after the receiving component accepted the immutable
+        action.
 
         :param action: Action previously drained from a runtime inbox.
         """
@@ -1164,11 +1246,10 @@ class NativeTerminalRuntime:
             pending = self._consumer_pending.get(action.action_id)
         if pending != action:
             if pending is None:
-                self._reject_forward_independent_completion(action)
+                self._reject_forward_independent_claim(action)
             raise NativeTerminalRuntimeError(
                 "consumer action is absent, stale, or already acknowledged"
             )
-        self._complete_forward_independent_handoff(action)
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
             if pending != action:
@@ -1178,7 +1259,15 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action changed during exact acknowledgement"
                 )
+            if action.action_id not in self._inbox_claimed_action_ids:
+                self._enter_runtime_fatal_locked(
+                    "consumer action was acknowledged before inbox claim"
+                )
+                raise NativeTerminalRuntimeError(
+                    "consumer action was acknowledged before inbox claim"
+                )
             del self._consumer_pending[action.action_id]
+            self._inbox_claimed_action_ids.remove(action.action_id)
             if action.kind in (
                 NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
                 NativeTerminalOwnerActionKind.PROCESS_FATAL,
@@ -1214,8 +1303,6 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action identity aliases another pending action"
                 )
-        if action.kind not in _SCHEDULER_ACTIONS:
-            self._complete_forward_independent_handoff(action)
         with self._condition:
             if not self._discard_aborted_action_locked(action):
                 raise NativeTerminalRuntimeError(
@@ -1254,8 +1341,6 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action identity aliases another pending action"
                 )
-        if action.kind not in _SCHEDULER_ACTIONS:
-            self._complete_forward_independent_handoff(action)
         with self._condition:
             return self._discard_aborted_action_locked(action)
 
@@ -1276,7 +1361,18 @@ class NativeTerminalRuntime:
             raise NativeTerminalRuntimeError(
                 "consumer action identity aliases another pending action"
             )
+        if (
+            action.kind not in _SCHEDULER_ACTIONS
+            and action.action_id not in self._inbox_claimed_action_ids
+        ):
+            self._enter_runtime_fatal_locked(
+                "aborted consumer action was discarded before inbox claim"
+            )
+            raise NativeTerminalRuntimeError(
+                "aborted consumer action was discarded before inbox claim"
+            )
         del self._consumer_pending[action.action_id]
+        self._inbox_claimed_action_ids.discard(action.action_id)
         binding_digest = action.binding.digest
         if action.kind in _SCHEDULER_ACTIONS:
             self._scheduler_pending.pop(binding_digest, None)
@@ -1293,43 +1389,107 @@ class NativeTerminalRuntime:
         self._condition.notify_all()
         return True
 
-    def _complete_forward_independent_handoff(
-        self, action: NativeTerminalOwnerAction
+    def _claim_consumer_actions(
+        self, actions: tuple[NativeTerminalOwnerAction, ...]
     ) -> None:
-        """Complete native handoff authority outside the runtime ledger lock.
+        """End scheduler handoffs at the isolated inbox-dequeue boundary.
 
-        :param action: Exact non-scheduler action accepted by its sole owner.
+        Claiming proves only that the dedicated consumer owns the immutable
+        action. The action remains in ``_consumer_pending`` until its existing
+        downstream acknowledgement, which preserves resource and lifecycle
+        authority across consumer work and recursive native submissions.
+
+        :param actions: Exact FIFO prefix removed from one runtime-owned inbox.
         """
 
-        if not self._forward_independent_handoff_enabled:
+        if type(actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction for action in actions
+        ):
+            raise TypeError("actions must contain NativeTerminalOwnerAction values")
+        for action in actions:
+            if action.kind in _SCHEDULER_ACTIONS:
+                continue
+            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
+                self._claim_forward_independent_handoff(action)
+            with self._condition:
+                pending = self._consumer_pending.get(action.action_id)
+                if (
+                    pending != action
+                    or action.action_id in self._inbox_claimed_action_ids
+                ):
+                    self._enter_runtime_fatal_locked(
+                        "consumer action changed during exact inbox claim"
+                    )
+                    raise NativeTerminalRuntimeError(
+                        "consumer action changed during exact inbox claim"
+                    )
+                self._inbox_claimed_action_ids.add(action.action_id)
+                self._condition.notify_all()
+
+    def _claim_forward_independent_handoff(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Claim native handoff authority before taking the runtime lock.
+
+        :param action: Exact non-scheduler action claimed by its sole owner.
+        """
+
+        if (
+            not self._forward_independent_handoff_enabled
+            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        ):
             return
         if action.kind in _SCHEDULER_ACTIONS:
             raise NativeTerminalRuntimeError(
-                "scheduler action cannot complete a forward-independent handoff"
+                "scheduler action cannot claim forward-independent handoff authority"
             )
         try:
-            self._owner.complete_forward_independent_handoff(action)
-        except Exception:  # noqa: BLE001
+            self._owner.claim_forward_independent_handoff(action)
+        except Exception:
             formatted_traceback = traceback.format_exc()
             with self._condition:
                 self._enter_runtime_fatal_locked(formatted_traceback)
             raise
 
-    def _reject_forward_independent_completion(
+    def _reject_forward_independent_claim(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Make an unknown or replayed downstream completion process-fatal.
+        """Make an unknown or replayed handoff claim process-fatal.
 
         :param action: Action identity rejected by the Python consumer ledger.
         """
 
-        if not self._forward_independent_handoff_enabled:
+        if (
+            not self._forward_independent_handoff_enabled
+            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        ):
             return
         try:
-            self._owner.complete_forward_independent_handoff(action)
+            self._owner.claim_forward_independent_handoff(action)
         except Exception:  # noqa: BLE001
             with self._condition:
                 self._enter_runtime_fatal_locked(traceback.format_exc())
+
+    def _activate_forward_independent_handoff(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Activate a scheduler wake only after unlocked inbox publication.
+
+        :param action: Exact action already visible to its dedicated consumer.
+        """
+
+        if (
+            not self._forward_independent_handoff_enabled
+            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        ):
+            return
+        try:
+            self._owner.activate_forward_independent_handoff(action)
+        except Exception:
+            formatted_traceback = traceback.format_exc()
+            with self._condition:
+                self._enter_runtime_fatal_locked(formatted_traceback)
+            raise
 
     def complete_work_action(
         self,
@@ -1399,7 +1559,7 @@ class NativeTerminalRuntime:
             pending = self._consumer_pending.get(action.action_id)
         if pending != action:
             if pending is None:
-                self._reject_forward_independent_completion(action)
+                self._reject_forward_independent_claim(action)
             raise NativeTerminalRuntimeError(
                 "work action is absent, stale, or already completed"
             )
@@ -1482,6 +1642,7 @@ class NativeTerminalRuntime:
 
         owner = self._owner.inventory()
         with self._condition:
+            self._require_consumer_claim_conservation_locked()
             return NativeTerminalRuntimeSnapshot(
                 disposition=self._disposition,
                 owner=owner,
@@ -1614,6 +1775,7 @@ class NativeTerminalRuntime:
                     len(self._scheduler_live) != 0
                     or len(self._scheduler_pending) != 0
                     or len(self._consumer_pending) != 0
+                    or len(self._inbox_claimed_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "clean close acquired new consumer authority during drain"
@@ -1704,6 +1866,7 @@ class NativeTerminalRuntime:
                     len(self._scheduler_live) != 0
                     or len(self._scheduler_pending) != 0
                     or len(self._consumer_pending) != 0
+                    or len(self._inbox_claimed_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "abort finish retains unaccepted consumer authority"
@@ -1907,7 +2070,7 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
 
     def _route_output(self, output: NativeTerminalOwnerOutput) -> None:
-        """Publish every native action before acknowledging its authority.
+        """Publish and activate every action before native acknowledgement.
 
         :param output: One action-bearing native commit.
         """
@@ -1934,6 +2097,7 @@ class NativeTerminalRuntime:
         for action in output.actions:
             try:
                 self._route_action(action)
+                self._activate_forward_independent_handoff(action)
             except Exception:  # noqa: BLE001
                 formatted_traceback = traceback.format_exc()
                 self._owner.fail_action_delivery(
@@ -2073,6 +2237,18 @@ class NativeTerminalRuntime:
                 "native action identity was routed more than once"
             )
         self._consumer_pending[action.action_id] = action
+
+    def _require_consumer_claim_conservation_locked(self) -> None:
+        """Require every inbox claim to retain downstream consumer authority."""
+
+        if self._inbox_claimed_action_ids.issubset(self._consumer_pending):
+            return
+        self._enter_runtime_fatal_locked(
+            "inbox claims exceed retained downstream consumer authority"
+        )
+        raise NativeTerminalRuntimeError(
+            "inbox claims exceed retained downstream consumer authority"
+        )
 
     def _fail_output_reactor(
         self, binding_digest: bytes | None, formatted_traceback: str

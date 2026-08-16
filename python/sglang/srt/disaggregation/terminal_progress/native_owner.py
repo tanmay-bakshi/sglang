@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NATIVE_SOURCE_RESOURCE_MASK,
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerInventory,
     NativeTerminalOwnerObservation,
@@ -36,6 +37,12 @@ class _NativeTerminalOwnerBridge(Protocol):
 
     def enable_forward_independent_handoff(self) -> None:
         """Enable the process-lifetime CPython scheduler handoff."""
+
+    def forward_independent_handoff_action_kinds(self) -> tuple[int, ...]:
+        """Return the native action kinds enrolled in scheduler handoff.
+
+        :returns: Complete native handoff classification.
+        """
 
     def register_producer(
         self,
@@ -121,8 +128,15 @@ class _NativeTerminalOwnerBridge(Protocol):
         :param action_id: One-shot native action identity.
         """
 
-    def complete_forward_independent_handoff(self, action_id: int) -> None:
-        """Complete one action at its owning Python consumer boundary.
+    def activate_forward_independent_handoff(self, action_id: int) -> bool:
+        """Activate one handoff after bounded inbox publication.
+
+        :param action_id: Exact forward-independent native action identity.
+        :returns: Whether an unclaimed action required a scheduler wake.
+        """
+
+    def claim_forward_independent_handoff(self, action_id: int) -> None:
+        """Claim one action at its owning Python inbox boundary.
 
         :param action_id: Exact forward-independent native action identity.
         """
@@ -534,6 +548,20 @@ class NativeTerminalOwner:
 
         self._native.enable_forward_independent_handoff()
 
+    def forward_independent_handoff_action_kinds(
+        self,
+    ) -> frozenset[NativeTerminalOwnerActionKind]:
+        """Return the native reducer's complete scheduler-handoff partition.
+
+        :returns: Exact forward-independent action kinds.
+        """
+
+        values = self._native.forward_independent_handoff_action_kinds()
+        kinds = tuple(NativeTerminalOwnerActionKind(value) for value in values)
+        if len(set(kinds)) != len(kinds):
+            raise RuntimeError("native handoff action classification is duplicated")
+        return frozenset(kinds)
+
     def register_lifecycle(
         self, registration: NativeTerminalLifecycleRegistration
     ) -> None:
@@ -702,17 +730,33 @@ class NativeTerminalOwner:
             raise TypeError("action must be NativeTerminalOwnerAction")
         self._native.acknowledge_action(action.action_id)
 
-    def complete_forward_independent_handoff(
+    def activate_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
-    ) -> None:
-        """Release one captured scheduler watermark at exact consumption.
+    ) -> bool:
+        """Activate a scheduler wake after exact consumer publication.
 
-        :param action: Forward-independent action completed by its sole owner.
+        A consumer may win the publication race and claim the action before
+        activation. In that case no scheduler wake remains necessary.
+
+        :param action: Action already published to its bounded consumer inbox.
+        :returns: Whether activation scheduled or extended a pending callback.
         """
 
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
-        self._native.complete_forward_independent_handoff(action.action_id)
+        return bool(self._native.activate_forward_independent_handoff(action.action_id))
+
+    def claim_forward_independent_handoff(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Release one captured scheduler watermark at exact inbox claim.
+
+        :param action: Forward-independent action claimed by its sole owner.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        self._native.claim_forward_independent_handoff(action.action_id)
 
     def fail_action_delivery(
         self, action: NativeTerminalOwnerAction, reason: str

@@ -1469,9 +1469,11 @@ class NativeTerminalOwnerInventory:
     :ivar observation_eventfd_error_count: Non-gating observation wake or drain
         failures.
     :ivar pending_action_count: Native actions not yet acknowledged.
-    :ivar pending_handoff_action_count: Forward-independent actions whose
-        owning Python consumer has not acknowledged completion.
-    :ivar completed_handoff_action_count: Exact consumer completions accepted.
+    :ivar unclaimed_handoff_action_count: Forward-independent actions whose
+        dedicated inbox has not claimed ownership.
+    :ivar claimed_handoff_action_count: Exact inbox claims accepted.
+    :ivar discarded_handoff_action_count: Handoffs discarded because bounded
+        consumer delivery failed before an inbox claim.
     :ivar handoff_callback_count: Coalesced pending-call watermarks executed.
     :ivar handoff_enabled: Whether scheduler GIL handoff was frozen at startup.
     :ivar handoff_callback_scheduled: Whether CPython owns a queued callback.
@@ -1521,8 +1523,9 @@ class NativeTerminalOwnerInventory:
     observation_count: int
     observation_eventfd_error_count: int
     pending_action_count: int
-    pending_handoff_action_count: int
-    completed_handoff_action_count: int
+    unclaimed_handoff_action_count: int
+    claimed_handoff_action_count: int
+    discarded_handoff_action_count: int
     handoff_callback_count: int
     registered_producer_count: int
     joined_producer_count: int
@@ -1571,8 +1574,9 @@ class NativeTerminalOwnerInventory:
             self.observation_count,
             self.observation_eventfd_error_count,
             self.pending_action_count,
-            self.pending_handoff_action_count,
-            self.completed_handoff_action_count,
+            self.unclaimed_handoff_action_count,
+            self.claimed_handoff_action_count,
+            self.discarded_handoff_action_count,
             self.handoff_callback_count,
             self.registered_producer_count,
             self.joined_producer_count,
@@ -1614,27 +1618,23 @@ class NativeTerminalOwnerInventory:
         if self.joined_producer_count > self.registered_producer_count:
             raise ValueError("joined producer count exceeds registered producers")
         if (
-            self.pending_handoff_action_count
-            + self.completed_handoff_action_count
+            self.unclaimed_handoff_action_count
+            + self.claimed_handoff_action_count
+            + self.discarded_handoff_action_count
             > self.action_count
         ):
             raise ValueError("native handoff accounting exceeds earned actions")
-        if (
-            self.handoff_callback_scheduled
-            != (self.scheduled_handoff_watermark > 0)
-            or self.handoff_callback_active
-            != (self.active_handoff_watermark > 0)
-        ):
+        if self.handoff_callback_scheduled != (
+            self.scheduled_handoff_watermark > 0
+        ) or self.handoff_callback_active != (self.active_handoff_watermark > 0):
             raise ValueError("native handoff callback state and watermark disagree")
-        if (
-            not self.handoff_enabled
-            and (
-                self.pending_handoff_action_count != 0
-                or self.completed_handoff_action_count != 0
-                or self.handoff_callback_count != 0
-                or self.handoff_callback_scheduled
-                or self.handoff_callback_active
-            )
+        if not self.handoff_enabled and (
+            self.unclaimed_handoff_action_count != 0
+            or self.claimed_handoff_action_count != 0
+            or self.discarded_handoff_action_count != 0
+            or self.handoff_callback_count != 0
+            or self.handoff_callback_scheduled
+            or self.handoff_callback_active
         ):
             raise ValueError("disabled native handoff retains controller state")
         if type(self.quarantined_binding_digests) is not tuple or any(
@@ -1690,7 +1690,7 @@ class NativeTerminalOwnerInventory:
                 or self.queued_output_count != 0
                 or self.queued_observation_count != 0
                 or self.pending_action_count != 0
-                or self.pending_handoff_action_count != 0
+                or self.unclaimed_handoff_action_count != 0
                 or self.active_source_count != 0
                 or self.active_decode_count != 0
                 or self.armed_deadline_count != 0
@@ -1733,12 +1733,9 @@ class NativeTerminalOwnerInventory:
                 value["observation_eventfd_error_count"]
             ),
             pending_action_count=int(value["pending_action_count"]),
-            pending_handoff_action_count=int(
-                value["pending_handoff_action_count"]
-            ),
-            completed_handoff_action_count=int(
-                value["completed_handoff_action_count"]
-            ),
+            unclaimed_handoff_action_count=int(value["unclaimed_handoff_action_count"]),
+            claimed_handoff_action_count=int(value["claimed_handoff_action_count"]),
+            discarded_handoff_action_count=int(value["discarded_handoff_action_count"]),
             handoff_callback_count=int(value["handoff_callback_count"]),
             registered_producer_count=int(value["registered_producer_count"]),
             joined_producer_count=int(value["joined_producer_count"]),
@@ -1763,18 +1760,12 @@ class NativeTerminalOwnerInventory:
             observation_eventfd_open=bool(value["observation_eventfd_open"]),
             output_drain_active=bool(value["output_drain_active"]),
             handoff_enabled=bool(value["handoff_enabled"]),
-            handoff_callback_scheduled=bool(
-                value["handoff_callback_scheduled"]
-            ),
+            handoff_callback_scheduled=bool(value["handoff_callback_scheduled"]),
             handoff_callback_active=bool(value["handoff_callback_active"]),
-            scheduled_handoff_watermark=int(
-                value["scheduled_handoff_watermark"]
-            ),
+            scheduled_handoff_watermark=int(value["scheduled_handoff_watermark"]),
             active_handoff_watermark=int(value["active_handoff_watermark"]),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
-            fatal_reason=(
-                None if len(fatal_reason_value) == 0 else fatal_reason_value
-            ),
+            fatal_reason=(None if len(fatal_reason_value) == 0 else fatal_reason_value),
             fatal_binding_digest=fatal_binding_digest,
             deadline_table_digest=bytes(value["deadline_table_digest"]),
         )

@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerInventory,
     NativeTerminalOwnerObservation,
     NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
@@ -564,8 +565,8 @@ def _complete_source(
     runtime.acknowledge_consumed_action(lifecycle[0])
 
 
-def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> None:
-    """A real pending call hands the GIL to the action owner and rejects replay."""
+def test_pending_call_returns_at_inbox_claim_before_downstream_lock() -> None:
+    """The callback ends at claim while downstream authority stays pending."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -575,12 +576,35 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
     runtime.start()
     previous_switch_interval = sys.getswitchinterval()
     scheduler_hot = threading.Event()
+    scheduler_owned_lock = threading.Lock()
+    inbox_claimed = threading.Event()
+    downstream_entered = threading.Event()
+    activation_observed = threading.Event()
     try:
         runtime.register_lifecycle(registration)
 
+        original_activate = runtime._owner.activate_forward_independent_handoff
+
+        def activate_after_route(action: NativeTerminalOwnerAction) -> bool:
+            """Prove route publication and lock release precede activation.
+
+            :param action: Exact action being enrolled in the scheduler handoff.
+            :returns: Whether the native owner scheduled a pending callback.
+            """
+
+            assert runtime.source_gather_actions.snapshot().queued_count == 1
+            assert not runtime._condition._is_owned()
+            activation_observed.set()
+            return original_activate(action)
+
         def consume_gather() -> NativeTerminalOwnerAction:
-            action = _drain_actions(runtime.source_gather_actions)[0]
             assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            action = _drain_actions(runtime.source_gather_actions)[0]
+            inbox_claimed.set()
+            downstream_entered.set()
+            if not scheduler_owned_lock.acquire(timeout=_WAIT_SECONDS):
+                raise TimeoutError("scheduler-owned downstream lock was not released")
+            scheduler_owned_lock.release()
             runtime.acknowledge_consumed_action(action)
             return action
 
@@ -597,23 +621,38 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            gather_future = executor.submit(consume_gather)
-            producer_future = executor.submit(submit_gather)
-            sys.setswitchinterval(0.005)
-            scheduler_hot.set()
-            expires_at = time.monotonic() + 0.5
-            scheduler_iterations = 0
-            while not gather_future.done() and time.monotonic() < expires_at:
-                scheduler_iterations += 1
-            action = gather_future.result(timeout=_WAIT_SECONDS)
-            producer_future.result(timeout=_WAIT_SECONDS)
-            sys.setswitchinterval(previous_switch_interval)
+        with mock.patch.object(
+            runtime._owner,
+            "activate_forward_independent_handoff",
+            side_effect=activate_after_route,
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                scheduler_owned_lock.acquire()
+                gather_future = executor.submit(consume_gather)
+                producer_future = executor.submit(submit_gather)
+                sys.setswitchinterval(0.005)
+                scheduler_hot.set()
+                expires_at = time.monotonic() + _WAIT_SECONDS
+                scheduler_iterations = 0
+                while not inbox_claimed.is_set() and time.monotonic() < expires_at:
+                    scheduler_iterations += 1
+                assert activation_observed.is_set()
+                assert inbox_claimed.is_set()
+                assert downstream_entered.is_set()
+                assert not gather_future.done()
+                snapshot = runtime.snapshot()
+                assert snapshot.owner.unclaimed_handoff_action_count == 0
+                assert snapshot.owner.claimed_handoff_action_count == 1
+                assert snapshot.consumer_pending_count == 1
+                scheduler_owned_lock.release()
+                action = gather_future.result(timeout=_WAIT_SECONDS)
+                producer_future.result(timeout=_WAIT_SECONDS)
+                sys.setswitchinterval(previous_switch_interval)
 
             assert scheduler_iterations > 0
             inventory = runtime.snapshot().owner
-            assert inventory.pending_handoff_action_count == 0
-            assert inventory.completed_handoff_action_count == 1
+            assert inventory.unclaimed_handoff_action_count == 0
+            assert inventory.claimed_handoff_action_count == 1
             assert inventory.handoff_callback_count == 1
 
             def consume_process_fatal() -> tuple[NativeTerminalOwnerAction, ...]:
@@ -622,13 +661,14 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
                     runtime.acknowledge_aborted_action(current)
                 return actions
 
-            fatal_future = executor.submit(consume_process_fatal)
-            with pytest.raises(
-                NativeTerminalRuntimeError,
-                match="absent, stale, or already acknowledged",
-            ):
-                runtime.acknowledge_consumed_action(action)
-            fatal_actions = fatal_future.result(timeout=_WAIT_SECONDS)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                fatal_future = executor.submit(consume_process_fatal)
+                with pytest.raises(
+                    NativeTerminalRuntimeError,
+                    match="absent, stale, or already acknowledged",
+                ):
+                    runtime.acknowledge_consumed_action(action)
+                fatal_actions = fatal_future.result(timeout=_WAIT_SECONDS)
             assert any(
                 current.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
                 for current in fatal_actions
@@ -638,6 +678,8 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
                 is NativeTerminalOwnerFatalCode.HANDOFF_AUTHORITY
             )
     finally:
+        if scheduler_owned_lock.locked():
+            scheduler_owned_lock.release()
         sys.setswitchinterval(previous_switch_interval)
         _finish_handoff_runtime(runtime)
 
@@ -664,9 +706,9 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
             )
 
         def consume_all_gathers() -> tuple[NativeTerminalOwnerAction, ...]:
+            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             actions = list(_drain_actions(runtime.source_gather_actions))
             assert len(actions) == 1
-            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             for registration in registrations[1:]:
                 runtime.submit(
                     _LOCAL_PRODUCER_ID,
@@ -697,8 +739,8 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
 
         inventory = runtime.snapshot().owner
         assert len(actions) == 3
-        assert inventory.pending_handoff_action_count == 0
-        assert inventory.completed_handoff_action_count == 3
+        assert inventory.unclaimed_handoff_action_count == 0
+        assert inventory.claimed_handoff_action_count == 3
         assert inventory.handoff_callback_count == 2
     finally:
         sys.setswitchinterval(previous_switch_interval)
@@ -730,8 +772,148 @@ def test_scheduler_actions_never_enter_the_forward_independent_handoff() -> None
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             snapshot = executor.submit(complete_and_close).result(timeout=_WAIT_SECONDS)
         assert snapshot.owner.action_count == 6
-        assert snapshot.owner.completed_handoff_action_count == 5
-        assert snapshot.owner.pending_handoff_action_count == 0
+        assert snapshot.owner.claimed_handoff_action_count == 5
+        assert snapshot.owner.unclaimed_handoff_action_count == 0
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_inbox_claim_may_win_before_post_route_activation() -> None:
+    """A consumer which wins publication makes activation a clean no-op."""
+
+    owner, registration = _direct_handoff_owner(68)
+    try:
+        _submit_direct_source_gather(owner, registration)
+        with selectors.DefaultSelector() as selector:
+            selector.register(owner.output_fileno(), selectors.EVENT_READ)
+            assert len(selector.select(_WAIT_SECONDS)) == 1
+        actions = tuple(
+            action for output in owner.drain_outputs() for action in output.actions
+        )
+        assert len(actions) == 1
+        action = actions[0]
+        before_claim = owner.inventory()
+        assert before_claim.unclaimed_handoff_action_count == 1
+        assert before_claim.claimed_handoff_action_count == 0
+        assert not before_claim.handoff_callback_scheduled
+
+        owner.claim_forward_independent_handoff(action)
+        assert not owner.activate_forward_independent_handoff(action)
+        owner.acknowledge_action(action)
+
+        after_activation = owner.inventory()
+        assert after_activation.unclaimed_handoff_action_count == 0
+        assert after_activation.claimed_handoff_action_count == 1
+        assert after_activation.discarded_handoff_action_count == 0
+        assert after_activation.handoff_callback_count == 0
+        assert not after_activation.handoff_callback_scheduled
+        assert not after_activation.handoff_callback_active
+    finally:
+        owner.abort_and_close()
+
+
+def test_delivery_failure_discards_unclaimed_handoff_authority() -> None:
+    """Rejected inbox delivery has distinct, conserved handoff accounting."""
+
+    owner, registration = _direct_handoff_owner(70)
+    try:
+        _submit_direct_source_gather(owner, registration)
+        with selectors.DefaultSelector() as selector:
+            selector.register(owner.output_fileno(), selectors.EVENT_READ)
+            assert len(selector.select(_WAIT_SECONDS)) == 1
+        actions = tuple(
+            action for output in owner.drain_outputs() for action in output.actions
+        )
+        assert len(actions) == 1
+        owner.fail_action_delivery(actions[0], "synthetic bounded-inbox rejection")
+
+        with selectors.DefaultSelector() as selector:
+            selector.register(owner.output_fileno(), selectors.EVENT_READ)
+            assert len(selector.select(_WAIT_SECONDS)) == 1
+        fatal_actions = tuple(
+            action for output in owner.drain_outputs() for action in output.actions
+        )
+        assert tuple(action.kind for action in fatal_actions) == (
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        )
+        for action in fatal_actions:
+            owner.acknowledge_action(action)
+
+        inventory = owner.inventory()
+        assert inventory.unclaimed_handoff_action_count == 0
+        assert inventory.claimed_handoff_action_count == 0
+        assert inventory.discarded_handoff_action_count == 1
+        assert (
+            inventory.fatal_code is NativeTerminalOwnerFatalCode.OUTPUT_QUEUE_OVERFLOW
+        )
+    finally:
+        owner.abort_and_close()
+
+
+def test_post_claim_abort_preserves_downstream_authority_without_replay() -> None:
+    """Abort drains a claimed action without claiming native authority twice."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 69)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+
+        def claim_gather() -> NativeTerminalOwnerAction:
+            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            return _drain_actions(runtime.source_gather_actions)[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            claim_future = executor.submit(claim_gather)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while not claim_future.done() and time.monotonic() < expires_at:
+                pass
+            gather = claim_future.result(timeout=_WAIT_SECONDS)
+
+        claimed = runtime.snapshot()
+        assert claimed.owner.unclaimed_handoff_action_count == 0
+        assert claimed.owner.claimed_handoff_action_count == 1
+        assert claimed.consumer_pending_count == 1
+
+        runtime.begin_abort("synthetic downstream failure after inbox claim")
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        fatal_actions = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in fatal_actions) == (
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        )
+        before_acknowledgement = runtime.snapshot()
+        assert before_acknowledgement.owner.claimed_handoff_action_count == 1
+        assert before_acknowledgement.owner.unclaimed_handoff_action_count == 0
+        assert before_acknowledgement.consumer_pending_count == 2
+
+        runtime.acknowledge_aborted_action(gather)
+        assert not runtime.acknowledge_aborted_action_if_pending(gather)
+        for action in fatal_actions:
+            runtime.acknowledge_aborted_action(action)
+
+        after_acknowledgement = runtime.snapshot()
+        assert after_acknowledgement.owner.claimed_handoff_action_count == 1
+        assert after_acknowledgement.owner.unclaimed_handoff_action_count == 0
+        assert after_acknowledgement.consumer_pending_count == 0
+        _drain_observations(runtime)
+        runtime.finish_abort_close()
+        stopped = runtime.snapshot()
+        assert stopped.disposition is NativeTerminalRuntimeDisposition.STOPPED
+        assert stopped.consumer_pending_count == 0
     finally:
         _finish_handoff_runtime(runtime)
 
@@ -748,17 +930,27 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
             with selectors.DefaultSelector() as selector:
                 selector.register(owner.output_fileno(), selectors.EVENT_READ)
                 assert len(selector.select(_WAIT_SECONDS)) == 1
+            initial_actions = tuple(
+                action for output in owner.drain_outputs() for action in output.actions
+            )
+            assert len(initial_actions) == 1
+            before_activation = owner.inventory()
+            assert before_activation.unclaimed_handoff_action_count == 1
+            assert not before_activation.handoff_callback_scheduled
+            assert not before_activation.handoff_callback_active
+            assert owner.activate_forward_independent_handoff(initial_actions[0])
+            owner.acknowledge_action(initial_actions[0])
             output_queued.set()
             assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
             assert owner.wait_for_process_fatal(_WAIT_SECONDS)
-            actions = tuple(
+            fatal_actions = tuple(
                 action for output in owner.drain_outputs() for action in output.actions
             )
-            for action in actions:
+            for action in fatal_actions:
                 owner.acknowledge_action(action)
-                owner.complete_forward_independent_handoff(action)
-            return actions
+            owner.claim_forward_independent_handoff(initial_actions[0])
+            return (*initial_actions, *fatal_actions)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             expiry_future = executor.submit(expire_active_handoff)
@@ -775,16 +967,16 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
             for action in actions
         )
         assert inventory.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_TIMEOUT
-        assert inventory.pending_handoff_action_count == 0
-        assert inventory.completed_handoff_action_count == 2
-        assert inventory.handoff_callback_count == 2
+        assert inventory.unclaimed_handoff_action_count == 0
+        assert inventory.claimed_handoff_action_count == 1
+        assert inventory.handoff_callback_count == 1
     finally:
         sys.setswitchinterval(previous_switch_interval)
         owner.abort_and_close()
 
 
 def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
-    """Clean close cannot discard a callback-owned downstream completion."""
+    """Clean close cannot discard unclaimed scheduler-handoff authority."""
 
     owner, registration = _direct_handoff_owner(67)
     previous_switch_interval = sys.getswitchinterval()
@@ -795,14 +987,20 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
             with selectors.DefaultSelector() as selector:
                 selector.register(owner.output_fileno(), selectors.EVENT_READ)
                 assert len(selector.select(_WAIT_SECONDS)) == 1
+            initial_actions = tuple(
+                action for output in owner.drain_outputs() for action in output.actions
+            )
+            assert len(initial_actions) == 1
+            assert owner.activate_forward_independent_handoff(initial_actions[0])
+            owner.acknowledge_action(initial_actions[0])
             output_queued.set()
             assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             with pytest.raises(RuntimeError) as error:
                 owner.close()
+            owner.claim_forward_independent_handoff(initial_actions[0])
             for output in owner.drain_outputs():
                 for action in output.actions:
                     owner.acknowledge_action(action)
-                    owner.complete_forward_independent_handoff(action)
             return str(error.value)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -818,7 +1016,7 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
         assert inventory.fatal_code is (
             NativeTerminalOwnerFatalCode.CLOSE_WITH_RETAINED_INVENTORY
         )
-        assert inventory.pending_handoff_action_count == 0
+        assert inventory.unclaimed_handoff_action_count == 0
     finally:
         sys.setswitchinterval(previous_switch_interval)
         owner.abort_and_close()
@@ -960,93 +1158,113 @@ def test_native_quiescence_waits_for_complete_output_projection() -> None:
             _finish_fail_closed(runtime)
 
 
-def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
-    runtime, owner, remote = _runtime(TerminalOwnerRole.DECODE)
+def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> None:
+    """The exact TP1 local fanout chain cannot extend its active callback."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
     registration = _registration(owner, remote, 75)
     binding_digest = registration.binding.digest
     runtime.start()
     try:
-        runtime.register_lifecycle(registration)
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
-        )
-        scatter = _drain_actions(runtime.decode_scatter_actions)
-        assert scatter[0].kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
-        runtime.complete_work_action(
-            _LOCAL_PRODUCER_ID,
-            scatter[0],
-            NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
-        )
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
-        )
-        teardown = _drain_actions(runtime.decode_work_actions)
-        assert teardown[0].kind is (NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY)
-        runtime.complete_work_action(
-            _LOCAL_PRODUCER_ID,
-            teardown[0],
-            NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
-        )
-        adoption = _drain_actions(runtime.scheduler_actions)
-        assert adoption[0].kind is NativeTerminalOwnerActionKind.ADOPTION_READY
-        snapshot = runtime.snapshot()
-        assert snapshot.scheduler_live_count == 1
-        assert snapshot.scheduler_pending_count == 1
-        runtime.complete_scheduler_action(
-            _OWNER_RECEIPT_PRODUCER_ID,
-            adoption[0],
-            NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
-        )
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_METADATA_CONSUMED,
-        )
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
-        )
-        local_ready = _drain_actions(runtime.coordinator_actions)
-        assert local_ready[0].kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY
-        runtime.acknowledge_consumed_action(local_ready[0])
-        runtime.submit_imported_receipt(
-            _OWNER_RECEIPT_PRODUCER_ID,
-            _receipt(
-                registration,
-                owner,
-                NativeTerminalReceiptKind.REQUEST_READY,
-                50,
-            ),
-            NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
-        )
-        lifecycle = _drain_actions(runtime.lifecycle_actions)
-        assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
-        runtime.acknowledge_consumed_action(lifecycle[0])
+
+        def drive_tp1_chain() -> NativeTerminalOwnerInventory:
+            runtime.register_lifecycle(registration)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+            )
+            scatter = _drain_actions(runtime.decode_scatter_actions)
+            assert scatter[0].kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                scatter[0],
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
+            )
+            teardown = _drain_actions(runtime.decode_work_actions)
+            assert (
+                teardown[0].kind is NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY
+            )
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                teardown[0],
+                NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
+            )
+            adoption = _drain_actions(runtime.scheduler_actions)
+            assert adoption[0].kind is NativeTerminalOwnerActionKind.ADOPTION_READY
+            runtime.complete_scheduler_action(
+                _OWNER_RECEIPT_PRODUCER_ID,
+                adoption[0],
+                NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_METADATA_CONSUMED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
+            )
+            local_ready = _drain_actions(runtime.coordinator_actions)
+            assert (
+                local_ready[0].kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY
+            )
+            runtime.submit_imported_receipt(
+                _OWNER_RECEIPT_PRODUCER_ID,
+                _receipt(
+                    registration,
+                    owner,
+                    NativeTerminalReceiptKind.REQUEST_READY,
+                    50,
+                ),
+                NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
+            )
+            runtime.acknowledge_consumed_action(local_ready[0])
+            lifecycle = _drain_actions(runtime.lifecycle_actions)
+            assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
+            runtime.acknowledge_consumed_action(lifecycle[0])
+            return runtime.snapshot().owner
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(drive_tp1_chain)
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while not future.done() and time.monotonic() < expires_at:
+                pass
+            owner_inventory = future.result(timeout=_WAIT_SECONDS)
+
+        assert owner_inventory.unclaimed_handoff_action_count == 0
+        assert owner_inventory.claimed_handoff_action_count == 4
+        assert owner_inventory.handoff_callback_count >= 2
         snapshot = runtime.snapshot()
         assert snapshot.scheduler_live_count == 0
         assert snapshot.scheduler_pending_count == 0
@@ -1057,7 +1275,7 @@ def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
         _drain_observations(runtime)
         runtime.close_clean()
     finally:
-        _finish_fail_closed(runtime)
+        _finish_handoff_runtime(runtime)
 
 
 def test_runtime_producer_directory_prevents_dynamic_or_cross_domain_authority() -> (
