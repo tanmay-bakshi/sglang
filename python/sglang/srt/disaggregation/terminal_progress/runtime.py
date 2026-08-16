@@ -1162,13 +1162,22 @@ class NativeTerminalRuntime:
             raise ValueError("scheduler actions require complete_scheduler_action")
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
+        if pending != action:
+            if pending is None:
+                self._reject_forward_independent_completion(action)
+            raise NativeTerminalRuntimeError(
+                "consumer action is absent, stale, or already acknowledged"
+            )
+        self._complete_forward_independent_handoff(action)
+        with self._condition:
+            pending = self._consumer_pending.get(action.action_id)
             if pending != action:
-                if pending is None:
-                    self._reject_forward_independent_completion_locked(action)
-                raise NativeTerminalRuntimeError(
-                    "consumer action is absent, stale, or already acknowledged"
+                self._enter_runtime_fatal_locked(
+                    "consumer action changed during exact acknowledgement"
                 )
-            self._complete_forward_independent_handoff_locked(action)
+                raise NativeTerminalRuntimeError(
+                    "consumer action changed during exact acknowledgement"
+                )
             del self._consumer_pending[action.action_id]
             if action.kind in (
                 NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
@@ -1196,6 +1205,18 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "aborted action acknowledgement requires fail-closed state"
                 )
+            pending = self._consumer_pending.get(action.action_id)
+            if pending is None:
+                raise NativeTerminalRuntimeError(
+                    "aborted action is absent, stale, or already acknowledged"
+                )
+            if pending != action:
+                raise NativeTerminalRuntimeError(
+                    "consumer action identity aliases another pending action"
+                )
+        if action.kind not in _SCHEDULER_ACTIONS:
+            self._complete_forward_independent_handoff(action)
+        with self._condition:
             if not self._discard_aborted_action_locked(action):
                 raise NativeTerminalRuntimeError(
                     "aborted action is absent, stale, or already acknowledged"
@@ -1226,6 +1247,16 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "conditional abort acknowledgement requires fail-closed state"
                 )
+            pending = self._consumer_pending.get(action.action_id)
+            if pending is None:
+                return False
+            if pending != action:
+                raise NativeTerminalRuntimeError(
+                    "consumer action identity aliases another pending action"
+                )
+        if action.kind not in _SCHEDULER_ACTIONS:
+            self._complete_forward_independent_handoff(action)
+        with self._condition:
             return self._discard_aborted_action_locked(action)
 
     def _discard_aborted_action_locked(
@@ -1245,8 +1276,6 @@ class NativeTerminalRuntime:
             raise NativeTerminalRuntimeError(
                 "consumer action identity aliases another pending action"
             )
-        if action.kind not in _SCHEDULER_ACTIONS:
-            self._complete_forward_independent_handoff_locked(action)
         del self._consumer_pending[action.action_id]
         binding_digest = action.binding.digest
         if action.kind in _SCHEDULER_ACTIONS:
@@ -1264,10 +1293,10 @@ class NativeTerminalRuntime:
         self._condition.notify_all()
         return True
 
-    def _complete_forward_independent_handoff_locked(
+    def _complete_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Complete native handoff authority under the consumer ledger lock.
+        """Complete native handoff authority outside the runtime ledger lock.
 
         :param action: Exact non-scheduler action accepted by its sole owner.
         """
@@ -1282,10 +1311,11 @@ class NativeTerminalRuntime:
             self._owner.complete_forward_independent_handoff(action)
         except Exception:  # noqa: BLE001
             formatted_traceback = traceback.format_exc()
-            self._enter_runtime_fatal_locked(formatted_traceback)
+            with self._condition:
+                self._enter_runtime_fatal_locked(formatted_traceback)
             raise
 
-    def _reject_forward_independent_completion_locked(
+    def _reject_forward_independent_completion(
         self, action: NativeTerminalOwnerAction
     ) -> None:
         """Make an unknown or replayed downstream completion process-fatal.
@@ -1298,7 +1328,8 @@ class NativeTerminalRuntime:
         try:
             self._owner.complete_forward_independent_handoff(action)
         except Exception:  # noqa: BLE001
-            self._enter_runtime_fatal_locked(traceback.format_exc())
+            with self._condition:
+                self._enter_runtime_fatal_locked(traceback.format_exc())
 
     def complete_work_action(
         self,
@@ -1366,12 +1397,12 @@ class NativeTerminalRuntime:
             raise ValueError("followup kind was not earned by this work action")
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
-            if pending != action:
-                if pending is None:
-                    self._reject_forward_independent_completion_locked(action)
-                raise NativeTerminalRuntimeError(
-                    "work action is absent, stale, or already completed"
-                )
+        if pending != action:
+            if pending is None:
+                self._reject_forward_independent_completion(action)
+            raise NativeTerminalRuntimeError(
+                "work action is absent, stale, or already completed"
+            )
         self.submit(
             producer_id=producer_id,
             binding_digest=action.binding.digest,
