@@ -1577,6 +1577,7 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
   owner.active_handoff_callback_id = call->callback_id;
   owner.active_handoff_watermark = watermark;
   ++owner.handoff_callback_count;
+  owner.condition.notify_all();
 
   const DeadlineSpec &shutdown = owner.deadline_specs[
       static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];

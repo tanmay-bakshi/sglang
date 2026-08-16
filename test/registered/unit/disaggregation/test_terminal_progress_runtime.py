@@ -658,8 +658,9 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
             actions = list(_drain_actions(runtime.source_gather_actions))
             assert len(actions) == 1
             first_action_drained.set()
-            assert later_actions_submitted.wait(timeout=_WAIT_SECONDS)
+            later_arrived = later_actions_submitted.wait(timeout=_WAIT_SECONDS)
             runtime.acknowledge_consumed_action(actions[0])
+            assert later_arrived
             while len(actions) < len(registrations):
                 current_actions = _drain_actions(runtime.source_gather_actions)
                 for action in current_actions:
