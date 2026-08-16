@@ -141,6 +141,42 @@ class _DecodeWiring:
         self.quarantines.append((transaction, reason))
 
 
+class _LaunchGate:
+    """Provide exact native launch ownership to composition tests."""
+
+    _next_token: int
+    _active_token: int | None
+
+    def __init__(self) -> None:
+        """Construct one deterministic exact-token gate."""
+
+        self._next_token = 1
+        self._active_token = None
+
+    def begin_scheduler_launch_handoff(self) -> int:
+        """Acquire one exact test token.
+
+        :returns: Newly minted positive token.
+        """
+
+        if self._active_token is not None:
+            raise RuntimeError("test launch gate is already active")
+        token = self._next_token
+        self._next_token += 1
+        self._active_token = token
+        return token
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Release the matching exact test token.
+
+        :param token: Token returned by the preceding acquisition.
+        """
+
+        if self._active_token != token:
+            raise RuntimeError("test launch token is absent or stale")
+        self._active_token = None
+
+
 def _identity_graph(
     marker: int = 1,
 ) -> tuple[TerminalRequestBinding, PackedTerminalSourcePlan]:
@@ -353,6 +389,7 @@ def test_composition_adopts_exact_request_before_local_ready() -> None:
         wiring=wiring,
         physical_capacity=2,
         process_fatal_handler=lambda inventory: None,
+        launch_gate=_LaunchGate(),
     )
 
     composition.register(registration)
@@ -391,6 +428,7 @@ def test_unpublished_cancellation_pairs_resources_and_inbox() -> None:
         wiring=wiring,
         physical_capacity=1,
         process_fatal_handler=lambda inventory: None,
+        launch_gate=_LaunchGate(),
     )
     composition.register(registration)
 

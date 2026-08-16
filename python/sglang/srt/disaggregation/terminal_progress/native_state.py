@@ -1478,6 +1478,26 @@ class NativeTerminalOwnerInventory:
         atomically after their complete Python lease population became durable.
     :ivar source_batch_handoff_action_count: Source actions claimed through
         synchronous exact-batch transfers.
+    :ivar registered_handoff_action_count: Forward-independent actions entered
+        into native downstream-lifetime authority.
+    :ivar active_handoff_action_count: Registered actions whose downstream
+        work has not settled.
+    :ivar settled_handoff_action_count: Registered actions retired by exact
+        settlement, failed delivery, or abort.
+    :ivar scheduler_launch_handoff_begin_count: Bounded scheduler launch lease
+        acquisitions begun at the native boundary.
+    :ivar scheduler_launch_handoff_acquisition_count: Exact scheduler launch
+        tokens minted after their captured watermark settled.
+    :ivar scheduler_launch_handoff_release_count: Minted scheduler launch
+        tokens released exactly once by their matching owner.
+    :ivar scheduler_launch_handoff_begin_active: Whether one bounded watermark
+        wait currently owns acquisition authority.
+    :ivar scheduler_launch_handoff_begin_watermark: Captured action watermark
+        for an active bounded wait.
+    :ivar active_scheduler_launch_handoff_token: Exact outstanding scheduler
+        launch token.
+    :ivar active_scheduler_launch_handoff_watermark: Settled action watermark
+        which authorized the outstanding token.
     :ivar handoff_enabled: Whether forward-independent delivery was enabled at
         startup.
     :ivar registered_producer_count: Exact producer registry size.
@@ -1525,6 +1545,16 @@ class NativeTerminalOwnerInventory:
     discarded_handoff_action_count: int
     source_batch_handoff_count: int
     source_batch_handoff_action_count: int
+    registered_handoff_action_count: int
+    active_handoff_action_count: int
+    settled_handoff_action_count: int
+    scheduler_launch_handoff_begin_count: int
+    scheduler_launch_handoff_acquisition_count: int
+    scheduler_launch_handoff_release_count: int
+    scheduler_launch_handoff_begin_active: bool
+    scheduler_launch_handoff_begin_watermark: int | None
+    active_scheduler_launch_handoff_token: int | None
+    active_scheduler_launch_handoff_watermark: int | None
     registered_producer_count: int
     joined_producer_count: int
     active_source_count: int
@@ -1573,6 +1603,12 @@ class NativeTerminalOwnerInventory:
             self.discarded_handoff_action_count,
             self.source_batch_handoff_count,
             self.source_batch_handoff_action_count,
+            self.registered_handoff_action_count,
+            self.active_handoff_action_count,
+            self.settled_handoff_action_count,
+            self.scheduler_launch_handoff_begin_count,
+            self.scheduler_launch_handoff_acquisition_count,
+            self.scheduler_launch_handoff_release_count,
             self.registered_producer_count,
             self.joined_producer_count,
             self.active_source_count,
@@ -1624,12 +1660,66 @@ class NativeTerminalOwnerInventory:
             > self.source_batch_handoff_action_count
         ):
             raise ValueError("native source batch handoff accounting is inconsistent")
+        if self.registered_handoff_action_count != (
+            self.active_handoff_action_count + self.settled_handoff_action_count
+        ):
+            raise ValueError("native active handoff accounting violates conservation")
+        active_scheduler_launch_count = int(
+            self.active_scheduler_launch_handoff_token is not None
+        )
+        if self.scheduler_launch_handoff_acquisition_count != (
+            self.scheduler_launch_handoff_release_count
+            + active_scheduler_launch_count
+        ):
+            raise ValueError(
+                "native scheduler launch handoff accounting violates conservation"
+            )
+        if (
+            self.scheduler_launch_handoff_begin_count
+            < self.scheduler_launch_handoff_acquisition_count
+        ):
+            raise ValueError(
+                "native scheduler launch acquisitions exceed begin attempts"
+            )
+        if self.scheduler_launch_handoff_begin_active != (
+            self.scheduler_launch_handoff_begin_watermark is not None
+        ):
+            raise ValueError("native scheduler launch begin state is inconsistent")
+        if (
+            self.active_scheduler_launch_handoff_token is None
+        ) != (
+            self.active_scheduler_launch_handoff_watermark is None
+        ):
+            raise ValueError("native scheduler launch token state is inconsistent")
+        optional_uints = (
+            self.scheduler_launch_handoff_begin_watermark,
+            self.active_scheduler_launch_handoff_token,
+            self.active_scheduler_launch_handoff_watermark,
+        )
+        if any(
+            value is not None and (type(value) is not int or value < 0)
+            for value in optional_uints
+        ):
+            raise ValueError(
+                "native scheduler launch identities must be unsigned integers"
+            )
+        if (
+            self.active_scheduler_launch_handoff_token is not None
+            and self.active_scheduler_launch_handoff_token == 0
+        ):
+            raise ValueError("native scheduler launch token must be positive")
         if not self.handoff_enabled and (
             self.unclaimed_handoff_action_count != 0
             or self.claimed_handoff_action_count != 0
             or self.discarded_handoff_action_count != 0
             or self.source_batch_handoff_count != 0
             or self.source_batch_handoff_action_count != 0
+            or self.registered_handoff_action_count != 0
+            or self.scheduler_launch_handoff_begin_count != 0
+            or self.scheduler_launch_handoff_acquisition_count != 0
+            or self.scheduler_launch_handoff_release_count != 0
+            or self.scheduler_launch_handoff_begin_active
+            or self.active_scheduler_launch_handoff_token is not None
         ):
             raise ValueError("disabled native handoff retains controller state")
         if type(self.quarantined_binding_digests) is not tuple or any(
@@ -1654,6 +1744,7 @@ class NativeTerminalOwnerInventory:
             self.observation_eventfd_open,
             self.output_drain_active,
             self.handoff_enabled,
+            self.scheduler_launch_handoff_begin_active,
         )
         if any(type(value) is not bool for value in flags):
             raise TypeError("native inventory lifecycle flags must be bool values")
@@ -1684,10 +1775,13 @@ class NativeTerminalOwnerInventory:
                 or self.queued_observation_count != 0
                 or self.pending_action_count != 0
                 or self.unclaimed_handoff_action_count != 0
+                or self.active_handoff_action_count != 0
                 or self.active_source_count != 0
                 or self.active_decode_count != 0
                 or self.armed_deadline_count != 0
                 or self.output_drain_active
+                or self.scheduler_launch_handoff_begin_active
+                or self.active_scheduler_launch_handoff_token is not None
             ):
                 raise ValueError("closed native inventory retains active work")
             if (
@@ -1732,6 +1826,38 @@ class NativeTerminalOwnerInventory:
             source_batch_handoff_count=int(value["source_batch_handoff_count"]),
             source_batch_handoff_action_count=int(
                 value["source_batch_handoff_action_count"]
+            ),
+            registered_handoff_action_count=int(
+                value["registered_handoff_action_count"]
+            ),
+            active_handoff_action_count=int(value["active_handoff_action_count"]),
+            settled_handoff_action_count=int(value["settled_handoff_action_count"]),
+            scheduler_launch_handoff_begin_count=int(
+                value["scheduler_launch_handoff_begin_count"]
+            ),
+            scheduler_launch_handoff_acquisition_count=int(
+                value["scheduler_launch_handoff_acquisition_count"]
+            ),
+            scheduler_launch_handoff_release_count=int(
+                value["scheduler_launch_handoff_release_count"]
+            ),
+            scheduler_launch_handoff_begin_active=bool(
+                value["scheduler_launch_handoff_begin_active"]
+            ),
+            scheduler_launch_handoff_begin_watermark=(
+                None
+                if value["scheduler_launch_handoff_begin_watermark"] is None
+                else int(value["scheduler_launch_handoff_begin_watermark"])
+            ),
+            active_scheduler_launch_handoff_token=(
+                None
+                if value["active_scheduler_launch_handoff_token"] is None
+                else int(value["active_scheduler_launch_handoff_token"])
+            ),
+            active_scheduler_launch_handoff_watermark=(
+                None
+                if value["active_scheduler_launch_handoff_watermark"] is None
+                else int(value["active_scheduler_launch_handoff_watermark"])
             ),
             registered_producer_count=int(value["registered_producer_count"]),
             joined_producer_count=int(value["joined_producer_count"]),

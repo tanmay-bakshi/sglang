@@ -5,7 +5,7 @@ import errno
 import os
 import threading
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedRequestKey,
@@ -21,6 +21,23 @@ from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
 LaunchResultT = TypeVar("LaunchResultT")
 BoundLaunchResultT = TypeVar("BoundLaunchResultT")
+
+
+@runtime_checkable
+class TerminalSchedulerLaunchGate(Protocol):
+    """Native exclusion around one already-authorized host submission."""
+
+    def begin_scheduler_launch_handoff(self) -> int:
+        """Wait for captured delivery work and mint one launch token.
+
+        :returns: Exact native launch token.
+        """
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Release one exact native launch token.
+
+        :param token: Token returned by :meth:`begin_scheduler_launch_handoff`.
+        """
 
 
 class SchedulerReceiptPublishResult(enum.StrEnum):
@@ -241,15 +258,25 @@ class TerminalReceiptInbox:
     _next_intent: int
     _active_intents: set[int]
     _active_delivery_intents: dict[int, SchedulerDeliveryIntent]
+    _launch_gate: TerminalSchedulerLaunchGate | None
 
-    def __init__(self, physical_capacity: int) -> None:
+    def __init__(
+        self,
+        physical_capacity: int,
+        launch_gate: TerminalSchedulerLaunchGate | None = None,
+    ) -> None:
         """Create one bounded runtime and its coalesced wake pipe.
 
         :param physical_capacity: Maximum configured in-flight generations.
+        :param launch_gate: Native delivery gate for production host submits.
         """
 
         if type(physical_capacity) is not int or physical_capacity <= 0:
             raise ValueError("physical_capacity must be a positive integer")
+        if launch_gate is not None and not isinstance(
+            launch_gate, TerminalSchedulerLaunchGate
+        ):
+            raise TypeError("launch_gate must satisfy TerminalSchedulerLaunchGate")
         read_fd, write_fd = os.pipe()
         os.set_blocking(read_fd, False)
         os.set_blocking(write_fd, False)
@@ -271,6 +298,7 @@ class TerminalReceiptInbox:
         self._next_intent = 0
         self._active_intents = set()
         self._active_delivery_intents = {}
+        self._launch_gate = launch_gate
 
     def fileno(self) -> int:
         """Return the scheduler's readable wake descriptor.
@@ -602,21 +630,86 @@ class TerminalReceiptInbox:
                         if len(self._pending) > 0:
                             publication = self._take_next_locked()
                         else:
-                            launch_result = submit()
-                            publication_target = self._publication_intent_snapshot()
-                            break
+                            publication = None
                 if len(publication_intents) > 0:
                     self._wait_for_publication_intents(publication_intents)
                     continue
                 if publication is not None:
                     self._consume_publication(publication, consume)
-            bound_result = bind(launch_result)
-            publication_target = publication_target.union(
-                self._publication_intent_snapshot()
+                    continue
+
+                launch_token = self._begin_scheduler_launch_handoff()
+                launch_authorized = False
+                publication_target = frozenset()
+                try:
+                    with self._state_lock:
+                        self._require_operational_locked()
+                        self._clear_wake_locked()
+                        publication_intents = self._publication_intent_snapshot()
+                        if len(publication_intents) == 0:
+                            if len(self._pending) > 0:
+                                publication = self._take_next_locked()
+                            else:
+                                launch_result = submit()
+                                publication_target = (
+                                    self._publication_intent_snapshot()
+                                )
+                                launch_authorized = True
+                    if launch_authorized:
+                        bound_result = bind(launch_result)
+                finally:
+                    self._end_scheduler_launch_handoff(launch_token)
+
+                if launch_authorized:
+                    publication_target = publication_target.union(
+                        self._publication_intent_snapshot()
+                    )
+                    self._wait_for_publication_intents(publication_target)
+                    self._drain_ready(consume)
+                    return bound_result
+                if len(publication_intents) > 0:
+                    self._wait_for_publication_intents(publication_intents)
+                    continue
+                if publication is None:
+                    raise SchedulerInboxError(
+                        "launch revalidation found no receipt or publication intent"
+                    )
+                self._consume_publication(publication, consume)
+
+    def _begin_scheduler_launch_handoff(self) -> int | None:
+        """Acquire one native token immediately before host submission.
+
+        :returns: Exact native token, or ``None`` without a bound launch gate.
+        """
+
+        gate = self._launch_gate
+        if gate is None:
+            return None
+        token = gate.begin_scheduler_launch_handoff()
+        if type(token) is not int or token <= 0:
+            raise SchedulerInboxError(
+                "native scheduler launch token must be a positive integer"
             )
-            self._wait_for_publication_intents(publication_target)
-            self._drain_ready(consume)
-            return bound_result
+        return token
+
+    def _end_scheduler_launch_handoff(self, token: int | None) -> None:
+        """Release the exact native token after immediate binding.
+
+        :param token: Exact token returned by the matching begin operation.
+        """
+
+        gate = self._launch_gate
+        if gate is None:
+            if token is not None:
+                raise SchedulerInboxError(
+                    "scheduler launch token exists without a native gate"
+                )
+            return
+        if type(token) is not int or token <= 0:
+            raise SchedulerInboxError(
+                "native scheduler launch token must be a positive integer"
+            )
+        gate.end_scheduler_launch_handoff(token)
 
     def mark_owner_dead(self) -> SchedulerReceiptInboxInventory:
         """Wake the scheduler into sticky process-fatal owner-death state.

@@ -298,6 +298,39 @@ class _RuntimeFence:
         self.calls.append(("abort", None))
 
 
+class _SchedulerLaunchGate:
+    """Record native launch ownership at the serving boundary."""
+
+    token: int
+    calls: list[tuple[str, int]]
+
+    def __init__(self, token: int = 47) -> None:
+        """Create one deterministic native launch gate.
+
+        :param token: Exact token returned by every test acquisition.
+        """
+
+        self.token = token
+        self.calls = []
+
+    def begin_scheduler_launch_handoff(self) -> int:
+        """Record acquisition and return the configured token.
+
+        :returns: Exact configured token.
+        """
+
+        self.calls.append(("begin", self.token))
+        return self.token
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Record release with the exact token supplied by serving.
+
+        :param token: Exact token returned by acquisition.
+        """
+
+        self.calls.append(("end", token))
+
+
 class _ManagerOwnedClose:
     """Close one scheduler serving object through the manager boundary."""
 
@@ -466,36 +499,46 @@ class _SchedulerPipeWriter:
 def _source_serving(
     consumer: _SourceConsumer,
     capacity: int = 2,
+    launch_gate: _SchedulerLaunchGate | None = None,
 ) -> TerminalSchedulerServing:
     """Build one source serving adapter.
 
     :param consumer: Exact scheduler-affine source consumer.
     :param capacity: Maximum live request generations.
+    :param launch_gate: Optional deterministic native launch gate.
     :returns: Qualified source adapter.
     """
 
+    if launch_gate is None:
+        launch_gate = _SchedulerLaunchGate()
     return TerminalSchedulerServing(
         role=TerminalSchedulerServingRole.SOURCE,
         physical_capacity=capacity,
         source_consumer=consumer,
+        launch_gate=launch_gate,
     )
 
 
 def _decode_serving(
     consumer: _DecodeConsumer,
     capacity: int = 2,
+    launch_gate: _SchedulerLaunchGate | None = None,
 ) -> TerminalSchedulerServing:
     """Build one decode serving adapter.
 
     :param consumer: Exact scheduler-affine decode consumer.
     :param capacity: Maximum live request generations.
+    :param launch_gate: Optional deterministic native launch gate.
     :returns: Qualified decode adapter.
     """
 
+    if launch_gate is None:
+        launch_gate = _SchedulerLaunchGate()
     return TerminalSchedulerServing(
         role=TerminalSchedulerServingRole.DECODE,
         physical_capacity=capacity,
         decode_consumer=consumer,
+        launch_gate=launch_gate,
     )
 
 
@@ -529,6 +572,36 @@ def test_native_runtime_binding_registers_without_reconstructing_identity() -> N
 
     assert serving.inventory().inbox.live_bindings == (binding,)
     serving.cancel_unpublished_request(binding)
+    serving.close()
+
+
+def test_serving_preserves_exact_native_launch_gate_across_submit_and_bind() -> None:
+    """Serving forwards one exact native token across immutable binding."""
+
+    consumer = _SourceConsumer()
+    token = (1 << 63) + 43
+    launch_gate = _SchedulerLaunchGate(token=token)
+    serving = _source_serving(consumer, launch_gate=launch_gate)
+    ordering: list[str] = []
+
+    def submit() -> str:
+        """Observe native ownership during model-worker submission."""
+
+        assert launch_gate.calls == [("begin", token)]
+        ordering.append("submit")
+        return "submitted"
+
+    def bind(result: str) -> str:
+        """Observe the same native ownership during result binding."""
+
+        assert result == "submitted"
+        assert launch_gate.calls == [("begin", token)]
+        ordering.append("bind")
+        return "bound"
+
+    assert serving.launch_and_bind_handoff(submit, bind) == "bound"
+    assert ordering == ["submit", "bind"]
+    assert launch_gate.calls == [("begin", token), ("end", token)]
     serving.close()
 
 

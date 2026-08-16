@@ -125,6 +125,68 @@ def _assert_conserved(inbox: TerminalReceiptInbox) -> None:
     )
 
 
+class _SchedulerLaunchGate:
+    """Record exact native scheduler launch-gate ownership."""
+
+    _tokens: list[int]
+    _ordering: list[str]
+    _begin_entered: threading.Event | None
+    _release_begin: threading.Event | None
+    calls: list[tuple[str, int]]
+
+    def __init__(
+        self,
+        *,
+        tokens: tuple[int, ...],
+        ordering: list[str],
+        begin_entered: threading.Event | None = None,
+        release_begin: threading.Event | None = None,
+    ) -> None:
+        """Create one deterministic launch gate.
+
+        :param tokens: Exact tokens returned by successive acquisitions.
+        :param ordering: Shared lifecycle ordering receipt.
+        :param begin_entered: Optional first-acquisition observation event.
+        :param release_begin: Optional first-acquisition release event.
+        """
+
+        self._tokens = list(tokens)
+        self._ordering = ordering
+        self._begin_entered = begin_entered
+        self._release_begin = release_begin
+        self.calls = []
+
+    def begin_scheduler_launch_handoff(self) -> int:
+        """Mint the next exact token after an optional controlled wait.
+
+        :returns: Next configured launch token.
+        """
+
+        if len(self._tokens) == 0:
+            raise AssertionError("unexpected scheduler launch-gate acquisition")
+        token = self._tokens.pop(0)
+        self.calls.append(("begin", token))
+        self._ordering.append(f"begin:{token}")
+        if self._begin_entered is not None:
+            self._begin_entered.set()
+            if self._release_begin is None:
+                raise AssertionError("controlled begin requires a release event")
+            if not self._release_begin.wait(timeout=5):
+                raise AssertionError("scheduler launch-gate release timed out")
+            self._begin_entered = None
+            self._release_begin = None
+        return token
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Record release of the exact token supplied by the inbox.
+
+        :param token: Exact token returned by the matching acquisition.
+        """
+
+        self.calls.append(("end", token))
+        self._ordering.append(f"end:{token}")
+
+
 def test_publication_queues_before_fd_wake_and_loop_entry_drains_fifo(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -301,6 +363,168 @@ def test_pending_receipt_is_consumed_before_host_submission() -> None:
 
     assert result == "submitted"
     assert ordering == ["consume", "submit"]
+    inbox.close()
+
+
+def test_native_launch_gate_begins_after_drain_and_spans_submit_and_bind() -> None:
+    """The exact native token owns submission and immutable result binding."""
+
+    ordering: list[str] = []
+    token = (1 << 63) + 17
+    launch_gate = _SchedulerLaunchGate(tokens=(token,), ordering=ordering)
+    inbox = TerminalReceiptInbox(physical_capacity=1, launch_gate=launch_gate)
+    binding = _binding(room_id=41, marker=27)
+    receipt = _receipt(binding, marker=37)
+    inbox.register_live(binding)
+    inbox.publish(receipt)
+
+    def consume(value: TerminalWireReceipt) -> None:
+        """Record the already-ready receipt before native gate acquisition."""
+
+        assert value == receipt
+        ordering.append("consume")
+
+    def submit() -> str:
+        """Require native ownership around exact host submission."""
+
+        assert launch_gate.calls == [("begin", token)]
+        ordering.append("submit")
+        return "submitted"
+
+    def bind(result: str) -> str:
+        """Require the same native ownership around immutable binding."""
+
+        assert result == "submitted"
+        assert launch_gate.calls == [("begin", token)]
+        ordering.append("bind")
+        return "bound"
+
+    assert (
+        inbox.launch_and_bind_handoff(submit=submit, bind=bind, consume=consume)
+        == "bound"
+    )
+    assert launch_gate.calls == [("begin", token), ("end", token)]
+    assert ordering == [
+        "consume",
+        f"begin:{token}",
+        "submit",
+        "bind",
+        f"end:{token}",
+    ]
+    inbox.close()
+
+
+@pytest.mark.parametrize("failure_site", ("submit", "bind"))
+def test_native_launch_gate_releases_exact_token_after_callback_failure(
+    failure_site: str,
+) -> None:
+    """Submission and binding failures cannot strand native gate ownership."""
+
+    ordering: list[str] = []
+    token = (1 << 62) + 29
+    launch_gate = _SchedulerLaunchGate(tokens=(token,), ordering=ordering)
+    inbox = TerminalReceiptInbox(physical_capacity=1, launch_gate=launch_gate)
+    failure = RuntimeError(f"synthetic {failure_site} failure")
+
+    def submit() -> str:
+        """Return or raise at the configured lifecycle site."""
+
+        ordering.append("submit")
+        if failure_site == "submit":
+            raise failure
+        return "submitted"
+
+    def bind(result: str) -> str:
+        """Raise only after observing the exact submission result."""
+
+        assert result == "submitted"
+        ordering.append("bind")
+        raise failure
+
+    with pytest.raises(RuntimeError) as raised:
+        inbox.launch_and_bind_handoff(
+            submit=submit,
+            bind=bind,
+            consume=lambda value: None,
+        )
+
+    assert raised.value is failure
+    assert launch_gate.calls == [("begin", token), ("end", token)]
+    expected = [f"begin:{token}", "submit"]
+    if failure_site == "bind":
+        expected.append("bind")
+    expected.append(f"end:{token}")
+    assert ordering == expected
+    inbox.close()
+
+
+def test_publication_queued_during_native_acquisition_is_revalidated_before_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GIL-releasing acquisition cannot let newly ready work miss the launch."""
+
+    ordering: list[str] = []
+    first_token = 1009
+    second_token = 1013
+    begin_entered = threading.Event()
+    release_begin = threading.Event()
+    publication_queued = threading.Event()
+    launch_gate = _SchedulerLaunchGate(
+        tokens=(first_token, second_token),
+        ordering=ordering,
+        begin_entered=begin_entered,
+        release_begin=release_begin,
+    )
+    inbox = TerminalReceiptInbox(physical_capacity=1, launch_gate=launch_gate)
+    binding = _binding(room_id=42, marker=28)
+    receipt = _receipt(binding, marker=38)
+    inbox.register_live(binding)
+    real_signal = inbox._signal_locked
+
+    def observe_signal() -> None:
+        """Expose the moment publication becomes authoritative."""
+
+        real_signal()
+        publication_queued.set()
+
+    monkeypatch.setattr(inbox, "_signal_locked", observe_signal)
+
+    def consume(value: TerminalWireReceipt) -> None:
+        """Consume racing work before the eventual host submission."""
+
+        assert value == receipt
+        ordering.append("consume")
+
+    def submit() -> str:
+        """Record the only authorized host submission."""
+
+        ordering.append("submit")
+        return "submitted"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        handoff = executor.submit(inbox.launch_handoff, submit, consume)
+        assert begin_entered.wait(timeout=5)
+        publication = executor.submit(inbox.publish, receipt)
+        queued_before_release = publication_queued.wait(timeout=5)
+        release_begin.set()
+        assert queued_before_release
+        assert publication.result(timeout=5) is SchedulerReceiptPublishResult.QUEUED
+        assert handoff.result(timeout=5) == "submitted"
+
+    assert launch_gate.calls == [
+        ("begin", first_token),
+        ("end", first_token),
+        ("begin", second_token),
+        ("end", second_token),
+    ]
+    assert ordering == [
+        f"begin:{first_token}",
+        f"end:{first_token}",
+        "consume",
+        f"begin:{second_token}",
+        "submit",
+        f"end:{second_token}",
+    ]
     inbox.close()
 
 

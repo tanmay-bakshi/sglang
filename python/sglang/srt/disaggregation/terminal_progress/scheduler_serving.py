@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxInventory,
     SchedulerReceiptPublishResult,
     TerminalReceiptInbox,
+    TerminalSchedulerLaunchGate,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import TerminalWireReceipt
 
@@ -357,6 +358,7 @@ class TerminalSchedulerServing:
         physical_capacity: int,
         source_consumer: TerminalSourceSchedulerConsumer | None = None,
         decode_consumer: TerminalDecodeSchedulerConsumer | None = None,
+        launch_gate: TerminalSchedulerLaunchGate,
     ) -> None:
         """Construct one role-specific serving adapter.
 
@@ -364,6 +366,7 @@ class TerminalSchedulerServing:
         :param physical_capacity: Maximum configured in-flight generations.
         :param source_consumer: Source scheduler-affine resource consumer.
         :param decode_consumer: Decode scheduler-affine resource consumer.
+        :param launch_gate: Native delivery authority for host submission.
         """
 
         if type(role) is not TerminalSchedulerServingRole:
@@ -382,10 +385,15 @@ class TerminalSchedulerServing:
                 )
             if source_consumer is not None:
                 raise ValueError("decode serving cannot carry a source consumer")
+        if not isinstance(launch_gate, TerminalSchedulerLaunchGate):
+            raise TypeError("launch_gate must satisfy TerminalSchedulerLaunchGate")
         self._role = role
         self._source_consumer = source_consumer
         self._decode_consumer = decode_consumer
-        self._inbox = TerminalReceiptInbox(physical_capacity=physical_capacity)
+        self._inbox = TerminalReceiptInbox(
+            physical_capacity=physical_capacity,
+            launch_gate=launch_gate,
+        )
         self._timing = terminal_progress_timing_recorder(
             logger,
             SystemTerminalOwnerClock().now_ns,

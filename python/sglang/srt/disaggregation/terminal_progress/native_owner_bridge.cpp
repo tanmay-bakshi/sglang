@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -705,6 +707,8 @@ struct SharedOwner {
   std::unordered_set<std::uint64_t> consumed_actions{};
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
   std::unordered_set<std::uint64_t> unclaimed_handoff_action_ids{};
+  std::unordered_map<std::uint64_t, ActionKind> active_handoff_actions{};
+  std::unordered_set<std::uint64_t> settled_handoff_action_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -724,6 +728,14 @@ struct SharedOwner {
   std::uint64_t handoff_discard_count{0};
   std::uint64_t source_batch_handoff_count{0};
   std::uint64_t source_batch_handoff_action_count{0};
+  std::uint64_t handoff_registration_count{0};
+  std::uint64_t scheduler_launch_handoff_begin_count{0};
+  std::uint64_t scheduler_launch_handoff_acquisition_count{0};
+  std::uint64_t scheduler_launch_handoff_release_count{0};
+  std::uint64_t next_scheduler_launch_handoff_token{1};
+  std::uint64_t active_scheduler_launch_handoff_token{0};
+  std::uint64_t active_scheduler_launch_handoff_watermark{0};
+  std::uint64_t scheduler_launch_handoff_begin_watermark{0};
   bool started{false};
   bool admission_open{true};
   bool event_admission_open{true};
@@ -737,6 +749,7 @@ struct SharedOwner {
   bool output_drain_active{false};
   bool observation_wake_armed{false};
   bool handoff_enabled{false};
+  bool scheduler_launch_handoff_begin_active{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   bool test_clock_enabled{false};
   std::uint64_t test_now_ns{0};
@@ -1465,14 +1478,39 @@ bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
 }
 
 bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
-  return std::all_of(
+  const bool unclaimed_is_authorized = std::all_of(
       owner.unclaimed_handoff_action_ids.begin(),
       owner.unclaimed_handoff_action_ids.end(),
       [&owner](std::uint64_t action_id) {
         const auto action = owner.pending_actions.find(action_id);
         return action != owner.pending_actions.end() &&
-               action_requires_forward_independent_handoff(action->second.kind);
+               action_requires_forward_independent_handoff(action->second.kind) &&
+               (owner.active_handoff_actions.count(action_id) == 1 ||
+                (owner.abort_started &&
+                 owner.settled_handoff_action_ids.count(action_id) == 1));
       });
+  const bool active_is_authorized = std::all_of(
+      owner.active_handoff_actions.begin(),
+      owner.active_handoff_actions.end(), [](const auto &entry) {
+        return action_requires_forward_independent_handoff(entry.second);
+      });
+  const bool action_conservation =
+      owner.handoff_registration_count ==
+      owner.active_handoff_actions.size() +
+          owner.settled_handoff_action_ids.size();
+  const bool token_conservation =
+      owner.scheduler_launch_handoff_acquisition_count ==
+      owner.scheduler_launch_handoff_release_count +
+          (owner.active_scheduler_launch_handoff_token == 0 ? 0 : 1);
+  const bool token_state_consistent =
+      (owner.active_scheduler_launch_handoff_token != 0 ||
+       owner.active_scheduler_launch_handoff_watermark == 0) &&
+      (owner.scheduler_launch_handoff_begin_active ||
+       owner.scheduler_launch_handoff_begin_watermark == 0) &&
+      !(owner.scheduler_launch_handoff_begin_active &&
+        owner.active_scheduler_launch_handoff_token != 0);
+  return unclaimed_is_authorized && active_is_authorized &&
+         action_conservation && token_conservation && token_state_consistent;
 }
 
 void enter_handoff_fatal_locked(SharedOwner &owner, FatalCode code,
@@ -1500,12 +1538,29 @@ void register_forward_independent_handoffs_locked(
     if (!action_requires_forward_independent_handoff(action.kind)) {
       continue;
     }
+    if (owner.active_handoff_actions.count(action.action_id) != 0 ||
+        owner.settled_handoff_action_ids.count(action.action_id) != 0) {
+      enter_handoff_fatal_locked(
+          owner, FatalCode::kHandoffAuthority,
+          "terminal handoff registered a replayed action identity");
+      return;
+    }
+    if (!owner.active_handoff_actions
+             .emplace(action.action_id, action.kind)
+             .second) {
+      enter_handoff_fatal_locked(
+          owner, FatalCode::kHandoffAuthority,
+          "terminal handoff registered duplicate active authority");
+      return;
+    }
     if (!owner.unclaimed_handoff_action_ids.insert(action.action_id).second) {
+      owner.active_handoff_actions.erase(action.action_id);
       enter_handoff_fatal_locked(
           owner, FatalCode::kHandoffAuthority,
           "terminal handoff registered a duplicate action identity");
       return;
     }
+    ++owner.handoff_registration_count;
   }
 }
 
@@ -1518,6 +1573,75 @@ void discard_forward_independent_handoff_locked(
     ++owner.handoff_discard_count;
   }
   owner.condition.notify_all();
+}
+
+void settle_forward_independent_handoff_locked(
+    SharedOwner &owner, std::uint64_t action_id) {
+  const auto active = owner.active_handoff_actions.find(action_id);
+  if (active == owner.active_handoff_actions.end() ||
+      owner.unclaimed_handoff_action_ids.count(action_id) != 0 ||
+      owner.settled_handoff_action_ids.count(action_id) != 0) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kHandoffAuthority,
+        "terminal handoff settlement was absent, premature, or replayed");
+    throw std::runtime_error(
+        "terminal handoff settlement was absent, premature, or replayed");
+  }
+  owner.active_handoff_actions.erase(active);
+  if (!owner.settled_handoff_action_ids.insert(action_id).second) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kHandoffAuthority,
+        "terminal handoff settlement duplicated terminal authority");
+    throw std::runtime_error(
+        "terminal handoff settlement duplicated terminal authority");
+  }
+  owner.condition.notify_all();
+}
+
+void fail_forward_independent_handoff_locked(
+    SharedOwner &owner, std::uint64_t action_id, ActionKind kind) {
+  if (!owner.handoff_enabled ||
+      !action_requires_forward_independent_handoff(kind)) {
+    return;
+  }
+  const auto active = owner.active_handoff_actions.find(action_id);
+  if (active != owner.active_handoff_actions.end()) {
+    owner.active_handoff_actions.erase(active);
+    if (!owner.settled_handoff_action_ids.insert(action_id).second) {
+      enter_handoff_fatal_locked(
+          owner, FatalCode::kHandoffAuthority,
+          "failed terminal handoff duplicated terminal authority");
+      throw std::runtime_error(
+          "failed terminal handoff duplicated terminal authority");
+    }
+    owner.condition.notify_all();
+    return;
+  }
+  if (owner.abort_started &&
+      owner.settled_handoff_action_ids.count(action_id) == 1) {
+    return;
+  }
+  enter_handoff_fatal_locked(
+      owner, FatalCode::kHandoffAuthority,
+      "failed terminal handoff was absent or already settled");
+  throw std::runtime_error(
+      "failed terminal handoff was absent or already settled");
+}
+
+void abort_forward_independent_handoffs_locked(SharedOwner &owner) {
+  for (const auto &entry : owner.active_handoff_actions) {
+    owner.settled_handoff_action_ids.insert(entry.first);
+  }
+  owner.active_handoff_actions.clear();
+  owner.condition.notify_all();
+}
+
+bool active_handoff_at_or_below_locked(const SharedOwner &owner,
+                                       std::uint64_t watermark) noexcept {
+  return std::any_of(
+      owner.active_handoff_actions.begin(),
+      owner.active_handoff_actions.end(),
+      [watermark](const auto &entry) { return entry.first <= watermark; });
 }
 
 void apply_publication_owner_loss_locked(Lifecycle &lifecycle) {
@@ -2573,7 +2697,7 @@ public:
     }
   }
 
-  ~NativeTerminalOwnerBridge() { abort_and_close(); }
+  ~NativeTerminalOwnerBridge() { force_abort_and_close_noexcept(); }
 
   NativeTerminalOwnerBridge(const NativeTerminalOwnerBridge &) = delete;
   NativeTerminalOwnerBridge &
@@ -2949,6 +3073,104 @@ public:
     owner_->condition.notify_all();
   }
 
+  void settle_forward_independent_handoff(std::uint64_t action_id) {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->started || owner_->closed || !owner_->handoff_enabled) {
+      enter_handoff_fatal_locked(
+          *owner_, FatalCode::kHandoffAuthority,
+          "terminal handoff settlement requires a running enabled owner");
+      throw std::runtime_error(
+          "terminal handoff settlement requires a running enabled owner");
+    }
+    settle_forward_independent_handoff_locked(*owner_, action_id);
+  }
+
+  std::uint64_t begin_scheduler_launch_handoff(double timeout_seconds) {
+    if (!std::isfinite(timeout_seconds) || timeout_seconds <= 0.0) {
+      throw std::invalid_argument(
+          "scheduler launch handoff timeout must be finite and positive");
+    }
+    py::gil_scoped_release release;
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    const auto reject_authority = [this](const std::string &reason) {
+      enter_handoff_fatal_locked(*owner_, FatalCode::kHandoffAuthority,
+                                 reason);
+      throw std::runtime_error(reason);
+    };
+    if (!owner_->started || owner_->closed || owner_->abort_started ||
+        !owner_->handoff_enabled) {
+      reject_authority(
+          "scheduler launch handoff requires a running enabled owner");
+    }
+    ++owner_->scheduler_launch_handoff_begin_count;
+    if (owner_->fatal_code != FatalCode::kNone) {
+      throw std::runtime_error(
+          "scheduler launch handoff cannot enter after process fatality");
+    }
+    if (owner_->scheduler_launch_handoff_begin_active ||
+        owner_->active_scheduler_launch_handoff_token != 0) {
+      reject_authority(
+          "scheduler launch handoff lease acquisition is concurrent");
+    }
+
+    owner_->scheduler_launch_handoff_begin_active = true;
+    const std::uint64_t watermark = owner_->next_action_id - 1;
+    owner_->scheduler_launch_handoff_begin_watermark = watermark;
+    const bool reached = owner_->condition.wait_for(
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return !active_handoff_at_or_below_locked(*owner_, watermark) ||
+                 owner_->fatal_code != FatalCode::kNone ||
+                 owner_->abort_started || owner_->closed;
+        });
+    if (!reached) {
+      owner_->scheduler_launch_handoff_begin_active = false;
+      owner_->scheduler_launch_handoff_begin_watermark = 0;
+      reject_authority(
+          "scheduler launch handoff timed out with active delivery authority");
+    }
+    if (owner_->fatal_code != FatalCode::kNone || owner_->abort_started ||
+        owner_->closed) {
+      owner_->scheduler_launch_handoff_begin_active = false;
+      owner_->scheduler_launch_handoff_begin_watermark = 0;
+      owner_->condition.notify_all();
+      throw std::runtime_error(
+          "scheduler launch handoff was interrupted by terminal authority");
+    }
+    if (owner_->next_scheduler_launch_handoff_token == 0 ||
+        owner_->next_scheduler_launch_handoff_token ==
+            std::numeric_limits<std::uint64_t>::max()) {
+      owner_->scheduler_launch_handoff_begin_active = false;
+      owner_->scheduler_launch_handoff_begin_watermark = 0;
+      reject_authority("scheduler launch handoff token space was exhausted");
+    }
+
+    const std::uint64_t token =
+        owner_->next_scheduler_launch_handoff_token++;
+    owner_->active_scheduler_launch_handoff_token = token;
+    owner_->active_scheduler_launch_handoff_watermark = watermark;
+    owner_->scheduler_launch_handoff_begin_active = false;
+    owner_->scheduler_launch_handoff_begin_watermark = 0;
+    ++owner_->scheduler_launch_handoff_acquisition_count;
+    owner_->condition.notify_all();
+    return token;
+  }
+
+  void end_scheduler_launch_handoff(std::uint64_t token) {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (token == 0 ||
+        owner_->active_scheduler_launch_handoff_token != token) {
+      enter_handoff_fatal_locked(
+          *owner_, FatalCode::kHandoffAuthority,
+          "scheduler launch handoff release was absent or replayed");
+      throw std::runtime_error(
+          "scheduler launch handoff release was absent or replayed");
+    }
+    owner_->active_scheduler_launch_handoff_token = 0;
+    owner_->active_scheduler_launch_handoff_watermark = 0;
+    ++owner_->scheduler_launch_handoff_release_count;
+    owner_->condition.notify_all();
+  }
+
   void fail_action_delivery(std::uint64_t action_id,
                             const std::string &reason) {
     std::lock_guard<std::mutex> lock(owner_->mutex);
@@ -2963,6 +3185,8 @@ public:
     trigger.kind = action->second.binding.owner.role == OwnerRole::kSource
                        ? EventKind::kSourceInboxOverflow
                        : EventKind::kDecodeInboxOverflow;
+    fail_forward_independent_handoff_locked(
+        *owner_, action_id, action->second.kind);
     discard_forward_independent_handoff_locked(*owner_, action_id);
     owner_->pending_actions.erase(action);
     owner_->output_drain_action_ids.erase(action_id);
@@ -3362,6 +3586,9 @@ public:
                  owner_->output_queue.empty() &&
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
+                 owner_->active_handoff_actions.empty() &&
+                 !owner_->scheduler_launch_handoff_begin_active &&
+                 owner_->active_scheduler_launch_handoff_token == 0 &&
                  !owner_->output_drain_active &&
                  !owner_->qualification.running;
         });
@@ -3389,6 +3616,9 @@ public:
                       owner_->output_drain_active ||
                       !owner_->output_drain_action_ids.empty() ||
                       !owner_->unclaimed_handoff_action_ids.empty() ||
+                      !owner_->active_handoff_actions.empty() ||
+                      owner_->scheduler_launch_handoff_begin_active ||
+                      owner_->active_scheduler_launch_handoff_token != 0 ||
                       !owner_->producers_joined;
       for (const auto &entry : owner_->lifecycles) {
         retained = retained || entry.second.live_resources != 0;
@@ -3428,6 +3658,7 @@ public:
       owner_->event_admission_open = false;
       owner_->stop_requested = true;
       owner_->qualification.running = false;
+      abort_forward_independent_handoffs_locked(*owner_);
       for (InputCommand &command : owner_->input_queue) {
         if (command.kind != InputKind::kRegisterLifecycle) {
           continue;
@@ -3478,7 +3709,10 @@ public:
         !owner_->fatal_output_queue.empty() ||
         owner_->output_drain_active ||
         !owner_->output_drain_action_ids.empty() ||
-        !owner_->unclaimed_handoff_action_ids.empty()) {
+        !owner_->unclaimed_handoff_action_ids.empty() ||
+        !owner_->active_handoff_actions.empty() ||
+        owner_->scheduler_launch_handoff_begin_active ||
+        owner_->active_scheduler_launch_handoff_token != 0) {
       throw std::runtime_error(
           "aborted close retained unrouted terminal authority");
     }
@@ -3486,7 +3720,33 @@ public:
     owner_->closed = true;
   }
 
-  void abort_and_close() noexcept {
+  void abort_and_close() {
+    if (owner_ == nullptr) {
+      return;
+    }
+    begin_abort();
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (owner_->closed) {
+      return;
+    }
+    if (owner_->scheduler_launch_handoff_begin_active ||
+        owner_->active_scheduler_launch_handoff_token != 0) {
+      throw std::runtime_error(
+          "aborted owner retains scheduler launch handoff authority");
+    }
+    owner_->output_queue.clear();
+    owner_->fatal_output_queue.clear();
+    owner_->pending_actions.clear();
+    owner_->output_drain_action_ids.clear();
+    owner_->unclaimed_handoff_action_ids.clear();
+    owner_->output_drain_active = false;
+    close_owner_fds_locked(*owner_);
+    owner_->closed = true;
+    owner_->condition.notify_all();
+  }
+
+private:
+  void force_abort_and_close_noexcept() noexcept {
     if (owner_ == nullptr) {
       return;
     }
@@ -3503,13 +3763,21 @@ public:
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
     owner_->unclaimed_handoff_action_ids.clear();
+    try {
+      abort_forward_independent_handoffs_locked(*owner_);
+    } catch (...) {
+      owner_->active_handoff_actions.clear();
+    }
+    owner_->active_scheduler_launch_handoff_token = 0;
+    owner_->active_scheduler_launch_handoff_watermark = 0;
+    owner_->scheduler_launch_handoff_begin_active = false;
+    owner_->scheduler_launch_handoff_begin_watermark = 0;
     owner_->output_drain_active = false;
     close_owner_fds_locked(*owner_);
     owner_->closed = true;
     owner_->condition.notify_all();
   }
 
-private:
   static void add_trusted_issuers(const py::dict &registration,
                                   Lifecycle &lifecycle) {
     for (const py::handle item : py::cast<py::sequence>(
@@ -3631,6 +3899,35 @@ private:
         owner_->source_batch_handoff_count;
     result["source_batch_handoff_action_count"] =
         owner_->source_batch_handoff_action_count;
+    result["registered_handoff_action_count"] =
+        owner_->handoff_registration_count;
+    result["active_handoff_action_count"] =
+        owner_->active_handoff_actions.size();
+    result["settled_handoff_action_count"] =
+        owner_->settled_handoff_action_ids.size();
+    result["scheduler_launch_handoff_begin_count"] =
+        owner_->scheduler_launch_handoff_begin_count;
+    result["scheduler_launch_handoff_acquisition_count"] =
+        owner_->scheduler_launch_handoff_acquisition_count;
+    result["scheduler_launch_handoff_release_count"] =
+        owner_->scheduler_launch_handoff_release_count;
+    result["scheduler_launch_handoff_begin_active"] =
+        owner_->scheduler_launch_handoff_begin_active;
+    if (owner_->scheduler_launch_handoff_begin_active) {
+      result["scheduler_launch_handoff_begin_watermark"] =
+          owner_->scheduler_launch_handoff_begin_watermark;
+    } else {
+      result["scheduler_launch_handoff_begin_watermark"] = py::none();
+    }
+    if (owner_->active_scheduler_launch_handoff_token != 0) {
+      result["active_scheduler_launch_handoff_token"] =
+          owner_->active_scheduler_launch_handoff_token;
+      result["active_scheduler_launch_handoff_watermark"] =
+          owner_->active_scheduler_launch_handoff_watermark;
+    } else {
+      result["active_scheduler_launch_handoff_token"] = py::none();
+      result["active_scheduler_launch_handoff_watermark"] = py::none();
+    }
     result["handoff_enabled"] = owner_->handoff_enabled;
     result["output_drain_active"] = owner_->output_drain_active;
     result["producer_count"] = owner_->producers.size();
@@ -3771,6 +4068,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("claim_source_forward_independent_handoffs",
            &NativeTerminalOwnerBridge::claim_source_forward_independent_handoffs,
            py::arg("action_ids"))
+      .def("settle_forward_independent_handoff",
+           &NativeTerminalOwnerBridge::settle_forward_independent_handoff,
+           py::arg("action_id"))
+      .def("begin_scheduler_launch_handoff",
+           &NativeTerminalOwnerBridge::begin_scheduler_launch_handoff,
+           py::arg("timeout_seconds"))
+      .def("end_scheduler_launch_handoff",
+           &NativeTerminalOwnerBridge::end_scheduler_launch_handoff,
+           py::arg("token"))
       .def("fail_action_delivery",
            &NativeTerminalOwnerBridge::fail_action_delivery,
            py::arg("action_id"), py::arg("reason"),

@@ -1083,6 +1083,7 @@ class PackedTerminalSourceServing:
             role=TerminalSchedulerServingRole.SOURCE,
             physical_capacity=physical_capacity,
             source_consumer=scheduler_consumer,
+            launch_gate=runtime,
         )
         delivery_leases = _PackedTerminalSourceDeliveryLeases(scheduler_serving)
         runtime.bind_source_delivery_authority(delivery_leases)

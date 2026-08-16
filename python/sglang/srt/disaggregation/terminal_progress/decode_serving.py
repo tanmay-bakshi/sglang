@@ -481,6 +481,7 @@ class PackedTerminalDecodeServing:
             wiring=wiring,
             physical_capacity=physical_capacity,
             process_fatal_handler=process_fatal_handler,
+            launch_gate=runtime,
         )
         self._actor = actor
         self._runtime = runtime

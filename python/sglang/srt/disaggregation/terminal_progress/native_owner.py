@@ -1,6 +1,7 @@
 import dataclasses
 import hashlib
 import logging
+import math
 import os
 import sys
 import traceback
@@ -140,6 +141,25 @@ class _NativeTerminalOwnerBridge(Protocol):
         """Atomically claim one complete source output-drain batch.
 
         :param action_ids: Exact source action identities with durable leases.
+        """
+
+    def settle_forward_independent_handoff(self, action_id: int) -> None:
+        """Retire one claimed action after downstream work completes.
+
+        :param action_id: Exact forward-independent native action identity.
+        """
+
+    def begin_scheduler_launch_handoff(self, timeout_seconds: float) -> int:
+        """Acquire one exact scheduler launch lease after bounded settlement.
+
+        :param timeout_seconds: Positive bounded settlement wait.
+        :returns: One-shot native scheduler launch token.
+        """
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Release one exact scheduler launch lease.
+
+        :param token: One-shot token returned by the matching begin call.
         """
 
     def fail_action_delivery(self, action_id: int, reason: str) -> None:
@@ -762,6 +782,48 @@ class NativeTerminalOwner:
         if len(set(action_ids)) != len(action_ids):
             raise ValueError("source handoff action identities must be unique")
         self._native.claim_source_forward_independent_handoffs(action_ids)
+
+    def settle_forward_independent_handoff(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Retire one claimed action after its downstream effect completes.
+
+        :param action: Forward-independent action with terminal downstream work.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        self._native.settle_forward_independent_handoff(action.action_id)
+
+    def begin_scheduler_launch_handoff(self, timeout_seconds: float) -> int:
+        """Wait for prior delivery work and acquire one scheduler launch lease.
+
+        The native boundary captures an action watermark, releases the GIL
+        while waiting for those actions to settle, and returns one exact token.
+
+        :param timeout_seconds: Positive finite settlement wait.
+        :returns: One-shot native scheduler launch token.
+        """
+
+        if type(timeout_seconds) not in (int, float):
+            raise TypeError("timeout_seconds must be a number")
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        token = int(self._native.begin_scheduler_launch_handoff(timeout))
+        if token <= 0:
+            raise RuntimeError("native scheduler launch token must be positive")
+        return token
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Release one exact scheduler launch lease.
+
+        :param token: One-shot token returned by the matching begin call.
+        """
+
+        if type(token) is not int or token <= 0:
+            raise ValueError("token must be a positive integer")
+        self._native.end_scheduler_launch_handoff(token)
 
     def fail_action_delivery(
         self, action: NativeTerminalOwnerAction, reason: str

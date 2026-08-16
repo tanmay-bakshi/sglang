@@ -857,6 +857,7 @@ class NativeTerminalRuntime:
     _output_thread: threading.Thread
 
     _OUTPUT_QUIESCENCE_TIMEOUT_SECONDS = 60.0
+    _SCHEDULER_LAUNCH_HANDOFF_TIMEOUT_SECONDS = 60.0
 
     def __init__(
         self,
@@ -1612,6 +1613,18 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action was acknowledged before inbox claim"
                 )
+            if (
+                self._forward_independent_handoff_enabled
+                and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+            ):
+                try:
+                    self._owner.settle_forward_independent_handoff(action)
+                except Exception as error:
+                    formatted_traceback = traceback.format_exc()
+                    self._enter_runtime_fatal_locked(formatted_traceback)
+                    raise NativeTerminalRuntimeError(
+                        "native forward-independent action settlement failed"
+                    ) from error
             del self._consumer_pending[action.action_id]
             self._inbox_claimed_action_ids.remove(action.action_id)
             if action.kind in (
@@ -1623,6 +1636,79 @@ class NativeTerminalRuntime:
                 if binding_digest not in self._scheduler_pending:
                     self._scheduler_live.pop(binding_digest, None)
             self._condition.notify_all()
+
+    def begin_scheduler_launch_handoff(self) -> int:
+        """Acquire one exact launch token after prior delivery settles.
+
+        The native owner captures its action watermark and releases the GIL for
+        the bounded wait. A token only authorizes immediate host submission and
+        immutable result binding; it carries no scheduler-policy authority.
+
+        :returns: Exact positive native launch token.
+        """
+
+        with self._condition:
+            if not self._forward_independent_handoff_enabled:
+                raise NativeTerminalRuntimeError(
+                    "scheduler launch handoff requires terminal delivery mode"
+                )
+            if self._disposition is not NativeTerminalRuntimeDisposition.RUNNING:
+                raise NativeTerminalRuntimeClosedError(
+                    "scheduler launch handoff requires a running runtime"
+                )
+        try:
+            token = self._owner.begin_scheduler_launch_handoff(
+                self._SCHEDULER_LAUNCH_HANDOFF_TIMEOUT_SECONDS
+            )
+        except Exception as error:
+            formatted_traceback = traceback.format_exc()
+            with self._condition:
+                closed = self._disposition in (
+                    NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                    NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+                    NativeTerminalRuntimeDisposition.STOPPED,
+                )
+                if not closed:
+                    self._enter_runtime_fatal_locked(formatted_traceback)
+            if closed:
+                raise NativeTerminalRuntimeClosedError(
+                    f"scheduler launch handoff was interrupted: {error}"
+                ) from error
+            raise NativeTerminalRuntimeError(
+                f"native scheduler launch handoff failed: {error}"
+            ) from error
+        with self._condition:
+            running = self._disposition is NativeTerminalRuntimeDisposition.RUNNING
+        if running:
+            return token
+        try:
+            self._owner.end_scheduler_launch_handoff(token)
+        except Exception as error:
+            with self._condition:
+                self._enter_runtime_fatal_locked(traceback.format_exc())
+            raise NativeTerminalRuntimeError(
+                "scheduler launch token cleanup failed after runtime closure"
+            ) from error
+        raise NativeTerminalRuntimeClosedError(
+            "scheduler launch handoff lost the race to runtime closure"
+        )
+
+    def end_scheduler_launch_handoff(self, token: int) -> None:
+        """Release the exact native token after immutable result binding.
+
+        :param token: Token returned by :meth:`begin_scheduler_launch_handoff`.
+        """
+
+        if type(token) is not int or token <= 0:
+            raise ValueError("token must be a positive integer")
+        try:
+            self._owner.end_scheduler_launch_handoff(token)
+        except Exception as error:
+            with self._condition:
+                self._enter_runtime_fatal_locked(traceback.format_exc())
+            raise NativeTerminalRuntimeError(
+                f"native scheduler launch token release failed: {error}"
+            ) from error
 
     def acknowledge_aborted_action(self, action: NativeTerminalOwnerAction) -> None:
         """Discard one consumer action after fail-closed quarantine wins.

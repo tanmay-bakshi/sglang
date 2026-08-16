@@ -554,6 +554,29 @@ def _submit_runtime_decode_scatter(
     )
 
 
+def _submit_runtime_source_gather(
+    runtime: NativeTerminalRuntime,
+    registration: NativeTerminalLifecycleRegistration,
+) -> None:
+    """Earn one source-gather action through a composed runtime.
+
+    :param runtime: Running source runtime.
+    :param registration: Registered source lifecycle.
+    """
+
+    binding_digest = registration.binding.digest
+    runtime.submit(
+        _LOCAL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+    )
+    runtime.submit(
+        _LOCAL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+    )
+
+
 def _wait_for_owner_inventory(
     owner: NativeTerminalOwner,
     predicate: Callable[[NativeTerminalOwnerInventory], bool],
@@ -1577,6 +1600,248 @@ def test_production_handoff_has_no_pending_call_surface() -> None:
     for source in sources:
         text = source.read_text(encoding="utf-8")
         assert all(token not in text for token in forbidden), source
+
+
+def test_scheduler_launch_handoff_waits_for_actual_action_completion() -> None:
+    """A preclaim cannot satisfy the next scheduler launch watermark."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 96)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        _submit_runtime_source_gather(runtime, registration)
+        gather = _drain_actions(runtime.source_gather_actions)[0]
+        preclaimed = runtime.snapshot().owner
+        assert preclaimed.claimed_handoff_action_count == 1
+        assert preclaimed.active_handoff_action_count == 1
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            inventory = _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            assert inventory.scheduler_launch_handoff_begin_watermark is not None
+            assert not launch.done()
+
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                gather,
+                NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+            )
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        assert type(token) is int
+        completed = runtime.snapshot().owner
+        assert completed.active_handoff_action_count == 0
+        assert completed.settled_handoff_action_count == 1
+        runtime.end_scheduler_launch_handoff(token)
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_action_emitted_during_launch_token_blocks_only_the_next_begin() -> None:
+    """Work racing an authorized enqueue is charged to the next launch."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 97)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        token = runtime.begin_scheduler_launch_handoff()
+        _submit_runtime_source_gather(runtime, registration)
+        gather = _drain_actions(runtime.source_gather_actions)[0]
+        runtime.end_scheduler_launch_handoff(token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            next_launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            inventory = _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            assert inventory.scheduler_launch_handoff_begin_watermark is not None
+            assert not next_launch.done()
+
+            runtime.acknowledge_consumed_action(gather)
+            next_token = next_launch.result(timeout=_WAIT_SECONDS)
+
+        runtime.end_scheduler_launch_handoff(next_token)
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_newer_action_does_not_extend_a_captured_launch_watermark() -> None:
+    """A later action cannot starve a wait over the captured action prefix."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registrations = (
+        _registration(owner, remote, 98),
+        _registration(owner, remote, 99),
+    )
+    runtime.start()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+        _submit_runtime_source_gather(runtime, registrations[0])
+        first = _drain_actions(runtime.source_gather_actions)[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            waiting = _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            watermark = waiting.scheduler_launch_handoff_begin_watermark
+            assert watermark is not None
+            assert first.action_id <= watermark
+            assert not launch.done()
+
+            _submit_runtime_source_gather(runtime, registrations[1])
+            second = _drain_actions(runtime.source_gather_actions)[0]
+            assert second.action_id > watermark
+            runtime.acknowledge_consumed_action(first)
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        runtime.end_scheduler_launch_handoff(token)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            next_launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            inventory = _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            assert inventory.scheduler_launch_handoff_begin_watermark is not None
+            assert not next_launch.done()
+            runtime.acknowledge_consumed_action(second)
+            next_token = next_launch.result(timeout=_WAIT_SECONDS)
+        runtime.end_scheduler_launch_handoff(next_token)
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_scheduler_launch_handoff_rejects_a_replayed_release() -> None:
+    """A released scheduler launch token is permanently stale."""
+
+    runtime, _, _ = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    runtime.start()
+    try:
+        token = runtime.begin_scheduler_launch_handoff()
+        runtime.end_scheduler_launch_handoff(token)
+        with pytest.raises(RuntimeError, match="absent or replayed"):
+            runtime.end_scheduler_launch_handoff(token)
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_scheduler_launch_handoff_rejects_nested_acquisition() -> None:
+    """One process cannot hold or await two scheduler launch tokens."""
+
+    runtime, _, _ = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    runtime.start()
+    try:
+        token = runtime.begin_scheduler_launch_handoff()
+        with pytest.raises(RuntimeError, match="acquisition is concurrent"):
+            runtime.begin_scheduler_launch_handoff()
+        runtime.end_scheduler_launch_handoff(token)
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_scheduler_action_does_not_enter_the_native_launch_watermark() -> None:
+    """Scheduler-affine reclaim authority cannot block its own launch seam."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 101)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=101,
+        )
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                102,
+            ),
+        )
+
+        token = runtime.begin_scheduler_launch_handoff()
+        runtime.end_scheduler_launch_handoff(token)
+
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                103,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_abort_settles_a_blocked_scheduler_launch_handoff() -> None:
+    """Fail-closed transition wakes a waiter without authorizing a launch."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 100)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        _submit_runtime_source_gather(runtime, registration)
+        gather = _drain_actions(runtime.source_gather_actions)[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            assert not launch.done()
+            runtime.begin_abort("synthetic abort during scheduler launch handoff")
+            with pytest.raises(RuntimeError, match="interrupted"):
+                launch.result(timeout=_WAIT_SECONDS)
+
+        runtime.acknowledge_aborted_action(gather)
+    finally:
+        _finish_handoff_runtime(runtime)
 
 
 def test_exact_source_batch_claim_survives_later_abort() -> None:

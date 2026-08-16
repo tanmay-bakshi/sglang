@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxInventory,
+    TerminalSchedulerLaunchGate,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServing,
@@ -673,6 +674,7 @@ class PackedTerminalDecodeServingComposition:
         wiring: TerminalDecodeAdoptionWiring,
         physical_capacity: int,
         process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None],
+        launch_gate: TerminalSchedulerLaunchGate,
     ) -> None:
         """Construct one process-lifetime decode serving composition.
 
@@ -680,6 +682,7 @@ class PackedTerminalDecodeServingComposition:
         :param physical_capacity: Maximum configured in-flight generations.
         :param process_fatal_handler: Scheduler-owned admission-stop and teardown
             operation.
+        :param launch_gate: Native delivery authority for host submission.
         """
 
         consumer = PackedTerminalDecodeSchedulerConsumer(
@@ -690,6 +693,7 @@ class PackedTerminalDecodeServingComposition:
             role=TerminalSchedulerServingRole.DECODE,
             physical_capacity=physical_capacity,
             decode_consumer=consumer,
+            launch_gate=launch_gate,
         )
         self._consumer = consumer
         self._scheduler_serving = scheduler_serving
