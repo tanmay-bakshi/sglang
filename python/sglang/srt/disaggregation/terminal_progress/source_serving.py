@@ -43,6 +43,10 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServingInventory,
     TerminalSchedulerServingRole,
 )
+from sglang.srt.disaggregation.terminal_progress.source_gather_worker import (
+    PackedTerminalSourceGatherWorker,
+    PackedTerminalSourceGatherWorkerInventory,
+)
 from sglang.srt.disaggregation.terminal_progress.source_scheduler_consumer import (
     PackedTerminalSourceSchedulerConsumer,
     PackedTerminalSourceSchedulerInventory,
@@ -155,9 +159,9 @@ class PackedTerminalSourceResourceInventory:
             self.publication_control_active_binding_digests
         ):
             raise ValueError("terminal publisher routes must remain active")
-        if not set(
-            self.unpublished_quarantined_result_slot_binding_digests
-        ).issubset(self.unpublished_quarantined_binding_digests):
+        if not set(self.unpublished_quarantined_result_slot_binding_digests).issubset(
+            self.unpublished_quarantined_binding_digests
+        ):
             raise ValueError(
                 "unpublished result slots must remain submission-quarantined"
             )
@@ -243,6 +247,7 @@ class PackedTerminalSourceServingInventory:
     :ivar wiring: Immutable source side-effect inventory.
     :ivar scheduler_consumer: Scheduler-affine resource inventory.
     :ivar scheduler_serving: Qualified scheduler receipt inventory.
+    :ivar gather_worker: Dedicated blocking source gather execution context.
     :ivar grouped_nixl: Request-level main and DFlash transfer inventory.
     :ivar resources: Packed actor, DFlash, and pre-lifecycle quarantine inventory.
     :ivar owner_dead_marked: Whether scheduler failure wake was published.
@@ -253,6 +258,7 @@ class PackedTerminalSourceServingInventory:
     wiring: PackedTerminalSourceInventory
     scheduler_consumer: PackedTerminalSourceSchedulerInventory
     scheduler_serving: TerminalSchedulerServingInventory
+    gather_worker: PackedTerminalSourceGatherWorkerInventory
     grouped_nixl: GroupedNixlTerminalOwnerInventory
     resources: PackedTerminalSourceResourceInventory
     owner_dead_marked: bool
@@ -272,6 +278,10 @@ class PackedTerminalSourceServingInventory:
         if type(self.scheduler_serving) is not TerminalSchedulerServingInventory:
             raise TypeError(
                 "scheduler_serving must be TerminalSchedulerServingInventory"
+            )
+        if type(self.gather_worker) is not PackedTerminalSourceGatherWorkerInventory:
+            raise TypeError(
+                "gather_worker must be PackedTerminalSourceGatherWorkerInventory"
             )
         if type(self.grouped_nixl) is not GroupedNixlTerminalOwnerInventory:
             raise TypeError("grouped_nixl must be GroupedNixlTerminalOwnerInventory")
@@ -301,6 +311,7 @@ class PackedTerminalSourceServingInventory:
             runtime.scheduler,
             runtime.coordinator,
             runtime.lifecycle,
+            runtime.source_gather,
             runtime.source_work,
             runtime.decode_work,
             runtime.publisher,
@@ -329,6 +340,8 @@ class PackedTerminalSourceServingInventory:
                 len(self.scheduler_consumer.active_binding_digests),
                 self.scheduler_serving.inbox.live_count,
                 len(self.scheduler_serving.retained_action_ids),
+                self.gather_worker.retained_action_count,
+                int(self.gather_worker.fatal_reason is not None),
                 self.grouped_nixl.active_group_count,
                 self.grouped_nixl.active_transfer_count,
                 self.grouped_nixl.quarantined_transfer_count,
@@ -354,12 +367,8 @@ class PackedTerminalSourceServingInventory:
                 int(native.eventfd_error != 0),
                 len(self.resources.actor_active_binding_digests),
                 len(self.resources.request_ready_import_binding_digests),
-                len(
-                    self.resources.publication_control_active_binding_digests
-                ),
-                len(
-                    self.resources.publication_control_terminal_binding_digests
-                ),
+                len(self.resources.publication_control_active_binding_digests),
+                len(self.resources.publication_control_terminal_binding_digests),
                 len(self.resources.source_transfer_info_room_ids),
                 len(self.resources.source_prefix_length_room_ids),
                 len(self.resources.source_prefetched_room_ids),
@@ -369,12 +378,8 @@ class PackedTerminalSourceServingInventory:
                 self.resources.dflash_unowned_native_handle_count,
                 self.resources.dflash_active_row_count,
                 self.resources.dflash_quarantined_row_count,
-                len(
-                    self.resources.unpublished_quarantined_binding_digests
-                ),
-                len(
-                    self.resources.unpublished_quarantined_result_slot_binding_digests
-                ),
+                len(self.resources.unpublished_quarantined_binding_digests),
+                len(self.resources.unpublished_quarantined_result_slot_binding_digests),
             )
         )
 
@@ -392,6 +397,7 @@ class PackedTerminalSourceServing:
     _wiring: PackedTerminalSourceWiring
     _scheduler_consumer: PackedTerminalSourceSchedulerConsumer
     _scheduler_serving: TerminalSchedulerServing
+    _gather_worker: PackedTerminalSourceGatherWorker
     _grouped_nixl: GroupedNixlTerminalOwner
     _work: PackedTerminalSourceWork
     _retire_native_producers: Callable[[], None]
@@ -418,6 +424,7 @@ class PackedTerminalSourceServing:
         process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None],
         grouped_nixl: GroupedNixlTerminalOwner,
         work: PackedTerminalSourceWork,
+        bind_gather_cuda_device: Callable[[], None],
         retire_native_producers: Callable[[], None],
         resource_inventory: Callable[[], PackedTerminalSourceResourceInventory],
         retire_submission: Callable[
@@ -436,6 +443,7 @@ class PackedTerminalSourceServing:
         :param process_fatal_handler: Scheduler-affine fail-closed handler.
         :param grouped_nixl: Sole request-grouped native completion owner.
         :param work: Algorithm-neutral source work callbacks.
+        :param bind_gather_cuda_device: Worker-thread CUDA device binding.
         :param retire_native_producers: Native event-channel retirement fence.
         :param resource_inventory: Exact external actor and DFlash ownership probe.
         :param retire_submission: Process-lifetime control-state retirement
@@ -450,12 +458,18 @@ class PackedTerminalSourceServing:
             raise ValueError("local_identity must belong to source")
         if type(physical_capacity) is not int or physical_capacity <= 0:
             raise ValueError("physical_capacity must be a positive integer")
+        if runtime.source_gather_actions.snapshot().capacity != physical_capacity:
+            raise ValueError(
+                "source gather inbox capacity must equal physical request capacity"
+            )
         if not callable(process_fatal_handler):
             raise TypeError("process_fatal_handler must be callable")
         if not isinstance(grouped_nixl, GroupedNixlTerminalOwner):
             raise TypeError("grouped_nixl must be GroupedNixlTerminalOwner")
         if type(work) is not PackedTerminalSourceWork:
             raise TypeError("work must be PackedTerminalSourceWork")
+        if not callable(bind_gather_cuda_device):
+            raise TypeError("bind_gather_cuda_device must be callable")
         if not callable(retire_native_producers):
             raise TypeError("retire_native_producers must be callable")
         if not callable(resource_inventory):
@@ -493,6 +507,12 @@ class PackedTerminalSourceServing:
         self._started = False
         self._closed = False
         self._lock = threading.Lock()
+        self._gather_worker = PackedTerminalSourceGatherWorker(
+            runtime=runtime,
+            consume_action=self._consume_gather_action,
+            bind_cuda_device=bind_gather_cuda_device,
+            fatal_listener=self._gather_worker_failed,
+        )
 
     @property
     def wiring(self) -> PackedTerminalSourceWiring:
@@ -539,13 +559,37 @@ class PackedTerminalSourceServing:
         )
 
     def start(self) -> None:
-        """Start the sole native runtime exactly once."""
+        """Start the native runtime and its dedicated gather execution context."""
 
         with self._lock:
             if self._started or self._closed:
                 raise RuntimeError("source serving cannot restart")
-            self._runtime.start()
             self._started = True
+        try:
+            self._runtime.start()
+            self._gather_worker.start()
+        except BaseException:
+            startup_traceback = traceback.format_exc()
+            try:
+                self._runtime.begin_abort("source serving startup failed")
+            except BaseException:  # noqa: BLE001
+                logger.critical(
+                    "Source runtime abort after startup failure also failed:\n%s",
+                    traceback.format_exc(),
+                )
+            try:
+                self._mark_owner_dead()
+            except BaseException:  # noqa: BLE001
+                logger.critical(
+                    "Source owner-death publication after startup failure also "
+                    "failed:\n%s",
+                    traceback.format_exc(),
+                )
+            logger.critical(
+                "Source serving failed during startup:\n%s",
+                startup_traceback,
+            )
+            raise
 
     def bind_submission(
         self,
@@ -663,6 +707,7 @@ class PackedTerminalSourceServing:
             wiring=self._wiring.inventory(),
             scheduler_consumer=self._scheduler_consumer.inventory(),
             scheduler_serving=self._scheduler_serving.inventory(),
+            gather_worker=self._gather_worker.inventory(),
             grouped_nixl=self._grouped_nixl.inventory(),
             resources=self._resource_inventory(),
             owner_dead_marked=owner_dead_marked,
@@ -670,14 +715,23 @@ class PackedTerminalSourceServing:
         )
 
     def stop_admission_and_retire_producers(self) -> None:
-        """Close admission and join every native and Python producer context."""
+        """Fence native gathers before retiring their downstream producers."""
 
         self._require_open()
-        self._grouped_nixl.stop_admission()
         self._runtime.stop_admission()
         self._retire_native_producers()
         with self._lock:
             self._native_producers_retired = True
+        shutdown_timeout: float = terminal_deadline_spec(
+            TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
+        ).seconds
+        if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
+            self._runtime.begin_abort()
+            raise RuntimeError(
+                "source shutdown retained native output before gather drain"
+            )
+        self._gather_worker.stop_and_join(shutdown_timeout, abort=False)
+        self._grouped_nixl.stop_admission()
         for producer_id in self._runtime.python_producer_ids:
             self._runtime.retire_python_producer(producer_id)
         self._runtime.join_producers()
@@ -719,19 +773,27 @@ class PackedTerminalSourceServing:
 
         self._require_open()
         self._runtime.begin_abort()
+        shutdown_timeout: float = terminal_deadline_spec(
+            TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
+        ).seconds
         snapshot = self._runtime.snapshot()
         if not snapshot.producers_joined:
             if not self._native_producers_retired:
                 self._retire_native_producers()
                 with self._lock:
                     self._native_producers_retired = True
+            if not self._runtime.wait_for_output_projection_quiescence(
+                shutdown_timeout
+            ):
+                raise RuntimeError("abort retained unrouted source terminal authority")
+            self._gather_worker.stop_and_join(shutdown_timeout, abort=True)
+            self._grouped_nixl.stop_admission()
             for producer_id in self._runtime.python_producer_ids:
                 self._runtime.retire_python_producer(producer_id)
             self._runtime.join_producers()
+        else:
+            self._gather_worker.stop_and_join(shutdown_timeout, abort=True)
         self._mark_owner_dead()
-        shutdown_timeout: float = terminal_deadline_spec(
-            TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
-        ).seconds
         if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
             raise RuntimeError("abort retained unrouted source terminal authority")
         self.drain_runtime_actions()
@@ -880,20 +942,30 @@ class PackedTerminalSourceServing:
         return len(actions)
 
     def _drain_source_work_actions(self) -> int:
-        """Execute owner-earned source work outside the scheduler loop.
+        """Execute ACKs before outcomes on the forward-independent reactor.
 
         :returns: Number of actions consumed or aborted.
         """
 
         actions = self._runtime.source_work_actions.drain()
-        for action in actions:
+        acknowledgements = tuple(
+            action
+            for action in actions
+            if action.kind is NativeTerminalOwnerActionKind.SOURCE_ACK_READY
+        )
+        outcomes = tuple(
+            action
+            for action in actions
+            if action.kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY
+        )
+        if len(acknowledgements) + len(outcomes) != len(actions):
+            raise RuntimeError("source work inbox carried another action kind")
+        for action in (*acknowledgements, *outcomes):
             if self._aborting:
                 self._runtime.acknowledge_aborted_action(action)
                 continue
             try:
-                if action.kind is NativeTerminalOwnerActionKind.SOURCE_GATHER_READY:
-                    self._wiring.consume_gather_ready(action, self._work.post_gather)
-                elif action.kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
+                if action.kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
                     self._wiring.consume_outcome_ready(action, self._work.send_outcomes)
                 elif action.kind is NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
                     self._wiring.consume_ack_ready(action, self._work.send_ack)
@@ -905,6 +977,35 @@ class PackedTerminalSourceServing:
                 self._runtime.begin_abort()
                 raise
         return len(actions)
+
+    def _consume_gather_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Consume one direct-inbox gather on its dedicated worker thread.
+
+        :param action: Exact native ``SOURCE_GATHER_READY`` authority.
+        """
+
+        self._wiring.consume_gather_ready(action, self._work.post_gather)
+
+    def _gather_worker_failed(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Publish worker death into scheduler-owned process-fatal handling.
+
+        :param reason: Stable gather worker failure evidence.
+        :param formatted_traceback: Complete worker traceback, if available.
+        """
+
+        traceback_text = formatted_traceback
+        if traceback_text is None:
+            traceback_text = "no traceback available"
+        logger.critical(
+            "Source gather worker entered process-fatal state: %s\n%s",
+            reason,
+            traceback_text,
+        )
+        self._mark_owner_dead()
 
     def _drain_grouped_nixl(self) -> int:
         """Commit complete request-level native transfer results.

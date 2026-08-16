@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
@@ -30,6 +29,11 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalProcessIdentity,
     TerminalPublicationIdentity,
     TerminalRequestBinding,
+)
+from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     PrefillTerminalGatewayOutputProjection,
@@ -428,6 +432,87 @@ def _manager_fixture(
     manager._terminal_process_fatal_traceback = None
     manager._terminal_runtime_installation = None
     return manager, reactor, actor, importer, serving, publication
+
+
+@pytest.mark.parametrize("fail_post", (False, True))
+def test_source_work_gather_phase_covers_every_grouped_mutation(
+    fail_post: bool,
+) -> None:
+    """Actor gather stability encloses grouped construction and quarantine."""
+
+    identity = _manager_identity(local_rank=1)
+    submission, _ = _manager_submission(identity)
+    action = NativeTerminalOwnerAction(
+        action_id=71,
+        kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        binding=NativeTerminalRequestBinding.from_binding(identity.local_binding),
+        commit_timestamp_ns=1_000,
+        receipt=None,
+    )
+    order: list[tuple[str, str | None]] = []
+    actor = MagicMock()
+    grouped = MagicMock()
+    manager = object.__new__(NixlKVManager)
+    manager._is_canonical_aux_writer = MagicMock(return_value=False)
+    manager._observe_terminal_output = MagicMock()
+
+    actor.begin_terminal_owner_gather.side_effect = lambda exact_action: order.append(
+        ("actor_begin", None)
+    )
+
+    def post_transfer(exact_action: object, post_auxiliary: object) -> None:
+        """Record or fail the actor-owned grouped transfer post.
+
+        :param exact_action: Exact gather authority.
+        :param post_auxiliary: Absent noncanonical auxiliary callback.
+        """
+
+        del exact_action, post_auxiliary
+        order.append(("actor_post", None))
+        if fail_post:
+            raise RuntimeError("synthetic grouped post failure")
+
+    actor.post_terminal_owner_transfer.side_effect = post_transfer
+    actor.finish_terminal_owner_gather.side_effect = (
+        lambda exact_action, reason: order.append(("actor_finish", reason))
+    )
+    grouped.begin_group.side_effect = lambda digest, members: order.append(
+        ("group_begin", None)
+    )
+    grouped.seal_group.side_effect = lambda digest: order.append(("group_seal", None))
+    grouped.quarantine_group.side_effect = lambda digest, reason: order.append(
+        ("group_quarantine", reason)
+    )
+
+    work = NixlKVManager._compose_terminal_source_work(
+        manager,
+        actor,
+        grouped,
+        None,
+    )
+    if fail_post:
+        with pytest.raises(RuntimeError, match="synthetic grouped post failure"):
+            work.post_gather(submission, action)
+        assert [label for label, _ in order] == [
+            "actor_begin",
+            "group_begin",
+            "actor_post",
+            "group_quarantine",
+            "actor_finish",
+        ]
+        assert order[-1][1] == (
+            "terminal source gather or transfer post became ambiguous"
+        )
+        return
+
+    work.post_gather(submission, action)
+    assert order == [
+        ("actor_begin", None),
+        ("group_begin", None),
+        ("actor_post", None),
+        ("group_seal", None),
+        ("actor_finish", None),
+    ]
 
 
 class _LeaseManager:

@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import logging
 import os
 import re
@@ -849,9 +850,7 @@ class DFlashBoundaryPackedAuxiliarySlotAllocation:
 
         with self._lock:
             self._require_reservation(reservation)
-            return self._pool.packed_auxiliary_slot_reservation_snapshot(
-                reservation
-            )
+            return self._pool.packed_auxiliary_slot_reservation_snapshot(reservation)
 
     def release_packed_auxiliary_slot(
         self,
@@ -902,8 +901,7 @@ class DFlashBoundaryPackedAuxiliarySlotAllocation:
 
 
 PackedDecodeAuxiliarySlotAllocation = (
-    AdoptedPackedAuxiliarySlotAllocation
-    | DFlashBoundaryPackedAuxiliarySlotAllocation
+    AdoptedPackedAuxiliarySlotAllocation | DFlashBoundaryPackedAuxiliarySlotAllocation
 )
 
 
@@ -985,6 +983,14 @@ class _PackedDecodeTransferStats:
         )
 
 
+class _TerminalGatherPhase(enum.Enum):
+    """Source gather construction phase for quarantine synchronization."""
+
+    NOT_STARTED = "not_started"
+    RUNNING = "running"
+    STABLE = "stable"
+
+
 @dataclasses.dataclass
 class _PrefillRequestRecord:
     """Source actor state retained until authenticated decoder teardown."""
@@ -1014,7 +1020,7 @@ class _PrefillRequestRecord:
     terminal_prepare_sent: bool = False
     terminal_prepare_started_at: float | None = None
     terminal_ready: PackedReady | None = None
-    terminal_gather_started: bool = False
+    terminal_gather_phase: _TerminalGatherPhase = _TerminalGatherPhase.NOT_STARTED
     terminal_gather_posted: bool = False
     terminal_teardown: PackedRequestTeardown | None = None
     terminal_ack_sent: bool = False
@@ -1212,7 +1218,7 @@ class PackedPrefillRuntime:
         try:
             submission.control.send_message(prepare)
         except (OSError, RuntimeError, TypeError, ValueError):
-            self._quarantine_terminal_record(
+            self._mark_terminal_record_quarantined(
                 record,
                 "terminal PREPARE publication became ambiguous",
             )
@@ -1232,7 +1238,7 @@ class PackedPrefillRuntime:
             if (
                 record.terminal_prepare_sent
                 or record.source_transfer is not None
-                or record.terminal_gather_started
+                or record.terminal_gather_phase is not _TerminalGatherPhase.NOT_STARTED
                 or record.main_handle is not None
                 or record.auxiliary_handle is not None
             ):
@@ -1269,7 +1275,7 @@ class PackedPrefillRuntime:
             if record.source_transfer is not None:
                 if record.terminal_ready == message:
                     return identity.local_binding
-                self._quarantine_terminal_record(
+                self._mark_terminal_record_quarantined(
                     record,
                     "terminal READY conflicts with prior delivery",
                 )
@@ -1277,7 +1283,7 @@ class PackedPrefillRuntime:
         try:
             transfer = self._ready.handle_ready(message, authenticated_decode_peer)
         except (RuntimeError, TypeError, ValueError):
-            self._quarantine_terminal_record(
+            self._mark_terminal_record_quarantined(
                 record,
                 "terminal READY validation failed",
             )
@@ -1293,12 +1299,36 @@ class PackedPrefillRuntime:
             record.condition.notify_all()
         return identity.local_binding
 
-    def begin_terminal_owner_transfer(
+    def begin_terminal_owner_gather(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Claim one gather phase before any grouped or actor side effect.
+
+        :param action: Exact ``SOURCE_GATHER_READY`` owner action.
+        """
+
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        with record.condition:
+            if not record.terminal_prepare_sent:
+                raise RuntimeError("terminal gather preceded PREPARE publication")
+            if record.terminal_quarantined:
+                raise RuntimeError("quarantined terminal source cannot gather")
+            if record.source_transfer is None:
+                raise RuntimeError("terminal gather preceded authenticated READY")
+            if record.terminal_gather_phase is not _TerminalGatherPhase.NOT_STARTED:
+                raise RuntimeError("terminal gather was already started")
+            record.terminal_gather_phase = _TerminalGatherPhase.RUNNING
+
+    def post_terminal_owner_transfer(
         self,
         action: NativeTerminalOwnerAction,
         post_auxiliary: Callable[[PackedPrefillSubmission], object] | None,
     ) -> None:
-        """Post gather and direct transfers only under owner authorization.
+        """Post gather and direct transfers inside an acquired gather phase.
 
         The canonical writer must supply a device-resident auxiliary poster.
         This actor intentionally does not call the legacy DRAM auxiliary path.
@@ -1319,15 +1349,12 @@ class PackedPrefillRuntime:
             raise TypeError("canonical terminal source requires auxiliary poster")
         if not canonical and post_auxiliary is not None:
             raise ValueError("noncanonical terminal source cannot post auxiliary data")
-        with self._lock:
-            if not record.terminal_prepare_sent:
-                raise RuntimeError("terminal gather preceded PREPARE publication")
+        with record.condition:
             transfer = record.source_transfer
             if transfer is None:
                 raise RuntimeError("terminal gather preceded authenticated READY")
-            if record.terminal_gather_started:
-                raise RuntimeError("terminal gather was already started")
-            record.terminal_gather_started = True
+            if record.terminal_gather_phase is not _TerminalGatherPhase.RUNNING:
+                raise RuntimeError("terminal transfer lacks running gather ownership")
         try:
             if canonical:
                 if post_auxiliary is None:
@@ -1354,11 +1381,41 @@ class PackedPrefillRuntime:
                 "Terminal source gather or transfer post failed:\n%s",
                 traceback.format_exc(),
             )
-            self._quarantine_terminal_record(
-                record,
-                "terminal source gather or transfer post failed",
-            )
             raise
+
+    def finish_terminal_owner_gather(
+        self,
+        action: NativeTerminalOwnerAction,
+        failure_reason: str | None,
+    ) -> None:
+        """Publish stable gather ownership after every side effect has ended.
+
+        :param action: Exact ``SOURCE_GATHER_READY`` owner action.
+        :param failure_reason: Stable ambiguity reason, otherwise ``None`` on
+            complete grouped submission.
+        """
+
+        if failure_reason is not None and (
+            type(failure_reason) is not str or len(failure_reason) == 0
+        ):
+            raise ValueError("failure_reason must be a non-empty string")
+        record = self._terminal_record_for_action(
+            action,
+            NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        )
+        newly_quarantined = False
+        with record.condition:
+            if record.terminal_gather_phase is not _TerminalGatherPhase.RUNNING:
+                raise RuntimeError("terminal gather lost running ownership")
+            if failure_reason is not None:
+                newly_quarantined = self._mark_terminal_record_quarantined_locked(
+                    record,
+                    failure_reason,
+                )
+            record.terminal_gather_phase = _TerminalGatherPhase.STABLE
+            record.condition.notify_all()
+        if failure_reason is not None and newly_quarantined:
+            self._record_terminal_quarantine(record, failure_reason)
 
     def send_terminal_owner_outcomes(
         self,
@@ -1422,7 +1479,7 @@ class PackedPrefillRuntime:
                 "Terminal source outcome settlement or publication failed:\n%s",
                 traceback.format_exc(),
             )
-            self._quarantine_terminal_record(
+            self._mark_terminal_record_quarantined(
                 record,
                 "terminal source outcome settlement or publication failed",
             )
@@ -1461,7 +1518,7 @@ class PackedPrefillRuntime:
                 record.terminal_teardown = request
             return identity.local_binding
         except (RuntimeError, TypeError, ValueError):
-            self._quarantine_terminal_record(
+            self._mark_terminal_record_quarantined(
                 record,
                 "terminal source teardown validation failed",
             )
@@ -1537,7 +1594,7 @@ class PackedPrefillRuntime:
                 "Terminal source teardown settlement or ACK failed:\n%s",
                 traceback.format_exc(),
             )
-            self._quarantine_terminal_record(
+            self._mark_terminal_record_quarantined(
                 record,
                 "terminal source teardown settlement or ACK failed",
             )
@@ -1568,9 +1625,13 @@ class PackedPrefillRuntime:
         if not callable(settle_main):
             raise TypeError("settle_main must be callable")
         record = self._terminal_record_for_action(action, action.kind)
-        self._quarantine_terminal_record(record, reason)
+        self._mark_terminal_record_quarantined(record, reason)
         canonical = self._writer_id == record.submission.plan.canonical_writer_id
         with record.condition:
+            while record.terminal_gather_phase is _TerminalGatherPhase.RUNNING:
+                record.condition.wait()
+            if record.terminal_gather_phase is not _TerminalGatherPhase.STABLE:
+                raise RuntimeError("terminal gather quarantine lacks stable ownership")
             lane = record.main_lane
             auxiliary_handle = record.auxiliary_handle
             main_settled = record.terminal_main_failure_settled
@@ -1965,12 +2026,12 @@ class PackedPrefillRuntime:
         elif request.auxiliary_handle_generation is not None:
             raise RuntimeError("noncanonical terminal teardown names an aux handle")
 
-    def _quarantine_terminal_record(
+    def _mark_terminal_record_quarantined(
         self,
         record: _PrefillRequestRecord,
         reason: str,
     ) -> None:
-        """Mark one terminal record ambiguous without releasing any resource.
+        """Mark one terminal record ambiguous without waiting or releasing.
 
         :param record: Exact actor-owned terminal record.
         :param reason: Stable fail-closed evidence.
@@ -1979,15 +2040,48 @@ class PackedPrefillRuntime:
         if type(reason) is not str or len(reason) == 0:
             raise ValueError("reason must be a non-empty string")
         with record.condition:
-            newly_quarantined = not record.terminal_quarantined
-            record.terminal_quarantined = True
-            if record.failure_reason is None:
-                record.failure_reason = reason
+            newly_quarantined = self._mark_terminal_record_quarantined_locked(
+                record,
+                reason,
+            )
+            if record.terminal_gather_phase is _TerminalGatherPhase.NOT_STARTED:
+                record.terminal_gather_phase = _TerminalGatherPhase.STABLE
             record.condition.notify_all()
         if newly_quarantined:
-            room = record.chunk_key.room_id
-            self._manager.record_failure(room, reason)
-            self._manager.update_status(room, KVPoll.Failed)
+            self._record_terminal_quarantine(record, reason)
+
+    @staticmethod
+    def _mark_terminal_record_quarantined_locked(
+        record: _PrefillRequestRecord,
+        reason: str,
+    ) -> bool:
+        """Mutate quarantine state while the caller holds its condition.
+
+        :param record: Exact actor-owned terminal record.
+        :param reason: Stable fail-closed evidence.
+        :returns: Whether this call established the first quarantine.
+        """
+
+        newly_quarantined = not record.terminal_quarantined
+        record.terminal_quarantined = True
+        if record.failure_reason is None:
+            record.failure_reason = reason
+        return newly_quarantined
+
+    def _record_terminal_quarantine(
+        self,
+        record: _PrefillRequestRecord,
+        reason: str,
+    ) -> None:
+        """Publish the first actor quarantine to legacy room health.
+
+        :param record: Exact actor-owned terminal record.
+        :param reason: Stable fail-closed evidence.
+        """
+
+        room = record.chunk_key.room_id
+        self._manager.record_failure(room, reason)
+        self._manager.update_status(room, KVPoll.Failed)
 
     def build_destination_capability(
         self,
@@ -2939,9 +3033,7 @@ class PackedDecodeRuntime:
             dflash_boundary_pool is not None
             and type(dflash_boundary_pool) is not DFlashBoundaryDeviceRowPool
         ):
-            raise TypeError(
-                "dflash_boundary_pool must be DFlashBoundaryDeviceRowPool"
-            )
+            raise TypeError("dflash_boundary_pool must be DFlashBoundaryDeviceRowPool")
         self._dflash_boundary_pool = dflash_boundary_pool
         self._outcomes = PackedDestinationOutcomeCoordinator(
             arena.protocol,

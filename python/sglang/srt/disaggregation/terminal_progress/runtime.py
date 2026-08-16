@@ -358,7 +358,8 @@ class NativeTerminalRuntimeSnapshot:
     :ivar scheduler: Scheduler action queue state.
     :ivar coordinator: Request-coordinator action queue state.
     :ivar lifecycle: Teardown and health action queue state.
-    :ivar source_work: Source gather, outcome, and ACK work queue state.
+    :ivar source_gather: Source gather queue owned by its blocking-work thread.
+    :ivar source_work: Source outcome and ACK work queue state.
     :ivar decode_work: Decode scatter and teardown work queue state.
     :ivar publisher: Gateway publication work queue state.
     :ivar observations: Non-authoritative observation queue state.
@@ -382,6 +383,7 @@ class NativeTerminalRuntimeSnapshot:
     scheduler: NativeTerminalActionInboxSnapshot
     coordinator: NativeTerminalActionInboxSnapshot
     lifecycle: NativeTerminalActionInboxSnapshot
+    source_gather: NativeTerminalActionInboxSnapshot
     source_work: NativeTerminalActionInboxSnapshot
     decode_work: NativeTerminalActionInboxSnapshot
     publisher: NativeTerminalActionInboxSnapshot
@@ -406,6 +408,7 @@ class NativeTerminalRuntimeSnapshot:
             self.scheduler,
             self.coordinator,
             self.lifecycle,
+            self.source_gather,
             self.source_work,
             self.decode_work,
             self.publisher,
@@ -458,9 +461,9 @@ _LIFECYCLE_ACTIONS = frozenset(
         NativeTerminalOwnerActionKind.PROCESS_FATAL,
     )
 )
+_SOURCE_GATHER_ACTIONS = frozenset((NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,))
 _SOURCE_WORK_ACTIONS = frozenset(
     (
-        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
         NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
         NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
     )
@@ -523,6 +526,7 @@ class NativeTerminalRuntime:
     _scheduler_actions: NativeTerminalActionInbox
     _coordinator_actions: NativeTerminalActionInbox
     _lifecycle_actions: NativeTerminalActionInbox
+    _source_gather_actions: NativeTerminalActionInbox
     _source_work_actions: NativeTerminalActionInbox
     _decode_work_actions: NativeTerminalActionInbox
     _publisher_actions: NativeTerminalActionInbox
@@ -557,6 +561,7 @@ class NativeTerminalRuntime:
         scheduler_capacity: int,
         coordinator_capacity: int,
         lifecycle_capacity: int,
+        source_gather_capacity: int,
         source_work_capacity: int,
         decode_work_capacity: int,
         publisher_capacity: int,
@@ -575,7 +580,8 @@ class NativeTerminalRuntime:
         :param scheduler_capacity: Scheduler inbox capacity.
         :param coordinator_capacity: Request-coordinator inbox capacity.
         :param lifecycle_capacity: Teardown and health inbox capacity.
-        :param source_work_capacity: Source continuation inbox capacity.
+        :param source_gather_capacity: Blocking source gather inbox capacity.
+        :param source_work_capacity: Source outcome and ACK inbox capacity.
         :param decode_work_capacity: Decode continuation inbox capacity.
         :param publisher_capacity: Gateway publication inbox capacity.
         :param observation_capacity: Non-gating metrics queue capacity.
@@ -599,6 +605,7 @@ class NativeTerminalRuntime:
             scheduler_capacity,
             coordinator_capacity,
             lifecycle_capacity,
+            source_gather_capacity,
             source_work_capacity,
             decode_work_capacity,
             publisher_capacity,
@@ -671,6 +678,9 @@ class NativeTerminalRuntime:
         )
         self._lifecycle_actions = NativeTerminalActionInbox(
             "packed-terminal-lifecycle-actions", lifecycle_capacity
+        )
+        self._source_gather_actions = NativeTerminalActionInbox(
+            "packed-terminal-source-gather-actions", source_gather_capacity
         )
         self._source_work_actions = NativeTerminalActionInbox(
             "packed-terminal-source-work-actions", source_work_capacity
@@ -758,12 +768,21 @@ class NativeTerminalRuntime:
 
     @property
     def source_work_actions(self) -> NativeTerminalActionInbox:
-        """Return owner-earned source gather, outcome, and ACK work.
+        """Return owner-earned source outcome and ACK work.
 
-        :returns: Bounded fd-signalled source worker queue.
+        :returns: Bounded fd-signalled source reactor queue.
         """
 
         return self._source_work_actions
+
+    @property
+    def source_gather_actions(self) -> NativeTerminalActionInbox:
+        """Return blocking gathers owned by the dedicated source worker.
+
+        :returns: Bounded fd-signalled source gather queue.
+        """
+
+        return self._source_gather_actions
 
     @property
     def decode_work_actions(self) -> NativeTerminalActionInbox:
@@ -1146,26 +1165,71 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "aborted action acknowledgement requires fail-closed state"
                 )
-            pending = self._consumer_pending.get(action.action_id)
-            if pending != action:
+            if not self._discard_aborted_action_locked(action):
                 raise NativeTerminalRuntimeError(
                     "aborted action is absent, stale, or already acknowledged"
                 )
-            del self._consumer_pending[action.action_id]
-            binding_digest = action.binding.digest
-            if action.kind in _SCHEDULER_ACTIONS:
-                self._scheduler_pending.pop(binding_digest, None)
-            if action.kind in (
-                NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
-                NativeTerminalOwnerActionKind.PROCESS_FATAL,
+
+    def acknowledge_aborted_action_if_pending(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> bool:
+        """Discard an action only when fail-closed ownership remains pending.
+
+        A blocking consumer can race a process-fatal transition after its side
+        effect returns but before the follow-up event commits. In that case the
+        original action remains in the consumer ledger. If the follow-up won
+        the race, the action is already gone and this operation is a no-op.
+
+        :param action: Exact consumer action being reconciled after abort.
+        :returns: Whether pending consumer ownership was discarded.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        with self._condition:
+            if self._disposition not in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
             ):
-                self._quarantined_bindings.add(binding_digest)
-            if (
-                binding_digest in self._quarantined_bindings
-                and binding_digest not in self._scheduler_pending
-            ):
-                self._scheduler_live.pop(binding_digest, None)
-            self._condition.notify_all()
+                raise NativeTerminalRuntimeError(
+                    "conditional abort acknowledgement requires fail-closed state"
+                )
+            return self._discard_aborted_action_locked(action)
+
+    def _discard_aborted_action_locked(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> bool:
+        """Discard pending consumer authority while the runtime lock is held.
+
+        :param action: Exact action being reconciled during fail-closed drain.
+        :returns: Whether the action still owned pending consumer authority.
+        """
+
+        pending = self._consumer_pending.get(action.action_id)
+        if pending is None:
+            return False
+        if pending != action:
+            raise NativeTerminalRuntimeError(
+                "consumer action identity aliases another pending action"
+            )
+        del self._consumer_pending[action.action_id]
+        binding_digest = action.binding.digest
+        if action.kind in _SCHEDULER_ACTIONS:
+            self._scheduler_pending.pop(binding_digest, None)
+        if action.kind in (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        ):
+            self._quarantined_bindings.add(binding_digest)
+        if (
+            binding_digest in self._quarantined_bindings
+            and binding_digest not in self._scheduler_pending
+        ):
+            self._scheduler_live.pop(binding_digest, None)
+        self._condition.notify_all()
+        return True
 
     def complete_work_action(
         self,
@@ -1322,6 +1386,7 @@ class NativeTerminalRuntime:
                 scheduler=self._scheduler_actions.snapshot(),
                 coordinator=self._coordinator_actions.snapshot(),
                 lifecycle=self._lifecycle_actions.snapshot(),
+                source_gather=self._source_gather_actions.snapshot(),
                 source_work=self._source_work_actions.snapshot(),
                 decode_work=self._decode_work_actions.snapshot(),
                 publisher=self._publisher_actions.snapshot(),
@@ -1372,6 +1437,7 @@ class NativeTerminalRuntime:
             self._scheduler_actions,
             self._coordinator_actions,
             self._lifecycle_actions,
+            self._source_gather_actions,
             self._source_work_actions,
             self._decode_work_actions,
             self._publisher_actions,
@@ -1419,8 +1485,14 @@ class NativeTerminalRuntime:
             self._disposition = NativeTerminalRuntimeDisposition.STOPPED
             self._condition.notify_all()
 
-    def begin_abort(self) -> None:
-        """Publish final quarantine authority while consumers remain alive."""
+    def begin_abort(self, reason: str | None = None) -> None:
+        """Publish final quarantine authority while consumers remain alive.
+
+        :param reason: Optional originating process-fatal evidence.
+        """
+
+        if reason is not None and (type(reason) is not str or len(reason) == 0):
+            raise ValueError("abort reason must be a non-empty string")
 
         with self._condition:
             if self._disposition is NativeTerminalRuntimeDisposition.STOPPED:
@@ -1431,9 +1503,12 @@ class NativeTerminalRuntime:
                 self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
                 self._condition.notify_all()
             else:
-                self._enter_runtime_fatal_locked(
-                    self._fatal_reason or "runtime aborted before clean close"
-                )
+                fatal_reason = reason
+                if fatal_reason is None:
+                    fatal_reason = self._fatal_reason
+                if fatal_reason is None:
+                    fatal_reason = "runtime aborted before clean close"
+                self._enter_runtime_fatal_locked(fatal_reason)
                 self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
         self._owner.begin_abort()
 
@@ -1455,6 +1530,7 @@ class NativeTerminalRuntime:
             self._scheduler_actions,
             self._coordinator_actions,
             self._lifecycle_actions,
+            self._source_gather_actions,
             self._source_work_actions,
             self._decode_work_actions,
             self._publisher_actions,
@@ -1782,6 +1858,9 @@ class NativeTerminalRuntime:
         if action.kind in _COORDINATOR_ACTIONS:
             self._enqueue_consumer_action(self._coordinator_actions, action)
             return
+        if action.kind in _SOURCE_GATHER_ACTIONS:
+            self._enqueue_consumer_action(self._source_gather_actions, action)
+            return
         if action.kind in _SOURCE_WORK_ACTIONS:
             self._enqueue_consumer_action(self._source_work_actions, action)
             return
@@ -1886,6 +1965,7 @@ class NativeTerminalRuntime:
         self._scheduler_actions._mark_fatal(self._fatal_reason)
         self._coordinator_actions._mark_fatal(self._fatal_reason)
         self._lifecycle_actions._mark_fatal(self._fatal_reason)
+        self._source_gather_actions._mark_fatal(self._fatal_reason)
         self._source_work_actions._mark_fatal(self._fatal_reason)
         self._decode_work_actions._mark_fatal(self._fatal_reason)
         self._publisher_actions._mark_fatal(self._fatal_reason)
@@ -1948,6 +2028,7 @@ class NativeTerminalRuntime:
         self._scheduler_actions._close(require_empty=require_empty)
         self._coordinator_actions._close(require_empty=require_empty)
         self._lifecycle_actions._close(require_empty=require_empty)
+        self._source_gather_actions._close(require_empty=require_empty)
         self._source_work_actions._close(require_empty=require_empty)
         self._decode_work_actions._close(require_empty=require_empty)
         self._publisher_actions._close(require_empty=require_empty)

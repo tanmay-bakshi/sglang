@@ -1,7 +1,9 @@
 import dataclasses
 import inspect
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import numpy as np
@@ -1798,7 +1800,9 @@ def test_prefill_terminal_actor_surface_contains_no_polling_or_collective() -> N
         PackedPrefillRuntime.bind_terminal_owner,
         PackedPrefillRuntime.publish_terminal_owner_prepare,
         PackedPrefillRuntime.deliver_terminal_owner_ready,
-        PackedPrefillRuntime.begin_terminal_owner_transfer,
+        PackedPrefillRuntime.begin_terminal_owner_gather,
+        PackedPrefillRuntime.post_terminal_owner_transfer,
+        PackedPrefillRuntime.finish_terminal_owner_gather,
         PackedPrefillRuntime.send_terminal_owner_outcomes,
         PackedPrefillRuntime.deliver_terminal_owner_teardown,
         PackedPrefillRuntime.settle_terminal_owner_teardown,
@@ -1869,16 +1873,19 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
         lambda exact: pytest.fail("terminal actor entered auxiliary polling"),
     )
 
-    runtime.begin_terminal_owner_transfer(
-        _terminal_prefill_action(
-            identity,
-            NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-            1,
-        ),
+    gather_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        1,
+    )
+    runtime.begin_terminal_owner_gather(gather_action)
+    runtime.post_terminal_owner_transfer(
+        gather_action,
         lambda exact_submission: (
             auxiliary_posts.append(exact_submission) or auxiliary_handle
         ),
     )
+    runtime.finish_terminal_owner_gather(gather_action, None)
 
     assert auxiliary_posts == [submission]
     assert record.terminal_gather_posted
@@ -1887,14 +1894,185 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     assert inventory.auxiliary_handle_bindings == (identity.local_binding.digest,)
     assert inventory.lane_bindings == (identity.local_binding.digest,)
     with pytest.raises(RuntimeError, match="already started"):
-        runtime.begin_terminal_owner_transfer(
+        runtime.begin_terminal_owner_gather(
             _terminal_prefill_action(
                 identity,
                 NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
                 2,
             ),
-            lambda exact_submission: object(),
         )
+
+
+def test_prefill_terminal_quarantine_before_gather_blocks_all_side_effects() -> None:
+    """Make pre-gather quarantine a terminal phase transition."""
+
+    runtime, _, _, _, _, identity, record = _terminal_prefill_actor_fixture()
+    record.source_transfer = object()
+    quarantine_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        2,
+    )
+
+    runtime.quarantine_terminal_owner_request(
+        quarantine_action,
+        "synthetic pre-gather quarantine",
+        lambda lane, action: pytest.fail("pre-gather quarantine found a main lane"),
+        None,
+    )
+
+    assert record.terminal_gather_phase is runtime_module._TerminalGatherPhase.STABLE
+    with pytest.raises(RuntimeError, match="quarantined terminal source"):
+        runtime.begin_terminal_owner_gather(
+            _terminal_prefill_action(
+                identity,
+                NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+                3,
+            ),
+        )
+
+
+def test_prefill_terminal_quarantine_waits_for_running_gather_stability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settle only resources installed by a fully stable gather attempt."""
+
+    runtime, manager, _, _, _, identity, record = _terminal_prefill_actor_fixture()
+    record.source_transfer = object()
+    gather_running = threading.Event()
+    allow_gather = threading.Event()
+    quarantine_marked = threading.Event()
+    main_handle = object()
+    auxiliary_handle = object()
+    main_lane = Mock()
+    original_record_failure = manager.record_failure
+
+    def record_failure(room_id: int, reason: str) -> None:
+        """Expose the exact point where quarantine begins waiting.
+
+        :param room_id: Failed packed room.
+        :param reason: Stable failure reason.
+        """
+
+        original_record_failure(room_id, reason)
+        quarantine_marked.set()
+
+    def post_auxiliary(submission: PackedPrefillSubmission) -> object:
+        """Hold gather construction while the lifecycle thread quarantines.
+
+        :param submission: Exact source submission.
+        :returns: Synthetic retained auxiliary handle.
+        """
+
+        gather_running.set()
+        if not allow_gather.wait(1.0):
+            raise TimeoutError("test did not release the running gather")
+        return auxiliary_handle
+
+    def post_main(
+        exact_record: runtime_module._PrefillRequestRecord,
+        transfer: object,
+        *,
+        binding_digest: bytes | None = None,
+    ) -> tuple[object, object]:
+        """Install the exact main resources after the blocked auxiliary post.
+
+        :param exact_record: Actor record under test.
+        :param transfer: Authenticated source transfer.
+        :param binding_digest: Native lifecycle binding.
+        :returns: Synthetic main handle and lane.
+        """
+
+        assert exact_record is record
+        assert transfer is record.source_transfer
+        assert binding_digest == identity.local_binding.digest
+        with exact_record.condition:
+            exact_record.main_handle = main_handle
+            exact_record.main_lane = main_lane
+        return main_handle, main_lane
+
+    monkeypatch.setattr(manager, "record_failure", record_failure)
+    monkeypatch.setattr(runtime, "_post_main_transfer", post_main)
+    settled: list[tuple[object, NativeTerminalOwnerAction]] = []
+    gather_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        1,
+    )
+    quarantine_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        2,
+    )
+
+    def run_gather() -> None:
+        """Drive the full actor phase around the blocked transfer post."""
+
+        runtime.begin_terminal_owner_gather(gather_action)
+        failure_reason: str | None = "synthetic gather did not finish"
+        try:
+            runtime.post_terminal_owner_transfer(gather_action, post_auxiliary)
+            failure_reason = None
+        finally:
+            runtime.finish_terminal_owner_gather(gather_action, failure_reason)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gather_future = executor.submit(run_gather)
+        assert gather_running.wait(1.0)
+        quarantine_future = executor.submit(
+            runtime.quarantine_terminal_owner_request,
+            quarantine_action,
+            "synthetic concurrent quarantine",
+            lambda lane, action: settled.append((lane, action)),
+            lambda handle, action: settled.append((handle, action)),
+        )
+        assert quarantine_marked.wait(1.0)
+        assert not quarantine_future.done()
+        assert settled == []
+        allow_gather.set()
+        gather_future.result(timeout=1.0)
+        quarantine_future.result(timeout=1.0)
+
+    assert record.terminal_gather_phase is runtime_module._TerminalGatherPhase.STABLE
+    assert settled == [
+        (main_lane, quarantine_action),
+        (auxiliary_handle, quarantine_action),
+    ]
+
+
+def test_prefill_terminal_gather_failure_marks_stable_without_self_wait() -> None:
+    """Let the gather owner publish failure before lifecycle settlement."""
+
+    runtime, _, _, _, _, identity, record = _terminal_prefill_actor_fixture()
+    record.source_transfer = object()
+
+    def fail_auxiliary(submission: PackedPrefillSubmission) -> object:
+        """Fail from the gather worker before auxiliary ownership is installed.
+
+        :param submission: Exact source submission.
+        :returns: This callback never returns.
+        :raises RuntimeError: Always, to exercise worker-local failure.
+        """
+
+        raise RuntimeError("synthetic auxiliary failure")
+
+    gather_action = _terminal_prefill_action(
+        identity,
+        NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        1,
+    )
+    runtime.begin_terminal_owner_gather(gather_action)
+    with pytest.raises(RuntimeError, match="synthetic auxiliary failure"):
+        try:
+            runtime.post_terminal_owner_transfer(gather_action, fail_auxiliary)
+        finally:
+            runtime.finish_terminal_owner_gather(
+                gather_action,
+                "terminal source gather or transfer post failed",
+            )
+
+    assert record.terminal_quarantined
+    assert record.terminal_gather_phase is runtime_module._TerminalGatherPhase.STABLE
 
 
 def test_prefill_terminal_outcomes_retain_resources_until_ack(
@@ -1906,7 +2084,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
         _terminal_prefill_actor_fixture()
     )
     record.source_transfer = Mock(layout=Mock(digest=b"d" * 32), lease_id=9)
-    record.terminal_gather_started = True
+    record.terminal_gather_phase = runtime_module._TerminalGatherPhase.STABLE
     record.terminal_gather_posted = True
     record.main_transport_started_at = runtime_module.time.perf_counter()
     main_handle = object()
