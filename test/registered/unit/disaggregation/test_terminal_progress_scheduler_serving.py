@@ -1232,6 +1232,48 @@ def test_idle_sleeper_registers_raw_terminal_wake_descriptor() -> None:
         os.close(write_fd)
 
 
+def test_terminal_cohort_requires_fd_driven_idle_sleep() -> None:
+    """Terminal publication cannot share a process with idle busy polling."""
+
+    tokenizer_read_fd, tokenizer_write_fd = os.pipe()
+    rpc_read_fd, rpc_write_fd = os.pipe()
+    try:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        scheduler.server_args = SimpleNamespace(
+            sleep_on_idle=False,
+            pd_terminal_local_membership=object(),
+        )
+        scheduler.ipc_channels = SimpleNamespace(
+            recv_from_tokenizer=tokenizer_read_fd,
+            recv_from_rpc=rpc_read_fd,
+        )
+
+        Scheduler.init_idle_sleeper(scheduler)
+
+        assert isinstance(scheduler.idle_sleeper, IdleSleeper)
+    finally:
+        os.close(tokenizer_read_fd)
+        os.close(tokenizer_write_fd)
+        os.close(rpc_read_fd)
+        os.close(rpc_write_fd)
+
+
+def test_nonterminal_cohort_retains_disabled_idle_sleep() -> None:
+    """The terminal wake contract does not change ordinary scheduler polling."""
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+    scheduler.server_args = SimpleNamespace(
+        sleep_on_idle=False,
+        pd_terminal_local_membership=None,
+    )
+
+    Scheduler.init_idle_sleeper(scheduler)
+
+    assert scheduler.idle_sleeper is None
+
+
 @pytest.mark.parametrize(
     "loop",
     (

@@ -845,12 +845,19 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        terminal_wake_required = (
+            self.server_args.pd_terminal_local_membership is not None
+        )
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
-            and self.server_args.sleep_on_idle
+            and (self.server_args.sleep_on_idle or terminal_wake_required)
         ):
+            # Terminal owner threads publish scheduler work through an eventfd.
+            # The publisher rank must block on that descriptor while idle;
+            # busy-loop housekeeping otherwise competes with the owners for
+            # the GIL and turns publication latency into scheduler cadence.
             self.idle_sleeper = IdleSleeper(
                 sockets=[
                     self.ipc_channels.recv_from_tokenizer,
