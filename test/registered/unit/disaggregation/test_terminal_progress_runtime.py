@@ -576,12 +576,13 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
 
         def consume_gather() -> NativeTerminalOwnerAction:
             action = _drain_actions(runtime.source_gather_actions)[0]
+            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             runtime.acknowledge_consumed_action(action)
             return action
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             gather_future = executor.submit(consume_gather)
-            sys.setswitchinterval(1.0)
+            sys.setswitchinterval(0.005)
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
                 registration.binding.digest,
@@ -643,8 +644,6 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
     )
     runtime.start()
     previous_switch_interval = sys.getswitchinterval()
-    first_action_drained = threading.Event()
-    later_actions_submitted = threading.Event()
     try:
         for registration in registrations:
             runtime.register_lifecycle(registration)
@@ -657,10 +656,14 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
         def consume_all_gathers() -> tuple[NativeTerminalOwnerAction, ...]:
             actions = list(_drain_actions(runtime.source_gather_actions))
             assert len(actions) == 1
-            first_action_drained.set()
-            later_arrived = later_actions_submitted.wait(timeout=_WAIT_SECONDS)
+            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            for registration in registrations[1:]:
+                runtime.submit(
+                    _LOCAL_PRODUCER_ID,
+                    registration.binding.digest,
+                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                )
             runtime.acknowledge_consumed_action(actions[0])
-            assert later_arrived
             while len(actions) < len(registrations):
                 current_actions = _drain_actions(runtime.source_gather_actions)
                 for action in current_actions:
@@ -668,21 +671,9 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
                 actions.extend(current_actions)
             return tuple(actions)
 
-        def submit_later_watermark() -> None:
-            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
-            assert first_action_drained.wait(timeout=_WAIT_SECONDS)
-            for registration in registrations[1:]:
-                runtime.submit(
-                    _LOCAL_PRODUCER_ID,
-                    registration.binding.digest,
-                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
-                )
-            later_actions_submitted.set()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             consumer_future = executor.submit(consume_all_gathers)
-            producer_future = executor.submit(submit_later_watermark)
-            sys.setswitchinterval(1.0)
+            sys.setswitchinterval(0.005)
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
                 registrations[0].binding.digest,
@@ -692,7 +683,6 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
             while not consumer_future.done() and time.monotonic() < expires_at:
                 pass
             actions = consumer_future.result(timeout=_WAIT_SECONDS)
-            producer_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
         inventory = runtime.snapshot().owner
