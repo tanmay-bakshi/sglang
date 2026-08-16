@@ -988,6 +988,10 @@ def test_source_drain_failure_still_executes_fail_closed_surrender() -> None:
     serving = MagicMock()
     publisher = MagicMock()
     reactor.stop_admission.side_effect = lambda: order.append("reactor-admission")
+    reactor.inventory.return_value = SimpleNamespace(
+        started=True,
+        admission_open=False,
+    )
     reactor.close.side_effect = lambda timeout: order.append("reactor-close")
     serving.stop_admission_and_retire_native_producers.side_effect = (
         lambda: order.append("native-producer-retirement")
