@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalDeadlineKind,
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
@@ -38,6 +39,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalReceiptKind,
     NativeTerminalReceiptOutcome,
     NativeTerminalRequestBinding,
+    canonical_native_terminal_deadlines,
 )
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalActionClaimError,
@@ -441,14 +443,40 @@ def _submit_direct_source_gather(
             NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
         )
     ):
-        owner.submit(
-            NativeTerminalOwnerEvent(
-                producer_id=_LOCAL_PRODUCER_ID,
-                binding_digest=registration.binding.digest,
-                kind=kind,
-                enqueued_ns=_TEST_CLOCK_NS - 1 + offset,
-            )
+        _submit_direct_source_event(
+            owner,
+            registration,
+            kind,
+            enqueued_ns=_TEST_CLOCK_NS - 1 + offset,
         )
+
+
+def _submit_direct_source_event(
+    owner: NativeTerminalOwner,
+    registration: NativeTerminalLifecycleRegistration,
+    kind: NativeTerminalOwnerEventKind,
+    *,
+    enqueued_ns: int = _TEST_CLOCK_NS,
+    reason: str | None = None,
+) -> None:
+    """Submit one source event through the production native boundary.
+
+    :param owner: Running source owner.
+    :param registration: Exact source lifecycle.
+    :param kind: Source lifecycle event kind.
+    :param enqueued_ns: Causal event enqueue timestamp.
+    :param reason: Failure evidence for request-local terminal events.
+    """
+
+    owner.submit(
+        NativeTerminalOwnerEvent(
+            producer_id=_LOCAL_PRODUCER_ID,
+            binding_digest=registration.binding.digest,
+            kind=kind,
+            enqueued_ns=enqueued_ns,
+            reason=reason,
+        )
+    )
 
 
 def _drain_direct_source_gathers(
@@ -1606,6 +1634,474 @@ def test_production_handoff_has_no_pending_call_surface() -> None:
         assert all(token not in text for token in forbidden), source
 
 
+def test_source_acceptance_reservation_blocks_launch_through_inbox_delivery() -> (
+    None
+):
+    """Accepted work remains launch-exclusive across its newer action ID."""
+
+    owner, registration = _direct_handoff_owner(960)
+    try:
+        _submit_direct_source_event(
+            owner,
+            registration,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=_TEST_CLOCK_NS - 1,
+        )
+        accepted = owner.inventory()
+        assert accepted.source_delivery_reservation_count == 1
+        assert accepted.registered_source_delivery_reservation_count == 1
+        assert accepted.transferred_source_delivery_reservation_count == 0
+        assert accepted.terminal_source_delivery_reservation_count == 0
+        assert accepted.active_handoff_action_count == 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            waiting = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            action_watermark = waiting.scheduler_launch_handoff_begin_watermark
+            reservation_watermark = (
+                waiting.scheduler_launch_handoff_begin_reservation_watermark
+            )
+            assert action_watermark is not None
+            assert reservation_watermark is not None
+            assert reservation_watermark > 0
+            assert not launch.done()
+
+            _submit_direct_source_event(
+                owner,
+                registration,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            transferred = _wait_for_owner_inventory(
+                owner,
+                lambda value: (
+                    value.queued_output_count == 1
+                    and value.source_reservation_backed_handoff_action_count == 1
+                ),
+            )
+            assert transferred.source_delivery_reservation_count == 0
+            assert transferred.transferred_source_delivery_reservation_count == 1
+            actions = tuple(
+                action
+                for output in owner.drain_outputs()
+                for action in output.actions
+            )
+            assert len(actions) == 1
+            action = actions[0]
+            assert action.kind is NativeTerminalOwnerActionKind.SOURCE_GATHER_READY
+            assert action.action_id > action_watermark
+
+            owner.claim_source_forward_independent_handoffs(actions)
+            claimed = owner.inventory()
+            assert claimed.claimed_handoff_action_count == 1
+            assert claimed.active_handoff_action_count == 1
+            assert claimed.source_reservation_backed_handoff_action_count == 1
+            assert not launch.done()
+
+            owner.settle_forward_independent_handoff(action)
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        owner.end_scheduler_launch_handoff(token)
+        owner.acknowledge_action(action)
+        settled = owner.inventory()
+        assert settled.source_reservation_backed_handoff_action_count == 0
+        assert settled.active_handoff_action_count == 0
+        assert settled.settled_handoff_action_count == 1
+    finally:
+        owner.abort_and_close()
+
+
+def test_reservation_after_captured_prefix_blocks_only_the_next_launch() -> None:
+    """A later acceptance cannot extend an already captured launch prefix."""
+
+    owner, registrations = _direct_handoff_owner_population((961, 962))
+    first, second = registrations
+    try:
+        _submit_direct_source_event(
+            owner,
+            first,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=_TEST_CLOCK_NS - 1,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            first_launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            captured = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            first_reservation_watermark = (
+                captured.scheduler_launch_handoff_begin_reservation_watermark
+            )
+            assert first_reservation_watermark is not None
+
+            _submit_direct_source_event(
+                owner,
+                second,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+                enqueued_ns=_TEST_CLOCK_NS - 1,
+            )
+            two_reservations = owner.inventory()
+            assert two_reservations.source_delivery_reservation_count == 2
+            assert (
+                two_reservations.registered_source_delivery_reservation_count == 2
+            )
+
+            _submit_direct_source_event(
+                owner,
+                first,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            _wait_for_owner_inventory(
+                owner,
+                lambda value: value.queued_output_count == 1,
+            )
+            first_actions = tuple(
+                action
+                for output in owner.drain_outputs()
+                for action in output.actions
+            )
+            assert len(first_actions) == 1
+            owner.claim_source_forward_independent_handoffs(first_actions)
+            owner.settle_forward_independent_handoff(first_actions[0])
+            first_token = first_launch.result(timeout=_WAIT_SECONDS)
+
+        after_first = owner.inventory()
+        assert after_first.source_delivery_reservation_count == 1
+        assert after_first.transferred_source_delivery_reservation_count == 1
+        owner.end_scheduler_launch_handoff(first_token)
+        owner.acknowledge_action(first_actions[0])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            second_launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            second_wait = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            second_reservation_watermark = (
+                second_wait.scheduler_launch_handoff_begin_reservation_watermark
+            )
+            assert second_reservation_watermark is not None
+            assert second_reservation_watermark > first_reservation_watermark
+            assert not second_launch.done()
+
+            _submit_direct_source_event(
+                owner,
+                second,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            _wait_for_owner_inventory(
+                owner,
+                lambda value: value.queued_output_count == 1,
+            )
+            second_actions = tuple(
+                action
+                for output in owner.drain_outputs()
+                for action in output.actions
+            )
+            assert len(second_actions) == 1
+            owner.claim_source_forward_independent_handoffs(second_actions)
+            owner.settle_forward_independent_handoff(second_actions[0])
+            second_token = second_launch.result(timeout=_WAIT_SECONDS)
+
+        owner.end_scheduler_launch_handoff(second_token)
+        owner.acknowledge_action(second_actions[0])
+    finally:
+        owner.abort_and_close()
+
+
+def test_abort_terminalizes_reservation_before_action_materialization() -> None:
+    """Abort wakes the launch waiter and consumes accepted reservation authority."""
+
+    owner, registration = _direct_handoff_owner(963)
+    _submit_direct_source_event(
+        owner,
+        registration,
+        NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+        enqueued_ns=_TEST_CLOCK_NS - 1,
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            owner.abort_and_close()
+            with pytest.raises(RuntimeError, match="interrupted"):
+                launch.result(timeout=_WAIT_SECONDS)
+
+        closed = owner.inventory()
+        assert closed.closed
+        assert closed.source_delivery_reservation_count == 0
+        assert closed.source_reservation_backed_handoff_action_count == 0
+        assert closed.registered_source_delivery_reservation_count == 1
+        assert closed.transferred_source_delivery_reservation_count == 0
+        assert closed.terminal_source_delivery_reservation_count == 1
+    finally:
+        owner.abort_and_close()
+
+
+def test_request_failure_terminalizes_reservation_without_gather_authority() -> None:
+    """Request-local failure consumes the accepted reservation exactly once."""
+
+    owner, registration = _direct_handoff_owner(964)
+    try:
+        _submit_direct_source_event(
+            owner,
+            registration,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=_TEST_CLOCK_NS - 1,
+        )
+        _submit_direct_source_event(
+            owner,
+            registration,
+            NativeTerminalOwnerEventKind.SOURCE_REQUEST_FAILED,
+            reason="synthetic request failure before producer completion",
+        )
+        failed = _wait_for_owner_inventory(
+            owner,
+            lambda value: (
+                value.terminal_source_delivery_reservation_count == 1
+                and value.queued_output_count == 1
+            ),
+        )
+        assert failed.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert failed.source_delivery_reservation_count == 0
+        assert failed.transferred_source_delivery_reservation_count == 0
+        assert failed.source_reservation_backed_handoff_action_count == 0
+        actions = tuple(
+            action for output in owner.drain_outputs() for action in output.actions
+        )
+        assert len(actions) == 1
+        assert actions[0].kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED
+        owner.acknowledge_action(actions[0])
+    finally:
+        owner.abort_and_close()
+
+
+def test_deadline_terminalizes_reservation_without_gather_authority() -> None:
+    """The deterministic producer deadline consumes its live reservation."""
+
+    owner, registration = _direct_handoff_owner(965)
+    try:
+        _submit_direct_source_event(
+            owner,
+            registration,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=_TEST_CLOCK_NS - 1,
+        )
+        _wait_for_owner_inventory(
+            owner,
+            lambda value: (
+                value.transition_count == 1
+                and value.source_delivery_reservation_count == 1
+            ),
+        )
+        producer_deadline = next(
+            value
+            for value in canonical_native_terminal_deadlines()
+            if value.kind is NativeTerminalDeadlineKind.OWNER_PRODUCER_AND_GATHER
+        )
+        owner.set_test_clock(_TEST_CLOCK_NS + producer_deadline.duration_ns)
+        owner.expire_deadlines_for_testing()
+
+        expired = _wait_for_owner_inventory(
+            owner,
+            lambda value: (
+                value.terminal_source_delivery_reservation_count == 1
+                and value.queued_output_count == 1
+            ),
+        )
+        assert expired.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert expired.source_delivery_reservation_count == 0
+        assert expired.transferred_source_delivery_reservation_count == 0
+        assert expired.source_reservation_backed_handoff_action_count == 0
+        actions = tuple(
+            action for output in owner.drain_outputs() for action in output.actions
+        )
+        assert len(actions) == 1
+        assert actions[0].kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED
+        owner.acknowledge_action(actions[0])
+    finally:
+        owner.abort_and_close()
+
+
+def test_reservation_inventory_rejects_impossible_accounting() -> None:
+    """Python inventory validation rejects every new conservation mismatch."""
+
+    owner, registration = _direct_handoff_owner(966)
+    try:
+        _submit_direct_source_event(
+            owner,
+            registration,
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            enqueued_ns=_TEST_CLOCK_NS - 1,
+        )
+        inventory = owner.inventory()
+        with pytest.raises(ValueError, match="reservation accounting"):
+            dataclasses.replace(
+                inventory,
+                registered_source_delivery_reservation_count=2,
+            )
+        with pytest.raises(ValueError, match="reservation-backed handoff"):
+            dataclasses.replace(
+                inventory,
+                source_reservation_backed_handoff_action_count=1,
+            )
+        with pytest.raises(ValueError, match="reservation begin state"):
+            dataclasses.replace(
+                inventory,
+                scheduler_launch_handoff_begin_active=True,
+                scheduler_launch_handoff_begin_watermark=0,
+            )
+        with pytest.raises(ValueError, match="reservation token state"):
+            dataclasses.replace(
+                inventory,
+                active_scheduler_launch_handoff_token=1,
+                active_scheduler_launch_handoff_watermark=0,
+                scheduler_launch_handoff_begin_count=1,
+                scheduler_launch_handoff_acquisition_count=1,
+            )
+    finally:
+        owner.abort_and_close()
+
+
+def test_concurrent_source_reservations_conserve_one_launch_prefix() -> None:
+    """Concurrent submitters, delivery, and launch settlement conserve authority."""
+
+    population = 12
+    owner, registrations = _direct_handoff_owner_population(
+        tuple(range(980, 980 + population))
+    )
+    try:
+        for registration in registrations:
+            assert owner.wait_for_lifecycle_registration(
+                registration.binding.digest,
+                _WAIT_SECONDS,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=population
+        ) as executor:
+            acceptance_futures = tuple(
+                executor.submit(
+                    _submit_direct_source_event,
+                    owner,
+                    registration,
+                    NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+                    enqueued_ns=_TEST_CLOCK_NS - 1,
+                )
+                for registration in registrations
+            )
+            for future in acceptance_futures:
+                future.result(timeout=_WAIT_SECONDS)
+
+        accepted = owner.inventory()
+        assert accepted.source_delivery_reservation_count == population
+        assert (
+            accepted.registered_source_delivery_reservation_count == population
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as launch_executor:
+            launch = launch_executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=population
+            ) as producer_executor:
+                completion_futures = tuple(
+                    producer_executor.submit(
+                        _submit_direct_source_event,
+                        owner,
+                        registration,
+                        NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                    )
+                    for registration in registrations
+                )
+                for future in completion_futures:
+                    future.result(timeout=_WAIT_SECONDS)
+
+            transferred = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.queued_output_count == population,
+            )
+            assert transferred.source_delivery_reservation_count == 0
+            assert (
+                transferred.transferred_source_delivery_reservation_count
+                == population
+            )
+            assert (
+                transferred.source_reservation_backed_handoff_action_count
+                == population
+            )
+            actions = tuple(
+                action
+                for output in owner.drain_outputs()
+                for action in output.actions
+            )
+            assert len(actions) == population
+            owner.claim_source_forward_independent_handoffs(actions)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=population
+            ) as delivery_executor:
+                settlement_futures = tuple(
+                    delivery_executor.submit(
+                        owner.settle_forward_independent_handoff,
+                        action,
+                    )
+                    for action in actions
+                )
+                for future in settlement_futures:
+                    future.result(timeout=_WAIT_SECONDS)
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        owner.end_scheduler_launch_handoff(token)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=population
+        ) as acknowledgement_executor:
+            acknowledgement_futures = tuple(
+                acknowledgement_executor.submit(owner.acknowledge_action, action)
+                for action in actions
+            )
+            for future in acknowledgement_futures:
+                future.result(timeout=_WAIT_SECONDS)
+
+        settled = owner.inventory()
+        assert settled.pending_action_count == 0
+        assert settled.source_delivery_reservation_count == 0
+        assert settled.source_reservation_backed_handoff_action_count == 0
+        assert settled.active_handoff_action_count == 0
+        assert settled.settled_handoff_action_count == population
+        assert settled.registered_source_delivery_reservation_count == (
+            settled.source_delivery_reservation_count
+            + settled.transferred_source_delivery_reservation_count
+            + settled.terminal_source_delivery_reservation_count
+        )
+    finally:
+        owner.abort_and_close()
+
+
 def test_scheduler_launch_handoff_waits_for_typed_inbox_delivery() -> None:
     """A launch waits for inbox claim, not downstream functional completion."""
 
@@ -1677,6 +2173,13 @@ def test_action_emitted_during_launch_token_blocks_only_the_next_begin() -> None
         ):
             pass
         assert runtime.source_gather_actions.snapshot().queued_count == 1
+        during_token = runtime.snapshot().owner
+        assert during_token.active_scheduler_launch_handoff_token == token
+        assert during_token.active_scheduler_launch_handoff_reservation_watermark == 0
+        assert during_token.registered_source_delivery_reservation_count == 1
+        assert during_token.source_delivery_reservation_count == 0
+        assert during_token.transferred_source_delivery_reservation_count == 1
+        assert during_token.source_reservation_backed_handoff_action_count == 1
         runtime.end_scheduler_launch_handoff(token)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -1686,6 +2189,11 @@ def test_action_emitted_during_launch_token_blocks_only_the_next_begin() -> None
                 lambda value: value.scheduler_launch_handoff_begin_active,
             )
             assert inventory.scheduler_launch_handoff_begin_watermark is not None
+            assert (
+                inventory.scheduler_launch_handoff_begin_reservation_watermark
+                is not None
+            )
+            assert inventory.scheduler_launch_handoff_begin_reservation_watermark > 0
             assert not next_launch.done()
 
             gather = _drain_actions(runtime.source_gather_actions)[0]

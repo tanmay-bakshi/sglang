@@ -403,7 +403,20 @@ def _native_producer_header_path() -> Path:
     return Path(__file__).with_name("native_producer_api.h")
 
 
-@lru_cache(maxsize=2)
+def _native_owner_sanitizer() -> str | None:
+    """Return the requested test-only native sanitizer.
+
+    :returns: Sanitizer name, or ``None`` for the production build profile.
+    """
+
+    sanitizer = os.environ.get("SGLANG_TERMINAL_OWNER_SANITIZER")
+    if sanitizer is None:
+        return None
+    if sanitizer != "thread":
+        raise RuntimeError("native terminal owner sanitizer must be 'thread'")
+    return sanitizer
+
+
 def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
     """Compile and load the CPU-only authoritative owner bridge.
 
@@ -415,8 +428,29 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
     :returns: Loaded pybind11 extension module.
     """
 
+    return _load_native_terminal_owner_module(
+        testing=testing,
+        sanitizer=_native_owner_sanitizer(),
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_native_terminal_owner_module(
+    *,
+    testing: bool,
+    sanitizer: str | None,
+) -> ModuleType:
+    """Compile one exact native-owner build profile.
+
+    :param testing: Whether native test-only controls are required.
+    :param sanitizer: Optional test-only native sanitizer.
+    :returns: Loaded pybind11 extension module.
+    """
+
     if not sys.platform.startswith("linux"):
         raise RuntimeError("native terminal owner requires Linux eventfd and timerfd")
+    if sanitizer is not None and not testing:
+        raise RuntimeError("native terminal owner sanitizers require a test build")
     source_path = _native_source_path()
     header_path = _native_producer_header_path()
     for required_path in (source_path, header_path):
@@ -424,17 +458,32 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
             raise RuntimeError(
                 f"native terminal owner source is absent: {required_path}"
             )
+    extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
+    extra_ldflags = ["-pthread"]
+    if sanitizer == "thread":
+        extra_cflags = [
+            "-O1",
+            "-g",
+            "-std=c++17",
+            "-fsanitize=thread",
+            "-fno-omit-frame-pointer",
+        ]
+        extra_ldflags.append("-fsanitize=thread")
+    if testing:
+        extra_cflags.append("-DSGLANG_TERMINAL_OWNER_TESTING")
     source_hasher = hashlib.sha256()
     for required_path in (source_path, header_path):
         source_hasher.update(required_path.name.encode("utf-8"))
         source_hasher.update(b"\0")
         source_hasher.update(required_path.read_bytes())
+    for build_value in (*extra_cflags, *extra_ldflags):
+        source_hasher.update(b"\0")
+        source_hasher.update(build_value.encode("utf-8"))
     source_digest = source_hasher.hexdigest()[:12]
     variant = "test" if testing else "runtime"
+    if sanitizer is not None:
+        variant = f"{variant}_{sanitizer}"
     module_name = f"sglang_terminal_owner_bridge_{source_digest}_{variant}"
-    extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
-    if testing:
-        extra_cflags.append("-DSGLANG_TERMINAL_OWNER_TESTING")
     build_directory_value = os.environ.get("SGLANG_TERMINAL_OWNER_BUILD_DIR")
     build_directory: str | None = None
     if build_directory_value is not None:
@@ -446,7 +495,7 @@ def load_native_terminal_owner_module(*, testing: bool = False) -> ModuleType:
         sources=[str(source_path)],
         extra_cflags=extra_cflags,
         extra_include_paths=[str(source_path.parent)],
-        extra_ldflags=["-pthread"],
+        extra_ldflags=extra_ldflags,
         build_directory=build_directory,
         with_cuda=False,
         verbose=False,
