@@ -569,6 +569,9 @@ class NativeTerminalRuntimeSnapshot:
         claimed before output projection and which do not yet have an inbox.
     :ivar source_preclaimed_consumer_count: Projected source actions whose
         inbox consumer has not yet accepted the preclaimed handoff.
+    :ivar decode_publication_preclaimed_count: Projected decode actions whose
+        native handoff was claimed at publication and whose inbox consumer has
+        not yet accepted that preclaim.
     :ivar quarantined_binding_digests: Fail-closed identities accepted by
         lifecycle consumers.
     :ivar output_reactor_alive: Whether the sole output consumer is alive.
@@ -594,6 +597,7 @@ class NativeTerminalRuntimeSnapshot:
     consumer_pending_count: int
     source_preclaimed_count: int
     source_preclaimed_consumer_count: int
+    decode_publication_preclaimed_count: int
     quarantined_binding_digests: tuple[bytes, ...]
     output_reactor_alive: bool
     producers_joined: bool
@@ -628,6 +632,7 @@ class NativeTerminalRuntimeSnapshot:
             self.consumer_pending_count,
             self.source_preclaimed_count,
             self.source_preclaimed_consumer_count,
+            self.decode_publication_preclaimed_count,
             self.dropped_observation_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
@@ -636,16 +641,20 @@ class NativeTerminalRuntimeSnapshot:
             raise ValueError("scheduler pending actions exceed live requests")
         if self.source_preclaimed_consumer_count > self.consumer_pending_count:
             raise ValueError("source preclaims exceed retained consumer authority")
+        if self.decode_publication_preclaimed_count > self.consumer_pending_count:
+            raise ValueError("decode preclaims exceed retained consumer authority")
         if not self.owner.handoff_enabled and (
             self.source_preclaimed_count != 0
             or self.source_preclaimed_consumer_count != 0
+            or self.decode_publication_preclaimed_count != 0
         ):
-            raise ValueError("disabled native handoff retains source preclaims")
+            raise ValueError("disabled native handoff retains runtime preclaims")
         if self.disposition is NativeTerminalRuntimeDisposition.STOPPED and (
             self.source_preclaimed_count != 0
             or self.source_preclaimed_consumer_count != 0
+            or self.decode_publication_preclaimed_count != 0
         ):
-            raise ValueError("stopped runtime retains source preclaims")
+            raise ValueError("stopped runtime retains handoff preclaims")
         if type(self.quarantined_binding_digests) is not tuple or any(
             type(digest) is not bytes or len(digest) != 32
             for digest in self.quarantined_binding_digests
@@ -750,6 +759,18 @@ _FORWARD_INDEPENDENT_HANDOFF_EXCLUSIONS = frozenset(
         NativeTerminalOwnerActionKind.PROCESS_FATAL,
     )
 )
+_DECODE_PUBLICATION_PRECLAIM_ACTIONS = frozenset(
+    (
+        NativeTerminalOwnerActionKind.LOCAL_DECODE_READY,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,
+        NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,
+    )
+)
+if not _DECODE_PUBLICATION_PRECLAIM_ACTIONS.issubset(
+    _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+):
+    raise RuntimeError("decode publication preclaims exceed native handoff actions")
 if _FORWARD_INDEPENDENT_HANDOFF_ACTIONS & _FORWARD_INDEPENDENT_HANDOFF_EXCLUSIONS:
     raise RuntimeError("terminal handoff action partitions overlap")
 if frozenset(NativeTerminalOwnerActionKind) != (
@@ -817,6 +838,7 @@ class NativeTerminalRuntime:
     _inbox_claimed_action_ids: set[int]
     _source_preclaimed_actions: dict[int, NativeTerminalOwnerAction]
     _source_preclaimed_consumer_action_ids: set[int]
+    _decode_publication_preclaimed_action_ids: set[int]
     _known_bindings: dict[bytes, NativeTerminalLifecycleRegistration]
     _quarantined_bindings: set[bytes]
     _condition: threading.Condition
@@ -1027,6 +1049,7 @@ class NativeTerminalRuntime:
         self._inbox_claimed_action_ids = set()
         self._source_preclaimed_actions = {}
         self._source_preclaimed_consumer_action_ids = set()
+        self._decode_publication_preclaimed_action_ids = set()
         self._known_bindings = {}
         self._quarantined_bindings = set()
         self._condition = threading.Condition()
@@ -1553,10 +1576,10 @@ class NativeTerminalRuntime:
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Retire one non-scheduler action after downstream acceptance.
 
-        The dedicated consumer accepts its source preclaim or claims its decode
-        handoff while dequeuing the action. This method releases the runtime's
-        consumer-side generation accounting only after the receiving component
-        accepted the immutable action.
+        The dedicated consumer accepts either its source batch preclaim or its
+        decode publication preclaim while dequeuing the action. This method
+        releases the runtime's consumer-side generation accounting only after
+        the receiving component accepted the immutable action.
 
         :param action: Action previously drained from a runtime inbox.
         """
@@ -1863,9 +1886,16 @@ class NativeTerminalRuntime:
             raise NativeTerminalRuntimeError(
                 "consumer action identity aliases another pending action"
             )
+        decode_publication_unaccepted = (
+            self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+            and self._forward_independent_handoff_enabled
+            and action.kind in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+            and action.action_id in self._decode_publication_preclaimed_action_ids
+        )
         if (
             action.kind not in _SCHEDULER_ACTIONS
             and action.action_id not in self._inbox_claimed_action_ids
+            and not decode_publication_unaccepted
         ):
             self._enter_runtime_fatal_locked(
                 "aborted consumer action was discarded before inbox claim"
@@ -1875,6 +1905,7 @@ class NativeTerminalRuntime:
             )
         del self._consumer_pending[action.action_id]
         self._inbox_claimed_action_ids.discard(action.action_id)
+        self._decode_publication_preclaimed_action_ids.discard(action.action_id)
         binding_digest = action.binding.digest
         if action.kind in _SCHEDULER_ACTIONS:
             self._scheduler_pending.pop(binding_digest, None)
@@ -1897,10 +1928,11 @@ class NativeTerminalRuntime:
         """Transfer projected actions at the isolated inbox-dequeue boundary.
 
         Source actions consume an atomically transferred batch preclaim.
-        Decode actions claim their visible native handoff here. In both cases,
-        the action remains in ``_consumer_pending`` until downstream
-        acknowledgement, preserving resource and lifecycle authority across
-        consumer work and recursive native submissions.
+        Decode actions consume the preclaim transferred with their durable
+        inbox publication. In both cases, the action remains in
+        ``_consumer_pending`` until downstream acknowledgement, preserving
+        resource and lifecycle authority across consumer work and recursive
+        native submissions.
 
         :param actions: Exact FIFO prefix removed from one runtime-owned inbox.
         :returns: Exact population newly claimed by this drain.
@@ -1912,7 +1944,7 @@ class NativeTerminalRuntime:
             type(action) is not NativeTerminalOwnerAction for action in actions
         ):
             raise TypeError("actions must contain NativeTerminalOwnerAction values")
-        claimable_actions: list[NativeTerminalOwnerAction] = []
+        claimed_actions: list[NativeTerminalOwnerAction] = []
         claim_failure: str | None = None
         with self._condition:
             for action in actions:
@@ -1947,66 +1979,34 @@ class NativeTerminalRuntime:
                         "source inbox action lacks preclaimed handoff authority"
                     )
                     continue
-                claimable_actions.append(action)
-        claim_error: Exception | None = None
-        claim_traceback: str | None = None
-        locally_claimed_actions: list[NativeTerminalOwnerAction] = []
-        for action in claimable_actions:
-            source_preclaimed = (
-                self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
-                and self._forward_independent_handoff_enabled
-                and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-            )
-            if (
-                action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-                and not source_preclaimed
-            ):
-                try:
-                    self._claim_forward_independent_handoff(action)
-                except Exception as error:  # noqa: BLE001
-                    if claim_error is None:
-                        claim_error = error
-                        claim_traceback = traceback.format_exc()
-            with self._condition:
-                pending = self._consumer_pending.get(action.action_id)
+                decode_preclaimed = (
+                    self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+                    and self._forward_independent_handoff_enabled
+                    and action.kind in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+                )
                 if (
-                    pending != action
-                    or action.action_id in self._inbox_claimed_action_ids
+                    decode_preclaimed
+                    and action.action_id
+                    not in self._decode_publication_preclaimed_action_ids
                 ):
                     if claim_failure is None:
                         claim_failure = (
-                            "consumer action changed while inbox claim completed"
+                            "decode inbox action lacks publication handoff preclaim"
                         )
                     self._enter_runtime_fatal_locked(
-                        "consumer action changed while inbox claim completed"
+                        "decode inbox action lacks publication handoff preclaim"
                     )
                     continue
                 if source_preclaimed:
-                    if (
-                        action.action_id
-                        not in self._source_preclaimed_consumer_action_ids
-                    ):
-                        if claim_failure is None:
-                            claim_failure = (
-                                "source handoff preclaim changed during inbox claim"
-                            )
-                        self._enter_runtime_fatal_locked(
-                            "source handoff preclaim changed during inbox claim"
-                        )
-                        continue
                     self._source_preclaimed_consumer_action_ids.remove(action.action_id)
+                if decode_preclaimed:
+                    self._decode_publication_preclaimed_action_ids.remove(
+                        action.action_id
+                    )
                 self._inbox_claimed_action_ids.add(action.action_id)
-                locally_claimed_actions.append(action)
+                claimed_actions.append(action)
                 self._condition.notify_all()
-        claimed = tuple(locally_claimed_actions)
-        if claim_error is not None:
-            if claim_traceback is None:
-                raise RuntimeError("native handoff claim lost its traceback")
-            raise NativeTerminalActionClaimError(
-                actions,
-                claimed,
-                claim_traceback,
-            ) from claim_error
+        claimed = tuple(claimed_actions)
         if claim_failure is not None:
             raise NativeTerminalActionClaimError(
                 actions,
@@ -2015,30 +2015,52 @@ class NativeTerminalRuntime:
             )
         return claimed
 
-    def _claim_forward_independent_handoff(
+    def _project_decode_publication_locked(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Claim native handoff authority before taking the runtime lock.
+        """Publish one decode action with native handoff already transferred.
 
-        :param action: Exact non-scheduler action claimed by its sole owner.
+        Retention, native claim, preclaim accounting, and the destination wake
+        form one transaction under the runtime condition. Failure before the
+        wake rolls every Python mutation back so the outer output rejection can
+        discard the exact native action without exposing consumer work.
+
+        :param action: Decode action entering its sole destination inbox.
         """
 
-        if (
-            not self._forward_independent_handoff_enabled
-            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-        ):
-            return
-        if action.kind in _SCHEDULER_ACTIONS:
+        inbox: NativeTerminalActionInbox
+        if action.kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY:
+            inbox = self._coordinator_actions
+        elif action.kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED:
+            inbox = self._lifecycle_actions
+        elif action.kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY:
+            inbox = self._decode_scatter_actions
+        elif action.kind is NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY:
+            inbox = self._decode_work_actions
+        else:
             raise NativeTerminalRuntimeError(
-                "scheduler action cannot claim forward-independent handoff authority"
+                "decode publication preclaim received an excluded action"
             )
+        self._retain_consumer_action_locked(action)
         try:
             self._owner.claim_forward_independent_handoff(action)
+            if action.action_id in self._decode_publication_preclaimed_action_ids:
+                raise NativeTerminalRuntimeError(
+                    "decode publication preclaim was replayed"
+                )
+            self._decode_publication_preclaimed_action_ids.add(action.action_id)
+            inbox._enqueue(action)
         except Exception:
-            formatted_traceback = traceback.format_exc()
-            with self._condition:
-                self._enter_runtime_fatal_locked(formatted_traceback)
+            self._decode_publication_preclaimed_action_ids.discard(action.action_id)
+            self._consumer_pending.pop(action.action_id, None)
+            self._condition.notify_all()
             raise
+        if (
+            action.kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
+            and action.binding.digest not in self._scheduler_pending
+        ):
+            self._scheduler_live.pop(action.binding.digest, None)
+        self._condition.notify_all()
 
     def _reject_forward_independent_claim(
         self, action: NativeTerminalOwnerAction
@@ -2058,36 +2080,6 @@ class NativeTerminalRuntime:
         except Exception:  # noqa: BLE001
             with self._condition:
                 self._enter_runtime_fatal_locked(traceback.format_exc())
-
-    def _activate_forward_independent_handoff(
-        self, action: NativeTerminalOwnerAction
-    ) -> None:
-        """Activate a decode scheduler wake before consumer publication.
-
-        The output reactor is not the main interpreter thread. A queued CPython
-        callback therefore cannot run until the output reactor yields the GIL.
-        The runtime condition remains held from activation through durable inbox
-        insertion, so fatality cannot split those two ownership transitions.
-
-        :param action: Exact decode action about to enter its dedicated inbox.
-        """
-
-        if (
-            not self._forward_independent_handoff_enabled
-            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-        ):
-            return
-        try:
-            activated = self._owner.activate_forward_independent_handoff(action)
-            if not activated:
-                raise NativeTerminalRuntimeError(
-                    "decode handoff was claimed before consumer publication"
-                )
-        except Exception:
-            formatted_traceback = traceback.format_exc()
-            with self._condition:
-                self._enter_runtime_fatal_locked(formatted_traceback)
-            raise
 
     def complete_work_action(
         self,
@@ -2261,6 +2253,9 @@ class NativeTerminalRuntime:
                 source_preclaimed_consumer_count=len(
                     self._source_preclaimed_consumer_action_ids
                 ),
+                decode_publication_preclaimed_count=len(
+                    self._decode_publication_preclaimed_action_ids
+                ),
                 quarantined_binding_digests=tuple(sorted(self._quarantined_bindings)),
                 output_reactor_alive=self._output_reactor_alive,
                 producers_joined=self._producers_joined,
@@ -2381,6 +2376,7 @@ class NativeTerminalRuntime:
                     or len(self._inbox_claimed_action_ids) != 0
                     or len(self._source_preclaimed_actions) != 0
                     or len(self._source_preclaimed_consumer_action_ids) != 0
+                    or len(self._decode_publication_preclaimed_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "clean close acquired new consumer authority during drain"
@@ -2474,6 +2470,7 @@ class NativeTerminalRuntime:
                     or len(self._inbox_claimed_action_ids) != 0
                     or len(self._source_preclaimed_actions) != 0
                     or len(self._source_preclaimed_consumer_action_ids) != 0
+                    or len(self._decode_publication_preclaimed_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "abort finish retains unaccepted consumer authority"
@@ -2721,7 +2718,13 @@ class NativeTerminalRuntime:
                 decode_handoff_required = (
                     self._owner_identity.role is NativeTerminalOwnerRole.DECODE
                     and self._forward_independent_handoff_enabled
+                    and action.kind in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+                )
+                invalid_decode_handoff = (
+                    self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+                    and self._forward_independent_handoff_enabled
                     and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+                    and action.kind not in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
                 )
                 # Fatal admission and durable publication remain one ownership
                 # transition until the bounded consumer inbox owns the action.
@@ -2735,9 +2738,14 @@ class NativeTerminalRuntime:
                             "functional action delivery lost the race to "
                             "fail-closed drain"
                         )
+                    if invalid_decode_handoff:
+                        raise NativeTerminalRuntimeError(
+                            "decode owner emitted a source-only handoff action"
+                        )
                     if decode_handoff_required:
-                        self._activate_forward_independent_handoff(action)
-                    self._project_action(action)
+                        self._project_decode_publication_locked(action)
+                    else:
+                        self._project_action(action)
             except Exception:  # noqa: BLE001
                 formatted_traceback = traceback.format_exc()
                 with self._condition:
@@ -2876,7 +2884,9 @@ class NativeTerminalRuntime:
         A source ``REQUEST_RETIRED`` action still carries native handoff
         authority. It is claimed directly after fatality, without scheduling a
         callback, before entering the same Python preclaim path as a normal
-        source batch. Quarantine and process-fatal actions need no handoff.
+        source batch. Decode ``REQUEST_RETIRED`` uses the same durable
+        publication preclaim as its normal output route. Quarantine and
+        process-fatal actions need no handoff.
 
         :param action: Exact lifecycle authority which must remain observable.
         """
@@ -2885,6 +2895,15 @@ class NativeTerminalRuntime:
             raise TypeError("action must be NativeTerminalOwnerAction")
         if action.kind not in _LIFECYCLE_ACTIONS:
             raise ValueError("fail-closed preservation requires a lifecycle action")
+        decode_preclaimed = (
+            self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+            and self._forward_independent_handoff_enabled
+            and action.kind in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+        )
+        if decode_preclaimed:
+            with self._condition:
+                self._project_decode_publication_locked(action)
+            return
         source_preclaimed = (
             self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
             and self._forward_independent_handoff_enabled
@@ -2914,8 +2933,8 @@ class NativeTerminalRuntime:
         become durable before one synchronous exact-batch native claim. That
         claim has no scheduler-thread or interpreter-main-thread dependency;
         the existing leases exclude another host launch until the projected
-        work reaches its causal completion milestones. Decode retains its
-        activate-before-publication handoff.
+        work reaches its causal completion milestones. Decode transfers native
+        handoff authority before the destination inbox wake.
 
         :param outputs: Complete native population drained by one readable wake.
         """
@@ -3229,6 +3248,10 @@ class NativeTerminalRuntime:
             self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
             and self._forward_independent_handoff_enabled
         )
+        decode_publication_handoff = (
+            self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+            and self._forward_independent_handoff_enabled
+        )
         if not source_batch_handoff and (
             len(preclaimed_ids) != 0
             or len(self._source_preclaimed_consumer_action_ids) != 0
@@ -3309,6 +3332,69 @@ class NativeTerminalRuntime:
                 )
                 raise NativeTerminalRuntimeError(
                     "source consumer handoff authority is not exactly partitioned"
+                )
+        if (
+            not decode_publication_handoff
+            and len(self._decode_publication_preclaimed_action_ids) != 0
+        ):
+            self._enter_runtime_fatal_locked(
+                "decode preclaims exist outside decode publication handoff mode"
+            )
+            raise NativeTerminalRuntimeError(
+                "decode preclaims exist outside decode publication handoff mode"
+            )
+        if not self._decode_publication_preclaimed_action_ids.issubset(
+            self._consumer_pending
+        ):
+            self._enter_runtime_fatal_locked(
+                "decode publication preclaims exceed consumer authority"
+            )
+            raise NativeTerminalRuntimeError(
+                "decode publication preclaims exceed consumer authority"
+            )
+        if any(
+            self._consumer_pending[action_id].kind
+            not in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+            or self._consumer_pending[action_id].binding.owner != self._owner_identity
+            for action_id in self._decode_publication_preclaimed_action_ids
+        ):
+            self._enter_runtime_fatal_locked(
+                "decode publication preclaim has an invalid action domain"
+            )
+            raise NativeTerminalRuntimeError(
+                "decode publication preclaim has an invalid action domain"
+            )
+        if (
+            len(
+                self._decode_publication_preclaimed_action_ids
+                & self._inbox_claimed_action_ids
+            )
+            != 0
+        ):
+            self._enter_runtime_fatal_locked(
+                "decode publication preclaims alias accepted inbox authority"
+            )
+            raise NativeTerminalRuntimeError(
+                "decode publication preclaims alias accepted inbox authority"
+            )
+        if decode_publication_handoff:
+            decode_handoff_consumer_ids = {
+                action_id
+                for action_id, action in self._consumer_pending.items()
+                if action.kind in _DECODE_PUBLICATION_PRECLAIM_ACTIONS
+            }
+            claimed_decode_handoff_ids = (
+                self._inbox_claimed_action_ids & decode_handoff_consumer_ids
+            )
+            if decode_handoff_consumer_ids != (
+                self._decode_publication_preclaimed_action_ids
+                | claimed_decode_handoff_ids
+            ):
+                self._enter_runtime_fatal_locked(
+                    "decode consumer handoff authority is not exactly partitioned"
+                )
+                raise NativeTerminalRuntimeError(
+                    "decode consumer handoff authority is not exactly partitioned"
                 )
         if self._inbox_claimed_action_ids.issubset(self._consumer_pending):
             return

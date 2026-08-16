@@ -187,17 +187,7 @@ enum class FatalCode : std::uint8_t {
   kDependencyDeath = 14,
   kCloseWithRetainedInventory = 15,
   kInternalError = 16,
-  kPendingCallQueueFailure = 17,
-  kHandoffTimeout = 18,
   kHandoffAuthority = 19,
-};
-
-enum class HandoffCallbackTerminalState : std::uint8_t {
-  kNone = 0,
-  kRestored = 1,
-  kCancelled = 2,
-  kTimedOut = 3,
-  kSchedulingRejected = 4,
 };
 
 enum class ProducerClass : std::uint8_t {
@@ -689,16 +679,12 @@ const char *fatal_name(FatalCode code) noexcept {
   case FatalCode::kDependencyDeath: return "dependency_death";
   case FatalCode::kCloseWithRetainedInventory: return "close_with_retained_inventory";
   case FatalCode::kInternalError: return "internal_error";
-  case FatalCode::kPendingCallQueueFailure: return "pending_call_queue_failure";
-  case FatalCode::kHandoffTimeout: return "handoff_timeout";
   case FatalCode::kHandoffAuthority: return "handoff_authority";
   }
   return "unknown";
 }
 
-class NativeTerminalOwnerBridge;
-
-struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
+struct SharedOwner {
   std::mutex mutex{};
   std::condition_variable condition{};
   std::condition_variable qualification_condition{};
@@ -719,7 +705,6 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::unordered_set<std::uint64_t> consumed_actions{};
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
   std::unordered_set<std::uint64_t> unclaimed_handoff_action_ids{};
-  std::unordered_set<std::uint64_t> activated_handoff_action_ids{};
   std::unordered_set<Nonce, NonceHash> minted_nonces{};
   QualificationState qualification{};
   std::thread reactor{};
@@ -735,14 +720,6 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::uint64_t delivered_observation_count{0};
   std::uint64_t dropped_observation_count{0};
   std::uint64_t observation_eventfd_error_count{0};
-  std::uint64_t next_handoff_callback_id{1};
-  std::uint64_t scheduled_handoff_callback_id{0};
-  std::uint64_t scheduled_handoff_watermark{0};
-  std::uint64_t active_handoff_callback_id{0};
-  std::uint64_t active_handoff_watermark{0};
-  std::uint64_t restoring_handoff_callback_id{0};
-  std::uint64_t terminal_handoff_callback_id{0};
-  std::uint64_t handoff_callback_count{0};
   std::uint64_t handoff_claim_count{0};
   std::uint64_t handoff_discard_count{0};
   std::uint64_t source_batch_handoff_count{0};
@@ -755,22 +732,13 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   bool producer_join_barrier_complete{false};
   bool producers_joined{false};
   bool abort_started{false};
-  bool abort_close_deferred{false};
   bool reactor_stopped{false};
   bool closed{false};
   bool output_drain_active{false};
   bool observation_wake_armed{false};
   bool handoff_enabled{false};
-  bool handoff_callback_scheduled{false};
-  bool handoff_callback_active{false};
-  bool handoff_callback_restoring{false};
-  bool handoff_callback_cancel_requested{false};
-  bool handoff_callback_timeout_requested{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   bool test_clock_enabled{false};
-  bool test_reject_next_handoff_pending_call{false};
-  bool test_hold_handoff_callback_activation{false};
-  bool test_hold_handoff_callback_restoration{false};
   std::uint64_t test_now_ns{0};
 #endif
   FatalCode fatal_code{FatalCode::kNone};
@@ -781,16 +749,7 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::string fatal_reason{};
   std::int32_t fatal_reason_code{0};
   std::int64_t fatal_backend_status{0};
-  HandoffCallbackTerminalState terminal_handoff_callback_state{
-      HandoffCallbackTerminalState::kNone};
 };
-
-struct PendingHandoffCall {
-  std::shared_ptr<SharedOwner> owner{};
-  std::uint64_t callback_id{0};
-};
-
-int terminal_handoff_pending_call(void *opaque) noexcept;
 
 void register_forward_independent_handoffs_locked(
     SharedOwner &owner, const Output &output) noexcept;
@@ -830,17 +789,6 @@ void close_owner_fds_locked(SharedOwner &owner) noexcept {
   close_fd(owner.observation_fd);
   close_fd(owner.timer_fd);
   close_fd(owner.shutdown_fd);
-}
-
-void finish_deferred_abort_close_locked(SharedOwner &owner) noexcept {
-  if (!owner.abort_close_deferred || owner.handoff_callback_scheduled ||
-      owner.handoff_callback_active || owner.handoff_callback_restoring) {
-    return;
-  }
-  close_owner_fds_locked(owner);
-  owner.abort_close_deferred = false;
-  owner.closed = true;
-  owner.condition.notify_all();
 }
 
 void signal_fd_locked(SharedOwner &owner, int fd) noexcept {
@@ -1516,20 +1464,14 @@ bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
   return false;
 }
 
-bool handoff_unclaimed_through_locked(const SharedOwner &owner,
-                                      std::uint64_t watermark) noexcept {
-  return std::any_of(
-      owner.activated_handoff_action_ids.begin(),
-      owner.activated_handoff_action_ids.end(),
-      [watermark](std::uint64_t action_id) { return action_id <= watermark; });
-}
-
 bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
   return std::all_of(
-      owner.activated_handoff_action_ids.begin(),
-      owner.activated_handoff_action_ids.end(),
+      owner.unclaimed_handoff_action_ids.begin(),
+      owner.unclaimed_handoff_action_ids.end(),
       [&owner](std::uint64_t action_id) {
-        return owner.unclaimed_handoff_action_ids.count(action_id) == 1;
+        const auto action = owner.pending_actions.find(action_id);
+        return action != owner.pending_actions.end() &&
+               action_requires_forward_independent_handoff(action->second.kind);
       });
 }
 
@@ -1547,36 +1489,6 @@ void enter_handoff_fatal_locked(SharedOwner &owner, FatalCode code,
   }
   owner.condition.notify_all();
   owner.qualification_condition.notify_all();
-}
-
-bool schedule_handoff_pending_call_locked(SharedOwner &owner,
-                                          std::uint64_t watermark) noexcept {
-  if (owner.handoff_callback_scheduled) {
-    owner.scheduled_handoff_watermark =
-        std::max(owner.scheduled_handoff_watermark, watermark);
-    return true;
-  }
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-  if (owner.test_reject_next_handoff_pending_call) {
-    owner.test_reject_next_handoff_pending_call = false;
-    return false;
-  }
-#endif
-  try {
-    auto call = std::make_unique<PendingHandoffCall>();
-    call->owner = owner.shared_from_this();
-    call->callback_id = owner.next_handoff_callback_id++;
-    if (Py_AddPendingCall(&terminal_handoff_pending_call, call.get()) != 0) {
-      return false;
-    }
-    owner.handoff_callback_scheduled = true;
-    owner.scheduled_handoff_callback_id = call->callback_id;
-    owner.scheduled_handoff_watermark = watermark;
-    call.release();
-    return true;
-  } catch (...) {
-    return false;
-  }
 }
 
 void register_forward_independent_handoffs_locked(
@@ -1602,222 +1514,10 @@ void discard_forward_independent_handoff_locked(
   if (!owner.handoff_enabled) {
     return;
   }
-  owner.activated_handoff_action_ids.erase(action_id);
   if (owner.unclaimed_handoff_action_ids.erase(action_id) == 1) {
     ++owner.handoff_discard_count;
   }
   owner.condition.notify_all();
-}
-
-void clear_scheduled_handoff_activation_locked(
-    SharedOwner &owner, std::uint64_t watermark) noexcept {
-  for (auto action = owner.activated_handoff_action_ids.begin();
-       action != owner.activated_handoff_action_ids.end();) {
-    if (*action <= watermark) {
-      action = owner.activated_handoff_action_ids.erase(action);
-      continue;
-    }
-    ++action;
-  }
-}
-
-int terminal_handoff_pending_call(void *opaque) noexcept {
-  std::unique_ptr<PendingHandoffCall> call(
-      static_cast<PendingHandoffCall *>(opaque));
-  if (call == nullptr || call->owner == nullptr) {
-    return 0;
-  }
-  SharedOwner &owner = *call->owner;
-  std::unique_lock<std::mutex> lock(owner.mutex);
-  if (owner.closed || !owner.handoff_enabled) {
-    if (owner.handoff_callback_scheduled &&
-        owner.scheduled_handoff_callback_id == call->callback_id) {
-      clear_scheduled_handoff_activation_locked(
-          owner, owner.scheduled_handoff_watermark);
-      owner.handoff_callback_scheduled = false;
-      owner.scheduled_handoff_callback_id = 0;
-      owner.scheduled_handoff_watermark = 0;
-      owner.terminal_handoff_callback_id = call->callback_id;
-      owner.terminal_handoff_callback_state =
-          HandoffCallbackTerminalState::kCancelled;
-      owner.condition.notify_all();
-    }
-    finish_deferred_abort_close_locked(owner);
-    return 0;
-  }
-  if (!owner.handoff_callback_scheduled ||
-      owner.scheduled_handoff_callback_id != call->callback_id ||
-      owner.handoff_callback_active) {
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffAuthority,
-        "terminal handoff callback identity was stale or concurrent");
-    if (owner.scheduled_handoff_callback_id == call->callback_id) {
-      clear_scheduled_handoff_activation_locked(
-          owner, owner.scheduled_handoff_watermark);
-      owner.handoff_callback_scheduled = false;
-      owner.scheduled_handoff_callback_id = 0;
-      owner.scheduled_handoff_watermark = 0;
-    }
-    owner.terminal_handoff_callback_id = call->callback_id;
-    owner.terminal_handoff_callback_state =
-        HandoffCallbackTerminalState::kCancelled;
-    finish_deferred_abort_close_locked(owner);
-    return 0;
-  }
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-  if (owner.test_hold_handoff_callback_activation) {
-    const DeadlineSpec &shutdown = owner.deadline_specs[
-        static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];
-    const std::uint64_t activation_deadline_ns =
-        owner_now_ns_locked(owner) + shutdown.duration_ns;
-    PyThreadState *activation_thread_state = PyEval_SaveThread();
-    const bool activation_released = owner.condition.wait_for(
-        lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          return !owner.test_hold_handoff_callback_activation ||
-                 owner.handoff_callback_cancel_requested ||
-                 owner.handoff_callback_timeout_requested || owner.closed ||
-                 (owner.test_clock_enabled &&
-                  owner_now_ns_locked(owner) >= activation_deadline_ns);
-        });
-    const bool activation_timed_out =
-        !activation_released ||
-        (owner.test_clock_enabled &&
-         owner_now_ns_locked(owner) >= activation_deadline_ns);
-    lock.unlock();
-    PyEval_RestoreThread(activation_thread_state);
-    lock.lock();
-    if (activation_timed_out || owner.handoff_callback_cancel_requested ||
-        owner.handoff_callback_timeout_requested || owner.closed) {
-      clear_scheduled_handoff_activation_locked(
-          owner, owner.scheduled_handoff_watermark);
-      owner.handoff_callback_scheduled = false;
-      owner.scheduled_handoff_callback_id = 0;
-      owner.scheduled_handoff_watermark = 0;
-      owner.handoff_callback_cancel_requested = false;
-      owner.handoff_callback_timeout_requested = false;
-      owner.terminal_handoff_callback_id = call->callback_id;
-      owner.terminal_handoff_callback_state =
-          activation_timed_out
-              ? HandoffCallbackTerminalState::kTimedOut
-              : HandoffCallbackTerminalState::kCancelled;
-      if (activation_timed_out) {
-        enter_handoff_fatal_locked(
-            owner, FatalCode::kHandoffTimeout,
-            "terminal handoff callback activation test hold timed out");
-      }
-      owner.condition.notify_all();
-      finish_deferred_abort_close_locked(owner);
-      return 0;
-    }
-  }
-#endif
-  const std::uint64_t watermark = owner.scheduled_handoff_watermark;
-  owner.handoff_callback_scheduled = false;
-  owner.scheduled_handoff_callback_id = 0;
-  owner.scheduled_handoff_watermark = 0;
-  owner.handoff_callback_active = true;
-  owner.active_handoff_callback_id = call->callback_id;
-  owner.active_handoff_watermark = watermark;
-  ++owner.handoff_callback_count;
-  owner.condition.notify_all();
-
-  const DeadlineSpec &shutdown = owner.deadline_specs[
-      static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];
-  const std::uint64_t started_ns = owner_now_ns_locked(owner);
-  const std::uint64_t deadline_ns = started_ns + shutdown.duration_ns;
-  PyThreadState *thread_state = PyEval_SaveThread();
-  bool wait_failed = false;
-  bool completed = false;
-  bool deadline_expired = false;
-  HandoffCallbackTerminalState terminal_state =
-      HandoffCallbackTerminalState::kRestored;
-  try {
-    completed = owner.condition.wait_for(
-        lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          if (owner.closed || owner.handoff_callback_cancel_requested ||
-              owner.handoff_callback_timeout_requested) {
-            return true;
-          }
-          if (!handoff_unclaimed_through_locked(owner, watermark)) {
-            return true;
-          }
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-          return owner.test_clock_enabled &&
-                 owner_now_ns_locked(owner) >= deadline_ns;
-#else
-          return false;
-#endif
-        });
-    const bool handoff_still_active =
-        handoff_unclaimed_through_locked(owner, watermark);
-    deadline_expired = handoff_still_active && !owner.closed &&
-                       owner_now_ns_locked(owner) >= deadline_ns;
-  } catch (...) {
-    wait_failed = true;
-  }
-  if (wait_failed) {
-    terminal_state = HandoffCallbackTerminalState::kCancelled;
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffAuthority,
-        "terminal handoff callback condition wait failed");
-  } else if (!completed || deadline_expired) {
-    terminal_state = HandoffCallbackTerminalState::kTimedOut;
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffTimeout,
-        "terminal handoff callback exceeded owner shutdown deadline");
-  } else if (owner.handoff_callback_timeout_requested) {
-    terminal_state = HandoffCallbackTerminalState::kTimedOut;
-  } else if (owner.closed || owner.handoff_callback_cancel_requested) {
-    terminal_state = HandoffCallbackTerminalState::kCancelled;
-  }
-  owner.handoff_callback_active = false;
-  owner.active_handoff_callback_id = 0;
-  owner.active_handoff_watermark = 0;
-  owner.handoff_callback_restoring = true;
-  owner.restoring_handoff_callback_id = call->callback_id;
-  owner.condition.notify_all();
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-  if (owner.test_hold_handoff_callback_restoration) {
-    const bool restoration_released = owner.condition.wait_for(
-        lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          return !owner.test_hold_handoff_callback_restoration ||
-                 owner.handoff_callback_cancel_requested ||
-                 owner.handoff_callback_timeout_requested || owner.closed ||
-                 (owner.test_clock_enabled &&
-                  owner_now_ns_locked(owner) >= deadline_ns);
-        });
-    const bool restoration_timed_out =
-        !restoration_released ||
-        (owner.test_clock_enabled && owner_now_ns_locked(owner) >= deadline_ns);
-    if (restoration_timed_out || owner.handoff_callback_timeout_requested) {
-      terminal_state = HandoffCallbackTerminalState::kTimedOut;
-      enter_handoff_fatal_locked(
-          owner, FatalCode::kHandoffTimeout,
-          "terminal handoff callback restoration test hold timed out");
-    } else if (owner.handoff_callback_cancel_requested || owner.closed) {
-      terminal_state = HandoffCallbackTerminalState::kCancelled;
-    }
-  }
-#endif
-  lock.unlock();
-  PyEval_RestoreThread(thread_state);
-  lock.lock();
-  if (!owner.handoff_callback_restoring ||
-      owner.restoring_handoff_callback_id != call->callback_id) {
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffAuthority,
-        "terminal handoff callback restoration identity disagreed");
-    terminal_state = HandoffCallbackTerminalState::kCancelled;
-  }
-  owner.handoff_callback_restoring = false;
-  owner.restoring_handoff_callback_id = 0;
-  owner.handoff_callback_cancel_requested = false;
-  owner.handoff_callback_timeout_requested = false;
-  owner.terminal_handoff_callback_id = call->callback_id;
-  owner.terminal_handoff_callback_state = terminal_state;
-  owner.condition.notify_all();
-  finish_deferred_abort_close_locked(owner);
-  return 0;
 }
 
 void apply_publication_owner_loss_locked(Lifecycle &lifecycle) {
@@ -3159,7 +2859,6 @@ public:
       throw std::runtime_error(
           "terminal handoff action claim was absent or replayed");
     }
-    owner_->activated_handoff_action_ids.erase(action_id);
     owner_->unclaimed_handoff_action_ids.erase(unclaimed);
     ++owner_->handoff_claim_count;
     owner_->condition.notify_all();
@@ -3235,8 +2934,7 @@ public:
           owner_->output_drain_action_ids.count(action_id) != 1 ||
           action->second.binding.owner.role != OwnerRole::kSource ||
           !action_requires_forward_independent_handoff(action->second.kind) ||
-          owner_->unclaimed_handoff_action_ids.count(action_id) != 1 ||
-          owner_->activated_handoff_action_ids.count(action_id) != 0) {
+          owner_->unclaimed_handoff_action_ids.count(action_id) != 1) {
         reject_authority(
             "source terminal handoff batch contained ineligible authority");
       }
@@ -3249,62 +2947,6 @@ public:
     ++owner_->source_batch_handoff_count;
     owner_->source_batch_handoff_action_count += action_ids.size();
     owner_->condition.notify_all();
-  }
-
-  bool activate_forward_independent_handoff(std::uint64_t action_id) {
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    if (!owner_->handoff_enabled) {
-      throw std::runtime_error("terminal handoff is not enabled");
-    }
-    if (owner_->owner_identity.role != OwnerRole::kDecode) {
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kHandoffAuthority,
-          "single-action handoff activation requires a decode-role owner");
-      throw std::runtime_error(
-          "single-action handoff activation requires a decode-role owner");
-    }
-    if (!owner_->started || owner_->closed || owner_->abort_started ||
-        owner_->fatal_code != FatalCode::kNone) {
-      throw std::runtime_error(
-          "decode terminal handoff requires a running non-fatal owner");
-    }
-    const auto action = owner_->pending_actions.find(action_id);
-    if (action == owner_->pending_actions.end()) {
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kHandoffAuthority,
-          "terminal handoff activation targeted an unknown action");
-      throw std::runtime_error(
-          "terminal handoff activation targeted an unknown action");
-    }
-    if (!action_requires_forward_independent_handoff(action->second.kind)) {
-      if (owner_->unclaimed_handoff_action_ids.count(action_id) != 0 ||
-          owner_->activated_handoff_action_ids.count(action_id) != 0) {
-        enter_handoff_fatal_locked(
-            *owner_, FatalCode::kHandoffAuthority,
-            "excluded terminal action retained handoff authority");
-        throw std::runtime_error(
-            "excluded terminal action retained handoff authority");
-      }
-      return false;
-    }
-    if (owner_->unclaimed_handoff_action_ids.count(action_id) == 0) {
-      return false;
-    }
-    if (!owner_->activated_handoff_action_ids.insert(action_id).second) {
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kHandoffAuthority,
-          "terminal handoff activation was replayed");
-      throw std::runtime_error("terminal handoff activation was replayed");
-    }
-    if (!schedule_handoff_pending_call_locked(*owner_, action_id)) {
-      discard_forward_independent_handoff_locked(*owner_, action_id);
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kPendingCallQueueFailure,
-          "terminal handoff pending-call scheduling failed");
-      throw std::runtime_error(
-          "terminal handoff pending-call scheduling failed");
-    }
-    return true;
   }
 
   void fail_action_delivery(std::uint64_t action_id,
@@ -3354,20 +2996,6 @@ public:
                  owner_->fatal_code != FatalCode::kNone || owner_->closed;
         });
     return reached && owner_->lifecycles.count(digest) == 1;
-  }
-
-  bool wait_for_forward_independent_handoff(double timeout_seconds) {
-    if (timeout_seconds <= 0.0) {
-      throw std::invalid_argument("handoff wait must be positive");
-    }
-    py::gil_scoped_release release;
-    std::unique_lock<std::mutex> lock(owner_->mutex);
-    const bool reached = owner_->condition.wait_for(
-        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
-          return owner_->handoff_callback_active ||
-                 owner_->fatal_code != FatalCode::kNone || owner_->closed;
-        });
-    return reached && owner_->handoff_callback_active;
   }
 
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
@@ -3426,28 +3054,6 @@ public:
           "test clock requires a running owner and monotonic time");
     }
     owner_->test_now_ns = now_ns;
-    owner_->condition.notify_all();
-  }
-
-  void reject_next_handoff_pending_call_for_test() {
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    if (!owner_->test_clock_enabled || !owner_->started || owner_->closed ||
-        owner_->test_reject_next_handoff_pending_call) {
-      throw std::runtime_error(
-          "pending-call rejection requires a running unused test control");
-    }
-    owner_->test_reject_next_handoff_pending_call = true;
-  }
-
-  void set_handoff_callback_holds_for_test(bool hold_activation,
-                                           bool hold_restoration) {
-    std::lock_guard<std::mutex> lock(owner_->mutex);
-    if (!owner_->test_clock_enabled || !owner_->started || owner_->closed) {
-      throw std::runtime_error(
-          "callback holds require a running deterministic test owner");
-    }
-    owner_->test_hold_handoff_callback_activation = hold_activation;
-    owner_->test_hold_handoff_callback_restoration = hold_restoration;
     owner_->condition.notify_all();
   }
 
@@ -3771,22 +3377,6 @@ public:
       owner_->admission_open = false;
       owner_->event_admission_open = false;
     }
-    if (!wait_for_consumed_handoff_callbacks_before_close()) {
-      std::lock_guard<std::mutex> lock(owner_->mutex);
-      if (!owner_->unclaimed_handoff_action_ids.empty() ||
-          !owner_->activated_handoff_action_ids.empty()) {
-        quarantine_all_locked(*owner_, FatalCode::kCloseWithRetainedInventory,
-                              nullptr,
-                              "owner close retained unresolved inventory");
-      } else if (owner_->handoff_callback_scheduled ||
-                 owner_->handoff_callback_active ||
-                 owner_->handoff_callback_restoring) {
-        enter_handoff_fatal_locked(
-            *owner_, FatalCode::kHandoffTimeout,
-            "owner close timed out consuming a terminal handoff callback");
-      }
-      throw std::runtime_error("owner close retained unresolved inventory");
-    }
     {
       std::lock_guard<std::mutex> lock(owner_->mutex);
       if (owner_->closed) {
@@ -3799,10 +3389,6 @@ public:
                       owner_->output_drain_active ||
                       !owner_->output_drain_action_ids.empty() ||
                       !owner_->unclaimed_handoff_action_ids.empty() ||
-                      !owner_->activated_handoff_action_ids.empty() ||
-                      owner_->handoff_callback_scheduled ||
-                      owner_->handoff_callback_active ||
-                      owner_->handoff_callback_restoring ||
                       !owner_->producers_joined;
       for (const auto &entry : owner_->lifecycles) {
         retained = retained || entry.second.live_resources != 0;
@@ -3879,10 +3465,6 @@ public:
   }
 
   void close_aborted() {
-    if (!wait_for_consumed_handoff_callbacks_before_close()) {
-      throw std::runtime_error(
-          "aborted close retained an unconsumed terminal callback");
-    }
     std::lock_guard<std::mutex> lock(owner_->mutex);
     if (owner_->closed) {
       return;
@@ -3896,11 +3478,7 @@ public:
         !owner_->fatal_output_queue.empty() ||
         owner_->output_drain_active ||
         !owner_->output_drain_action_ids.empty() ||
-        !owner_->unclaimed_handoff_action_ids.empty() ||
-        !owner_->activated_handoff_action_ids.empty() ||
-        owner_->handoff_callback_scheduled ||
-        owner_->handoff_callback_active ||
-        owner_->handoff_callback_restoring) {
+        !owner_->unclaimed_handoff_action_ids.empty()) {
       throw std::runtime_error(
           "aborted close retained unrouted terminal authority");
     }
@@ -3925,40 +3503,13 @@ public:
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
     owner_->unclaimed_handoff_action_ids.clear();
-    owner_->activated_handoff_action_ids.clear();
     owner_->output_drain_active = false;
-    const bool callback_live = owner_->handoff_callback_scheduled ||
-                               owner_->handoff_callback_active ||
-                               owner_->handoff_callback_restoring;
-    if (callback_live) {
-      owner_->abort_close_deferred = true;
-      owner_->handoff_callback_cancel_requested = true;
-      owner_->condition.notify_all();
-      return;
-    }
     close_owner_fds_locked(*owner_);
     owner_->closed = true;
     owner_->condition.notify_all();
   }
 
 private:
-  bool wait_for_consumed_handoff_callbacks_before_close() {
-    std::unique_lock<std::mutex> lock(owner_->mutex);
-    if (!owner_->unclaimed_handoff_action_ids.empty() ||
-        !owner_->activated_handoff_action_ids.empty()) {
-      return false;
-    }
-    const DeadlineSpec &shutdown = owner_->deadline_specs[
-        static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];
-    return owner_->condition.wait_for(
-        lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          return (!owner_->handoff_callback_scheduled &&
-                  !owner_->handoff_callback_active &&
-                  !owner_->handoff_callback_restoring) ||
-                 owner_->closed;
-        });
-  }
-
   static void add_trusted_issuers(const py::dict &registration,
                                   Lifecycle &lifecycle) {
     for (const py::handle item : py::cast<py::sequence>(
@@ -3974,7 +3525,7 @@ private:
   py::dict inventory_locked() const {
     if (!handoff_authority_is_consistent_locked(*owner_)) {
       throw std::runtime_error(
-          "activated terminal handoffs exceed unclaimed authority");
+          "unclaimed terminal handoff lacks pending action authority");
     }
     py::dict result;
     std::size_t active_source_count = 0;
@@ -4076,26 +3627,11 @@ private:
         owner_->unclaimed_handoff_action_ids.size();
     result["claimed_handoff_action_count"] = owner_->handoff_claim_count;
     result["discarded_handoff_action_count"] = owner_->handoff_discard_count;
-    result["handoff_callback_count"] = owner_->handoff_callback_count;
     result["source_batch_handoff_count"] =
         owner_->source_batch_handoff_count;
     result["source_batch_handoff_action_count"] =
         owner_->source_batch_handoff_action_count;
     result["handoff_enabled"] = owner_->handoff_enabled;
-    result["handoff_callback_scheduled"] =
-        owner_->handoff_callback_scheduled;
-    result["handoff_callback_active"] = owner_->handoff_callback_active;
-    result["handoff_callback_restoring"] =
-        owner_->handoff_callback_restoring;
-    result["scheduled_handoff_watermark"] =
-        owner_->scheduled_handoff_watermark;
-    result["active_handoff_watermark"] = owner_->active_handoff_watermark;
-    result["restoring_handoff_callback_id"] =
-        owner_->restoring_handoff_callback_id;
-    result["terminal_handoff_callback_id"] =
-        owner_->terminal_handoff_callback_id;
-    result["terminal_handoff_callback_state"] =
-        static_cast<int>(owner_->terminal_handoff_callback_state);
     result["output_drain_active"] = owner_->output_drain_active;
     result["producer_count"] = owner_->producers.size();
     py::list producers;
@@ -4235,9 +3771,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("claim_source_forward_independent_handoffs",
            &NativeTerminalOwnerBridge::claim_source_forward_independent_handoffs,
            py::arg("action_ids"))
-      .def("activate_forward_independent_handoff",
-           &NativeTerminalOwnerBridge::activate_forward_independent_handoff,
-           py::arg("action_id"))
       .def("fail_action_delivery",
            &NativeTerminalOwnerBridge::fail_action_delivery,
            py::arg("action_id"), py::arg("reason"),
@@ -4246,9 +3779,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("wait_for_lifecycle_registration",
            &NativeTerminalOwnerBridge::wait_for_lifecycle_registration,
            py::arg("binding_digest"), py::arg("timeout_seconds"))
-      .def("wait_for_forward_independent_handoff",
-           &NativeTerminalOwnerBridge::wait_for_forward_independent_handoff,
-           py::arg("timeout_seconds"))
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
       .def("wait_for_process_fatal",
            &NativeTerminalOwnerBridge::wait_for_process_fatal,
@@ -4260,11 +3790,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("now_ns"))
       .def("set_test_clock", &NativeTerminalOwnerBridge::set_test_clock,
            py::arg("now_ns"))
-      .def("reject_next_handoff_pending_call_for_test",
-           &NativeTerminalOwnerBridge::reject_next_handoff_pending_call_for_test)
-      .def("set_handoff_callback_holds_for_test",
-           &NativeTerminalOwnerBridge::set_handoff_callback_holds_for_test,
-           py::arg("hold_activation"), py::arg("hold_restoration"))
       .def("expire_deadlines_for_test",
            &NativeTerminalOwnerBridge::expire_deadlines_for_test)
       .def("abort_active_qualification_for_test",

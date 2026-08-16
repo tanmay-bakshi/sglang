@@ -263,19 +263,7 @@ class NativeTerminalOwnerFatalCode(enum.IntEnum):
     DEPENDENCY_DEATH = 14
     CLOSE_WITH_RETAINED_INVENTORY = 15
     INTERNAL_ERROR = 16
-    PENDING_CALL_QUEUE_FAILURE = 17
-    HANDOFF_TIMEOUT = 18
     HANDOFF_AUTHORITY = 19
-
-
-class NativeTerminalHandoffCallbackTerminalState(enum.IntEnum):
-    """Terminal disposition of the latest consumed callback generation."""
-
-    NONE = 0
-    RESTORED = 1
-    CANCELLED = 2
-    TIMED_OUT = 3
-    SCHEDULING_REJECTED = 4
 
 
 _ROLE_TO_NATIVE = {
@@ -1483,30 +1471,15 @@ class NativeTerminalOwnerInventory:
         native authority has not transferred into Python delivery ownership.
     :ivar claimed_handoff_action_count: Actions transferred into Python
         delivery ownership. Source batch claims precede inbox projection;
-        decode claims occur when the destination inbox accepts the action.
+        decode claims precede their destination-inbox wake.
     :ivar discarded_handoff_action_count: Handoffs discarded because bounded
         Python delivery failed before ownership transferred.
-    :ivar handoff_callback_count: Decode pending-call generations executed.
     :ivar source_batch_handoff_count: Exact source output-drain batches claimed
         atomically after their complete Python lease population became durable.
     :ivar source_batch_handoff_action_count: Source actions claimed through
         synchronous exact-batch transfers.
     :ivar handoff_enabled: Whether forward-independent delivery was enabled at
         startup.
-    :ivar handoff_callback_scheduled: Whether CPython owns a queued callback.
-    :ivar handoff_callback_active: Whether the main interpreter is currently
-        parked behind one captured callback generation.
-    :ivar handoff_callback_restoring: Whether a consumed callback is
-        reacquiring the GIL before recording its terminal disposition.
-    :ivar scheduled_handoff_watermark: Largest action captured by the queued
-        callback, or zero when none is scheduled.
-    :ivar active_handoff_watermark: Largest action captured by the active
-        callback, or zero when none is active.
-    :ivar restoring_handoff_callback_id: Callback generation currently
-        reacquiring the GIL, or zero when none is restoring.
-    :ivar terminal_handoff_callback_id: Latest callback generation with an
-        explicit terminal disposition.
-    :ivar terminal_handoff_callback_state: Disposition of that generation.
     :ivar registered_producer_count: Exact producer registry size.
     :ivar joined_producer_count: Producers explicitly joined at drain.
     :ivar active_source_count: Source generations with live resources.
@@ -1550,7 +1523,6 @@ class NativeTerminalOwnerInventory:
     unclaimed_handoff_action_count: int
     claimed_handoff_action_count: int
     discarded_handoff_action_count: int
-    handoff_callback_count: int
     source_batch_handoff_count: int
     source_batch_handoff_action_count: int
     registered_producer_count: int
@@ -1574,14 +1546,6 @@ class NativeTerminalOwnerInventory:
     observation_eventfd_open: bool
     output_drain_active: bool
     handoff_enabled: bool
-    handoff_callback_scheduled: bool
-    handoff_callback_active: bool
-    handoff_callback_restoring: bool
-    scheduled_handoff_watermark: int
-    active_handoff_watermark: int
-    restoring_handoff_callback_id: int
-    terminal_handoff_callback_id: int
-    terminal_handoff_callback_state: NativeTerminalHandoffCallbackTerminalState
     fatal_code: NativeTerminalOwnerFatalCode
     fatal_reason: str | None
     fatal_binding_digest: bytes | None
@@ -1607,7 +1571,6 @@ class NativeTerminalOwnerInventory:
             self.unclaimed_handoff_action_count,
             self.claimed_handoff_action_count,
             self.discarded_handoff_action_count,
-            self.handoff_callback_count,
             self.source_batch_handoff_count,
             self.source_batch_handoff_action_count,
             self.registered_producer_count,
@@ -1620,10 +1583,6 @@ class NativeTerminalOwnerInventory:
             self.transition_count,
             self.action_count,
             self.qualification_trace_count,
-            self.scheduled_handoff_watermark,
-            self.active_handoff_watermark,
-            self.restoring_handoff_callback_id,
-            self.terminal_handoff_callback_id,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("native inventory counts must be non-negative")
@@ -1665,38 +1624,12 @@ class NativeTerminalOwnerInventory:
             > self.source_batch_handoff_action_count
         ):
             raise ValueError("native source batch handoff accounting is inconsistent")
-        if self.handoff_callback_scheduled != (
-            self.scheduled_handoff_watermark > 0
-        ) or self.handoff_callback_active != (self.active_handoff_watermark > 0):
-            raise ValueError("native handoff callback state and watermark disagree")
-        if self.handoff_callback_restoring != (
-            self.restoring_handoff_callback_id > 0
-        ):
-            raise ValueError("native callback restoration state and identity disagree")
-        if type(self.terminal_handoff_callback_state) is not (
-            NativeTerminalHandoffCallbackTerminalState
-        ):
-            raise TypeError(
-                "terminal_handoff_callback_state must be a native terminal state"
-            )
-        if (
-            self.terminal_handoff_callback_state
-            is NativeTerminalHandoffCallbackTerminalState.NONE
-        ) != (self.terminal_handoff_callback_id == 0):
-            raise ValueError("native callback terminal state and identity disagree")
         if not self.handoff_enabled and (
             self.unclaimed_handoff_action_count != 0
             or self.claimed_handoff_action_count != 0
             or self.discarded_handoff_action_count != 0
-            or self.handoff_callback_count != 0
-            or self.handoff_callback_scheduled
-            or self.handoff_callback_active
-            or self.handoff_callback_restoring
             or self.source_batch_handoff_count != 0
             or self.source_batch_handoff_action_count != 0
-            or self.terminal_handoff_callback_id != 0
-            or self.terminal_handoff_callback_state
-            is not NativeTerminalHandoffCallbackTerminalState.NONE
         ):
             raise ValueError("disabled native handoff retains controller state")
         if type(self.quarantined_binding_digests) is not tuple or any(
@@ -1721,9 +1654,6 @@ class NativeTerminalOwnerInventory:
             self.observation_eventfd_open,
             self.output_drain_active,
             self.handoff_enabled,
-            self.handoff_callback_scheduled,
-            self.handoff_callback_active,
-            self.handoff_callback_restoring,
         )
         if any(type(value) is not bool for value in flags):
             raise TypeError("native inventory lifecycle flags must be bool values")
@@ -1758,9 +1688,6 @@ class NativeTerminalOwnerInventory:
                 or self.active_decode_count != 0
                 or self.armed_deadline_count != 0
                 or self.output_drain_active
-                or self.handoff_callback_scheduled
-                or self.handoff_callback_active
-                or self.handoff_callback_restoring
             ):
                 raise ValueError("closed native inventory retains active work")
             if (
@@ -1802,7 +1729,6 @@ class NativeTerminalOwnerInventory:
             unclaimed_handoff_action_count=int(value["unclaimed_handoff_action_count"]),
             claimed_handoff_action_count=int(value["claimed_handoff_action_count"]),
             discarded_handoff_action_count=int(value["discarded_handoff_action_count"]),
-            handoff_callback_count=int(value["handoff_callback_count"]),
             source_batch_handoff_count=int(value["source_batch_handoff_count"]),
             source_batch_handoff_action_count=int(
                 value["source_batch_handoff_action_count"]
@@ -1830,20 +1756,6 @@ class NativeTerminalOwnerInventory:
             observation_eventfd_open=bool(value["observation_eventfd_open"]),
             output_drain_active=bool(value["output_drain_active"]),
             handoff_enabled=bool(value["handoff_enabled"]),
-            handoff_callback_scheduled=bool(value["handoff_callback_scheduled"]),
-            handoff_callback_active=bool(value["handoff_callback_active"]),
-            handoff_callback_restoring=bool(value["handoff_callback_restoring"]),
-            scheduled_handoff_watermark=int(value["scheduled_handoff_watermark"]),
-            active_handoff_watermark=int(value["active_handoff_watermark"]),
-            restoring_handoff_callback_id=int(
-                value["restoring_handoff_callback_id"]
-            ),
-            terminal_handoff_callback_id=int(value["terminal_handoff_callback_id"]),
-            terminal_handoff_callback_state=(
-                NativeTerminalHandoffCallbackTerminalState(
-                    int(value["terminal_handoff_callback_state"])
-                )
-            ),
             fatal_code=NativeTerminalOwnerFatalCode(int(value["fatal_code"])),
             fatal_reason=(None if len(fatal_reason_value) == 0 else fatal_reason_value),
             fatal_binding_digest=fatal_binding_digest,

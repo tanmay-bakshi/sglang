@@ -27,7 +27,6 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NATIVE_SOURCE_RESOURCE_MASK,
     NativeSourceLifecyclePhase,
-    NativeTerminalHandoffCallbackTerminalState,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
@@ -1140,10 +1139,10 @@ def test_source_fatal_before_delivery_acquisition_allocates_no_authority(
         assert begin_delivery_bindings == []
         assert work_labels == ["quarantine"]
         assert final_inventory.runtime.owner.source_batch_handoff_count == 0
-        assert final_inventory.runtime.owner.handoff_callback_count == 0
         assert final_inventory.runtime.consumer_pending_count == 0
         assert final_inventory.runtime.source_preclaimed_count == 0
         assert final_inventory.runtime.source_preclaimed_consumer_count == 0
+        assert final_inventory.runtime.decode_publication_preclaimed_count == 0
         assert final_inventory.delivery_leases.active_binding_digests == ()
         assert final_inventory.scheduler_serving.inbox.active_delivery_intents == ()
     finally:
@@ -1653,10 +1652,6 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
                 assert owner.claimed_handoff_action_count == 1
                 assert owner.source_batch_handoff_count == 1
                 assert owner.source_batch_handoff_action_count == 1
-                assert owner.handoff_callback_count == 0
-                assert not owner.handoff_callback_scheduled
-                assert not owner.handoff_callback_active
-                assert not owner.handoff_callback_restoring
                 assert serving._delivery_leases.inventory().active_binding_digests == (
                     identity.local_binding.digest,
                 )
@@ -2816,16 +2811,9 @@ def test_full_source_composition_retires_exactly_once(
         owner = final_inventory.runtime.owner
         assert owner.source_batch_handoff_count == 5
         assert owner.source_batch_handoff_action_count == 5
-        assert owner.handoff_callback_count == 0
-        assert not owner.handoff_callback_scheduled
-        assert not owner.handoff_callback_active
-        assert not owner.handoff_callback_restoring
-        assert (
-            owner.terminal_handoff_callback_state
-            is NativeTerminalHandoffCallbackTerminalState.NONE
-        )
         assert final_inventory.runtime.source_preclaimed_count == 0
         assert final_inventory.runtime.source_preclaimed_consumer_count == 0
+        assert final_inventory.runtime.decode_publication_preclaimed_count == 0
         serving.close_clean(_WAIT_SECONDS)
         serving_closed = True
     finally:

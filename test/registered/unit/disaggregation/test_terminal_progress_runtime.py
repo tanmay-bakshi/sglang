@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -19,7 +20,6 @@ from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
-    NativeTerminalHandoffCallbackTerminalState,
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
@@ -526,6 +526,34 @@ def _drain_direct_decode_scatter(
     return actions[0]
 
 
+def _submit_runtime_decode_scatter(
+    runtime: NativeTerminalRuntime,
+    registration: NativeTerminalLifecycleRegistration,
+) -> None:
+    """Earn one decode-scatter action through a composed runtime.
+
+    :param runtime: Running decode runtime.
+    :param registration: Registered decode lifecycle.
+    """
+
+    binding_digest = registration.binding.digest
+    runtime.submit(
+        _LOCAL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+    )
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+    )
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+    )
+
+
 def _wait_for_owner_inventory(
     owner: NativeTerminalOwner,
     predicate: Callable[[NativeTerminalOwnerInventory], bool],
@@ -699,21 +727,12 @@ def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
 
 
 def _finish_handoff_runtime(runtime: NativeTerminalRuntime) -> None:
-    """Drive fail-closed cleanup from a non-main consumer context.
-
-    A pending-call callback can only run on the main interpreter thread. The
-    cleanup worker therefore remains able to consume final quarantine actions
-    even when the callback is queued while the main thread waits for it.
+    """Drive exact fail-closed cleanup for a handoff-enabled runtime.
 
     :param runtime: Handoff-enabled runtime requiring exact cleanup.
     """
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_finish_fail_closed, runtime)
-        expires_at = time.monotonic() + _WAIT_SECONDS
-        while not future.done() and time.monotonic() < expires_at:
-            pass
-        future.result(timeout=_WAIT_SECONDS)
+    _finish_fail_closed(runtime)
 
 
 def _complete_source(
@@ -1101,10 +1120,6 @@ def test_source_batch_claim_does_not_borrow_downstream_lock() -> None:
             snapshot = runtime.snapshot()
             assert snapshot.owner.unclaimed_handoff_action_count == 0
             assert snapshot.owner.claimed_handoff_action_count == 1
-            assert snapshot.owner.handoff_callback_count == 0
-            assert snapshot.owner.terminal_handoff_callback_state is (
-                NativeTerminalHandoffCallbackTerminalState.NONE
-            )
             assert snapshot.consumer_pending_count == 1
             scheduler_owned_lock.release()
             gather_future.result(timeout=_WAIT_SECONDS)
@@ -1154,12 +1169,6 @@ def test_exact_source_batch_rejection_is_atomic(invalid_case: str) -> None:
         assert inventory.claimed_handoff_action_count == 0
         assert inventory.source_batch_handoff_count == 0
         assert inventory.source_batch_handoff_action_count == 0
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
-        assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.NONE
-        )
     finally:
         owner.abort_and_close()
 
@@ -1182,13 +1191,6 @@ def test_exact_source_batch_claims_complete_multi_action_population(
         assert inventory.claimed_handoff_action_count == len(actions)
         assert inventory.source_batch_handoff_count == 1
         assert inventory.source_batch_handoff_action_count == len(actions)
-        assert inventory.handoff_callback_count == 0
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
-        assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.NONE
-        )
 
         for action in actions:
             owner.acknowledge_action(action)
@@ -1197,367 +1199,383 @@ def test_exact_source_batch_claims_complete_multi_action_population(
         owner.abort_and_close()
 
 
-def test_decode_pending_call_rejection_is_fatal_and_discards_functional_work() -> (
-    None
-):
-    """Generic decode activation distinguishes rejection from a won claim."""
-
-    owner, registration = _direct_decode_handoff_owner(86)
-    try:
-        action = _drain_direct_decode_scatter(owner, registration)
-        owner.reject_next_handoff_pending_call_for_testing()
-        with pytest.raises(
-            RuntimeError,
-            match="terminal handoff pending-call scheduling failed",
-        ):
-            owner.activate_forward_independent_handoff(action)
-
-        rejected = owner.inventory()
-        assert rejected.fatal_code is (
-            NativeTerminalOwnerFatalCode.PENDING_CALL_QUEUE_FAILURE
-        )
-        assert rejected.unclaimed_handoff_action_count == 0
-        assert rejected.claimed_handoff_action_count == 0
-        assert rejected.discarded_handoff_action_count == 1
-        assert not rejected.handoff_callback_scheduled
-        assert not rejected.handoff_callback_active
-        assert not rejected.handoff_callback_restoring
-
-        owner.fail_action_delivery(
-            action,
-            "discard decode work after pending-call scheduling rejection",
-        )
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: inventory.queued_fatal_output_count == 1,
-        )
-        fatal_actions = tuple(
-            current
-            for output in owner.drain_outputs()
-            for current in output.actions
-        )
-        assert tuple(current.kind for current in fatal_actions) == (
-            NativeTerminalOwnerActionKind.PROCESS_FATAL,
-        )
-        for fatal_action in fatal_actions:
-            owner.acknowledge_action(fatal_action)
-
-        drained = owner.inventory()
-        assert drained.pending_action_count == 0
-        assert drained.unclaimed_handoff_action_count == 0
-        assert drained.claimed_handoff_action_count == 0
-        assert drained.discarded_handoff_action_count == 1
-        assert drained.fatal_code is (
-            NativeTerminalOwnerFatalCode.PENDING_CALL_QUEUE_FAILURE
-        )
-    finally:
-        owner.abort_and_close()
-
-
-def test_decode_activation_rejection_precedes_inbox_publication() -> None:
-    """A composed decode runtime never publishes rejected handoff work."""
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_claimed", "expected_discarded"),
+    (
+        ("before_claim", 0, 1),
+        ("after_claim", 1, 0),
+        ("enqueue", 1, 0),
+    ),
+)
+def test_decode_publication_failure_exposes_no_consumer_work(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    expected_claimed: int,
+    expected_discarded: int,
+) -> None:
+    """Every failed publication rolls back Python authority before its wake."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.DECODE,
         enable_forward_independent_handoff=True,
-        testing=True,
+    )
+    registration = _registration(owner, remote, 86)
+    original_claim = runtime._owner.claim_forward_independent_handoff
+
+    def fail_before_claim(action: NativeTerminalOwnerAction) -> None:
+        """Fail without mutating native authority.
+
+        :param action: Exact decode action entering publication.
+        """
+
+        raise RuntimeError(f"synthetic pre-claim failure for {action.action_id}")
+
+    def fail_after_claim(action: NativeTerminalOwnerAction) -> None:
+        """Fail after the real native claim commits.
+
+        :param action: Exact decode action entering publication.
+        """
+
+        original_claim(action)
+        raise RuntimeError(f"synthetic post-claim failure for {action.action_id}")
+
+    if failure_mode == "before_claim":
+        monkeypatch.setattr(
+            runtime._owner,
+            "claim_forward_independent_handoff",
+            fail_before_claim,
+        )
+    elif failure_mode == "after_claim":
+        monkeypatch.setattr(
+            runtime._owner,
+            "claim_forward_independent_handoff",
+            fail_after_claim,
+        )
+    else:
+
+        def fail_enqueue(action: NativeTerminalOwnerAction) -> None:
+            """Reject the destination wake after native claim.
+
+            :param action: Exact decode action entering its destination.
+            """
+
+            raise NativeTerminalRuntimeError(
+                f"synthetic decode inbox failure for {action.action_id}"
+            )
+
+        monkeypatch.setattr(runtime._decode_scatter_actions, "_enqueue", fail_enqueue)
+
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        _submit_runtime_decode_scatter(runtime, registration)
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+
+        snapshot = runtime.snapshot()
+        assert snapshot.fatal_reason is not None
+        assert runtime.decode_scatter_actions.snapshot().queued_count == 0
+        assert snapshot.decode_publication_preclaimed_count == 0
+        assert snapshot.owner.unclaimed_handoff_action_count == 0
+        assert snapshot.owner.claimed_handoff_action_count == expected_claimed
+        assert snapshot.owner.discarded_handoff_action_count == expected_discarded
+        assert all(
+            action.kind is not NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
+            for action in runtime._consumer_pending.values()
+        )
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_decode_publication_preclaim_is_atomic_for_an_awakened_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inbox wake cannot expose work before its exact preclaim is durable."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
     )
     registration = _registration(owner, remote, 87)
-    runtime._owner.enable_test_clock(_TEST_CLOCK_NS)
-    runtime.start()
-    try:
-        runtime.register_lifecycle(registration)
-        runtime._owner.reject_next_handoff_pending_call_for_testing()
-        binding_digest = registration.binding.digest
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
-            enqueued_ns=_TEST_CLOCK_NS - 3,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
-            enqueued_ns=_TEST_CLOCK_NS - 2,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
-            enqueued_ns=_TEST_CLOCK_NS - 1,
-        )
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    original_enqueue = runtime._decode_scatter_actions._enqueue
 
-        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
-        snapshot = runtime.snapshot()
-        assert snapshot.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
-        assert runtime.decode_scatter_actions.snapshot().queued_count == 0
-        assert snapshot.owner.unclaimed_handoff_action_count == 0
-        assert snapshot.owner.claimed_handoff_action_count == 0
-        assert snapshot.owner.discarded_handoff_action_count == 1
-        assert snapshot.owner.handoff_callback_count == 0
-        assert not snapshot.owner.handoff_callback_scheduled
-        assert not snapshot.owner.handoff_callback_active
-        assert not snapshot.owner.handoff_callback_restoring
-        fatal_actions = _drain_actions(runtime.lifecycle_actions)
-        assert tuple(action.kind for action in fatal_actions) == (
-            NativeTerminalOwnerActionKind.PROCESS_FATAL,
-        )
-        runtime.acknowledge_aborted_action(fatal_actions[0])
-        assert runtime.snapshot().consumer_pending_count == 0
-    finally:
-        _finish_handoff_runtime(runtime)
+    def hold_after_enqueue(action: NativeTerminalOwnerAction) -> None:
+        """Hold the transaction after the wake becomes readable.
 
-
-def test_native_abort_before_decode_activation_projects_no_functional_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Native fatality closes decode activation before inbox publication."""
-
-    runtime, owner, remote = _runtime(
-        TerminalOwnerRole.DECODE,
-        enable_forward_independent_handoff=True,
-    )
-    registration = _registration(owner, remote, 88)
-    activation_entered = threading.Event()
-    release_activation = threading.Event()
-    original_activation = runtime._owner.activate_forward_independent_handoff
-
-    def pause_before_activation(action: NativeTerminalOwnerAction) -> bool:
-        """Expose the native-fatal to decode-activation ordering.
-
-        :param action: Exact decode action about to activate.
-        :returns: Native activation disposition after the race release.
+        :param action: Exact decode action durably queued by the real inbox.
         """
 
-        activation_entered.set()
-        if not release_activation.wait(_WAIT_SECONDS):
-            raise TimeoutError("decode activation was not released")
-        return original_activation(action)
+        original_enqueue(action)
+        publication_entered.set()
+        if not release_publication.wait(_WAIT_SECONDS):
+            raise TimeoutError("decode publication transaction was not released")
 
     monkeypatch.setattr(
-        runtime._owner,
-        "activate_forward_independent_handoff",
-        pause_before_activation,
+        runtime._decode_scatter_actions,
+        "_enqueue",
+        hold_after_enqueue,
     )
     runtime.start()
     try:
         runtime.register_lifecycle(registration)
-        binding_digest = registration.binding.digest
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
-        )
-        assert activation_entered.wait(_WAIT_SECONDS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            consumer = executor.submit(_drain_actions, runtime.decode_scatter_actions)
+            _submit_runtime_decode_scatter(runtime, registration)
+            assert publication_entered.wait(_WAIT_SECONDS)
+            assert not consumer.done()
+            condition_acquired = runtime._condition.acquire(blocking=False)
+            if condition_acquired:
+                runtime._condition.release()
+            assert not condition_acquired
 
-        runtime._owner.begin_abort()
-        native_fatal = runtime._owner.inventory()
-        assert native_fatal.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-        release_activation.set()
+            release_publication.set()
+            actions = consumer.result(timeout=_WAIT_SECONDS)
 
-        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        assert len(actions) == 1
         snapshot = runtime.snapshot()
-        assert snapshot.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
-        assert snapshot.owner.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-        assert runtime.decode_scatter_actions.snapshot().queued_count == 0
-        assert snapshot.owner.handoff_callback_count == 0
+        assert snapshot.decode_publication_preclaimed_count == 0
         assert snapshot.owner.unclaimed_handoff_action_count == 0
-        assert snapshot.owner.claimed_handoff_action_count == 0
-        assert snapshot.owner.discarded_handoff_action_count == 1
-        fatal_actions = _drain_actions(runtime.lifecycle_actions)
-        assert tuple(action.kind for action in fatal_actions) == (
-            NativeTerminalOwnerActionKind.PROCESS_FATAL,
-        )
-        runtime.acknowledge_aborted_action(fatal_actions[0])
-        assert runtime.snapshot().consumer_pending_count == 0
-    finally:
-        release_activation.set()
-        _finish_handoff_runtime(runtime)
-
-
-def test_decode_activation_and_projection_linearize_before_runtime_fatal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime fatality cannot enter between activation and publication."""
-
-    runtime, owner, remote = _runtime(
-        TerminalOwnerRole.DECODE,
-        enable_forward_independent_handoff=True,
-    )
-    registration = _registration(owner, remote, 89)
-    activation_entered = threading.Event()
-    release_activation = threading.Event()
-
-    def hold_activation(action: NativeTerminalOwnerAction) -> bool:
-        """Hold the exact activation-to-projection boundary.
-
-        :param action: Decode action being made forward-independent.
-        :returns: ``True`` after the test releases activation.
-        """
-
-        assert action.kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
-        activation_entered.set()
-        if not release_activation.wait(_WAIT_SECONDS):
-            raise TimeoutError("decode activation was not released")
-        return True
-
-    monkeypatch.setattr(
-        runtime._owner,
-        "activate_forward_independent_handoff",
-        hold_activation,
-    )
-    runtime.start()
-    try:
-        runtime.register_lifecycle(registration)
-        binding_digest = registration.binding.digest
-        runtime.submit(
-            _LOCAL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
-        )
-        runtime.submit(
-            _REMOTE_CONTROL_PRODUCER_ID,
-            binding_digest,
-            NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
-        )
-        assert activation_entered.wait(_WAIT_SECONDS)
-
-        condition_acquired = runtime._condition.acquire(blocking=False)
-        if condition_acquired:
-            runtime._condition.release()
-        assert not condition_acquired
-
-        release_activation.set()
+        assert snapshot.owner.claimed_handoff_action_count == 1
         with runtime._condition:
-            assert runtime.decode_scatter_actions.snapshot().queued_count == 1
-            assert len(runtime._consumer_pending) == 1
-            runtime._enter_runtime_fatal_locked(
-                "synthetic fatal after decode activation linearization"
-            )
+            assert actions[0].action_id in runtime._inbox_claimed_action_ids
+        runtime.acknowledge_consumed_action(actions[0])
+    finally:
+        release_publication.set()
+        _finish_handoff_runtime(runtime)
+
+
+def test_busy_consumer_does_not_gate_later_decode_publication() -> None:
+    """Later decode work reaches its inbox while earlier work remains queued."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    registrations = (
+        _registration(owner, remote, 88),
+        _registration(owner, remote, 89),
+    )
+    runtime.start()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+            _submit_runtime_decode_scatter(runtime, registration)
+
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.decode_scatter_actions.snapshot().queued_count != 2
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.decode_scatter_actions.snapshot().queued_count == 2
+        snapshot = runtime.snapshot()
+        assert snapshot.decode_publication_preclaimed_count == 2
+        assert snapshot.owner.claimed_handoff_action_count == 2
+        assert snapshot.owner.unclaimed_handoff_action_count == 0
+
+        for action in _drain_actions(runtime.decode_scatter_actions):
+            runtime.acknowledge_consumed_action(action)
+        assert runtime.snapshot().decode_publication_preclaimed_count == 0
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_sibling_routing_failure_preserves_decode_retirement_preclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling failure preserves real native retirement authority."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 91)
+    routed_retirement: list[NativeTerminalOwnerAction] = []
+    original_route_output = runtime._route_output
+    original_project = runtime._project_action
+
+    def reject_sibling_projection(action: NativeTerminalOwnerAction) -> None:
+        """Fail the first action before it acquires a consumer.
+
+        :param action: Exact action entering output projection.
+        """
+
+        if action.kind is NativeTerminalOwnerActionKind.REQUEST_QUARANTINED:
+            raise NativeTerminalRuntimeError("synthetic sibling routing failure")
+        original_project(action)
+
+    def route_with_failing_sibling(output: NativeTerminalOwnerOutput) -> None:
+        """Prepend one decode-valid routing failure to a native retirement.
+
+        The retirement itself is earned by the real native reducer. Only the
+        synthetic sibling exists to enter the generic post-failure lifecycle
+        branch, which native decode outputs do not otherwise batch today.
+
+        :param output: Real native decode-cancellation output.
+        """
+
+        assert len(output.actions) == 1
+        retirement = output.actions[0]
+        assert retirement.kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
+        routed_retirement.append(retirement)
+        sibling = NativeTerminalOwnerAction(
+            action_id=retirement.action_id + 1_000_000,
+            kind=NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            binding=retirement.binding,
+            commit_timestamp_ns=retirement.commit_timestamp_ns,
+            receipt=None,
+        )
+        original_route_output(
+            dataclasses.replace(output, actions=(sibling, retirement))
+        )
+
+    monkeypatch.setattr(runtime, "_project_action", reject_sibling_projection)
+    monkeypatch.setattr(runtime, "_route_output", route_with_failing_sibling)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        runtime.submit(
+            _LOCAL_PRODUCER_ID,
+            registration.binding.digest,
+            NativeTerminalOwnerEventKind.DECODE_CANCEL_UNPUBLISHED,
+        )
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+
+        assert len(routed_retirement) == 1
+        retirement = routed_retirement[0]
+        snapshot = runtime.snapshot()
+        assert snapshot.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
+        assert snapshot.decode_publication_preclaimed_count == 1
+        native_inventory = snapshot.owner
+        assert native_inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert native_inventory.pending_action_count == 0
+        assert native_inventory.unclaimed_handoff_action_count == 0
+        assert native_inventory.claimed_handoff_action_count == 1
+        assert native_inventory.discarded_handoff_action_count == 0
+
+        actions = _drain_actions(runtime.lifecycle_actions)
+        assert actions == (retirement,)
+        assert runtime.snapshot().decode_publication_preclaimed_count == 0
+        runtime.acknowledge_aborted_action(retirement)
+        assert runtime.snapshot().consumer_pending_count == 0
+    finally:
+        monkeypatch.undo()
+        _finish_handoff_runtime(runtime)
+
+
+def test_native_abort_racing_decode_publication_preserves_exact_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native abort before claim still leaves one conservable Python owner."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 90)
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    original_claim = runtime._owner.claim_forward_independent_handoff
+
+    def hold_claim(action: NativeTerminalOwnerAction) -> None:
+        """Expose native abort immediately before the publication claim.
+
+        :param action: Exact decode action entering publication.
+        """
+
+        claim_entered.set()
+        if not release_claim.wait(_WAIT_SECONDS):
+            raise TimeoutError("decode claim race was not released")
+        original_claim(action)
+
+    monkeypatch.setattr(
+        runtime._owner,
+        "claim_forward_independent_handoff",
+        hold_claim,
+    )
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        _submit_runtime_decode_scatter(runtime, registration)
+        assert claim_entered.wait(_WAIT_SECONDS)
+        assert runtime.decode_scatter_actions.snapshot().queued_count == 0
+        runtime._owner.begin_abort()
+        release_claim.set()
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
 
         actions = _drain_actions(runtime.decode_scatter_actions)
         assert len(actions) == 1
-        runtime.acknowledge_aborted_action(actions[0])
         snapshot = runtime.snapshot()
-        assert snapshot.consumer_pending_count == 0
-        assert snapshot.owner.unclaimed_handoff_action_count == 0
+        assert (
+            snapshot.owner.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
+        )
         assert snapshot.owner.claimed_handoff_action_count == 1
+        assert snapshot.decode_publication_preclaimed_count == 0
+        runtime.begin_abort("reconcile native abort after publication")
+        runtime.acknowledge_aborted_action(actions[0])
     finally:
-        release_activation.set()
+        release_claim.set()
         _finish_handoff_runtime(runtime)
 
 
-def test_decode_handoff_schedules_next_generation_during_restoration() -> None:
-    """Generic decode restoration does not masquerade as a source batch."""
+def test_runtime_abort_after_decode_publication_consumes_preclaim_once() -> None:
+    """Abort after the publication transaction preserves one downstream owner."""
 
-    owner, registration = _direct_decode_handoff_owner(88)
-    scatter = _drain_direct_decode_scatter(owner, registration)
-    owner.set_handoff_callback_holds_for_testing(
-        hold_activation=False,
-        hold_restoration=True,
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
     )
-
-    def drive_both_generations() -> NativeTerminalOwnerInventory:
-        """Claim two decode actions across the first callback restoration.
-
-        :returns: Quiescent native controller inventory.
-        """
-
-        assert owner.activate_forward_independent_handoff(scatter)
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: inventory.handoff_callback_active,
-        )
-        owner.claim_forward_independent_handoff(scatter)
-        owner.acknowledge_action(scatter)
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: inventory.handoff_callback_restoring,
-        )
-
-        for kind in (
-            NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
-            NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
-        ):
-            owner.submit(
-                NativeTerminalOwnerEvent(
-                    producer_id=_LOCAL_PRODUCER_ID,
-                    binding_digest=registration.binding.digest,
-                    kind=kind,
-                    enqueued_ns=_TEST_CLOCK_NS,
-                )
-            )
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: inventory.queued_output_count == 1,
-        )
-        teardown_actions = tuple(
-            action for output in owner.drain_outputs() for action in output.actions
-        )
-        assert len(teardown_actions) == 1
-        teardown = teardown_actions[0]
-        assert teardown.kind is NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY
-
-        assert owner.activate_forward_independent_handoff(teardown)
-        overlapping = owner.inventory()
-        assert overlapping.fatal_code is NativeTerminalOwnerFatalCode.NONE
-        assert overlapping.handoff_callback_restoring
-        assert overlapping.handoff_callback_scheduled
-        owner.claim_forward_independent_handoff(teardown)
-        owner.acknowledge_action(teardown)
-        owner.set_handoff_callback_holds_for_testing(
-            hold_activation=False,
-            hold_restoration=False,
-        )
-        return _wait_for_owner_inventory(
-            owner,
-            lambda inventory: (
-                inventory.handoff_callback_count == 2
-                and not inventory.handoff_callback_scheduled
-                and not inventory.handoff_callback_active
-                and not inventory.handoff_callback_restoring
-            ),
-        )
-
+    registration = _registration(owner, remote, 92)
+    runtime.start()
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(drive_both_generations)
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while not future.done() and time.monotonic() < expires_at:
-                pass
-            inventory = future.result(timeout=_WAIT_SECONDS)
-        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.NONE
-        assert inventory.pending_action_count == 0
-        assert inventory.unclaimed_handoff_action_count == 0
-        assert inventory.claimed_handoff_action_count == 2
-        assert inventory.source_batch_handoff_count == 0
-        assert inventory.source_batch_handoff_action_count == 0
-        assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.RESTORED
-        )
+        runtime.register_lifecycle(registration)
+        _submit_runtime_decode_scatter(runtime, registration)
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.decode_scatter_actions.snapshot().queued_count == 0
+            and time.monotonic() < expires_at
+        ):
+            pass
+        before_abort = runtime.snapshot()
+        assert before_abort.decode_publication_preclaimed_count == 1
+        assert before_abort.owner.claimed_handoff_action_count == 1
+
+        runtime.begin_abort("synthetic abort after decode publication")
+        actions = _drain_actions(runtime.decode_scatter_actions)
+        assert len(actions) == 1
+        assert runtime.snapshot().decode_publication_preclaimed_count == 0
+        runtime.acknowledge_aborted_action(actions[0])
+        assert not runtime.acknowledge_aborted_action_if_pending(actions[0])
     finally:
-        if not owner.inventory().closed:
-            owner.set_handoff_callback_holds_for_testing(
-                hold_activation=False,
-                hold_restoration=False,
-            )
-        owner.abort_and_close()
+        _finish_handoff_runtime(runtime)
+
+
+def test_production_handoff_has_no_pending_call_surface() -> None:
+    """Production handoff code contains no main-thread callback rendezvous."""
+
+    terminal_progress = (
+        Path(__file__).resolve().parents[4]
+        / "python"
+        / "sglang"
+        / "srt"
+        / "disaggregation"
+        / "terminal_progress"
+    )
+    sources = (
+        terminal_progress / "native_owner_bridge.cpp",
+        terminal_progress / "native_owner.py",
+        terminal_progress / "runtime.py",
+    )
+    forbidden = (
+        "Py_AddPendingCall",
+        "activate_forward_independent_handoff",
+        "wait_for_forward_independent_handoff",
+        "handoff_callback",
+    )
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        assert all(token not in text for token in forbidden), source
 
 
 def test_exact_source_batch_claim_survives_later_abort() -> None:
@@ -1571,7 +1589,6 @@ def test_exact_source_batch_claim_survives_later_abort() -> None:
         assert claimed.claimed_handoff_action_count == len(actions)
         assert claimed.source_batch_handoff_count == 1
         assert claimed.source_batch_handoff_action_count == len(actions)
-        assert claimed.handoff_callback_count == 0
 
         owner.abort_and_close()
         closed = owner.inventory()
@@ -1582,10 +1599,6 @@ def test_exact_source_batch_claim_survives_later_abort() -> None:
         assert closed.claimed_handoff_action_count == len(actions)
         assert closed.source_batch_handoff_count == 1
         assert closed.source_batch_handoff_action_count == len(actions)
-        assert closed.handoff_callback_count == 0
-        assert closed.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.NONE
-        )
     finally:
         owner.abort_and_close()
 
@@ -1607,7 +1620,6 @@ def test_abort_before_exact_source_batch_claim_transfers_no_authority() -> None:
     assert inventory.claimed_handoff_action_count == 0
     assert inventory.source_batch_handoff_count == 0
     assert inventory.source_batch_handoff_action_count == 0
-    assert inventory.handoff_callback_count == 0
 
 
 def test_later_arrivals_form_a_distinct_exact_source_batch() -> None:
@@ -1630,7 +1642,6 @@ def test_later_arrivals_form_a_distinct_exact_source_batch() -> None:
         assert first_claimed.claimed_handoff_action_count == 1
         assert first_claimed.source_batch_handoff_count == 1
         assert first_claimed.source_batch_handoff_action_count == 1
-        assert first_claimed.handoff_callback_count == 0
 
         owner.acknowledge_action(first_actions[0])
         later_actions = tuple(
@@ -1647,10 +1658,6 @@ def test_later_arrivals_form_a_distinct_exact_source_batch() -> None:
         assert inventory.claimed_handoff_action_count == 3
         assert inventory.source_batch_handoff_count == 2
         assert inventory.source_batch_handoff_action_count == 3
-        assert inventory.handoff_callback_count == 0
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
     finally:
         owner.abort_and_close()
 
@@ -1688,67 +1695,6 @@ def test_scheduler_actions_never_enter_the_forward_independent_handoff() -> None
         assert snapshot.owner.unclaimed_handoff_action_count == 0
     finally:
         _finish_handoff_runtime(runtime)
-
-
-def test_direct_decode_claim_may_win_before_generic_activation() -> None:
-    """A direct decode claim makes later generic activation a clean no-op."""
-
-    owner, registration = _direct_decode_handoff_owner(68)
-    try:
-        action = _drain_direct_decode_scatter(owner, registration)
-        before_claim = owner.inventory()
-        assert before_claim.unclaimed_handoff_action_count == 1
-        assert before_claim.claimed_handoff_action_count == 0
-        assert not before_claim.handoff_callback_scheduled
-
-        owner.claim_forward_independent_handoff(action)
-        assert not owner.activate_forward_independent_handoff(action)
-        owner.acknowledge_action(action)
-
-        after_activation = owner.inventory()
-        assert after_activation.unclaimed_handoff_action_count == 0
-        assert after_activation.claimed_handoff_action_count == 1
-        assert after_activation.discarded_handoff_action_count == 0
-        assert after_activation.handoff_callback_count == 0
-        assert not after_activation.handoff_callback_scheduled
-        assert not after_activation.handoff_callback_active
-    finally:
-        owner.abort_and_close()
-
-
-def test_source_generic_activation_fails_closed_but_direct_claim_remains() -> None:
-    """Source can reconcile directly but cannot re-enter post-route activation."""
-
-    owner, registration = _direct_handoff_owner(68)
-    try:
-        _submit_direct_source_gather(owner, registration)
-        with selectors.DefaultSelector() as selector:
-            selector.register(owner.output_fileno(), selectors.EVENT_READ)
-            assert len(selector.select(_WAIT_SECONDS)) == 1
-        actions = tuple(
-            action for output in owner.drain_outputs() for action in output.actions
-        )
-        assert len(actions) == 1
-        action = actions[0]
-
-        with pytest.raises(RuntimeError, match="requires a decode-role owner"):
-            owner.activate_forward_independent_handoff(action)
-
-        rejected = owner.inventory()
-        assert rejected.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_AUTHORITY
-        assert rejected.unclaimed_handoff_action_count == 1
-        assert rejected.claimed_handoff_action_count == 0
-        assert not rejected.handoff_callback_scheduled
-        assert not rejected.handoff_callback_active
-        assert not rejected.handoff_callback_restoring
-
-        owner.claim_forward_independent_handoff(action)
-        owner.acknowledge_action(action)
-        reconciled = owner.inventory()
-        assert reconciled.unclaimed_handoff_action_count == 0
-        assert reconciled.claimed_handoff_action_count == 1
-    finally:
-        owner.abort_and_close()
 
 
 def test_delivery_failure_discards_unclaimed_handoff_authority() -> None:
@@ -1907,102 +1853,6 @@ def test_failed_claim_excludes_preclaimed_duplicate_from_local_authority() -> No
         runtime.acknowledge_consumed_action(error.locally_claimed_actions[0])
     finally:
         _finish_fail_closed(runtime)
-
-
-def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
-    """An unconsumed decode callback expires into process-fatal authority."""
-
-    owner, registration = _direct_decode_handoff_owner(66)
-    initial_action = _drain_direct_decode_scatter(owner, registration)
-    previous_switch_interval = sys.getswitchinterval()
-    output_queued = threading.Event()
-    try:
-
-        def expire_active_handoff() -> tuple[NativeTerminalOwnerAction, ...]:
-            before_activation = owner.inventory()
-            assert before_activation.unclaimed_handoff_action_count == 1
-            assert not before_activation.handoff_callback_scheduled
-            assert not before_activation.handoff_callback_active
-            assert owner.activate_forward_independent_handoff(initial_action)
-            owner.acknowledge_action(initial_action)
-            output_queued.set()
-            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
-            owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
-            assert owner.wait_for_process_fatal(_WAIT_SECONDS)
-            fatal_actions = tuple(
-                action for output in owner.drain_outputs() for action in output.actions
-            )
-            for action in fatal_actions:
-                owner.acknowledge_action(action)
-            owner.claim_forward_independent_handoff(initial_action)
-            return (initial_action, *fatal_actions)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            expiry_future = executor.submit(expire_active_handoff)
-            sys.setswitchinterval(0.005)
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while not output_queued.is_set() and time.monotonic() < expires_at:
-                pass
-            assert output_queued.is_set()
-            actions = expiry_future.result(timeout=_WAIT_SECONDS)
-            sys.setswitchinterval(previous_switch_interval)
-
-        inventory = owner.inventory()
-        assert len(actions) == 2
-        assert any(
-            action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
-            for action in actions
-        )
-        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_TIMEOUT
-        assert inventory.unclaimed_handoff_action_count == 0
-        assert inventory.claimed_handoff_action_count == 1
-        assert inventory.handoff_callback_count == 1
-    finally:
-        sys.setswitchinterval(previous_switch_interval)
-        owner.abort_and_close()
-
-
-def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
-    """Clean close cannot discard unclaimed scheduler-handoff authority."""
-
-    owner, registration = _direct_decode_handoff_owner(67)
-    initial_action = _drain_direct_decode_scatter(owner, registration)
-    previous_switch_interval = sys.getswitchinterval()
-    output_queued = threading.Event()
-    try:
-
-        def reject_close_and_resolve_actions() -> str:
-            assert owner.activate_forward_independent_handoff(initial_action)
-            owner.acknowledge_action(initial_action)
-            output_queued.set()
-            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
-            with pytest.raises(RuntimeError) as error:
-                owner.close()
-            owner.claim_forward_independent_handoff(initial_action)
-            for output in owner.drain_outputs():
-                for action in output.actions:
-                    owner.acknowledge_action(action)
-            return str(error.value)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            close_future = executor.submit(reject_close_and_resolve_actions)
-            sys.setswitchinterval(0.005)
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while not output_queued.is_set() and time.monotonic() < expires_at:
-                pass
-            assert output_queued.is_set()
-            close_error = close_future.result(timeout=_WAIT_SECONDS)
-            sys.setswitchinterval(previous_switch_interval)
-
-        assert "retained unresolved inventory" in close_error
-        inventory = owner.inventory()
-        assert inventory.fatal_code is (
-            NativeTerminalOwnerFatalCode.CLOSE_WITH_RETAINED_INVENTORY
-        )
-        assert inventory.unclaimed_handoff_action_count == 0
-    finally:
-        sys.setswitchinterval(previous_switch_interval)
-        owner.abort_and_close()
 
 
 def test_runtime_routes_source_continuations_and_drains_after_admission_close() -> None:
@@ -2195,8 +2045,8 @@ def test_native_quiescence_waits_for_complete_output_projection() -> None:
             _finish_fail_closed(runtime)
 
 
-def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> None:
-    """The exact TP1 local fanout chain cannot extend its active callback."""
+def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> None:
+    """Four decode actions preclaim at publication; adoption stays scheduler-owned."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.DECODE,
@@ -2206,6 +2056,30 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
     binding_digest = registration.binding.digest
     runtime.start()
     try:
+
+        def drain_preclaimed(
+            inbox: NativeTerminalActionInbox,
+            expected_claim_count: int,
+        ) -> tuple[NativeTerminalOwnerAction, ...]:
+            """Observe then consume one publication-preclaimed action.
+
+            :param inbox: Exact decode destination inbox.
+            :param expected_claim_count: Cumulative native claim count.
+            :returns: Exact claimed action population.
+            """
+
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while inbox.snapshot().queued_count == 0 and time.monotonic() < expires_at:
+                pass
+            assert inbox.snapshot().queued_count == 1
+            before_drain = runtime.snapshot()
+            assert before_drain.decode_publication_preclaimed_count == 1
+            assert (
+                before_drain.owner.claimed_handoff_action_count == expected_claim_count
+            )
+            actions = _drain_actions(inbox)
+            assert runtime.snapshot().decode_publication_preclaimed_count == 0
+            return actions
 
         def drive_tp1_chain() -> NativeTerminalOwnerInventory:
             runtime.register_lifecycle(registration)
@@ -2224,7 +2098,7 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
                 binding_digest,
                 NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
             )
-            scatter = _drain_actions(runtime.decode_scatter_actions)
+            scatter = drain_preclaimed(runtime.decode_scatter_actions, 1)
             assert scatter[0].kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
             runtime.complete_work_action(
                 _LOCAL_PRODUCER_ID,
@@ -2236,7 +2110,7 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
                 binding_digest,
                 NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
             )
-            teardown = _drain_actions(runtime.decode_work_actions)
+            teardown = drain_preclaimed(runtime.decode_work_actions, 2)
             assert (
                 teardown[0].kind is NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY
             )
@@ -2255,6 +2129,15 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
                 binding_digest,
                 NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
             )
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while (
+                runtime.scheduler_actions.snapshot().queued_count == 0
+                and time.monotonic() < expires_at
+            ):
+                pass
+            adoption_snapshot = runtime.snapshot()
+            assert adoption_snapshot.decode_publication_preclaimed_count == 0
+            assert adoption_snapshot.owner.claimed_handoff_action_count == 2
             adoption = _drain_actions(runtime.scheduler_actions)
             assert adoption[0].kind is NativeTerminalOwnerActionKind.ADOPTION_READY
             runtime.complete_scheduler_action(
@@ -2272,7 +2155,7 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
                 binding_digest,
                 NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
             )
-            local_ready = _drain_actions(runtime.coordinator_actions)
+            local_ready = drain_preclaimed(runtime.coordinator_actions, 3)
             assert (
                 local_ready[0].kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY
             )
@@ -2287,7 +2170,7 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
                 NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
             )
             runtime.acknowledge_consumed_action(local_ready[0])
-            lifecycle = _drain_actions(runtime.lifecycle_actions)
+            lifecycle = drain_preclaimed(runtime.lifecycle_actions, 4)
             assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
             runtime.acknowledge_consumed_action(lifecycle[0])
             return runtime.snapshot().owner
@@ -2301,16 +2184,21 @@ def test_decode_local_ready_claim_allows_nested_request_ready_before_ack() -> No
 
         assert owner_inventory.unclaimed_handoff_action_count == 0
         assert owner_inventory.claimed_handoff_action_count == 4
-        assert owner_inventory.handoff_callback_count >= 2
         snapshot = runtime.snapshot()
         assert snapshot.scheduler_live_count == 0
         assert snapshot.scheduler_pending_count == 0
         assert snapshot.consumer_pending_count == 0
+        assert snapshot.decode_publication_preclaimed_count == 0
         runtime.stop_admission()
         _retire_all_producers(runtime)
         runtime.join_producers()
         _drain_observations(runtime)
         runtime.close_clean()
+        closed = runtime.snapshot()
+        assert closed.disposition is NativeTerminalRuntimeDisposition.STOPPED
+        assert closed.owner.closed
+        assert closed.decode_publication_preclaimed_count == 0
+        assert closed.consumer_pending_count == 0
     finally:
         _finish_handoff_runtime(runtime)
 
@@ -2798,9 +2686,7 @@ def test_fatal_reserve_survives_saturated_normal_output_queue() -> None:
         _finish_fail_closed(runtime)
 
 
-def test_mixed_source_batch_rejects_work_and_preserves_lifecycle_authority() -> (
-    None
-):
+def test_mixed_source_batch_rejects_work_and_preserves_lifecycle_authority() -> None:
     """A co-drained native fatal preserves only fail-closed lifecycle work."""
 
     runtime, owner, remote = _runtime(
@@ -2996,7 +2882,9 @@ def test_mixed_source_batch_rejects_work_and_preserves_lifecycle_authority() -> 
             time.sleep(0.001)
 
         before_claim = runtime.snapshot()
-        assert before_claim.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
+        assert (
+            before_claim.disposition is NativeTerminalRuntimeDisposition.PROCESS_FATAL
+        )
         assert runtime.scheduler_actions.snapshot().queued_count == 0
         assert runtime.publisher_actions.snapshot().queued_count == 0
         assert runtime.source_gather_actions.snapshot().queued_count == 0
@@ -3030,7 +2918,9 @@ def test_mixed_source_batch_rejects_work_and_preserves_lifecycle_authority() -> 
         runtime.join_producers()
         _drain_observations(runtime)
         runtime.finish_abort_close()
-        assert runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.STOPPED
+        assert (
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.STOPPED
+        )
     finally:
         release_drain.set()
         _finish_handoff_runtime(runtime)

@@ -128,13 +128,6 @@ class _NativeTerminalOwnerBridge(Protocol):
         :param action_id: One-shot native action identity.
         """
 
-    def activate_forward_independent_handoff(self, action_id: int) -> bool:
-        """Activate one decode handoff at its consumer-delivery seam.
-
-        :param action_id: Exact forward-independent native action identity.
-        :returns: Whether an unclaimed action required a scheduler wake.
-        """
-
     def claim_forward_independent_handoff(self, action_id: int) -> None:
         """Claim one action after its Python delivery owner is durable.
 
@@ -179,13 +172,6 @@ class _NativeTerminalOwnerBridge(Protocol):
         :returns: Whether the binding became reactor-visible.
         """
 
-    def wait_for_forward_independent_handoff(self, timeout_seconds: float) -> bool:
-        """Wait until the main interpreter is parked by a callback generation.
-
-        :param timeout_seconds: Positive wall-clock bound.
-        :returns: Whether a forward-independent handoff became active.
-        """
-
     def wait_for_process_fatal(self, timeout_seconds: float) -> bool:
         """Wait until a test owner enters process-fatal authority.
 
@@ -203,18 +189,6 @@ class _NativeTerminalOwnerBridge(Protocol):
         """Advance the deterministic clock monotonically.
 
         :param now_ns: New monotonic time.
-        """
-
-    def reject_next_handoff_pending_call_for_test(self) -> None:
-        """Reject the next pending call before CPython accepts ownership."""
-
-    def set_handoff_callback_holds_for_test(
-        self, hold_activation: bool, hold_restoration: bool
-    ) -> None:
-        """Control deterministic callback activation and restoration holds.
-
-        :param hold_activation: Whether a queued callback pauses before active.
-        :param hold_restoration: Whether a claimed callback pauses before GIL restore.
         """
 
     def expire_deadlines_for_test(self) -> None:
@@ -633,35 +607,6 @@ class NativeTerminalOwner:
             raise ValueError("now_ns must be a positive integer")
         self._native.set_test_clock(now_ns)
 
-    def reject_next_handoff_pending_call_for_testing(self) -> None:
-        """Reject the next native pending call before CPython owns it.
-
-        :raises RuntimeError: If this owner is not a native test build.
-        """
-
-        if not self._testing:
-            raise RuntimeError("pending-call controls require a native test build")
-        self._native.reject_next_handoff_pending_call_for_test()
-
-    def set_handoff_callback_holds_for_testing(
-        self, *, hold_activation: bool, hold_restoration: bool
-    ) -> None:
-        """Control deterministic pending-call activation and restoration holds.
-
-        :param hold_activation: Whether callbacks pause before becoming active.
-        :param hold_restoration: Whether callbacks pause before restoring the GIL.
-        :raises RuntimeError: If this owner is not a native test build.
-        """
-
-        if not self._testing:
-            raise RuntimeError("callback holds require a native test build")
-        if type(hold_activation) is not bool or type(hold_restoration) is not bool:
-            raise TypeError("callback hold controls must be bool values")
-        self._native.set_handoff_callback_holds_for_test(
-            hold_activation,
-            hold_restoration,
-        )
-
     def expire_deadlines_for_testing(self) -> None:
         """Evaluate armed deadlines without sleeping in a native test build.
 
@@ -779,24 +724,6 @@ class NativeTerminalOwner:
             raise TypeError("action must be NativeTerminalOwnerAction")
         self._native.acknowledge_action(action.action_id)
 
-    def activate_forward_independent_handoff(
-        self, action: NativeTerminalOwnerAction
-    ) -> bool:
-        """Activate a decode scheduler wake at consumer delivery.
-
-        Production activates before bounded inbox publication, so scheduling
-        rejection cannot strand visible Python authority. Direct callers may
-        still observe ``False`` after an action was already claimed. Source
-        delivery uses the exact-batch handoff and may never enter this path.
-
-        :param action: Exact decode action crossing consumer delivery.
-        :returns: Whether activation scheduled or extended a pending callback.
-        """
-
-        if type(action) is not NativeTerminalOwnerAction:
-            raise TypeError("action must be NativeTerminalOwnerAction")
-        return bool(self._native.activate_forward_independent_handoff(action.action_id))
-
     def claim_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
@@ -907,19 +834,6 @@ class NativeTerminalOwner:
                 binding_digest,
                 timeout_seconds,
             )
-        )
-
-    def wait_for_forward_independent_handoff(self, timeout_seconds: float) -> bool:
-        """Wait until CPython begins one captured callback generation.
-
-        :param timeout_seconds: Positive wall-clock wait bound.
-        :returns: Whether the handoff callback became active.
-        """
-
-        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
-            raise ValueError("timeout_seconds must be a positive float")
-        return bool(
-            self._native.wait_for_forward_independent_handoff(timeout_seconds)
         )
 
     def wait_for_process_fatal(self, timeout_seconds: float) -> bool:
