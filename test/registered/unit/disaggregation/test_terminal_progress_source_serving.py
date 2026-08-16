@@ -635,7 +635,7 @@ def test_gather_worker_owns_direct_inbox_and_binds_device_once(
         serving.bind_submission(submission, lambda submission: None)
         serving.attach_producer_completion(submission)
         assert serving.packed_ready(identity.local_binding.digest)
-        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         assert gather_entered.wait(timeout=_WAIT_SECONDS)
 
         ack = _action(
@@ -757,7 +757,7 @@ def test_gather_worker_failure_is_process_fatal() -> None:
         serving.bind_submission(submission, lambda submission: None)
         serving.attach_producer_completion(submission)
         assert serving.packed_ready(identity.local_binding.digest)
-        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
         inventory = serving.inventory()
         assert inventory.gather_worker.fatal_reason == "source gather action failed"
@@ -797,7 +797,7 @@ def test_gather_worker_launch_failure_remains_abortable(
     )
     assert not inventory.gather_worker.thread_alive
     assert inventory.owner_dead_marked
-    assert len(fatal_inventories) == 1
+    assert fatal_inventories == []
     assert runtime.disposition.value == "abort_draining"
 
     final_inventory = serving.abort_and_close()
@@ -892,7 +892,7 @@ def test_full_source_composition_retires_exactly_once(
         serving.attach_producer_completion(submission)
         digest = identity.local_binding.digest
         assert serving.packed_ready(digest)
-        assert runtime.wait_for_output_projection_quiescence(_WAIT_SECONDS)
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
         _pump(serving, runtime)
         assert work_labels == ["gather"]
