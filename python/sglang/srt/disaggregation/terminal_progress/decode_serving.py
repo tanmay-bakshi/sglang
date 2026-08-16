@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from functools import partial
 from typing import TypeVar
 
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -856,7 +857,13 @@ class PackedTerminalDecodeServing:
                     execution.transfer(action)
                     continue
                 try:
-                    self._scheduler_serving.publish_action(action)
+                    self._scheduler_serving.publish_action(
+                        action,
+                        publication_commit=partial(
+                            self._runtime.settle_decode_scheduler_publication_handoff,
+                            action,
+                        ),
+                    )
                 except TerminalSchedulerActionPublicationError as error:
                     failure_reason = (
                         "decode scheduler action publication failed: "
@@ -899,7 +906,8 @@ class PackedTerminalDecodeServing:
                     self._runtime.acknowledge_aborted_action_if_pending(action)
                 except Exception:  # noqa: BLE001
                     logger.critical(
-                        "Decode scheduler batch reconciliation failed for action %d:\n%s",
+                        "Decode scheduler batch reconciliation failed "
+                        "for action %d:\n%s",
                         action.action_id,
                         traceback.format_exc(),
                     )

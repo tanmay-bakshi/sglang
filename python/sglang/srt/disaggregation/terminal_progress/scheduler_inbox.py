@@ -391,22 +391,27 @@ class TerminalReceiptInbox:
             exact binding.
         """
 
-        return self.publish_after_retention(receipt, lambda: None)
+        return self.publish_after_retention(receipt, lambda: None, lambda: None)
 
     def publish_after_retention(
         self,
         receipt: TerminalWireReceipt,
         retain: Callable[[], None],
+        commit: Callable[[], None],
     ) -> SchedulerReceiptPublishResult:
         """Publish after retaining scheduler-affine authority.
 
         The publication intent is announced before ``retain`` runs, and the
         receipt cannot become visible until ``retain`` returns successfully.
-        This lets adapters retain an opaque native action without opening a
-        race between host submission and scheduler consumption.
+        A newly queued receipt invokes ``commit`` under the state lock before
+        its wake becomes visible. This lets adapters transfer both opaque
+        action ownership and causal launch exclusion without opening a gap to
+        scheduler consumption.
 
         :param receipt: Canonical fixed-width scheduler receipt.
         :param retain: Nonblocking callback which retains matching authority.
+        :param commit: Nonblocking callback which finalizes causal authority
+            after insertion and before scheduler visibility.
         :returns: Whether the receipt was queued or coalesced.
         :raises SchedulerReceiptInboxFatalError: If a bound or duplicate
             invariant enters process-fatal disposition.
@@ -418,6 +423,8 @@ class TerminalReceiptInbox:
             raise TypeError("receipt must be TerminalWireReceipt")
         if not callable(retain):
             raise TypeError("retain must be callable")
+        if not callable(commit):
+            raise TypeError("commit must be callable")
         intent = self._begin_publication_intent()
         fatal_error: SchedulerReceiptInboxFatalError | None = None
         result: SchedulerReceiptPublishResult | None = None
@@ -459,9 +466,19 @@ class TerminalReceiptInbox:
                     self._pending.append(publication)
                     self._active_encoded[request_key] = encoded
                     self._validate_bounds_locked()
-                    self._signal_locked()
                     if self._fatal_cause is None:
-                        result = SchedulerReceiptPublishResult.QUEUED
+                        try:
+                            commit()
+                        except Exception:
+                            self._enter_process_fatal_locked(
+                                SchedulerInboxFatalCause.OWNER_DEATH
+                            )
+                            raise
+                        self._signal_locked()
+                        if self._fatal_cause is None:
+                            result = SchedulerReceiptPublishResult.QUEUED
+                        else:
+                            fatal_error = self._fatal_error_locked()
                     else:
                         fatal_error = self._fatal_error_locked()
         finally:

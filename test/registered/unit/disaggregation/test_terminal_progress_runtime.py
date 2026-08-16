@@ -92,11 +92,13 @@ class _TestSourceDeliveryAuthority(NativeTerminalSourceDeliveryAuthority):
 
     def __init__(
         self,
-        acquire: Callable[
-            [tuple[NativeTerminalOwnerAction, ...]],
-            NativeTerminalDeliveryLeaseDisposition,
-        ]
-        | None = None,
+        acquire: (
+            Callable[
+                [tuple[NativeTerminalOwnerAction, ...]],
+                NativeTerminalDeliveryLeaseDisposition,
+            ]
+            | None
+        ) = None,
     ) -> None:
         """Construct one authority with an optional acquisition observer.
 
@@ -348,8 +350,7 @@ def _direct_handoff_owner_population(
         _process_identity(TerminalOwnerRole.DECODE, _REMOTE_GENERATION)
     )
     registrations = tuple(
-        _registration(owner_identity, remote_identity, room_id)
-        for room_id in room_ids
+        _registration(owner_identity, remote_identity, room_id) for room_id in room_ids
     )
     owner = NativeTerminalOwner(
         input_capacity=16,
@@ -385,18 +386,35 @@ def _direct_decode_handoff_owner(
     :returns: Running owner and its registered decode lifecycle.
     """
 
+    owner, registrations = _direct_decode_handoff_owner_population((room_id,))
+    return owner, registrations[0]
+
+
+def _direct_decode_handoff_owner_population(
+    room_ids: tuple[int, ...],
+) -> tuple[NativeTerminalOwner, tuple[NativeTerminalLifecycleRegistration, ...]]:
+    """Start one deterministic decode owner for an exact request population.
+
+    :param room_ids: Non-empty unique decode request identities.
+    :returns: Running owner and its registered decode lifecycles.
+    """
+
+    if len(room_ids) == 0 or len(set(room_ids)) != len(room_ids):
+        raise ValueError("room_ids must be non-empty and unique")
     owner_identity = NativeTerminalProcessIdentity.from_identity(
         _process_identity(TerminalOwnerRole.DECODE, _OWNER_GENERATION)
     )
     remote_identity = NativeTerminalProcessIdentity.from_identity(
         _process_identity(TerminalOwnerRole.SOURCE, _REMOTE_GENERATION)
     )
-    registration = _registration(owner_identity, remote_identity, room_id)
+    registrations = tuple(
+        _registration(owner_identity, remote_identity, room_id) for room_id in room_ids
+    )
     owner = NativeTerminalOwner(
         input_capacity=16,
         output_capacity=16,
         observation_capacity=16,
-        maximum_live_lifecycles=4,
+        maximum_live_lifecycles=max(4, len(registrations)),
         owner_identity=owner_identity,
         testing=True,
     )
@@ -415,13 +433,21 @@ def _direct_decode_handoff_owner(
             allowed_role=NativeTerminalOwnerRole.DECODE,
             authenticated_issuer=remote_identity,
         ),
+        NativeTerminalProducerRegistration(
+            producer_id=_OWNER_RECEIPT_PRODUCER_ID,
+            name="python-owner-receipt",
+            producer_class=NativeTerminalProducerClass.RECEIPT,
+            allowed_role=NativeTerminalOwnerRole.DECODE,
+            authenticated_issuer=owner_identity,
+        ),
     ):
         owner.register_producer(producer)
     owner.enable_test_clock(_TEST_CLOCK_NS)
     owner.enable_forward_independent_handoff()
-    owner.register_lifecycle(registration)
+    for registration in registrations:
+        owner.register_lifecycle(registration)
     owner.start()
-    return owner, registration
+    return owner, registrations
 
 
 def _submit_direct_source_gather(
@@ -552,6 +578,138 @@ def _drain_direct_decode_scatter(
     assert len(actions) == 1
     assert actions[0].kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
     return actions[0]
+
+
+def _submit_direct_decode_event(
+    owner: NativeTerminalOwner,
+    registration: NativeTerminalLifecycleRegistration,
+    producer_id: int,
+    kind: NativeTerminalOwnerEventKind,
+    *,
+    receipt: NativeTerminalReceipt | None = None,
+    reason: str | None = None,
+) -> None:
+    """Submit one decode event through the production native boundary.
+
+    :param owner: Running decode owner.
+    :param registration: Exact decode lifecycle.
+    :param producer_id: Registered producer authority for this event.
+    :param kind: Decode lifecycle event kind.
+    :param receipt: Authenticated receipt authority when required.
+    :param reason: Failure evidence for request-local terminal events.
+    """
+
+    owner.submit(
+        NativeTerminalOwnerEvent(
+            producer_id=producer_id,
+            binding_digest=registration.binding.digest,
+            kind=kind,
+            enqueued_ns=_TEST_CLOCK_NS,
+            receipt=receipt,
+            reason=reason,
+        )
+    )
+
+
+def _drain_one_direct_decode_action(
+    owner: NativeTerminalOwner,
+    kind: NativeTerminalOwnerActionKind,
+) -> NativeTerminalOwnerAction:
+    """Wait for and drain one exact decode action.
+
+    :param owner: Running decode owner.
+    :param kind: Sole action kind expected in the output queue.
+    :returns: Exact native decode action.
+    """
+
+    _wait_for_owner_inventory(
+        owner,
+        lambda inventory: inventory.queued_output_count == 1,
+    )
+    actions = tuple(
+        action for output in owner.drain_outputs() for action in output.actions
+    )
+    assert len(actions) == 1
+    assert actions[0].kind is kind
+    return actions[0]
+
+
+def _consume_direct_decode_delivery_action(
+    owner: NativeTerminalOwner,
+    action: NativeTerminalOwnerAction,
+) -> None:
+    """Claim, settle, and acknowledge one non-scheduler decode action.
+
+    :param owner: Native owner carrying the action handoff.
+    :param action: Exact action delivered to its typed consumer.
+    """
+
+    owner.claim_forward_independent_handoff(action)
+    owner.settle_forward_independent_handoff(action)
+    owner.acknowledge_action(action)
+
+
+def _drive_direct_decode_to_adoption(
+    owner: NativeTerminalOwner,
+    registration: NativeTerminalLifecycleRegistration,
+) -> NativeTerminalOwnerAction:
+    """Advance one writer-started decode request to adoption authority.
+
+    :param owner: Running deterministic decode owner.
+    :param registration: Request whose writer aggregation already started.
+    :returns: Unclaimed adoption action retaining decode reservation authority.
+    """
+
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _REMOTE_CONTROL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+    )
+    scatter = _drain_one_direct_decode_action(
+        owner,
+        NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,
+    )
+    _consume_direct_decode_delivery_action(owner, scatter)
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _LOCAL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+    )
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _LOCAL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
+    )
+    teardown = _drain_one_direct_decode_action(
+        owner,
+        NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,
+    )
+    _consume_direct_decode_delivery_action(owner, teardown)
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _LOCAL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
+    )
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _REMOTE_CONTROL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+    )
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _REMOTE_CONTROL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
+    )
+    return _drain_one_direct_decode_action(
+        owner,
+        NativeTerminalOwnerActionKind.ADOPTION_READY,
+    )
 
 
 def _submit_runtime_decode_scatter(
@@ -1032,8 +1190,7 @@ def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
             assert publisher.action_id not in runtime._consumer_pending
             assert scheduler.action_id in runtime._consumer_pending
         assert (
-            runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.RUNNING
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.RUNNING
         )
         runtime.complete_scheduler_action(
             _OWNER_RECEIPT_PRODUCER_ID,
@@ -1124,8 +1281,7 @@ def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomi
             assert scheduler.action_id not in runtime._consumer_pending
             assert publisher.action_id in runtime._consumer_pending
         assert (
-            runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.RUNNING
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.RUNNING
         )
         runtime.complete_work_action(
             _OWNER_RECEIPT_PRODUCER_ID,
@@ -1207,8 +1363,7 @@ def test_work_completion_retains_exact_authority_after_native_rejection(
             assert runtime._consumer_pending.get(publisher.action_id) == publisher
             assert publisher.action_id in runtime._inbox_claimed_action_ids
         assert (
-            runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.RUNNING
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.RUNNING
         )
 
         runtime.complete_work_action(
@@ -1305,8 +1460,7 @@ def test_scheduler_completion_retains_exact_authority_after_native_rejection(
             assert runtime._consumer_pending.get(scheduler.action_id) == scheduler
             assert scheduler.action_id in runtime._inbox_claimed_action_ids
         assert (
-            runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.RUNNING
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.RUNNING
         )
 
         runtime.complete_scheduler_action(
@@ -2061,9 +2215,7 @@ def test_production_handoff_has_no_pending_call_surface() -> None:
         assert all(token not in text for token in forbidden), source
 
 
-def test_source_acceptance_reservation_blocks_launch_through_inbox_delivery() -> (
-    None
-):
+def test_source_acceptance_reservation_blocks_launch_through_inbox_delivery() -> None:
     """Accepted work remains launch-exclusive across its newer action ID."""
 
     owner, registration = _direct_handoff_owner(960)
@@ -2114,9 +2266,7 @@ def test_source_acceptance_reservation_blocks_launch_through_inbox_delivery() ->
             assert transferred.source_delivery_reservation_count == 0
             assert transferred.transferred_source_delivery_reservation_count == 1
             actions = tuple(
-                action
-                for output in owner.drain_outputs()
-                for action in output.actions
+                action for output in owner.drain_outputs() for action in output.actions
             )
             assert len(actions) == 1
             action = actions[0]
@@ -2177,9 +2327,7 @@ def test_reservation_after_captured_prefix_blocks_only_the_next_launch() -> None
             )
             two_reservations = owner.inventory()
             assert two_reservations.source_delivery_reservation_count == 2
-            assert (
-                two_reservations.registered_source_delivery_reservation_count == 2
-            )
+            assert two_reservations.registered_source_delivery_reservation_count == 2
 
             _submit_direct_source_event(
                 owner,
@@ -2191,9 +2339,7 @@ def test_reservation_after_captured_prefix_blocks_only_the_next_launch() -> None
                 lambda value: value.queued_output_count == 1,
             )
             first_actions = tuple(
-                action
-                for output in owner.drain_outputs()
-                for action in output.actions
+                action for output in owner.drain_outputs() for action in output.actions
             )
             assert len(first_actions) == 1
             owner.claim_source_forward_independent_handoffs(first_actions)
@@ -2232,9 +2378,7 @@ def test_reservation_after_captured_prefix_blocks_only_the_next_launch() -> None
                 lambda value: value.queued_output_count == 1,
             )
             second_actions = tuple(
-                action
-                for output in owner.drain_outputs()
-                for action in output.actions
+                action for output in owner.drain_outputs() for action in output.actions
             )
             assert len(second_actions) == 1
             owner.claim_source_forward_independent_handoffs(second_actions)
@@ -2367,6 +2511,282 @@ def test_deadline_terminalizes_reservation_without_gather_authority() -> None:
         owner.abort_and_close()
 
 
+def test_decode_writer_reservation_blocks_launch_until_adoption_publication() -> None:
+    """Writer admission stays launch-exclusive across the newer adoption ID."""
+
+    owner, registration = _direct_decode_handoff_owner(967)
+    try:
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _LOCAL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+        )
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _REMOTE_CONTROL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+        )
+        accepted = owner.inventory()
+        assert accepted.decode_delivery_reservation_count == 1
+        assert accepted.registered_decode_delivery_reservation_count == 1
+        assert accepted.transferred_decode_delivery_reservation_count == 0
+        assert accepted.terminal_decode_delivery_reservation_count == 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            waiting = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            action_watermark = waiting.scheduler_launch_handoff_begin_watermark
+            reservation_watermark = (
+                waiting.scheduler_launch_handoff_begin_decode_reservation_watermark
+            )
+            assert action_watermark is not None
+            assert reservation_watermark is not None
+            assert reservation_watermark > 0
+            assert not launch.done()
+
+            adoption = _drive_direct_decode_to_adoption(owner, registration)
+            transferred = owner.inventory()
+            assert adoption.action_id > action_watermark
+            assert transferred.decode_delivery_reservation_count == 0
+            assert transferred.transferred_decode_delivery_reservation_count == 1
+            assert transferred.decode_reservation_backed_handoff_action_count == 1
+
+            owner.claim_forward_independent_handoff(adoption)
+            claimed = owner.inventory()
+            assert claimed.claimed_handoff_action_count == 3
+            assert claimed.active_handoff_action_count == 1
+            assert claimed.decode_reservation_backed_handoff_action_count == 1
+            assert not launch.done()
+
+            owner.settle_forward_independent_handoff(adoption)
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        owner.end_scheduler_launch_handoff(token)
+        owner.acknowledge_action(adoption)
+        settled = owner.inventory()
+        assert settled.decode_delivery_reservation_count == 0
+        assert settled.decode_reservation_backed_handoff_action_count == 0
+        assert settled.registered_decode_delivery_reservation_count == (
+            settled.decode_delivery_reservation_count
+            + settled.transferred_decode_delivery_reservation_count
+            + settled.terminal_decode_delivery_reservation_count
+        )
+    finally:
+        owner.abort_and_close()
+
+
+def test_decode_reservation_after_snapshot_is_charged_to_next_launch() -> None:
+    """A later writer cannot extend the captured decode reservation prefix."""
+
+    owner, registrations = _direct_decode_handoff_owner_population((968, 969))
+    first, second = registrations
+    try:
+        for registration in registrations:
+            _submit_direct_decode_event(
+                owner,
+                registration,
+                _LOCAL_PRODUCER_ID,
+                NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+            )
+        _submit_direct_decode_event(
+            owner,
+            first,
+            _REMOTE_CONTROL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            first_launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            captured = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            first_watermark = (
+                captured.scheduler_launch_handoff_begin_decode_reservation_watermark
+            )
+            assert first_watermark is not None
+
+            _submit_direct_decode_event(
+                owner,
+                second,
+                _REMOTE_CONTROL_PRODUCER_ID,
+                NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+            )
+            reserved = owner.inventory()
+            assert reserved.decode_delivery_reservation_count == 2
+            assert reserved.registered_decode_delivery_reservation_count == 2
+
+            first_adoption = _drive_direct_decode_to_adoption(owner, first)
+            owner.claim_forward_independent_handoff(first_adoption)
+            owner.settle_forward_independent_handoff(first_adoption)
+            first_token = first_launch.result(timeout=_WAIT_SECONDS)
+
+        after_first = owner.inventory()
+        assert after_first.decode_delivery_reservation_count == 1
+        assert after_first.transferred_decode_delivery_reservation_count == 1
+        owner.end_scheduler_launch_handoff(first_token)
+        owner.acknowledge_action(first_adoption)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            second_launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            waiting = _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            second_watermark = (
+                waiting.scheduler_launch_handoff_begin_decode_reservation_watermark
+            )
+            assert second_watermark is not None
+            assert second_watermark > first_watermark
+            assert not second_launch.done()
+
+            second_adoption = _drive_direct_decode_to_adoption(owner, second)
+            owner.claim_forward_independent_handoff(second_adoption)
+            owner.settle_forward_independent_handoff(second_adoption)
+            second_token = second_launch.result(timeout=_WAIT_SECONDS)
+
+        owner.end_scheduler_launch_handoff(second_token)
+        owner.acknowledge_action(second_adoption)
+        settled = owner.inventory()
+        assert settled.decode_delivery_reservation_count == 0
+        assert settled.decode_reservation_backed_handoff_action_count == 0
+    finally:
+        owner.abort_and_close()
+
+
+def test_decode_request_failure_terminalizes_live_delivery_reservation() -> None:
+    """Request-local failure consumes writer authority without adoption."""
+
+    owner, registration = _direct_decode_handoff_owner(970)
+    try:
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _LOCAL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+        )
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _REMOTE_CONTROL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+        )
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _LOCAL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_REQUEST_FAILED,
+            reason="synthetic failure before writer manifest completion",
+        )
+        failed = _wait_for_owner_inventory(
+            owner,
+            lambda value: (
+                value.terminal_decode_delivery_reservation_count == 1
+                and value.queued_output_count == 1
+            ),
+        )
+        assert failed.fatal_code is NativeTerminalOwnerFatalCode.NONE
+        assert failed.decode_delivery_reservation_count == 0
+        assert failed.transferred_decode_delivery_reservation_count == 0
+        assert failed.decode_reservation_backed_handoff_action_count == 0
+        quarantined = _drain_one_direct_decode_action(
+            owner,
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+        )
+        owner.acknowledge_action(quarantined)
+    finally:
+        owner.abort_and_close()
+
+
+def test_decode_abort_terminalizes_reservation_and_interrupts_launch() -> None:
+    """Process abort consumes writer authority and denies the waiting launch."""
+
+    owner, registration = _direct_decode_handoff_owner(971)
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _LOCAL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+    )
+    _submit_direct_decode_event(
+        owner,
+        registration,
+        _REMOTE_CONTROL_PRODUCER_ID,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(
+                owner.begin_scheduler_launch_handoff,
+                _WAIT_SECONDS,
+            )
+            _wait_for_owner_inventory(
+                owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            owner.abort_and_close()
+            with pytest.raises(RuntimeError, match="interrupted"):
+                launch.result(timeout=_WAIT_SECONDS)
+
+        closed = owner.inventory()
+        assert closed.closed
+        assert closed.decode_delivery_reservation_count == 0
+        assert closed.decode_reservation_backed_handoff_action_count == 0
+        assert closed.registered_decode_delivery_reservation_count == 1
+        assert closed.transferred_decode_delivery_reservation_count == 0
+        assert closed.terminal_decode_delivery_reservation_count == 1
+    finally:
+        owner.abort_and_close()
+
+
+def test_decode_abort_clears_a_held_local_ready_command() -> None:
+    """Abort removes a captured test command before waking its reactor."""
+
+    owner, registration = _direct_decode_handoff_owner(973)
+    try:
+        assert owner.wait_for_lifecycle_registration(
+            registration.binding.digest,
+            _WAIT_SECONDS,
+        )
+        owner.hold_decode_delivery_dispatch_for_testing()
+        _submit_direct_decode_event(
+            owner,
+            registration,
+            _LOCAL_PRODUCER_ID,
+            NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
+        )
+        captured = _wait_for_owner_inventory(
+            owner,
+            lambda value: (
+                value.queued_input_count == 1
+                and value.decode_delivery_reservation_count == 1
+            ),
+        )
+        assert captured.registered_decode_delivery_reservation_count == 1
+
+        owner.begin_abort()
+        aborted = owner.inventory()
+        assert aborted.queued_input_count == 0
+        assert aborted.decode_delivery_reservation_count == 0
+        assert aborted.terminal_decode_delivery_reservation_count == 1
+    finally:
+        owner.abort_and_close()
+
+
 def test_reservation_inventory_rejects_impossible_accounting() -> None:
     """Python inventory validation rejects every new conservation mismatch."""
 
@@ -2421,9 +2841,7 @@ def test_concurrent_source_reservations_conserve_one_launch_prefix() -> None:
                 _WAIT_SECONDS,
             )
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=population
-        ) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=population) as executor:
             acceptance_futures = tuple(
                 executor.submit(
                     _submit_direct_source_event,
@@ -2439,9 +2857,7 @@ def test_concurrent_source_reservations_conserve_one_launch_prefix() -> None:
 
         accepted = owner.inventory()
         assert accepted.source_delivery_reservation_count == population
-        assert (
-            accepted.registered_source_delivery_reservation_count == population
-        )
+        assert accepted.registered_source_delivery_reservation_count == population
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as launch_executor:
             launch = launch_executor.submit(
@@ -2474,17 +2890,13 @@ def test_concurrent_source_reservations_conserve_one_launch_prefix() -> None:
             )
             assert transferred.source_delivery_reservation_count == 0
             assert (
-                transferred.transferred_source_delivery_reservation_count
-                == population
+                transferred.transferred_source_delivery_reservation_count == population
             )
             assert (
-                transferred.source_reservation_backed_handoff_action_count
-                == population
+                transferred.source_reservation_backed_handoff_action_count == population
             )
             actions = tuple(
-                action
-                for output in owner.drain_outputs()
-                for action in output.actions
+                action for output in owner.drain_outputs() for action in output.actions
             )
             assert len(actions) == population
             owner.claim_source_forward_independent_handoffs(actions)
@@ -2575,6 +2987,106 @@ def test_scheduler_launch_handoff_waits_for_typed_inbox_delivery() -> None:
             _LOCAL_PRODUCER_ID,
             gather,
             NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+        )
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_decode_runtime_inbox_claim_does_not_settle_scheduler_publication() -> None:
+    """Adoption excludes launch until qualified scheduler publication."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 972)
+    binding_digest = registration.binding.digest
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        runtime.submit(
+            _LOCAL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+        )
+        runtime.submit(
+            _REMOTE_CONTROL_PRODUCER_ID,
+            binding_digest,
+            NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+            )
+            scatter = _drain_actions(runtime.decode_scatter_actions)[0]
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                scatter,
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
+            )
+            teardown = _drain_actions(runtime.decode_work_actions)[0]
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                teardown,
+                NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
+            )
+
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while (
+                runtime.scheduler_actions.snapshot().queued_count != 1
+                and time.monotonic() < expires_at
+            ):
+                pass
+            assert runtime.scheduler_actions.snapshot().queued_count == 1
+            projected = runtime.snapshot()
+            assert projected.decode_publication_preclaimed_count == 1
+            assert projected.owner.decode_delivery_reservation_count == 0
+            assert projected.owner.transferred_decode_delivery_reservation_count == 1
+            assert projected.owner.decode_reservation_backed_handoff_action_count == 1
+            assert projected.owner.active_handoff_action_count == 1
+            assert not launch.done()
+
+            adoption = _drain_actions(runtime.scheduler_actions)[0]
+            claimed = runtime.snapshot()
+            assert claimed.decode_publication_preclaimed_count == 0
+            assert claimed.owner.active_handoff_action_count == 1
+            assert claimed.owner.decode_reservation_backed_handoff_action_count == 1
+            assert not launch.done()
+
+            runtime.settle_decode_scheduler_publication_handoff(adoption)
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        runtime.end_scheduler_launch_handoff(token)
+        settled = runtime.snapshot()
+        assert settled.owner.active_handoff_action_count == 0
+        assert settled.owner.decode_reservation_backed_handoff_action_count == 0
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            adoption,
+            NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
         )
     finally:
         _finish_handoff_runtime(runtime)
@@ -2960,8 +3472,7 @@ def test_clean_close_rejects_delivered_consumer_authority() -> None:
         runtime.acknowledge_consumed_action(retired)
         runtime.close_clean()
         assert (
-            runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.STOPPED
+            runtime.snapshot().disposition is NativeTerminalRuntimeDisposition.STOPPED
         )
     finally:
         _finish_handoff_runtime(runtime)
@@ -3357,13 +3868,12 @@ def test_python_producer_retirement_resumes_after_mid_roster_failure() -> None:
             runtime._owner,
             "retire_python_producer",
             side_effect=retire_until_failure,
+        ), pytest.raises(
+            RuntimeError,
+            match="synthetic producer retirement failure",
         ):
-            with pytest.raises(
-                RuntimeError,
-                match="synthetic producer retirement failure",
-            ):
-                for producer_id in runtime.unretired_python_producer_ids:
-                    runtime.retire_python_producer(producer_id)
+            for producer_id in runtime.unretired_python_producer_ids:
+                runtime.retire_python_producer(producer_id)
 
         assert attempted_ids == [producer_ids[0], failed_producer_id]
         assert runtime.unretired_python_producer_ids == producer_ids[1:]

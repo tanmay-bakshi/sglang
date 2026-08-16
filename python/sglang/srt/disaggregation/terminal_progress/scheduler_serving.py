@@ -273,8 +273,10 @@ class TerminalSchedulerActionPublicationError(SchedulerReceiptInboxFatalError):
         self.disposition = disposition
         self.serving_inventory = inventory
         self.args = (
-            "terminal scheduler action publication failed: "
-            f"{disposition.value} (cause={cause.value})",
+            (
+                "terminal scheduler action publication failed: "
+                f"{disposition.value} (cause={cause.value})"
+            ),
         )
 
     @property
@@ -495,15 +497,31 @@ class TerminalSchedulerServing:
     def publish_action(
         self,
         action: NativeTerminalOwnerAction,
+        publication_commit: Callable[[], None] | None = None,
     ) -> SchedulerReceiptPublishResult:
         """Publish one exact native scheduler authority and actively wake.
 
         :param action: Owner-minted reclaim or adoption action.
+        :param publication_commit: Decode causal-authority transfer executed
+            after qualified receipt insertion and before scheduler visibility.
+            Decode publication requires it; source publication forbids it.
         :returns: Whether the qualified receipt queued or coalesced.
         """
 
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
+        if self._role is TerminalSchedulerServingRole.DECODE:
+            if not callable(publication_commit):
+                raise TypeError("decode publication_commit must be callable")
+        elif publication_commit is not None:
+            raise ValueError("source publication cannot carry publication_commit")
+
+        def commit() -> None:
+            """Finalize causal authority when the caller supplied a transfer."""
+
+            if publication_commit is not None:
+                publication_commit()
+
         wire_receipt: TerminalWireReceipt | None = None
         encoded: bytes | None = None
         request_key: PackedRequestKey | None = None
@@ -548,8 +566,9 @@ class TerminalSchedulerServing:
             return self._inbox.publish_after_retention(
                 wire_receipt,
                 retain_action,
+                commit,
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             logger.error(
                 "Terminal scheduler action publication failed:\n%s",
                 traceback.format_exc(),

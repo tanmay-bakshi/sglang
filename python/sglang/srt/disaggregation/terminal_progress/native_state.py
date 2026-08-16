@@ -1484,6 +1484,8 @@ class NativeTerminalOwnerInventory:
         their typed consumer inbox.
     :ivar settled_handoff_action_count: Registered actions retired by exact
         inbox delivery, failed delivery, or abort.
+    :ivar abort_settled_handoff_delivery_count: Aborted native handoffs whose
+        Python delivery owner has not yet consumed the exact abort replay entry.
     :ivar source_delivery_reservation_count: Accepted source submissions not
         yet transferred into their gather-action handoff.
     :ivar source_reservation_backed_handoff_action_count: Active source gather
@@ -1494,6 +1496,19 @@ class NativeTerminalOwnerInventory:
         atomically into source gather actions.
     :ivar terminal_source_delivery_reservation_count: Reservations consumed by
         request-local or process-terminal ownership before gather creation.
+    :ivar decode_delivery_reservation_count: Accepted decode delivery
+        generations not yet transferred into their corresponding handoff. Each
+        request has a writer-to-adoption generation and a local-ready-ingress-to-
+        local-ready generation.
+    :ivar decode_reservation_backed_handoff_action_count: Active adoption-ready
+        or local-decode-ready actions retaining their accepted reservation.
+    :ivar registered_decode_delivery_reservation_count: Decode delivery
+        reservations established synchronously at writer aggregation or local-
+        ready event admission.
+    :ivar transferred_decode_delivery_reservation_count: Reservations moved
+        atomically into decode adoption-ready or local-decode-ready actions.
+    :ivar terminal_decode_delivery_reservation_count: Reservations consumed by
+        request-local or process-terminal ownership before their action exists.
     :ivar scheduler_launch_handoff_begin_count: Bounded scheduler launch lease
         acquisitions begun at the native boundary.
     :ivar scheduler_launch_handoff_acquisition_count: Exact scheduler launch
@@ -1506,12 +1521,16 @@ class NativeTerminalOwnerInventory:
         for an active bounded wait.
     :ivar scheduler_launch_handoff_begin_reservation_watermark: Captured source
         reservation watermark for an active bounded wait.
+    :ivar scheduler_launch_handoff_begin_decode_reservation_watermark: Captured
+        decode reservation watermark for an active bounded wait.
     :ivar active_scheduler_launch_handoff_token: Exact outstanding scheduler
         launch token.
     :ivar active_scheduler_launch_handoff_watermark: Settled action watermark
         which authorized the outstanding token.
     :ivar active_scheduler_launch_handoff_reservation_watermark: Settled source
         reservation watermark which authorized the outstanding token.
+    :ivar active_scheduler_launch_handoff_decode_reservation_watermark: Settled
+        decode reservation watermark which authorized the outstanding token.
     :ivar handoff_enabled: Whether forward-independent delivery was enabled at
         startup.
     :ivar registered_producer_count: Exact producer registry size.
@@ -1562,20 +1581,28 @@ class NativeTerminalOwnerInventory:
     registered_handoff_action_count: int
     active_handoff_action_count: int
     settled_handoff_action_count: int
+    abort_settled_handoff_delivery_count: int
     source_delivery_reservation_count: int
     source_reservation_backed_handoff_action_count: int
     registered_source_delivery_reservation_count: int
     transferred_source_delivery_reservation_count: int
     terminal_source_delivery_reservation_count: int
+    decode_delivery_reservation_count: int
+    decode_reservation_backed_handoff_action_count: int
+    registered_decode_delivery_reservation_count: int
+    transferred_decode_delivery_reservation_count: int
+    terminal_decode_delivery_reservation_count: int
     scheduler_launch_handoff_begin_count: int
     scheduler_launch_handoff_acquisition_count: int
     scheduler_launch_handoff_release_count: int
     scheduler_launch_handoff_begin_active: bool
     scheduler_launch_handoff_begin_watermark: int | None
     scheduler_launch_handoff_begin_reservation_watermark: int | None
+    scheduler_launch_handoff_begin_decode_reservation_watermark: int | None
     active_scheduler_launch_handoff_token: int | None
     active_scheduler_launch_handoff_watermark: int | None
     active_scheduler_launch_handoff_reservation_watermark: int | None
+    active_scheduler_launch_handoff_decode_reservation_watermark: int | None
     registered_producer_count: int
     joined_producer_count: int
     active_source_count: int
@@ -1627,11 +1654,17 @@ class NativeTerminalOwnerInventory:
             self.registered_handoff_action_count,
             self.active_handoff_action_count,
             self.settled_handoff_action_count,
+            self.abort_settled_handoff_delivery_count,
             self.source_delivery_reservation_count,
             self.source_reservation_backed_handoff_action_count,
             self.registered_source_delivery_reservation_count,
             self.transferred_source_delivery_reservation_count,
             self.terminal_source_delivery_reservation_count,
+            self.decode_delivery_reservation_count,
+            self.decode_reservation_backed_handoff_action_count,
+            self.registered_decode_delivery_reservation_count,
+            self.transferred_decode_delivery_reservation_count,
+            self.terminal_decode_delivery_reservation_count,
             self.scheduler_launch_handoff_begin_count,
             self.scheduler_launch_handoff_acquisition_count,
             self.scheduler_launch_handoff_release_count,
@@ -1690,6 +1723,13 @@ class NativeTerminalOwnerInventory:
             self.active_handoff_action_count + self.settled_handoff_action_count
         ):
             raise ValueError("native active handoff accounting violates conservation")
+        if (
+            self.abort_settled_handoff_delivery_count
+            > self.settled_handoff_action_count
+        ):
+            raise ValueError(
+                "native abort handoff replay accounting exceeds settled actions"
+            )
         if self.registered_source_delivery_reservation_count != (
             self.source_delivery_reservation_count
             + self.transferred_source_delivery_reservation_count
@@ -1706,6 +1746,23 @@ class NativeTerminalOwnerInventory:
         ):
             raise ValueError(
                 "native reservation-backed handoff accounting is inconsistent"
+            )
+        if self.registered_decode_delivery_reservation_count != (
+            self.decode_delivery_reservation_count
+            + self.transferred_decode_delivery_reservation_count
+            + self.terminal_decode_delivery_reservation_count
+        ):
+            raise ValueError(
+                "native decode delivery reservation accounting violates conservation"
+            )
+        if (
+            self.decode_reservation_backed_handoff_action_count
+            > self.active_handoff_action_count
+            or self.decode_reservation_backed_handoff_action_count
+            > self.transferred_decode_delivery_reservation_count
+        ):
+            raise ValueError(
+                "native decode reservation-backed handoff accounting is inconsistent"
             )
         active_scheduler_launch_count = int(
             self.active_scheduler_launch_handoff_token is not None
@@ -1734,6 +1791,13 @@ class NativeTerminalOwnerInventory:
             raise ValueError(
                 "native scheduler reservation begin state is inconsistent"
             )
+        if self.scheduler_launch_handoff_begin_active != (
+            self.scheduler_launch_handoff_begin_decode_reservation_watermark
+            is not None
+        ):
+            raise ValueError(
+                "native scheduler decode reservation begin state is inconsistent"
+            )
         if (
             self.active_scheduler_launch_handoff_token is None
         ) != (
@@ -1748,12 +1812,22 @@ class NativeTerminalOwnerInventory:
             raise ValueError(
                 "native scheduler reservation token state is inconsistent"
             )
+        if (
+            self.active_scheduler_launch_handoff_token is None
+        ) != (
+            self.active_scheduler_launch_handoff_decode_reservation_watermark is None
+        ):
+            raise ValueError(
+                "native scheduler decode reservation token state is inconsistent"
+            )
         optional_uints = (
             self.scheduler_launch_handoff_begin_watermark,
             self.scheduler_launch_handoff_begin_reservation_watermark,
+            self.scheduler_launch_handoff_begin_decode_reservation_watermark,
             self.active_scheduler_launch_handoff_token,
             self.active_scheduler_launch_handoff_watermark,
             self.active_scheduler_launch_handoff_reservation_watermark,
+            self.active_scheduler_launch_handoff_decode_reservation_watermark,
         )
         if any(
             value is not None and (type(value) is not int or value < 0)
@@ -1774,11 +1848,17 @@ class NativeTerminalOwnerInventory:
             or self.source_batch_handoff_count != 0
             or self.source_batch_handoff_action_count != 0
             or self.registered_handoff_action_count != 0
+            or self.abort_settled_handoff_delivery_count != 0
             or self.source_delivery_reservation_count != 0
             or self.source_reservation_backed_handoff_action_count != 0
             or self.registered_source_delivery_reservation_count != 0
             or self.transferred_source_delivery_reservation_count != 0
             or self.terminal_source_delivery_reservation_count != 0
+            or self.decode_delivery_reservation_count != 0
+            or self.decode_reservation_backed_handoff_action_count != 0
+            or self.registered_decode_delivery_reservation_count != 0
+            or self.transferred_decode_delivery_reservation_count != 0
+            or self.terminal_decode_delivery_reservation_count != 0
             or self.scheduler_launch_handoff_begin_count != 0
             or self.scheduler_launch_handoff_acquisition_count != 0
             or self.scheduler_launch_handoff_release_count != 0
@@ -1840,8 +1920,11 @@ class NativeTerminalOwnerInventory:
                 or self.pending_action_count != 0
                 or self.unclaimed_handoff_action_count != 0
                 or self.active_handoff_action_count != 0
+                or self.abort_settled_handoff_delivery_count != 0
                 or self.source_delivery_reservation_count != 0
                 or self.source_reservation_backed_handoff_action_count != 0
+                or self.decode_delivery_reservation_count != 0
+                or self.decode_reservation_backed_handoff_action_count != 0
                 or self.active_source_count != 0
                 or self.active_decode_count != 0
                 or self.armed_deadline_count != 0
@@ -1898,6 +1981,9 @@ class NativeTerminalOwnerInventory:
             ),
             active_handoff_action_count=int(value["active_handoff_action_count"]),
             settled_handoff_action_count=int(value["settled_handoff_action_count"]),
+            abort_settled_handoff_delivery_count=int(
+                value["abort_settled_handoff_delivery_count"]
+            ),
             source_delivery_reservation_count=int(
                 value["source_delivery_reservation_count"]
             ),
@@ -1912,6 +1998,21 @@ class NativeTerminalOwnerInventory:
             ),
             terminal_source_delivery_reservation_count=int(
                 value["terminal_source_delivery_reservation_count"]
+            ),
+            decode_delivery_reservation_count=int(
+                value["decode_delivery_reservation_count"]
+            ),
+            decode_reservation_backed_handoff_action_count=int(
+                value["decode_reservation_backed_handoff_action_count"]
+            ),
+            registered_decode_delivery_reservation_count=int(
+                value["registered_decode_delivery_reservation_count"]
+            ),
+            transferred_decode_delivery_reservation_count=int(
+                value["transferred_decode_delivery_reservation_count"]
+            ),
+            terminal_decode_delivery_reservation_count=int(
+                value["terminal_decode_delivery_reservation_count"]
             ),
             scheduler_launch_handoff_begin_count=int(
                 value["scheduler_launch_handoff_begin_count"]
@@ -1942,6 +2043,18 @@ class NativeTerminalOwnerInventory:
                     ]
                 )
             ),
+            scheduler_launch_handoff_begin_decode_reservation_watermark=(
+                None
+                if value[
+                    "scheduler_launch_handoff_begin_decode_reservation_watermark"
+                ]
+                is None
+                else int(
+                    value[
+                        "scheduler_launch_handoff_begin_decode_reservation_watermark"
+                    ]
+                )
+            ),
             active_scheduler_launch_handoff_token=(
                 None
                 if value["active_scheduler_launch_handoff_token"] is None
@@ -1961,6 +2074,18 @@ class NativeTerminalOwnerInventory:
                 else int(
                     value[
                         "active_scheduler_launch_handoff_reservation_watermark"
+                    ]
+                )
+            ),
+            active_scheduler_launch_handoff_decode_reservation_watermark=(
+                None
+                if value[
+                    "active_scheduler_launch_handoff_decode_reservation_watermark"
+                ]
+                is None
+                else int(
+                    value[
+                        "active_scheduler_launch_handoff_decode_reservation_watermark"
                     ]
                 )
             ),

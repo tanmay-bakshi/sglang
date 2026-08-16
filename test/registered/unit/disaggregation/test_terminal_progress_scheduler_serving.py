@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-import sglang.srt.disaggregation.terminal_progress.scheduler_inbox as scheduler_inbox_module
 import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.decode import (
@@ -20,6 +19,9 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.nixl.conn import NixlTerminalRuntimeInstallation
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.terminal_progress import (
+    scheduler_inbox as scheduler_inbox_module,
+)
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeServingComposition,
 )
@@ -561,6 +563,53 @@ def test_loop_entry_consumes_exact_source_action_and_retires_generation() -> Non
     serving.close()
 
 
+def test_decode_publication_requires_explicit_handoff_commit() -> None:
+    """Decode publication cannot omit its causal handoff settlement."""
+
+    consumer = _DecodeConsumer()
+    serving = _decode_serving(consumer)
+    binding = _binding(2, 2, TerminalOwnerRole.DECODE)
+    action = _action(binding, 12)
+    commits: list[int] = []
+    serving.register_request(binding)
+
+    with pytest.raises(TypeError, match="decode publication_commit must be callable"):
+        serving.publish_action(action)
+
+    assert serving.inventory().retained_action_ids == ()
+    assert (
+        serving.publish_action(
+            action,
+            publication_commit=lambda: commits.append(action.action_id),
+        )
+        is SchedulerReceiptPublishResult.QUEUED
+    )
+    assert commits == [action.action_id]
+    assert serving.drain_at_loop_entry() == (action,)
+    serving.close()
+
+
+def test_source_publication_rejects_decode_handoff_commit() -> None:
+    """Source reclaim cannot carry decode-only settlement authority."""
+
+    consumer = _SourceConsumer()
+    serving = _source_serving(consumer)
+    binding = _binding(3, 3, TerminalOwnerRole.SOURCE)
+    action = _action(binding, 13)
+    serving.register_request(binding)
+
+    with pytest.raises(
+        ValueError,
+        match="source publication cannot carry publication_commit",
+    ):
+        serving.publish_action(action, publication_commit=lambda: None)
+
+    assert serving.inventory().retained_action_ids == ()
+    assert serving.publish_action(action) is SchedulerReceiptPublishResult.QUEUED
+    assert serving.drain_at_loop_entry() == (action,)
+    serving.close()
+
+
 def test_native_runtime_binding_registers_without_reconstructing_identity() -> None:
     """The runtime's exact native binding is the scheduler admission source."""
 
@@ -633,7 +682,7 @@ def test_decode_launch_handoff_consumes_while_forward_barrier_remains_held(
         """Publish after the synthetic host submission begins."""
 
         assert begin_publication.wait(timeout=5)
-        return serving.publish_action(action)
+        return serving.publish_action(action, publication_commit=lambda: None)
 
     def submit() -> str:
         """Return after host submission without releasing the forward barrier."""

@@ -97,7 +97,6 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
-    NativeTerminalOwnerAction,
     NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
@@ -1749,20 +1748,6 @@ class Scheduler(
         if serving is None:
             raise RuntimeError("terminal scheduler serving is not bound")
         serving.cancel_unpublished_request(binding)
-
-    def publish_terminal_scheduler_action(
-        self,
-        action: NativeTerminalOwnerAction,
-    ) -> None:
-        """Publish one owner action through the qualified scheduler inbox.
-
-        :param action: Exact reclaim or adoption action from the native owner.
-        """
-
-        serving = self.terminal_scheduler_serving
-        if serving is None:
-            raise RuntimeError("terminal scheduler serving is not bound")
-        serving.publish_action(action)
 
     def mark_terminal_owner_dead(self) -> None:
         """Wake the scheduler into sticky fail-closed owner-death state."""

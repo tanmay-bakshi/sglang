@@ -214,6 +214,12 @@ class _NativeTerminalOwnerBridge(Protocol):
     def expire_deadlines_for_test(self) -> None:
         """Evaluate all armed deadlines at deterministic test time."""
 
+    def hold_decode_delivery_dispatch_for_test(self) -> None:
+        """Hold one local-ready event after reservation admission."""
+
+    def release_decode_delivery_dispatch_for_test(self) -> None:
+        """Release the exact local-ready event captured by the test hold."""
+
     def abort_active_qualification_for_test(self) -> None:
         """Synchronously stop an active qualification test population."""
 
@@ -685,6 +691,28 @@ class NativeTerminalOwner:
         if not self._testing:
             raise RuntimeError("deterministic clocks require a native test build")
         self._native.expire_deadlines_for_test()
+
+    def hold_decode_delivery_dispatch_for_testing(self) -> None:
+        """Hold one local-ready event after its native reservation commits.
+
+        :raises RuntimeError: If this owner was not built for testing or is not
+            a quiescent decode owner.
+        """
+
+        if not self._testing:
+            raise RuntimeError("decode delivery holds require a native test build")
+        self._native.hold_decode_delivery_dispatch_for_test()
+
+    def release_decode_delivery_dispatch_for_testing(self) -> None:
+        """Release the exact local-ready event captured by the test hold.
+
+        :raises RuntimeError: If this owner was not built for testing or no
+            event is held.
+        """
+
+        if not self._testing:
+            raise RuntimeError("decode delivery holds require a native test build")
+        self._native.release_decode_delivery_dispatch_for_test()
 
     def abort_active_qualification_for_testing(self) -> None:
         """Synchronously stop an active native qualification population.

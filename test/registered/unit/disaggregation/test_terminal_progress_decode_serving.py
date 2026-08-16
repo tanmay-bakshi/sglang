@@ -1,3 +1,4 @@
+import concurrent.futures
 import contextlib
 import dataclasses
 import inspect
@@ -94,6 +95,7 @@ from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceWriter,
 )
 from sglang.srt.disaggregation.terminal_progress.wire import (
+    TerminalWireReceipt,
     TerminalWireReceiptImportNamespace,
     TerminalWireReceiptIssuer,
 )
@@ -571,6 +573,7 @@ def _runtime(
     source_identity: TerminalProcessIdentity,
     *,
     enable_forward_independent_handoff: bool,
+    testing: bool = False,
 ) -> NativeTerminalRuntime:
     """Construct one decode runtime with a complete frozen producer directory.
 
@@ -578,6 +581,7 @@ def _runtime(
     :param source_identity: Authenticated source control peer.
     :param enable_forward_independent_handoff: Whether native delivery authority
         gates scheduler launches.
+    :param testing: Whether to expose deterministic native test controls.
     :returns: Dormant process-lifetime runtime.
     """
 
@@ -653,6 +657,7 @@ def _runtime(
         publisher_capacity=8,
         observation_capacity=64,
         enable_forward_independent_handoff=enable_forward_independent_handoff,
+        testing=testing,
     )
 
 
@@ -855,6 +860,8 @@ def _registration(
 
 def _serving(
     decode_tp_size: int,
+    *,
+    testing: bool = False,
 ) -> tuple[
     PackedTerminalDecodeServing,
     NativeTerminalRuntime,
@@ -869,6 +876,7 @@ def _serving(
     """Construct one decode serving composition and all evidence ledgers.
 
     :param decode_tp_size: Destination attention TP width.
+    :param testing: Whether to expose deterministic native test controls.
     :returns: Composition, owners, registration, manifest, and ledgers.
     """
 
@@ -878,6 +886,7 @@ def _serving(
         local_identity,
         source_plan.writers[0].process_identity,
         enable_forward_independent_handoff=True,
+        testing=testing,
     )
     actor, actor_state = _actor(source_plan)
     completion = _CudaCompletion(runtime)
@@ -1005,6 +1014,81 @@ def _drive_to_adoption(
     )
 
 
+def _stage_runtime_adoption(
+    serving: PackedTerminalDecodeServing,
+    runtime: NativeTerminalRuntime,
+    registration: PackedTerminalDecodeSchedulerRegistration,
+    *,
+    expected_scheduler_count: int,
+) -> None:
+    """Drive one reservation-backed adoption into the runtime scheduler inbox.
+
+    :param serving: Open composition whose worker owns scatter execution.
+    :param runtime: Running decode runtime owning the lifecycle.
+    :param registration: Exact registered request generation.
+    :param expected_scheduler_count: Total queued scheduler actions after this
+        lifecycle reaches adoption.
+    """
+
+    binding_digest = registration.binding.digest
+    runtime.submit(
+        _LOCAL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_ALLOCATION_PUBLISHED,
+    )
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_AGGREGATION_STARTED,
+    )
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
+    )
+    expires_at = time.monotonic() + _WAIT_SECONDS
+    while (
+        runtime.decode_work_actions.snapshot().queued_count != 1
+        and time.monotonic() < expires_at
+    ):
+        pass
+    assert runtime.decode_work_actions.snapshot().queued_count == 1
+    assert serving.drain_decode_work_actions() == 1
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+    )
+    runtime.submit(
+        _REMOTE_CONTROL_PRODUCER_ID,
+        binding_digest,
+        NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
+    )
+    expires_at = time.monotonic() + _WAIT_SECONDS
+    while (
+        runtime.scheduler_actions.snapshot().queued_count != expected_scheduler_count
+        and time.monotonic() < expires_at
+    ):
+        pass
+    assert runtime.scheduler_actions.snapshot().queued_count == expected_scheduler_count
+
+
+def _assert_fail_closed_handoff_zero(
+    runtime: NativeTerminalRuntime,
+    inventory: PackedTerminalDecodeServingInventory,
+) -> None:
+    """Assert exact-zero delayed delivery authority after fail-closed close.
+
+    :param runtime: Closed runtime supplying final disposition.
+    :param inventory: Last pre-close serving inventory.
+    """
+
+    assert inventory.runtime.decode_scheduler_publication_handoff_count == 0
+    assert inventory.runtime.owner.active_handoff_action_count == 0
+    assert inventory.runtime.owner.abort_settled_handoff_delivery_count == 0
+    assert runtime.disposition is NativeTerminalRuntimeDisposition.STOPPED
+
+
 def test_tp1_full_success_retires_every_authority_exactly_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1128,6 +1212,225 @@ def test_runtime_fds_and_launch_binding_are_stable() -> None:
         assert runtime.disposition.value == "stopped"
 
 
+def test_adoption_settles_only_after_qualified_scheduler_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A waiting scheduler cannot consume before atomic native settlement.
+
+    :param monkeypatch: Scoped settlement barrier on the publication seam.
+    """
+
+    (
+        serving,
+        runtime,
+        _,
+        actor_state,
+        registration,
+        manifest,
+        _,
+        scheduler_events,
+        _,
+    ) = _serving(1, testing=True)
+    settlement_entered = threading.Event()
+    release_settlement = threading.Event()
+    consumer_entered = threading.Event()
+    dispatch_captured = False
+    settle_handoff = runtime.settle_decode_scheduler_publication_handoff
+
+    def record_settlement(action: NativeTerminalOwnerAction) -> None:
+        """Hold the commit after insertion but before scheduler visibility.
+
+        :param action: Published adoption action releasing launch exclusion.
+        """
+
+        settlement_entered.set()
+        if not release_settlement.wait(_WAIT_SECONDS):
+            raise TimeoutError("decode publication settlement was not released")
+        settle_handoff(action)
+
+    monkeypatch.setattr(
+        runtime,
+        "settle_decode_scheduler_publication_handoff",
+        record_settlement,
+    )
+    drain_scheduler_inbox = serving._scheduler_serving._inbox.drain_at_loop_entry
+
+    def observe_scheduler_drain(
+        consume: Callable[[TerminalWireReceipt], None],
+    ) -> tuple[TerminalWireReceipt, ...]:
+        """Expose the scheduler-thread drain before it acquires inbox state.
+
+        :param consume: Exact scheduler receipt consumer.
+        :returns: Exact receipts consumed by the real inbox drain.
+        """
+
+        consumer_entered.set()
+        return drain_scheduler_inbox(consume)
+
+    monkeypatch.setattr(
+        serving._scheduler_serving._inbox,
+        "drain_at_loop_entry",
+        observe_scheduler_drain,
+    )
+
+    def release_after_scheduler_contention() -> None:
+        """Release publication only after the scheduler reaches its drain."""
+
+        assert consumer_entered.wait(_WAIT_SECONDS)
+        assert scheduler_events == []
+        release_settlement.set()
+
+    serving.start()
+    try:
+        serving.register_request(registration, manifest)
+        serving.allocation_published(
+            registration.transaction,
+            object.__new__(object),
+            (),
+        )
+        writer_id = registration.source_plan.writers[0].writer_id
+        serving.control_received(writer_id, object())
+        serving.control_received(writer_id, object())
+        _pump_until(
+            serving,
+            lambda inventory: "teardown" in actor_state.events,
+        )
+        serving.control_received(writer_id, object())
+        serving.control_received(writer_id, object())
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.scheduler_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.scheduler_actions.snapshot().queued_count == 1
+        transition_floor = runtime.snapshot().owner.transition_count
+        submit = runtime.submit
+
+        def serialize_local_ready_submit(
+            producer_id: int,
+            binding_digest: bytes,
+            kind: NativeTerminalOwnerEventKind,
+            *,
+            receipt: NativeTerminalReceipt | None = None,
+            reason: str | None = None,
+            enqueued_ns: int | None = None,
+        ) -> None:
+            """Let prior scheduler events commit before the held local-ready event.
+
+            :param producer_id: Exact producer authority.
+            :param binding_digest: Target lifecycle digest.
+            :param kind: Native lifecycle event kind.
+            :param receipt: Optional authenticated receipt.
+            :param reason: Optional failure evidence.
+            :param enqueued_ns: Optional producer timestamp.
+            """
+
+            nonlocal dispatch_captured
+            if kind is NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED:
+                expires_at = time.monotonic() + _WAIT_SECONDS
+                while (
+                    runtime.snapshot().owner.transition_count < transition_floor + 2
+                    and time.monotonic() < expires_at
+                ):
+                    pass
+                if runtime.snapshot().owner.transition_count < transition_floor + 2:
+                    raise TimeoutError(
+                        "decode adoption predecessors did not become quiescent"
+                    )
+                runtime._owner.hold_decode_delivery_dispatch_for_testing()
+            submit(
+                producer_id,
+                binding_digest,
+                kind,
+                receipt=receipt,
+                reason=reason,
+                enqueued_ns=enqueued_ns,
+            )
+            if kind is NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED:
+                dispatch_captured = True
+
+        monkeypatch.setattr(runtime, "submit", serialize_local_ready_submit)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            publisher = executor.submit(serving.drain_scheduler_actions)
+            try:
+                assert settlement_entered.wait(_WAIT_SECONDS)
+                release = executor.submit(release_after_scheduler_contention)
+                consumed = serving.drain_scheduler_at_loop_entry()
+                release.result(timeout=_WAIT_SECONDS)
+            finally:
+                release_settlement.set()
+
+            assert publisher.result(timeout=_WAIT_SECONDS) == 1
+
+        assert tuple(action.kind for action in consumed) == (
+            NativeTerminalOwnerActionKind.ADOPTION_READY,
+        )
+        assert scheduler_events == ["adopt", "finalize"]
+
+        post_adoption = runtime.snapshot().owner
+        assert post_adoption.registered_decode_delivery_reservation_count == 2
+        assert post_adoption.decode_delivery_reservation_count == 1
+        assert post_adoption.decode_reservation_backed_handoff_action_count == 0
+        assert post_adoption.queued_output_count == 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while (
+                not runtime.snapshot().owner.scheduler_launch_handoff_begin_active
+                and time.monotonic() < expires_at
+            ):
+                pass
+            waiting = runtime.snapshot().owner
+            assert waiting.scheduler_launch_handoff_begin_active
+            action_watermark = waiting.scheduler_launch_handoff_begin_watermark
+            reservation_watermark = (
+                waiting.scheduler_launch_handoff_begin_decode_reservation_watermark
+            )
+            assert action_watermark is not None
+            assert reservation_watermark is not None
+            assert reservation_watermark > 0
+            assert not launch.done()
+
+            runtime._owner.release_decode_delivery_dispatch_for_testing()
+            dispatch_captured = False
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while (
+                runtime.coordinator_actions.snapshot().queued_count != 1
+                and time.monotonic() < expires_at
+            ):
+                pass
+            assert runtime.coordinator_actions.snapshot().queued_count == 1
+            transferred = runtime.snapshot().owner
+            assert transferred.decode_delivery_reservation_count == 0
+            assert transferred.decode_reservation_backed_handoff_action_count == 1
+            with runtime._condition:
+                local_ready_actions = tuple(
+                    action
+                    for action in runtime._consumer_pending.values()
+                    if action.kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY
+                )
+            assert len(local_ready_actions) == 1
+            assert local_ready_actions[0].action_id > action_watermark
+            assert not launch.done()
+
+            assert serving.drain_coordinator_actions() == 1
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        runtime.end_scheduler_launch_handoff(token)
+        local_ready_delivered = runtime.snapshot().owner
+        assert local_ready_delivered.decode_delivery_reservation_count == 0
+        assert local_ready_delivered.decode_reservation_backed_handoff_action_count == 0
+        assert local_ready_delivered.transferred_decode_delivery_reservation_count == 2
+    finally:
+        release_settlement.set()
+        if dispatch_captured:
+            runtime._owner.release_decode_delivery_dispatch_for_testing()
+        serving.abort_and_close()
+        assert runtime.disposition.value == "stopped"
+
+
 @pytest.mark.parametrize(
     "failure_after_retention",
     (False, True),
@@ -1158,17 +1461,44 @@ def test_scheduler_batch_failure_conserves_current_and_later_actions(
         registration,
         scheduler_events,
     )
-    actions = (
-        _adoption_action(registration.binding, action_id=1_001),
-        _adoption_action(second_registration.binding, action_id=1_002),
-    )
     serving.start()
     closed = False
     try:
         serving.register_request(registration, manifest)
         serving.register_request(second_registration, second_manifest)
-        for action in actions:
-            runtime._route_action(action)
+        _stage_runtime_adoption(
+            serving,
+            runtime,
+            registration,
+            expected_scheduler_count=1,
+        )
+        _stage_runtime_adoption(
+            serving,
+            runtime,
+            second_registration,
+            expected_scheduler_count=2,
+        )
+        drained_actions: list[NativeTerminalOwnerAction] = []
+        drain_scheduler_actions = runtime.scheduler_actions.drain
+
+        def record_scheduler_actions(
+            maximum_items: int | None = None,
+        ) -> tuple[NativeTerminalOwnerAction, ...]:
+            """Record the exact candidate batch crossing the runtime inbox.
+
+            :param maximum_items: Optional FIFO-prefix bound.
+            :returns: Exact actions claimed by the real runtime inbox.
+            """
+
+            actions = drain_scheduler_actions(maximum_items)
+            drained_actions.extend(actions)
+            return actions
+
+        monkeypatch.setattr(
+            runtime.scheduler_actions,
+            "drain",
+            record_scheduler_actions,
+        )
 
         with monkeypatch.context() as scoped_patch:
             if failure_after_retention:
@@ -1196,14 +1526,16 @@ def test_scheduler_batch_failure_conserves_current_and_later_actions(
                 def fail_before_retention(
                     receipt: object,
                     retain: Callable[[], None],
+                    commit: Callable[[], None],
                 ) -> None:
                     """Reject publication before scheduler authority transfers.
 
                     :param receipt: Candidate scheduler receipt.
                     :param retain: Uncalled action-retention boundary.
+                    :param commit: Uncalled causal-authority transfer boundary.
                     """
 
-                    del receipt, retain
+                    del receipt, retain, commit
                     raise OSError("synthetic pre-retention publication failure")
 
                 scoped_patch.setattr(
@@ -1216,31 +1548,200 @@ def test_scheduler_batch_failure_conserves_current_and_later_actions(
                 serving.drain_scheduler_actions()
 
         assert raised.value.scheduler_retains_action is failure_after_retention
-        with runtime._condition:
-            pending_action_ids = frozenset(runtime._consumer_pending)
-            claimed_action_ids = frozenset(runtime._inbox_claimed_action_ids)
-        assert actions[1].action_id not in pending_action_ids
-        assert actions[1].action_id not in claimed_action_ids
+        assert len(drained_actions) == 2
+        candidate_action_ids = frozenset(action.action_id for action in drained_actions)
         expected_retained = (
-            frozenset((actions[0].action_id,))
+            frozenset((drained_actions[0].action_id,))
             if failure_after_retention
             else frozenset()
         )
-        candidate_action_ids = frozenset(action.action_id for action in actions)
+        with runtime._condition:
+            pending_action_ids = frozenset(runtime._consumer_pending)
+            claimed_action_ids = frozenset(runtime._inbox_claimed_action_ids)
         assert pending_action_ids & candidate_action_ids == expected_retained
         assert claimed_action_ids & candidate_action_ids == expected_retained
-        scheduler_retained = frozenset(
-            serving._scheduler_serving.inventory().retained_action_ids
-        )
-        assert scheduler_retained & candidate_action_ids == expected_retained
+        runtime_snapshot = runtime.snapshot()
+        assert runtime_snapshot.decode_scheduler_publication_handoff_count == 0
+        assert runtime_snapshot.owner.active_handoff_action_count == 0
+        scheduler_retained = serving._scheduler_serving.inventory().retained_action_ids
+        assert frozenset(scheduler_retained) == expected_retained
 
         inventory = serving.abort_and_close()
         closed = True
         assert runtime.disposition is NativeTerminalRuntimeDisposition.STOPPED
-        assert frozenset(inventory.scheduler_serving.retained_action_ids) == (
-            expected_retained
-        )
+        assert inventory.scheduler_serving.retained_action_ids == scheduler_retained
     finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_precommit_publication_failure_closes_without_delayed_handoffs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-commit rejection settles every delayed handoff fail closed.
+
+    :param monkeypatch: Scoped pre-commit publication failure.
+    """
+
+    serving, runtime, _, _, registration, manifest, _, _, _ = _serving(1)
+
+    def reject_before_commit(
+        receipt: object,
+        retain: Callable[[], None],
+        commit: Callable[[], None],
+    ) -> None:
+        """Reject before either scheduler retention callback can execute.
+
+        :param receipt: Candidate scheduler receipt.
+        :param retain: Uncalled action-retention boundary.
+        :param commit: Uncalled handoff-settlement boundary.
+        """
+
+        del receipt, retain, commit
+        raise OSError("synthetic pre-commit publication failure")
+
+    serving.start()
+    closed = False
+    try:
+        serving.register_request(registration, manifest)
+        _stage_runtime_adoption(
+            serving,
+            runtime,
+            registration,
+            expected_scheduler_count=1,
+        )
+        monkeypatch.setattr(
+            serving._scheduler_serving._inbox,
+            "publish_after_retention",
+            reject_before_commit,
+        )
+        with pytest.raises(TerminalSchedulerActionPublicationError):
+            serving.drain_scheduler_actions()
+        after_failure = runtime.snapshot()
+        assert after_failure.decode_scheduler_publication_handoff_count == 0
+        assert after_failure.owner.active_handoff_action_count == 0
+        assert after_failure.owner.abort_settled_handoff_delivery_count == 0
+
+        inventory = serving.abort_and_close()
+        closed = True
+        _assert_fail_closed_handoff_zero(runtime, inventory)
+    finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_postinsertion_commit_failure_closes_without_delayed_handoffs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed commit after inbox insertion is reconciled fail closed.
+
+    :param monkeypatch: Scoped post-insertion commit failure.
+    """
+
+    serving, runtime, _, _, registration, manifest, _, _, _ = _serving(1)
+
+    def reject_commit(action: NativeTerminalOwnerAction) -> None:
+        """Reject the handoff commit after qualified receipt insertion.
+
+        :param action: Exact delayed adoption authority.
+        """
+
+        assert action.kind is NativeTerminalOwnerActionKind.ADOPTION_READY
+        raise RuntimeError("synthetic post-insertion commit failure")
+
+    serving.start()
+    closed = False
+    try:
+        serving.register_request(registration, manifest)
+        _stage_runtime_adoption(
+            serving,
+            runtime,
+            registration,
+            expected_scheduler_count=1,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "settle_decode_scheduler_publication_handoff",
+            reject_commit,
+        )
+        with pytest.raises(TerminalSchedulerActionPublicationError):
+            serving.drain_scheduler_actions()
+        after_failure = runtime.snapshot()
+        assert after_failure.decode_scheduler_publication_handoff_count == 1
+        assert after_failure.owner.active_handoff_action_count == 0
+        assert after_failure.owner.abort_settled_handoff_delivery_count == 1
+
+        inventory = serving.abort_and_close()
+        closed = True
+        _assert_fail_closed_handoff_zero(runtime, inventory)
+    finally:
+        if not closed:
+            serving.abort_and_close()
+
+
+def test_abort_racing_publication_commit_closes_without_delayed_handoffs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort settlement and a racing publication commit reconcile once.
+
+    :param monkeypatch: Scoped commit barrier exposing the abort race.
+    """
+
+    serving, runtime, _, _, registration, manifest, _, _, _ = _serving(1)
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    settle_handoff = runtime.settle_decode_scheduler_publication_handoff
+
+    def hold_commit(action: NativeTerminalOwnerAction) -> None:
+        """Hold after insertion until native abort settles active authority.
+
+        :param action: Exact delayed adoption authority.
+        """
+
+        commit_entered.set()
+        if not release_commit.wait(_WAIT_SECONDS):
+            raise TimeoutError("publication commit was not released")
+        settle_handoff(action)
+
+    serving.start()
+    closed = False
+    try:
+        serving.register_request(registration, manifest)
+        _stage_runtime_adoption(
+            serving,
+            runtime,
+            registration,
+            expected_scheduler_count=1,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "settle_decode_scheduler_publication_handoff",
+            hold_commit,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            publication = executor.submit(serving.drain_scheduler_actions)
+            assert commit_entered.wait(_WAIT_SECONDS)
+            before_abort = runtime.snapshot()
+            assert before_abort.decode_scheduler_publication_handoff_count == 1
+            assert before_abort.owner.active_handoff_action_count == 1
+
+            runtime.begin_abort("synthetic abort racing publication commit")
+            during_abort = runtime.snapshot()
+            assert during_abort.decode_scheduler_publication_handoff_count == 1
+            assert during_abort.owner.active_handoff_action_count == 0
+            assert during_abort.owner.abort_settled_handoff_delivery_count == 1
+            release_commit.set()
+            assert publication.result(timeout=_WAIT_SECONDS) == 1
+        after_commit = runtime.snapshot()
+        assert after_commit.decode_scheduler_publication_handoff_count == 0
+        assert after_commit.owner.active_handoff_action_count == 0
+        assert after_commit.owner.abort_settled_handoff_delivery_count == 0
+
+        inventory = serving.abort_and_close()
+        closed = True
+        _assert_fail_closed_handoff_zero(runtime, inventory)
+    finally:
+        release_commit.set()
         if not closed:
             serving.abort_and_close()
 

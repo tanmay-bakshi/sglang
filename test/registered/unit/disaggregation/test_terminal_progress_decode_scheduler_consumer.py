@@ -393,7 +393,10 @@ def test_composition_adopts_exact_request_before_local_ready() -> None:
     )
 
     composition.register(registration)
-    composition.scheduler_serving.publish_action(_action(registration.binding))
+    composition.scheduler_serving.publish_action(
+        _action(registration.binding),
+        publication_commit=lambda: None,
+    )
     consumed = composition.scheduler_serving.drain_at_loop_entry()
 
     assert tuple(action.action_id for action in consumed) == (1,)

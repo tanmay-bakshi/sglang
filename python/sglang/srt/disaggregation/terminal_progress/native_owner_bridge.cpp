@@ -690,9 +690,14 @@ struct SourceDeliveryReservation {
   std::uint64_t reservation_id{0};
 };
 
+struct DecodeDeliveryReservation {
+  std::uint64_t reservation_id{0};
+};
+
 struct ActiveHandoffAuthority {
   ActionKind kind;
   std::optional<std::uint64_t> source_reservation_id;
+  std::optional<std::uint64_t> decode_reservation_id;
 };
 
 struct SharedOwner {
@@ -717,6 +722,8 @@ struct SharedOwner {
   std::unordered_set<std::uint64_t> output_drain_action_ids{};
   std::unordered_map<Digest, SourceDeliveryReservation, DigestHash, DigestEqual>
       source_delivery_reservations{};
+  std::unordered_map<Digest, DecodeDeliveryReservation, DigestHash, DigestEqual>
+      decode_delivery_reservations{};
   std::unordered_set<std::uint64_t> unclaimed_handoff_action_ids{};
   std::unordered_map<std::uint64_t, ActiveHandoffAuthority>
       active_handoff_actions{};
@@ -748,6 +755,10 @@ struct SharedOwner {
   std::uint64_t source_delivery_reservation_registration_count{0};
   std::uint64_t source_delivery_reservation_transfer_count{0};
   std::uint64_t source_delivery_reservation_terminal_count{0};
+  std::uint64_t next_decode_delivery_reservation_id{1};
+  std::uint64_t decode_delivery_reservation_registration_count{0};
+  std::uint64_t decode_delivery_reservation_transfer_count{0};
+  std::uint64_t decode_delivery_reservation_terminal_count{0};
   std::uint64_t scheduler_launch_handoff_begin_count{0};
   std::uint64_t scheduler_launch_handoff_acquisition_count{0};
   std::uint64_t scheduler_launch_handoff_release_count{0};
@@ -755,8 +766,10 @@ struct SharedOwner {
   std::uint64_t active_scheduler_launch_handoff_token{0};
   std::uint64_t active_scheduler_launch_handoff_watermark{0};
   std::uint64_t active_scheduler_launch_handoff_reservation_watermark{0};
+  std::uint64_t active_scheduler_launch_handoff_decode_reservation_watermark{0};
   std::uint64_t scheduler_launch_handoff_begin_watermark{0};
   std::uint64_t scheduler_launch_handoff_begin_reservation_watermark{0};
+  std::uint64_t scheduler_launch_handoff_begin_decode_reservation_watermark{0};
   bool started{false};
   bool admission_open{true};
   bool event_admission_open{true};
@@ -773,6 +786,8 @@ struct SharedOwner {
   bool scheduler_launch_handoff_begin_active{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   bool test_clock_enabled{false};
+  bool test_decode_delivery_dispatch_held{false};
+  bool test_decode_delivery_dispatch_captured{false};
   std::uint64_t test_now_ns{0};
 #endif
   FatalCode fatal_code{FatalCode::kNone};
@@ -795,6 +810,12 @@ bool terminalize_source_delivery_reservation_locked(
     SharedOwner &owner, const Digest &binding_digest) noexcept;
 
 void terminalize_all_source_delivery_reservations_locked(
+    SharedOwner &owner) noexcept;
+
+bool terminalize_decode_delivery_reservation_locked(
+    SharedOwner &owner, const Digest &binding_digest) noexcept;
+
+void terminalize_all_decode_delivery_reservations_locked(
     SharedOwner &owner) noexcept;
 
 bool enter_process_fatal_state_locked(SharedOwner &owner, FatalCode code,
@@ -844,6 +865,7 @@ bool enter_process_fatal_state_locked(SharedOwner &owner, FatalCode code,
     return false;
   }
   terminalize_all_source_delivery_reservations_locked(owner);
+  terminalize_all_decode_delivery_reservations_locked(owner);
   owner.fatal_code = code;
   try {
     owner.fatal_reason = reason;
@@ -1517,6 +1539,7 @@ void quarantine_all_locked(SharedOwner &owner, FatalCode code,
 
 bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
   switch (kind) {
+  case ActionKind::kAdoptionReady:
   case ActionKind::kLocalDecodeReady:
   case ActionKind::kRequestRetired:
   case ActionKind::kSourceGatherReady:
@@ -1526,7 +1549,6 @@ bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
   case ActionKind::kDecodeTeardownReady:
   case ActionKind::kGatewayPublicationReady: return true;
   case ActionKind::kReclaimAuthorized:
-  case ActionKind::kAdoptionReady:
   case ActionKind::kRequestQuarantined:
   case ActionKind::kProcessFatal: return false;
   }
@@ -1552,8 +1574,14 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
         if (!action_requires_forward_independent_handoff(authority.kind)) {
           return false;
         }
-        return authority.source_reservation_id.has_value() ==
-               (authority.kind == ActionKind::kSourceGatherReady);
+        const bool source_backed = authority.source_reservation_id.has_value();
+        const bool decode_backed = authority.decode_reservation_id.has_value();
+        return source_backed ==
+                   (authority.kind == ActionKind::kSourceGatherReady) &&
+               decode_backed ==
+                   (authority.kind == ActionKind::kAdoptionReady ||
+                    authority.kind == ActionKind::kLocalDecodeReady) &&
+               !(source_backed && decode_backed);
       });
   const bool action_conservation =
       owner.handoff_registration_count ==
@@ -1564,6 +1592,11 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
       owner.source_delivery_reservations.size() +
           owner.source_delivery_reservation_transfer_count +
           owner.source_delivery_reservation_terminal_count;
+  const bool decode_reservation_conservation =
+      owner.decode_delivery_reservation_registration_count ==
+      owner.decode_delivery_reservations.size() +
+          owner.decode_delivery_reservation_transfer_count +
+          owner.decode_delivery_reservation_terminal_count;
   const bool live_reservations_are_valid = std::all_of(
       owner.source_delivery_reservations.begin(),
       owner.source_delivery_reservations.end(), [&owner](const auto &entry) {
@@ -1609,6 +1642,53 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
                             reservation_id;
                    }) == 1;
       });
+  const bool live_decode_reservations_are_valid = std::all_of(
+      owner.decode_delivery_reservations.begin(),
+      owner.decode_delivery_reservations.end(), [&owner](const auto &entry) {
+        const std::uint64_t reservation_id = entry.second.reservation_id;
+        if (reservation_id == 0 ||
+            reservation_id >= owner.next_decode_delivery_reservation_id) {
+          return false;
+        }
+        return std::count_if(
+                   owner.decode_delivery_reservations.begin(),
+                   owner.decode_delivery_reservations.end(),
+                   [reservation_id](const auto &candidate) {
+                     return candidate.second.reservation_id == reservation_id;
+                   }) == 1;
+      });
+  const bool transferred_decode_reservations_are_valid = std::all_of(
+      owner.active_handoff_actions.begin(),
+      owner.active_handoff_actions.end(), [&owner](const auto &entry) {
+        const std::optional<std::uint64_t> reservation_id =
+            entry.second.decode_reservation_id;
+        if (!reservation_id.has_value()) {
+          return entry.second.kind != ActionKind::kAdoptionReady &&
+                 entry.second.kind != ActionKind::kLocalDecodeReady;
+        }
+        if ((entry.second.kind != ActionKind::kAdoptionReady &&
+             entry.second.kind != ActionKind::kLocalDecodeReady) ||
+            reservation_id.value() == 0 ||
+            reservation_id.value() >=
+                owner.next_decode_delivery_reservation_id) {
+          return false;
+        }
+        if (std::any_of(owner.decode_delivery_reservations.begin(),
+                        owner.decode_delivery_reservations.end(),
+                        [reservation_id](const auto &reservation) {
+                          return reservation.second.reservation_id ==
+                                 reservation_id.value();
+                        })) {
+          return false;
+        }
+        return std::count_if(
+                   owner.active_handoff_actions.begin(),
+                   owner.active_handoff_actions.end(),
+                   [reservation_id](const auto &candidate) {
+                     return candidate.second.decode_reservation_id ==
+                            reservation_id;
+                   }) == 1;
+      });
   const bool abort_settlement_is_authorized =
       (!owner.abort_started &&
        owner.abort_settled_handoff_delivery_ids.empty()) ||
@@ -1627,15 +1707,22 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
   const bool token_state_consistent =
       (owner.active_scheduler_launch_handoff_token != 0 ||
        (owner.active_scheduler_launch_handoff_watermark == 0 &&
-        owner.active_scheduler_launch_handoff_reservation_watermark == 0)) &&
+        owner.active_scheduler_launch_handoff_reservation_watermark == 0 &&
+        owner.active_scheduler_launch_handoff_decode_reservation_watermark ==
+            0)) &&
       (owner.scheduler_launch_handoff_begin_active ||
        (owner.scheduler_launch_handoff_begin_watermark == 0 &&
-        owner.scheduler_launch_handoff_begin_reservation_watermark == 0)) &&
+        owner.scheduler_launch_handoff_begin_reservation_watermark == 0 &&
+        owner.scheduler_launch_handoff_begin_decode_reservation_watermark ==
+            0)) &&
       !(owner.scheduler_launch_handoff_begin_active &&
         owner.active_scheduler_launch_handoff_token != 0);
   return unclaimed_is_authorized && active_is_authorized &&
          action_conservation && reservation_conservation &&
-         live_reservations_are_valid && transferred_reservations_are_valid &&
+         decode_reservation_conservation && live_reservations_are_valid &&
+         transferred_reservations_are_valid &&
+         live_decode_reservations_are_valid &&
+         transferred_decode_reservations_are_valid &&
          abort_settlement_is_authorized && token_conservation &&
          token_state_consistent;
 }
@@ -1717,6 +1804,81 @@ void terminalize_all_source_delivery_reservations_locked(
   owner.condition.notify_all();
 }
 
+bool reserve_decode_delivery_locked(SharedOwner &owner,
+                                    const Event &event) noexcept {
+  if (!owner.handoff_enabled ||
+      owner.owner_identity.role != OwnerRole::kDecode ||
+      (event.kind != EventKind::kDecodeWriterAggregationStarted &&
+       event.kind != EventKind::kDecodeLocalReadyIssued)) {
+    return true;
+  }
+  if (owner.next_decode_delivery_reservation_id == 0 ||
+      owner.next_decode_delivery_reservation_id ==
+          std::numeric_limits<std::uint64_t>::max()) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kHandoffAuthority,
+        "decode delivery reservation identity space was exhausted");
+    return false;
+  }
+  if (owner.decode_delivery_reservations.count(event.binding_digest) != 0) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kHandoffAuthority,
+        "decode delivery reservation duplicated a live binding");
+    return false;
+  }
+  const std::uint64_t reservation_id =
+      owner.next_decode_delivery_reservation_id++;
+  try {
+    const bool inserted =
+        owner.decode_delivery_reservations
+            .emplace(event.binding_digest,
+                     DecodeDeliveryReservation{reservation_id})
+            .second;
+    if (!inserted) {
+      enter_handoff_fatal_locked(
+          owner, FatalCode::kHandoffAuthority,
+          "decode delivery reservation insertion was not unique");
+      return false;
+    }
+  } catch (...) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kInternalError,
+        "decode delivery reservation allocation failed");
+    return false;
+  }
+  ++owner.decode_delivery_reservation_registration_count;
+  owner.condition.notify_all();
+  return true;
+}
+
+bool terminalize_decode_delivery_reservation_locked(
+    SharedOwner &owner, const Digest &binding_digest) noexcept {
+  const auto reservation =
+      owner.decode_delivery_reservations.find(binding_digest);
+  if (reservation == owner.decode_delivery_reservations.end()) {
+    return false;
+  }
+  owner.decode_delivery_reservations.erase(reservation);
+  ++owner.decode_delivery_reservation_terminal_count;
+  owner.condition.notify_all();
+  return true;
+}
+
+void terminalize_all_decode_delivery_reservations_locked(
+    SharedOwner &owner) noexcept {
+  owner.decode_delivery_reservation_terminal_count +=
+      owner.decode_delivery_reservations.size();
+  owner.decode_delivery_reservations.clear();
+  owner.condition.notify_all();
+}
+
+bool decode_phase_retains_delivery_reservation(
+    std::uint8_t phase_value) noexcept {
+  const DecodePhase phase = static_cast<DecodePhase>(phase_value);
+  return phase >= DecodePhase::kWriterAggregating &&
+         phase <= DecodePhase::kAckAggregating;
+}
+
 bool register_forward_independent_handoffs_locked(
     SharedOwner &owner, const Output &output) noexcept {
   if (!owner.handoff_enabled) {
@@ -1725,12 +1887,28 @@ bool register_forward_independent_handoffs_locked(
   const bool transfers_source_reservation =
       !output.process_fatal && output.role == OwnerRole::kSource &&
       output.event_kind == EventKind::kSourceProducerCompleted;
+  const bool transfers_decode_reservation =
+      !output.process_fatal && output.role == OwnerRole::kDecode &&
+      (output.event_kind == EventKind::kDecodeAckManifestCompleted ||
+       output.event_kind == EventKind::kDecodeLocalReadyIssued);
+  const ActionKind decode_reservation_action_kind =
+      output.event_kind == EventKind::kDecodeAckManifestCompleted
+          ? ActionKind::kAdoptionReady
+          : ActionKind::kLocalDecodeReady;
   if (transfers_source_reservation &&
       (output.actions.size() != 1 ||
        output.actions.front().kind != ActionKind::kSourceGatherReady)) {
     enter_handoff_fatal_locked(
         owner, FatalCode::kHandoffAuthority,
         "source producer completion did not yield one gather handoff");
+    return false;
+  }
+  if (transfers_decode_reservation &&
+      (output.actions.size() != 1 ||
+       output.actions.front().kind != decode_reservation_action_kind)) {
+    enter_handoff_fatal_locked(
+        owner, FatalCode::kHandoffAuthority,
+        "decode delivery completion did not yield its exact handoff");
     return false;
   }
   std::optional<std::uint64_t> source_reservation_id{};
@@ -1745,6 +1923,18 @@ bool register_forward_independent_handoffs_locked(
     }
     source_reservation_id = reservation->second.reservation_id;
   }
+  std::optional<std::uint64_t> decode_reservation_id{};
+  if (transfers_decode_reservation) {
+    const auto reservation =
+        owner.decode_delivery_reservations.find(output.binding.digest);
+    if (reservation == owner.decode_delivery_reservations.end()) {
+      enter_handoff_fatal_locked(
+          owner, FatalCode::kHandoffAuthority,
+          "decode handoff lacked its accepted-delivery reservation");
+      return false;
+    }
+    decode_reservation_id = reservation->second.reservation_id;
+  }
 
   std::size_t registration_count = 0;
   for (const Action &action : output.actions) {
@@ -1753,7 +1943,13 @@ bool register_forward_independent_handoffs_locked(
     }
     ++registration_count;
     const bool source_gather = action.kind == ActionKind::kSourceGatherReady;
+    const bool decode_backed =
+        action.kind == ActionKind::kAdoptionReady ||
+        action.kind == ActionKind::kLocalDecodeReady;
     if (source_gather != transfers_source_reservation ||
+        decode_backed != transfers_decode_reservation ||
+        (transfers_decode_reservation &&
+         action.kind != decode_reservation_action_kind) ||
         owner.pending_actions.count(action.action_id) != 1 ||
         owner.unclaimed_handoff_action_ids.count(action.action_id) != 0 ||
         std::count_if(output.actions.begin(), output.actions.end(),
@@ -1779,9 +1975,14 @@ bool register_forward_independent_handoffs_locked(
       if (!action_requires_forward_independent_handoff(action.kind)) {
         continue;
       }
-      ActiveHandoffAuthority authority{action.kind, std::nullopt};
+      ActiveHandoffAuthority authority{action.kind, std::nullopt,
+                                       std::nullopt};
       if (action.kind == ActionKind::kSourceGatherReady) {
         authority.source_reservation_id = source_reservation_id;
+      }
+      if (action.kind == ActionKind::kAdoptionReady ||
+          action.kind == ActionKind::kLocalDecodeReady) {
+        authority.decode_reservation_id = decode_reservation_id;
       }
       if (!owner.active_handoff_actions
                .emplace(action.action_id, std::move(authority))
@@ -1808,6 +2009,10 @@ bool register_forward_independent_handoffs_locked(
   if (transfers_source_reservation) {
     owner.source_delivery_reservations.erase(output.binding.digest);
     ++owner.source_delivery_reservation_transfer_count;
+  }
+  if (transfers_decode_reservation) {
+    owner.decode_delivery_reservations.erase(output.binding.digest);
+    ++owner.decode_delivery_reservation_transfer_count;
   }
   owner.handoff_registration_count += registration_count;
   owner.condition.notify_all();
@@ -1905,26 +2110,44 @@ void abort_forward_independent_handoffs_locked(SharedOwner &owner) {
 
 bool active_handoff_at_or_below_locked(const SharedOwner &owner,
                                        std::uint64_t action_watermark,
-                                       std::uint64_t reservation_watermark) noexcept {
-  const bool live_reservation = std::any_of(
+                                       std::uint64_t reservation_watermark,
+                                       std::uint64_t
+                                           decode_reservation_watermark) noexcept {
+  const bool live_source_reservation = std::any_of(
       owner.source_delivery_reservations.begin(),
       owner.source_delivery_reservations.end(),
       [reservation_watermark](const auto &entry) {
         return entry.second.reservation_id <= reservation_watermark;
       });
-  if (live_reservation) {
+  if (live_source_reservation) {
+    return true;
+  }
+  const bool live_decode_reservation = std::any_of(
+      owner.decode_delivery_reservations.begin(),
+      owner.decode_delivery_reservations.end(),
+      [decode_reservation_watermark](const auto &entry) {
+        return entry.second.reservation_id <= decode_reservation_watermark;
+      });
+  if (live_decode_reservation) {
     return true;
   }
   return std::any_of(
       owner.active_handoff_actions.begin(),
       owner.active_handoff_actions.end(),
-      [action_watermark, reservation_watermark](const auto &entry) {
+      [action_watermark, reservation_watermark,
+       decode_reservation_watermark](const auto &entry) {
         if (entry.first <= action_watermark) {
           return true;
         }
-        return entry.second.source_reservation_id.has_value() &&
-               entry.second.source_reservation_id.value() <=
-                   reservation_watermark;
+        const bool captured_source_reservation =
+            entry.second.source_reservation_id.has_value() &&
+            entry.second.source_reservation_id.value() <=
+                reservation_watermark;
+        const bool captured_decode_reservation =
+            entry.second.decode_reservation_id.has_value() &&
+            entry.second.decode_reservation_id.value() <=
+                decode_reservation_watermark;
+        return captured_source_reservation || captured_decode_reservation;
       });
 }
 
@@ -2089,6 +2312,19 @@ void expire_deadlines_locked(SharedOwner &owner) {
             owner, FatalCode::kHandoffAuthority, nullptr,
             "source deadline lost its accepted-delivery reservation");
         return;
+      }
+      if (owner.handoff_enabled &&
+          lifecycle.role == OwnerRole::kDecode) {
+        const bool terminalized =
+            terminalize_decode_delivery_reservation_locked(
+                owner, lifecycle.binding.digest);
+        if (decode_phase_retains_delivery_reservation(previous_phase) &&
+            !terminalized) {
+          quarantine_all_locked(
+              owner, FatalCode::kHandoffAuthority, nullptr,
+              "decode deadline lost its writer-delivery reservation");
+          return;
+        }
       }
       quarantine_live(lifecycle);
       Output output{};
@@ -2568,6 +2804,19 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
       reduce_source_locked(owner, lifecycle, canonical_event, output,
                            completed_ns);
     } else {
+      if (owner.handoff_enabled &&
+          canonical_event.kind == EventKind::kDecodeRequestFailed) {
+        const bool terminalized =
+            terminalize_decode_delivery_reservation_locked(
+                owner, lifecycle.binding.digest);
+        if (decode_phase_retains_delivery_reservation(previous_phase) &&
+            !terminalized) {
+          enter_handoff_fatal_locked(
+              owner, FatalCode::kHandoffAuthority,
+              "decode failure lost its writer-delivery reservation");
+          return;
+        }
+      }
       reduce_decode_locked(owner, lifecycle, canonical_event, output,
                            completed_ns);
     }
@@ -2699,7 +2948,7 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
     }
     for (;;) {
       {
-        std::lock_guard<std::mutex> lock(owner->mutex);
+        std::unique_lock<std::mutex> lock(owner->mutex);
         if (owner->input_queue.empty()) {
           enqueue_next_qualification_events_locked(*owner);
           if (owner->input_queue.empty()) {
@@ -2707,6 +2956,24 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
             break;
           }
         }
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+        const InputCommand &next_command = owner->input_queue.front();
+        const bool holds_decode_delivery =
+            owner->test_decode_delivery_dispatch_held &&
+            owner->test_decode_delivery_dispatch_captured &&
+            next_command.kind == InputKind::kEvent &&
+            next_command.event.kind == EventKind::kDecodeLocalReadyIssued;
+        if (holds_decode_delivery) {
+          owner->condition.wait(lock, [&]() {
+            return !owner->test_decode_delivery_dispatch_held ||
+                   owner->fatal_code != FatalCode::kNone || owner->closed;
+          });
+          if (owner->input_queue.empty()) {
+            finish_producer_join_barrier_locked(*owner);
+            break;
+          }
+        }
+#endif
         InputCommand command = std::move(owner->input_queue.front());
         owner->input_queue.pop_front();
         if (owner->fatal_code != FatalCode::kNone &&
@@ -2749,11 +3016,24 @@ int submit_event_locked(SharedOwner &owner, Event event) noexcept {
   if (!reserve_source_delivery_locked(owner, event)) {
     return EIO;
   }
+  if (!reserve_decode_delivery_locked(owner, event)) {
+    return EIO;
+  }
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+  const bool captures_test_decode_delivery_dispatch =
+      owner.test_decode_delivery_dispatch_held &&
+      event.kind == EventKind::kDecodeLocalReadyIssued;
+#endif
   InputCommand command{};
   command.kind = InputKind::kEvent;
   command.event = std::move(event);
   owner.input_queue.push_back(std::move(command));
   ++producer.next_submission_sequence;
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+  if (captures_test_decode_delivery_dispatch) {
+    owner.test_decode_delivery_dispatch_captured = true;
+  }
+#endif
   signal_fd_locked(owner, owner.input_fd);
   return owner.fatal_code == FatalCode::kNone ? 0 : EIO;
 }
@@ -3016,7 +3296,8 @@ public:
   operator=(const NativeTerminalOwnerBridge &) = delete;
 
   py::tuple forward_independent_handoff_action_kinds() const {
-    constexpr std::array<ActionKind, 8> kinds{
+    constexpr std::array<ActionKind, 9> kinds{
+        ActionKind::kAdoptionReady,
         ActionKind::kLocalDecodeReady,
         ActionKind::kRequestRetired,
         ActionKind::kSourceGatherReady,
@@ -3429,13 +3710,18 @@ public:
     const std::uint64_t watermark = owner_->next_action_id - 1;
     const std::uint64_t reservation_watermark =
         owner_->next_source_delivery_reservation_id - 1;
+    const std::uint64_t decode_reservation_watermark =
+        owner_->next_decode_delivery_reservation_id - 1;
     owner_->scheduler_launch_handoff_begin_watermark = watermark;
     owner_->scheduler_launch_handoff_begin_reservation_watermark =
         reservation_watermark;
+    owner_->scheduler_launch_handoff_begin_decode_reservation_watermark =
+        decode_reservation_watermark;
     const bool reached = owner_->condition.wait_for(
         lock, std::chrono::duration<double>(timeout_seconds), [&]() {
           return !active_handoff_at_or_below_locked(
-                     *owner_, watermark, reservation_watermark) ||
+                     *owner_, watermark, reservation_watermark,
+                     decode_reservation_watermark) ||
                  owner_->fatal_code != FatalCode::kNone ||
                  owner_->abort_started || owner_->closed;
         });
@@ -3443,6 +3729,7 @@ public:
       owner_->scheduler_launch_handoff_begin_active = false;
       owner_->scheduler_launch_handoff_begin_watermark = 0;
       owner_->scheduler_launch_handoff_begin_reservation_watermark = 0;
+      owner_->scheduler_launch_handoff_begin_decode_reservation_watermark = 0;
       reject_authority(
           "scheduler launch handoff timed out with active delivery authority");
     }
@@ -3451,6 +3738,7 @@ public:
       owner_->scheduler_launch_handoff_begin_active = false;
       owner_->scheduler_launch_handoff_begin_watermark = 0;
       owner_->scheduler_launch_handoff_begin_reservation_watermark = 0;
+      owner_->scheduler_launch_handoff_begin_decode_reservation_watermark = 0;
       owner_->condition.notify_all();
       throw std::runtime_error(
           "scheduler launch handoff was interrupted by terminal authority");
@@ -3461,6 +3749,7 @@ public:
       owner_->scheduler_launch_handoff_begin_active = false;
       owner_->scheduler_launch_handoff_begin_watermark = 0;
       owner_->scheduler_launch_handoff_begin_reservation_watermark = 0;
+      owner_->scheduler_launch_handoff_begin_decode_reservation_watermark = 0;
       reject_authority("scheduler launch handoff token space was exhausted");
     }
 
@@ -3470,9 +3759,12 @@ public:
     owner_->active_scheduler_launch_handoff_watermark = watermark;
     owner_->active_scheduler_launch_handoff_reservation_watermark =
         reservation_watermark;
+    owner_->active_scheduler_launch_handoff_decode_reservation_watermark =
+        decode_reservation_watermark;
     owner_->scheduler_launch_handoff_begin_active = false;
     owner_->scheduler_launch_handoff_begin_watermark = 0;
     owner_->scheduler_launch_handoff_begin_reservation_watermark = 0;
+    owner_->scheduler_launch_handoff_begin_decode_reservation_watermark = 0;
     ++owner_->scheduler_launch_handoff_acquisition_count;
     owner_->condition.notify_all();
     return token;
@@ -3491,6 +3783,7 @@ public:
     owner_->active_scheduler_launch_handoff_token = 0;
     owner_->active_scheduler_launch_handoff_watermark = 0;
     owner_->active_scheduler_launch_handoff_reservation_watermark = 0;
+    owner_->active_scheduler_launch_handoff_decode_reservation_watermark = 0;
     ++owner_->scheduler_launch_handoff_release_count;
     owner_->condition.notify_all();
   }
@@ -3612,6 +3905,38 @@ public:
           "deadline expiry requires a running deterministic test clock");
     }
     expire_deadlines_locked(*owner_);
+  }
+
+  void hold_decode_delivery_dispatch_for_test() {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->started || owner_->closed || !owner_->handoff_enabled ||
+        owner_->owner_identity.role != OwnerRole::kDecode ||
+        owner_->fatal_code != FatalCode::kNone ||
+        !owner_->input_queue.empty() ||
+        !owner_->output_queue.empty() ||
+        !owner_->fatal_output_queue.empty() ||
+        !owner_->pending_actions.empty() ||
+        owner_->scheduler_launch_handoff_begin_active ||
+        owner_->active_scheduler_launch_handoff_token != 0 ||
+        owner_->test_decode_delivery_dispatch_held) {
+      throw std::runtime_error(
+          "decode delivery dispatch hold requires a quiescent decode owner");
+    }
+    owner_->test_decode_delivery_dispatch_held = true;
+    owner_->test_decode_delivery_dispatch_captured = false;
+  }
+
+  void release_decode_delivery_dispatch_for_test() {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->started || owner_->closed ||
+        !owner_->test_decode_delivery_dispatch_held ||
+        !owner_->test_decode_delivery_dispatch_captured) {
+      throw std::runtime_error(
+          "decode delivery dispatch release lacks a captured event");
+    }
+    owner_->test_decode_delivery_dispatch_held = false;
+    owner_->test_decode_delivery_dispatch_captured = false;
+    owner_->condition.notify_all();
   }
 
   void abort_active_qualification_for_test() {
@@ -3895,6 +4220,7 @@ public:
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
                  owner_->source_delivery_reservations.empty() &&
+                 owner_->decode_delivery_reservations.empty() &&
                  !owner_->output_drain_active &&
                  !owner_->qualification.running;
         });
@@ -3916,6 +4242,7 @@ public:
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
                  owner_->source_delivery_reservations.empty() &&
+                 owner_->decode_delivery_reservations.empty() &&
                  owner_->active_handoff_actions.empty() &&
                  !owner_->scheduler_launch_handoff_begin_active &&
                  owner_->active_scheduler_launch_handoff_token == 0 &&
@@ -3946,6 +4273,7 @@ public:
                       owner_->output_drain_active ||
                       !owner_->output_drain_action_ids.empty() ||
                       !owner_->source_delivery_reservations.empty() ||
+                      !owner_->decode_delivery_reservations.empty() ||
                       !owner_->unclaimed_handoff_action_ids.empty() ||
                       !owner_->active_handoff_actions.empty() ||
                       !owner_->abort_settled_handoff_delivery_ids.empty() ||
@@ -3991,6 +4319,7 @@ public:
       owner_->stop_requested = true;
       owner_->qualification.running = false;
       terminalize_all_source_delivery_reservations_locked(*owner_);
+      terminalize_all_decode_delivery_reservations_locked(*owner_);
       abort_forward_independent_handoffs_locked(*owner_);
       for (InputCommand &command : owner_->input_queue) {
         if (command.kind != InputKind::kRegisterLifecycle) {
@@ -4008,6 +4337,10 @@ public:
         }
       }
       owner_->input_queue.clear();
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+      owner_->test_decode_delivery_dispatch_held = false;
+      owner_->test_decode_delivery_dispatch_captured = false;
+#endif
       if (owner_->fatal_code == FatalCode::kNone) {
         quarantine_all_locked(*owner_, FatalCode::kDependencyDeath, nullptr,
                               "owner aborted before clean close");
@@ -4049,6 +4382,7 @@ public:
         owner_->output_drain_active ||
         !owner_->output_drain_action_ids.empty() ||
         !owner_->source_delivery_reservations.empty() ||
+        !owner_->decode_delivery_reservations.empty() ||
         !owner_->unclaimed_handoff_action_ids.empty() ||
         !owner_->active_handoff_actions.empty() ||
         !owner_->abort_settled_handoff_delivery_ids.empty() ||
@@ -4085,6 +4419,7 @@ public:
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
     owner_->source_delivery_reservations.clear();
+    owner_->decode_delivery_reservations.clear();
     owner_->unclaimed_handoff_action_ids.clear();
     owner_->abort_settled_handoff_delivery_ids.clear();
     owner_->output_drain_active = false;
@@ -4111,7 +4446,12 @@ private:
     owner_->pending_actions.clear();
     owner_->output_drain_action_ids.clear();
     owner_->source_delivery_reservations.clear();
+    owner_->decode_delivery_reservations.clear();
     owner_->unclaimed_handoff_action_ids.clear();
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+    owner_->test_decode_delivery_dispatch_held = false;
+    owner_->test_decode_delivery_dispatch_captured = false;
+#endif
     try {
       abort_forward_independent_handoffs_locked(*owner_);
     } catch (...) {
@@ -4121,9 +4461,11 @@ private:
     owner_->active_scheduler_launch_handoff_token = 0;
     owner_->active_scheduler_launch_handoff_watermark = 0;
     owner_->active_scheduler_launch_handoff_reservation_watermark = 0;
+    owner_->active_scheduler_launch_handoff_decode_reservation_watermark = 0;
     owner_->scheduler_launch_handoff_begin_active = false;
     owner_->scheduler_launch_handoff_begin_watermark = 0;
     owner_->scheduler_launch_handoff_begin_reservation_watermark = 0;
+    owner_->scheduler_launch_handoff_begin_decode_reservation_watermark = 0;
     owner_->output_drain_active = false;
     close_owner_fds_locked(*owner_);
     owner_->closed = true;
@@ -4257,6 +4599,8 @@ private:
         owner_->active_handoff_actions.size();
     result["settled_handoff_action_count"] =
         owner_->settled_handoff_action_ids.size();
+    result["abort_settled_handoff_delivery_count"] =
+        owner_->abort_settled_handoff_delivery_ids.size();
     result["source_delivery_reservation_count"] =
         owner_->source_delivery_reservations.size();
     result["source_reservation_backed_handoff_action_count"] =
@@ -4271,6 +4615,20 @@ private:
         owner_->source_delivery_reservation_transfer_count;
     result["terminal_source_delivery_reservation_count"] =
         owner_->source_delivery_reservation_terminal_count;
+    result["decode_delivery_reservation_count"] =
+        owner_->decode_delivery_reservations.size();
+    result["decode_reservation_backed_handoff_action_count"] =
+        std::count_if(owner_->active_handoff_actions.begin(),
+                      owner_->active_handoff_actions.end(),
+                      [](const auto &entry) {
+                        return entry.second.decode_reservation_id.has_value();
+                      });
+    result["registered_decode_delivery_reservation_count"] =
+        owner_->decode_delivery_reservation_registration_count;
+    result["transferred_decode_delivery_reservation_count"] =
+        owner_->decode_delivery_reservation_transfer_count;
+    result["terminal_decode_delivery_reservation_count"] =
+        owner_->decode_delivery_reservation_terminal_count;
     result["scheduler_launch_handoff_begin_count"] =
         owner_->scheduler_launch_handoff_begin_count;
     result["scheduler_launch_handoff_acquisition_count"] =
@@ -4284,9 +4642,13 @@ private:
           owner_->scheduler_launch_handoff_begin_watermark;
       result["scheduler_launch_handoff_begin_reservation_watermark"] =
           owner_->scheduler_launch_handoff_begin_reservation_watermark;
+      result["scheduler_launch_handoff_begin_decode_reservation_watermark"] =
+          owner_->scheduler_launch_handoff_begin_decode_reservation_watermark;
     } else {
       result["scheduler_launch_handoff_begin_watermark"] = py::none();
       result["scheduler_launch_handoff_begin_reservation_watermark"] =
+          py::none();
+      result["scheduler_launch_handoff_begin_decode_reservation_watermark"] =
           py::none();
     }
     if (owner_->active_scheduler_launch_handoff_token != 0) {
@@ -4296,10 +4658,14 @@ private:
           owner_->active_scheduler_launch_handoff_watermark;
       result["active_scheduler_launch_handoff_reservation_watermark"] =
           owner_->active_scheduler_launch_handoff_reservation_watermark;
+      result["active_scheduler_launch_handoff_decode_reservation_watermark"] =
+          owner_->active_scheduler_launch_handoff_decode_reservation_watermark;
     } else {
       result["active_scheduler_launch_handoff_token"] = py::none();
       result["active_scheduler_launch_handoff_watermark"] = py::none();
       result["active_scheduler_launch_handoff_reservation_watermark"] =
+          py::none();
+      result["active_scheduler_launch_handoff_decode_reservation_watermark"] =
           py::none();
     }
     result["handoff_enabled"] = owner_->handoff_enabled;
@@ -4472,6 +4838,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("now_ns"))
       .def("expire_deadlines_for_test",
            &NativeTerminalOwnerBridge::expire_deadlines_for_test)
+      .def("hold_decode_delivery_dispatch_for_test",
+           &NativeTerminalOwnerBridge::hold_decode_delivery_dispatch_for_test)
+      .def(
+          "release_decode_delivery_dispatch_for_test",
+          &NativeTerminalOwnerBridge::release_decode_delivery_dispatch_for_test)
       .def("abort_active_qualification_for_test",
            &NativeTerminalOwnerBridge::abort_active_qualification_for_test,
            py::call_guard<py::gil_scoped_release>())
