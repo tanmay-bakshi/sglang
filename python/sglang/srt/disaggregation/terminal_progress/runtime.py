@@ -1163,6 +1163,8 @@ class NativeTerminalRuntime:
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
             if pending != action:
+                if pending is None:
+                    self._reject_forward_independent_completion_locked(action)
                 raise NativeTerminalRuntimeError(
                     "consumer action is absent, stale, or already acknowledged"
                 )
@@ -1283,6 +1285,21 @@ class NativeTerminalRuntime:
             self._enter_runtime_fatal_locked(formatted_traceback)
             raise
 
+    def _reject_forward_independent_completion_locked(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Make an unknown or replayed downstream completion process-fatal.
+
+        :param action: Action identity rejected by the Python consumer ledger.
+        """
+
+        if not self._forward_independent_handoff_enabled:
+            return
+        try:
+            self._owner.complete_forward_independent_handoff(action)
+        except Exception:  # noqa: BLE001
+            self._enter_runtime_fatal_locked(traceback.format_exc())
+
     def complete_work_action(
         self,
         producer_id: int,
@@ -1350,6 +1367,8 @@ class NativeTerminalRuntime:
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
             if pending != action:
+                if pending is None:
+                    self._reject_forward_independent_completion_locked(action)
                 raise NativeTerminalRuntimeError(
                     "work action is absent, stale, or already completed"
                 )

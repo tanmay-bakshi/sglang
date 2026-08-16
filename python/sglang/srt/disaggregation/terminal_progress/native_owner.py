@@ -157,6 +157,13 @@ class _NativeTerminalOwnerBridge(Protocol):
         :returns: Whether the binding became reactor-visible.
         """
 
+    def wait_for_forward_independent_handoff(self, timeout_seconds: float) -> bool:
+        """Wait until the main interpreter is parked behind a watermark.
+
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether a forward-independent handoff became active.
+        """
+
     def enable_test_clock(self, now_ns: int) -> None:
         """Enable the deterministic clock before reactor startup.
 
@@ -771,6 +778,19 @@ class NativeTerminalOwner:
                 binding_digest,
                 timeout_seconds,
             )
+        )
+
+    def wait_for_forward_independent_handoff(self, timeout_seconds: float) -> bool:
+        """Wait until CPython begins one captured-watermark handoff.
+
+        :param timeout_seconds: Positive wall-clock wait bound.
+        :returns: Whether the handoff callback became active.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(
+            self._native.wait_for_forward_independent_handoff(timeout_seconds)
         )
 
     def producer_api(self) -> object:

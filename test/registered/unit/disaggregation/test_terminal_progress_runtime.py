@@ -1,4 +1,6 @@
+import concurrent.futures
 import selectors
+import sys
 import threading
 import time
 from unittest import mock
@@ -11,10 +13,14 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalPublicationIdentity,
     TerminalRequestBinding,
 )
+from sglang.srt.disaggregation.terminal_progress.native_owner import (
+    NativeTerminalOwner,
+)
 from sglang.srt.disaggregation.terminal_progress.native_state import (
     NativeTerminalLifecycleRegistration,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
+    NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerFatalCode,
     NativeTerminalOwnerObservation,
@@ -51,6 +57,7 @@ _OWNER_RECEIPT_PRODUCER_ID = 2
 _REMOTE_RECEIPT_PRODUCER_ID = 3
 _REMOTE_CONTROL_PRODUCER_ID = 4
 _NATIVE_PRODUCER_ID = 5
+_TEST_CLOCK_NS = 1_000_000_000
 
 
 def _process_identity(
@@ -78,6 +85,7 @@ def _runtime(
     observation_capacity: int = 64,
     output_capacity: int = 64,
     maximum_live_lifecycles: int = 16,
+    enable_forward_independent_handoff: bool = False,
 ) -> tuple[
     NativeTerminalRuntime,
     NativeTerminalProcessIdentity,
@@ -90,6 +98,8 @@ def _runtime(
     :param observation_capacity: Non-authoritative observation bound.
     :param output_capacity: Native normal-action queue bound.
     :param maximum_live_lifecycles: Admission and fail-closed reserve bound.
+    :param enable_forward_independent_handoff: Whether this runtime exercises
+        the CPython scheduler handoff.
     :returns: Runtime, owner identity, and remote peer identity.
     """
 
@@ -171,7 +181,7 @@ def _runtime(
         decode_work_capacity=16,
         publisher_capacity=16,
         observation_capacity=observation_capacity,
-        enable_forward_independent_handoff=False,
+        enable_forward_independent_handoff=enable_forward_independent_handoff,
     )
     return runtime, owner, remote
 
@@ -222,6 +232,72 @@ def _registration(
         publication_identity=publication,
         trusted_issuers=(owner, remote),
     )
+
+
+def _direct_handoff_owner(
+    room_id: int,
+) -> tuple[NativeTerminalOwner, NativeTerminalLifecycleRegistration]:
+    """Start a deterministic native owner with handoff enabled.
+
+    :param room_id: Stable source request identity.
+    :returns: Running owner and its registered source lifecycle.
+    """
+
+    owner_identity = NativeTerminalProcessIdentity.from_identity(
+        _process_identity(TerminalOwnerRole.SOURCE, _OWNER_GENERATION)
+    )
+    remote_identity = NativeTerminalProcessIdentity.from_identity(
+        _process_identity(TerminalOwnerRole.DECODE, _REMOTE_GENERATION)
+    )
+    registration = _registration(owner_identity, remote_identity, room_id)
+    owner = NativeTerminalOwner(
+        input_capacity=16,
+        output_capacity=16,
+        observation_capacity=16,
+        maximum_live_lifecycles=4,
+        owner_identity=owner_identity,
+        testing=True,
+    )
+    owner.register_producer(
+        NativeTerminalProducerRegistration(
+            producer_id=_LOCAL_PRODUCER_ID,
+            name="python-local",
+            producer_class=NativeTerminalProducerClass.LOCAL,
+            allowed_role=NativeTerminalOwnerRole.SOURCE,
+            authenticated_issuer=None,
+        )
+    )
+    owner.enable_test_clock(_TEST_CLOCK_NS)
+    owner.enable_forward_independent_handoff()
+    owner.register_lifecycle(registration)
+    owner.start()
+    return owner, registration
+
+
+def _submit_direct_source_gather(
+    owner: NativeTerminalOwner,
+    registration: NativeTerminalLifecycleRegistration,
+) -> None:
+    """Earn one source-gather action through the real native reducer.
+
+    :param owner: Running deterministic source owner.
+    :param registration: Exact source lifecycle.
+    """
+
+    for offset, kind in enumerate(
+        (
+            NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+        )
+    ):
+        owner.submit(
+            NativeTerminalOwnerEvent(
+                producer_id=_LOCAL_PRODUCER_ID,
+                binding_digest=registration.binding.digest,
+                kind=kind,
+                enqueued_ns=_TEST_CLOCK_NS + offset,
+            )
+        )
 
 
 def _receipt(
@@ -362,6 +438,21 @@ def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
     runtime.finish_abort_close()
 
 
+def _finish_handoff_runtime(runtime: NativeTerminalRuntime) -> None:
+    """Drive fail-closed cleanup from a non-main consumer context.
+
+    A pending-call callback can only run on the main interpreter thread. The
+    cleanup worker therefore remains able to consume final quarantine actions
+    even when the callback is queued while the main thread waits for it.
+
+    :param runtime: Handoff-enabled runtime requiring exact cleanup.
+    """
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_finish_fail_closed, runtime)
+        future.result(timeout=_WAIT_SECONDS)
+
+
 def _complete_source(
     runtime: NativeTerminalRuntime,
     registration: NativeTerminalLifecycleRegistration,
@@ -465,6 +556,237 @@ def _complete_source(
     lifecycle = _drain_actions(runtime.lifecycle_actions)
     assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
     runtime.acknowledge_consumed_action(lifecycle[0])
+
+
+def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> None:
+    """A real pending call hands the GIL to the action owner and rejects replay."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 61)
+    runtime.start()
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        runtime.register_lifecycle(registration)
+
+        def consume_gather() -> NativeTerminalOwnerAction:
+            action = _drain_actions(runtime.source_gather_actions)[0]
+            runtime.acknowledge_consumed_action(action)
+            return action
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            gather_future = executor.submit(consume_gather)
+            sys.setswitchinterval(1.0)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            expires_at = time.monotonic() + 0.5
+            scheduler_iterations = 0
+            while not gather_future.done() and time.monotonic() < expires_at:
+                scheduler_iterations += 1
+            action = gather_future.result(timeout=_WAIT_SECONDS)
+            sys.setswitchinterval(previous_switch_interval)
+
+            assert scheduler_iterations > 0
+            inventory = runtime.snapshot().owner
+            assert inventory.pending_handoff_action_count == 0
+            assert inventory.completed_handoff_action_count == 1
+            assert inventory.handoff_callback_count == 1
+
+            def consume_process_fatal() -> tuple[NativeTerminalOwnerAction, ...]:
+                actions = _drain_actions(runtime.lifecycle_actions)
+                for current in actions:
+                    runtime.acknowledge_aborted_action(current)
+                return actions
+
+            fatal_future = executor.submit(consume_process_fatal)
+            with pytest.raises(
+                NativeTerminalRuntimeError,
+                match="absent, stale, or already acknowledged",
+            ):
+                runtime.acknowledge_consumed_action(action)
+            fatal_actions = fatal_future.result(timeout=_WAIT_SECONDS)
+            assert any(
+                current.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+                for current in fatal_actions
+            )
+            assert (
+                runtime.snapshot().owner.fatal_code
+                is NativeTerminalOwnerFatalCode.HANDOFF_AUTHORITY
+            )
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+        _finish_handoff_runtime(runtime)
+
+
+def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None:
+    """Actions arriving during a handoff cannot extend its captured watermark."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registrations = tuple(_registration(owner, remote, room_id) for room_id in (62, 63, 64))
+    runtime.start()
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        for registration in registrations:
+            runtime.register_lifecycle(registration)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registration.binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_SUBMISSION_ACCEPTED,
+            )
+
+        def consume_all_gathers() -> tuple[NativeTerminalOwnerAction, ...]:
+            actions: list[NativeTerminalOwnerAction] = []
+            while len(actions) < len(registrations):
+                actions.extend(_drain_actions(runtime.source_gather_actions))
+            for action in actions:
+                runtime.acknowledge_consumed_action(action)
+            return tuple(actions)
+
+        def submit_later_watermark() -> None:
+            assert runtime._owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            for registration in registrations[1:]:
+                runtime.submit(
+                    _LOCAL_PRODUCER_ID,
+                    registration.binding.digest,
+                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            consumer_future = executor.submit(consume_all_gathers)
+            producer_future = executor.submit(submit_later_watermark)
+            sys.setswitchinterval(1.0)
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                registrations[0].binding.digest,
+                NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+            )
+            expires_at = time.monotonic() + 0.5
+            while not consumer_future.done() and time.monotonic() < expires_at:
+                pass
+            actions = consumer_future.result(timeout=_WAIT_SECONDS)
+            producer_future.result(timeout=_WAIT_SECONDS)
+            sys.setswitchinterval(previous_switch_interval)
+
+        inventory = runtime.snapshot().owner
+        assert len(actions) == 3
+        assert inventory.pending_handoff_action_count == 0
+        assert inventory.completed_handoff_action_count == 3
+        assert inventory.handoff_callback_count == 2
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+        _finish_handoff_runtime(runtime)
+
+
+def test_scheduler_actions_never_enter_the_forward_independent_handoff() -> None:
+    """The source reclaim action stays scheduler-affine while peers hand off."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 65)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+
+        def complete_and_close() -> object:
+            _complete_source(runtime, registration, owner, remote)
+            snapshot = runtime.snapshot()
+            runtime.stop_admission()
+            _retire_all_producers(runtime)
+            runtime.join_producers()
+            _drain_observations(runtime)
+            runtime.close_clean()
+            return snapshot
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            snapshot = executor.submit(complete_and_close).result(
+                timeout=_WAIT_SECONDS
+            )
+        assert snapshot.owner.action_count == 6
+        assert snapshot.owner.completed_handoff_action_count == 5
+        assert snapshot.owner.pending_handoff_action_count == 0
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
+    """An unconsumed watermark expires into native process-fatal authority."""
+
+    owner, registration = _direct_handoff_owner(66)
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        def expire_active_handoff() -> None:
+            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            expiry_future = executor.submit(expire_active_handoff)
+            sys.setswitchinterval(1.0)
+            _submit_direct_source_gather(owner, registration)
+            expires_at = time.monotonic() + 0.5
+            while not expiry_future.done() and time.monotonic() < expires_at:
+                pass
+            expiry_future.result(timeout=_WAIT_SECONDS)
+            sys.setswitchinterval(previous_switch_interval)
+
+        inventory = owner.inventory()
+        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_TIMEOUT
+        assert inventory.pending_handoff_action_count >= 1
+        assert inventory.handoff_callback_count >= 1
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+        owner.abort_and_close()
+
+
+def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
+    """Clean close cannot discard a callback-owned downstream completion."""
+
+    owner, registration = _direct_handoff_owner(67)
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        def reject_close_and_resolve_actions() -> str:
+            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
+            with pytest.raises(RuntimeError) as error:
+                owner.close()
+            for output in owner.drain_outputs():
+                for action in output.actions:
+                    owner.acknowledge_action(action)
+                    owner.complete_forward_independent_handoff(action)
+            return str(error.value)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            close_future = executor.submit(reject_close_and_resolve_actions)
+            sys.setswitchinterval(1.0)
+            _submit_direct_source_gather(owner, registration)
+            expires_at = time.monotonic() + 0.5
+            while not close_future.done() and time.monotonic() < expires_at:
+                pass
+            close_error = close_future.result(timeout=_WAIT_SECONDS)
+            sys.setswitchinterval(previous_switch_interval)
+
+        assert "retained unresolved inventory" in close_error
+        inventory = owner.inventory()
+        assert inventory.fatal_code is (
+            NativeTerminalOwnerFatalCode.CLOSE_WITH_RETAINED_INVENTORY
+        )
+        assert inventory.pending_handoff_action_count == 0
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+        owner.abort_and_close()
 
 
 def test_runtime_routes_source_continuations_and_drains_after_admission_close() -> None:

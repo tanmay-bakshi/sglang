@@ -1580,15 +1580,29 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
 
   const DeadlineSpec &shutdown = owner.deadline_specs[
       static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];
+  const std::uint64_t started_ns = owner_now_ns_locked(owner);
+  const std::uint64_t deadline_ns = started_ns + shutdown.duration_ns;
   PyThreadState *thread_state = PyEval_SaveThread();
   bool wait_failed = false;
   bool completed = false;
+  bool deadline_expired = false;
   try {
     completed = owner.condition.wait_for(
         lock, std::chrono::nanoseconds(shutdown.duration_ns), [&]() {
-          return !handoff_pending_through_locked(owner, watermark) ||
-                 owner.closed;
+          if (!handoff_pending_through_locked(owner, watermark) ||
+              owner.closed) {
+            return true;
+          }
+#ifdef SGLANG_TERMINAL_OWNER_TESTING
+          return owner.test_clock_enabled &&
+                 owner_now_ns_locked(owner) >= deadline_ns;
+#else
+          return false;
+#endif
         });
+    deadline_expired =
+        handoff_pending_through_locked(owner, watermark) && !owner.closed &&
+        owner_now_ns_locked(owner) >= deadline_ns;
   } catch (...) {
     wait_failed = true;
   }
@@ -1596,7 +1610,7 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
     enter_handoff_fatal_locked(
         owner, FatalCode::kHandoffAuthority,
         "terminal handoff callback condition wait failed");
-  } else if (!completed) {
+  } else if (!completed || deadline_expired) {
     enter_handoff_fatal_locked(
         owner, FatalCode::kHandoffTimeout,
         "terminal handoff callback exceeded owner shutdown deadline");
@@ -2986,6 +3000,19 @@ public:
     return reached && owner_->lifecycles.count(digest) == 1;
   }
 
+  bool wait_for_forward_independent_handoff(double timeout_seconds) {
+    if (timeout_seconds <= 0.0) {
+      throw std::invalid_argument("handoff wait must be positive");
+    }
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    const bool reached = owner_->condition.wait_for(
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return owner_->handoff_callback_active ||
+                 owner_->fatal_code != FatalCode::kNone || owner_->closed;
+        });
+    return reached && owner_->handoff_callback_active;
+  }
+
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   py::dict lifecycle_snapshot(const py::bytes &binding_digest) const {
     const Digest digest =
@@ -3019,6 +3046,7 @@ public:
     }
     owner_->test_clock_enabled = true;
     owner_->test_now_ns = now_ns;
+    owner_->condition.notify_all();
   }
 
   void set_test_clock(std::uint64_t now_ns) {
@@ -3748,6 +3776,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def("wait_for_lifecycle_registration",
            &NativeTerminalOwnerBridge::wait_for_lifecycle_registration,
            py::arg("binding_digest"), py::arg("timeout_seconds"))
+      .def("wait_for_forward_independent_handoff",
+           &NativeTerminalOwnerBridge::wait_for_forward_independent_handoff,
+           py::arg("timeout_seconds"),
+           py::call_guard<py::gil_scoped_release>())
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
       .def("lifecycle_snapshot",
            &NativeTerminalOwnerBridge::lifecycle_snapshot,
