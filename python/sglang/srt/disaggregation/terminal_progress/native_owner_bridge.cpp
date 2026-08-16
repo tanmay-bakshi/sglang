@@ -3069,6 +3069,7 @@ public:
           "test clock requires a running owner and monotonic time");
     }
     owner_->test_now_ns = now_ns;
+    owner_->condition.notify_all();
   }
 
   void expire_deadlines_for_test() {
