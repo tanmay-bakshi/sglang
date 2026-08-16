@@ -36,9 +36,11 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
 from sglang.srt.disaggregation.common.staging_layout import (
     StagingComponentId,
     StagingComponentSpan,
+    StagingCopyGroup,
     StagingWriterId,
 )
 from sglang.srt.disaggregation.common.staging_runtime import (
+    StagingEndpoint,
     StagingEndpointBufferBinding,
 )
 from sglang.srt.disaggregation.nixl.packed_staging import (
@@ -65,6 +67,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedNixlRuntimeArtifactIdentity,
     PackedNixlRuntimeRoot,
     PackedPeerIdentity,
+    PackedPreparedSourceCopy,
     PackedReadyCoordinator,
     PackedReadyError,
     PackedRegistrationQuarantine,
@@ -110,10 +113,11 @@ KEY = PackedChunkKey(
 
 
 def test_packed_copy_executor_prioritizes_completion_progress() -> None:
-    """Gather and scatter remain schedulable across model forwards."""
+    """Preparation, gather, and scatter remain schedulable across forwards."""
 
     source_stream = object()
     scatter_stream = object()
+    preparation_stream = object()
     with (
         patch(
             "sglang.srt.disaggregation.nixl.packed_staging.torch.device",
@@ -124,15 +128,17 @@ def test_packed_copy_executor_prioritizes_completion_progress() -> None:
         ) as set_device,
         patch(
             "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.Stream",
-            side_effect=(source_stream, scatter_stream),
+            side_effect=(source_stream, scatter_stream, preparation_stream),
         ) as stream,
     ):
         executor = PackedCopyExecutor(gpu_id=3)
 
     assert executor._source_stream is source_stream
     assert executor._scatter_stream is scatter_stream
+    assert executor._preparation_stream is preparation_stream
     set_device.assert_called_once_with(3)
     assert stream.call_args_list == [
+        call(device="cuda-device", priority=-5),
         call(device="cuda-device", priority=-5),
         call(device="cuda-device", priority=-5),
     ]
@@ -141,20 +147,28 @@ def test_packed_copy_executor_prioritizes_completion_progress() -> None:
 def test_packed_gather_waits_on_exact_producer_event() -> None:
     """Gather has no mutable-stream fallback after event ownership is sealed."""
 
+    coordinator, _, ready, peer = _registered_ready()
+    transfer = coordinator.handle_ready(ready, peer)
+    writer_layout = writer_layout_for(transfer.layout, transfer.writer_id)
     producer_event = object()
+    preparation_event = object()
     source_stream = Mock()
     source_lane = MagicMock()
-    transfer = SimpleNamespace(
-        layout=object(),
-        writer_id=object(),
-        length_bytes=4096,
-    )
-    writer_layout = SimpleNamespace(
-        length_bytes=4096,
-        lease_offset=0,
-        copy_groups=(),
+    owner_token = object()
+    prepared_copy = PackedPreparedSourceCopy(
+        key=transfer.key,
+        layout=transfer.layout,
+        writer_id=transfer.writer_id,
+        source_binding=transfer.source_binding,
+        groups=(),
+        ready_event=preparation_event,
+        resources=(),
+        terminal_binding_digest=None,
+        _transfer=transfer,
+        _owner_token=owner_token,
     )
     executor = object.__new__(PackedCopyExecutor)
+    executor._owner_token = owner_token
     executor._source_stream = source_stream
 
     with (
@@ -166,16 +180,188 @@ def test_packed_gather_waits_on_exact_producer_event() -> None:
             "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.stream",
             return_value=contextlib.nullcontext(),
         ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.tensor",
+            side_effect=AssertionError("gather allocated device metadata"),
+        ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.np.array",
+            side_effect=AssertionError("gather copied host metadata"),
+        ),
     ):
         length_bytes = executor.gather(
             transfer=transfer,
+            prepared_copy=prepared_copy,
             source_lane=source_lane,
             producer_event=producer_event,
         )
 
-    assert length_bytes == 4096
-    source_stream.wait_event.assert_called_once_with(producer_event)
+    assert length_bytes == writer_layout.length_bytes
+    assert source_stream.wait_event.call_args_list == [
+        call(preparation_event),
+        call(producer_event),
+    ]
     source_stream.wait_stream.assert_not_called()
+
+
+def test_packed_copy_preparation_deduplicates_request_local_tensors() -> None:
+    """Copy groups share exact component pointers and page tensors."""
+
+    component = SimpleNamespace(
+        component_id=MAIN_KV_COMPONENT,
+        tensor_ptrs=(0x1000, 0x2000),
+        page_size=4,
+    )
+    active = SimpleNamespace(
+        component=component,
+        page_count=2,
+        page_array=np.asarray((3, 4), dtype=np.int32),
+    )
+    binding = StagingEndpointBufferBinding(
+        endpoint=StagingEndpoint.SOURCE,
+        components=(active,),
+    )
+    groups = tuple(
+        StagingCopyGroup(
+            component_id=MAIN_KV_COMPONENT,
+            source_entry_indices=(0, 1),
+            destination_entry_indices=(0, 1),
+            packed_offset=index * 256,
+            page_count=2,
+            source_token_bytes=16,
+            destination_token_bytes=16,
+            source_offset_bytes=0,
+            destination_offset_bytes=0,
+            copy_bytes_per_token=16,
+            length_bytes=256,
+        )
+        for index in range(2)
+    )
+    pointer_tensor = object()
+    page_tensor = object()
+    ready_event = Mock()
+    executor = object.__new__(PackedCopyExecutor)
+    executor._device = "cuda-device"
+    executor._failed_preparation_resources = []
+    executor._preparation_stream = object()
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.stream",
+            return_value=contextlib.nullcontext(),
+        ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.tensor",
+            side_effect=(pointer_tensor, page_tensor),
+        ) as tensor,
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.Event",
+            return_value=ready_event,
+        ),
+    ):
+        prepared, resources, event = executor._prepare_copy_groups(
+            copy_groups=groups,
+            binding=binding,
+            endpoint=StagingEndpoint.SOURCE,
+        )
+
+    assert len(prepared) == 2
+    assert tensor.call_count == 2
+    assert resources == (pointer_tensor, page_tensor)
+    assert all(group.entry_ptrs is pointer_tensor for group in prepared)
+    assert all(group.page_indices is page_tensor for group in prepared)
+    assert event is ready_event
+    ready_event.record.assert_called_once_with(executor._preparation_stream)
+
+
+def test_packed_copy_preparation_retains_partial_device_metadata() -> None:
+    """A failed asynchronous preparation cannot release an enqueued tensor."""
+
+    component = SimpleNamespace(
+        component_id=MAIN_KV_COMPONENT,
+        tensor_ptrs=(0x1000,),
+        page_size=4,
+    )
+    active = SimpleNamespace(
+        component=component,
+        page_count=2,
+        page_array=np.asarray((3, 4), dtype=np.int32),
+    )
+    binding = StagingEndpointBufferBinding(
+        endpoint=StagingEndpoint.SOURCE,
+        components=(active,),
+    )
+    group = StagingCopyGroup(
+        component_id=MAIN_KV_COMPONENT,
+        source_entry_indices=(0,),
+        destination_entry_indices=(0,),
+        packed_offset=0,
+        page_count=2,
+        source_token_bytes=16,
+        destination_token_bytes=16,
+        source_offset_bytes=0,
+        destination_offset_bytes=0,
+        copy_bytes_per_token=16,
+        length_bytes=128,
+    )
+    pointer_tensor = object()
+    executor = object.__new__(PackedCopyExecutor)
+    executor._device = "cuda-device"
+    executor._failed_preparation_resources = []
+    executor._preparation_stream = object()
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.stream",
+            return_value=contextlib.nullcontext(),
+        ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.tensor",
+            side_effect=(pointer_tensor, RuntimeError("injected page copy failure")),
+        ),
+        pytest.raises(RuntimeError, match="injected page copy failure"),
+    ):
+        executor._prepare_copy_groups(
+            copy_groups=(group,),
+            binding=binding,
+            endpoint=StagingEndpoint.SOURCE,
+        )
+
+    assert executor._failed_preparation_resources == [(pointer_tensor,)]
+
+
+def test_prepared_source_copy_rejects_equal_but_distinct_transfer() -> None:
+    """Prepared metadata cannot be replayed through an equivalent transfer."""
+
+    coordinator, _, ready, peer = _registered_ready()
+    transfer = coordinator.handle_ready(ready, peer)
+    owner_token = object()
+    prepared_copy = PackedPreparedSourceCopy(
+        key=transfer.key,
+        layout=transfer.layout,
+        writer_id=transfer.writer_id,
+        source_binding=transfer.source_binding,
+        groups=(),
+        ready_event=Mock(),
+        resources=(),
+        terminal_binding_digest=None,
+        _transfer=transfer,
+        _owner_token=owner_token,
+    )
+
+    with pytest.raises(RuntimeError, match="another transfer instance"):
+        prepared_copy.require_transfer(
+            dataclasses.replace(transfer),
+            owner_token,
+            None,
+        )
+
+    with pytest.raises(RuntimeError, match="another terminal binding"):
+        prepared_copy.require_transfer(
+            transfer,
+            owner_token,
+            b"x" * 32,
+        )
 
 
 WRITERS = tuple(

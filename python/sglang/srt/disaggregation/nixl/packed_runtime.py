@@ -10,7 +10,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -75,6 +75,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedNixlRuntimeArtifactIdentity,
     PackedNixlRuntimeRoot,
     PackedPeerIdentity,
+    PackedPreparedSourceCopy,
     PackedReadyCoordinator,
     PackedScatterSubmission,
     PackedSourceTransfer,
@@ -1002,6 +1003,7 @@ class _PrefillRequestRecord:
         default_factory=threading.Condition
     )
     source_transfer: PackedSourceTransfer | None = None
+    prepared_source_copy: PackedPreparedSourceCopy | None = None
     failure_reason: str | None = None
     main_lane: PackedTransferLane | None = None
     main_handle: object | None = None
@@ -1238,6 +1240,7 @@ class PackedPrefillRuntime:
             if (
                 record.terminal_prepare_sent
                 or record.source_transfer is not None
+                or record.prepared_source_copy is not None
                 or record.terminal_gather_phase is not _TerminalGatherPhase.NOT_STARTED
                 or record.main_handle is not None
                 or record.auxiliary_handle is not None
@@ -1273,6 +1276,10 @@ class PackedPrefillRuntime:
             if prepare_started_at is None:
                 raise RuntimeError("terminal READY lost PREPARE timing authority")
             if record.source_transfer is not None:
+                if record.prepared_source_copy is None:
+                    raise RuntimeError(
+                        "terminal READY transfer lost prepared copy ownership"
+                    )
                 if record.terminal_ready == message:
                     return identity.local_binding
                 self._mark_terminal_record_quarantined(
@@ -1280,23 +1287,46 @@ class PackedPrefillRuntime:
                     "terminal READY conflicts with prior delivery",
                 )
                 raise RuntimeError("terminal READY conflicts with prior delivery")
+        prepared_copy: PackedPreparedSourceCopy | None = None
         try:
+            executor = self._source_copy_executor()
             transfer = self._ready.handle_ready(message, authenticated_decode_peer)
+            prepared_copy = executor.prepare_source_copy(
+                transfer,
+                terminal_binding_digest=identity.local_binding.digest,
+            )
+            if type(prepared_copy) is not PackedPreparedSourceCopy:
+                raise TypeError("source copy executor returned an invalid preparation")
         except (RuntimeError, TypeError, ValueError):
             self._mark_terminal_record_quarantined(
                 record,
-                "terminal READY validation failed",
+                "terminal READY validation or source preparation failed",
             )
             raise
+        if prepared_copy is None:
+            raise RuntimeError("terminal READY lost prepared copy result")
+        raced = False
         with record.condition:
-            if record.source_transfer is not None:
-                raise RuntimeError("terminal READY raced another delivery")
-            record.ready_wait_duration_ms = (
-                time.perf_counter() - prepare_started_at
-            ) * 1000.0
-            record.source_transfer = transfer
-            record.terminal_ready = message
-            record.condition.notify_all()
+            if (
+                record.source_transfer is not None
+                or record.prepared_source_copy is not None
+            ):
+                executor.quarantine_source_copy(prepared_copy)
+                raced = True
+            else:
+                record.ready_wait_duration_ms = (
+                    time.perf_counter() - prepare_started_at
+                ) * 1000.0
+                record.source_transfer = transfer
+                record.prepared_source_copy = prepared_copy
+                record.terminal_ready = message
+                record.condition.notify_all()
+        if raced:
+            self._mark_terminal_record_quarantined(
+                record,
+                "terminal READY delivery raced after preparation",
+            )
+            raise RuntimeError("terminal READY raced another delivery")
         return identity.local_binding
 
     def begin_terminal_owner_gather(
@@ -1319,6 +1349,8 @@ class PackedPrefillRuntime:
                 raise RuntimeError("quarantined terminal source cannot gather")
             if record.source_transfer is None:
                 raise RuntimeError("terminal gather preceded authenticated READY")
+            if record.prepared_source_copy is None:
+                raise RuntimeError("terminal gather lost prepared copy ownership")
             if record.terminal_gather_phase is not _TerminalGatherPhase.NOT_STARTED:
                 raise RuntimeError("terminal gather was already started")
             record.terminal_gather_phase = _TerminalGatherPhase.RUNNING
@@ -2243,10 +2275,24 @@ class PackedPrefillRuntime:
                     message,
                     authenticated_decode_peer,
                 )
+                executor = self._source_copy_executor()
+                prepared_copy = executor.prepare_source_copy(
+                    transfer,
+                    terminal_binding_digest=None,
+                )
+                if type(prepared_copy) is not PackedPreparedSourceCopy:
+                    raise TypeError(
+                        "source copy executor returned an invalid preparation"
+                    )
                 with record.condition:
-                    if record.source_transfer is not None:
+                    if (
+                        record.source_transfer is not None
+                        or record.prepared_source_copy is not None
+                    ):
+                        executor.quarantine_source_copy(prepared_copy)
                         raise RuntimeError("packed READY was duplicated")
                     record.source_transfer = transfer
+                    record.prepared_source_copy = prepared_copy
                     record.condition.notify_all()
                 return
             if type(message) is PackedRequestTeardown:
@@ -2361,18 +2407,23 @@ class PackedPrefillRuntime:
                 raise RuntimeError(
                     "packed source terminal binding differs from actor authority"
                 )
+        prepared_copy = record.prepared_source_copy
+        if prepared_copy is None:
+            raise RuntimeError("packed source transfer lost prepared copy ownership")
         lane = self._acquire_lane(transfer)
         executor = self._source_copy_executor()
         gather_started_at = time.perf_counter()
         if binding_digest is None:
             executor.gather(
                 transfer=transfer,
+                prepared_copy=prepared_copy,
                 source_lane=lane,
                 producer_event=record.submission.producer_event,
             )
         else:
             executor.gather(
                 transfer=transfer,
+                prepared_copy=prepared_copy,
                 source_lane=lane,
                 producer_event=record.submission.producer_event,
                 binding_digest=binding_digest,
@@ -2835,6 +2886,7 @@ class PackedPrefillRuntime:
                 if (
                     record.main_handle is not None
                     or record.auxiliary_handle is not None
+                    or record.prepared_source_copy is not None
                 ):
                     self._failed_records.append(record)
 
@@ -3264,6 +3316,7 @@ class PackedDecodeRuntime:
                 allocation_authority=allocation_authority,
                 lifecycle_authority=lifecycle_authority,
                 protocol=self._arena.protocol,
+                copy_executor=self._arena.copy_executor,
                 outcome_coordinator=self._outcomes,
                 chunk_plans=(plan,),
                 auxiliary_allocation_lease=auxiliary_lease,
@@ -3598,6 +3651,7 @@ class PackedDecodeRuntime:
                     submission = self._arena.copy_executor.scatter(
                         scatter.work,
                         scatter.proofs,
+                        scatter.prepared_copy,
                     )
                     record.scatters[key] = (scatter, submission)
                 record.scatter_started_by_owner = True
@@ -3963,6 +4017,7 @@ class PackedDecodeRuntime:
                 submission = self._arena.copy_executor.scatter(
                     scatter.work,
                     scatter.proofs,
+                    scatter.prepared_copy,
                 )
                 record.scatters[key] = (scatter, submission)
                 continue

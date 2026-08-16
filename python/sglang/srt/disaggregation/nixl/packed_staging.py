@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedLease,
     PackedPrepare,
     PackedReady,
+    PackedScatterPreparation,
     PackedScatterWork,
     PackedTopology,
     PackedTransportPath,
@@ -42,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_layout import (
     StagingComponentGeometry,
     StagingComponentId,
     StagingComponentSpan,
+    StagingCopyGroup,
     StagingWriterId,
     StagingWriterLayout,
 )
@@ -3720,17 +3722,134 @@ class PackedGatherError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class PackedPreparedCopyGroup:
+    """Device-resident metadata for one immutable copy group.
+
+    :ivar group: Exact canonical copy geometry.
+    :ivar entry_ptrs: Device tensor of component entry base addresses.
+    :ivar page_indices: Device tensor of request-local physical page indices.
+    :ivar physical_tokens: Physical token span covered by the group.
+    :ivar bytes_per_entry: Bytes copied for each component entry.
+    :ivar grid: Exact two-dimensional Triton launch grid.
+    :ivar page_size: Component page size used by the copy kernel.
+    """
+
+    group: StagingCopyGroup
+    entry_ptrs: torch.Tensor
+    page_indices: torch.Tensor
+    physical_tokens: int
+    bytes_per_entry: int
+    grid: tuple[int, int]
+    page_size: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedPreparedSourceCopy:
+    """Request-owned source metadata prepared before gather eligibility.
+
+    :ivar key: Exact request and chunk generation.
+    :ivar layout: Identity-stable canonical layout.
+    :ivar writer_id: Exact local source writer.
+    :ivar source_binding: Identity-stable immutable source binding.
+    :ivar groups: Canonically ordered writer copy groups.
+    :ivar ready_event: Device event recorded after metadata construction.
+    :ivar resources: Unique tensors retained through terminal retirement.
+    :ivar terminal_binding_digest: Exact terminal lifecycle, otherwise ``None``.
+    """
+
+    key: PackedChunkKey
+    layout: StagingChunkLayout
+    writer_id: StagingWriterId
+    source_binding: StagingEndpointBufferBinding
+    groups: tuple[PackedPreparedCopyGroup, ...]
+    ready_event: torch.cuda.Event
+    resources: tuple[torch.Tensor, ...]
+    terminal_binding_digest: bytes | None
+    _transfer: PackedSourceTransfer
+    _owner_token: object
+
+    def require_transfer(
+        self,
+        transfer: PackedSourceTransfer,
+        owner_token: object,
+        terminal_binding_digest: bytes | None,
+    ) -> None:
+        """Require the exact transfer and executor that prepared this metadata.
+
+        :param transfer: Candidate source transfer.
+        :param owner_token: Process-local copy-executor identity.
+        :param terminal_binding_digest: Candidate terminal lifecycle identity.
+        """
+
+        if type(transfer) is not PackedSourceTransfer:
+            raise TypeError("transfer must be PackedSourceTransfer")
+        if owner_token is not self._owner_token:
+            raise RuntimeError("prepared source copy belongs to another executor")
+        if transfer is not self._transfer:
+            raise RuntimeError(
+                "prepared source copy belongs to another transfer instance"
+            )
+        if terminal_binding_digest != self.terminal_binding_digest:
+            raise RuntimeError("prepared source copy has another terminal binding")
+        if transfer.key != self.key or transfer.writer_id != self.writer_id:
+            raise RuntimeError("prepared source copy belongs to another transfer")
+        if transfer.layout is not self.layout:
+            raise RuntimeError("prepared source copy has another layout instance")
+        if transfer.source_binding is not self.source_binding:
+            raise RuntimeError("prepared source copy has another binding instance")
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedPreparedScatterCopy:
+    """Request-owned destination metadata prepared before publication.
+
+    :ivar key: Exact request and chunk generation.
+    :ivar layout: Identity-stable canonical layout.
+    :ivar destination_binding: Identity-stable immutable destination binding.
+    :ivar groups: Canonically ordered all-writer copy groups.
+    :ivar ready_event: Device event recorded after metadata construction.
+    :ivar resources: Unique tensors retained through terminal retirement.
+    """
+
+    key: PackedChunkKey
+    layout: StagingChunkLayout
+    destination_binding: StagingEndpointBufferBinding
+    groups: tuple[PackedPreparedCopyGroup, ...]
+    ready_event: torch.cuda.Event
+    resources: tuple[torch.Tensor, ...]
+    _owner_token: object
+
+    def require_work(self, work: PackedScatterWork, owner_token: object) -> None:
+        """Require the exact scatter work and executor that prepared metadata.
+
+        :param work: Candidate protocol-owned scatter work.
+        :param owner_token: Process-local copy-executor identity.
+        """
+
+        if type(work) is not PackedScatterWork:
+            raise TypeError("work must be PackedScatterWork")
+        if owner_token is not self._owner_token:
+            raise RuntimeError("prepared scatter copy belongs to another executor")
+        if work.key != self.key:
+            raise RuntimeError("prepared scatter copy belongs to another request")
+        if work.layout is not self.layout:
+            raise RuntimeError("prepared scatter copy has another layout instance")
+        if work.destination_binding is not self.destination_binding:
+            raise RuntimeError("prepared scatter copy has another binding instance")
+
+
+@dataclasses.dataclass(frozen=True)
 class PackedScatterSubmission:
-    """Resources retained until one asynchronous scatter event is terminal.
+    """Prepared metadata retained until asynchronous scatter is terminal.
 
     :ivar started_event: CUDA event immediately preceding this scatter's work.
     :ivar event: CUDA completion event.
-    :ivar resources: Temporary pointer and page tensors used by kernels.
+    :ivar prepared_copy: Request-owned metadata used by every scatter kernel.
     """
 
     started_event: torch.cuda.Event
     event: torch.cuda.Event
-    resources: tuple[torch.Tensor, ...]
+    prepared_copy: PackedPreparedScatterCopy
 
     def elapsed_milliseconds(self) -> float:
         """Return exact device time after terminal completion.
@@ -3753,8 +3872,12 @@ class PackedCopyExecutor:
     _PROGRESS_STREAM_PRIORITY: ClassVar[int] = -5
 
     _device: torch.device
-    _failed_scatter_resources: list[torch.Tensor]
+    _failed_preparation_resources: list[tuple[torch.Tensor, ...]]
     _gpu_id: int
+    _owner_token: object
+    _preparation_stream: torch.cuda.Stream
+    _quarantined_scatter_copies: list[PackedPreparedScatterCopy]
+    _quarantined_source_copies: list[PackedPreparedSourceCopy]
     _scatter_base_address: int | None
     _scatter_buffer: torch.Tensor | None
     _scatter_stream: torch.cuda.Stream
@@ -3766,15 +3889,18 @@ class PackedCopyExecutor:
         gpu_id: int,
         scatter_buffer: torch.Tensor | None = None,
     ) -> None:
-        """Initialize dedicated gather and scatter streams.
+        """Initialize dedicated metadata, gather, and scatter streams.
 
         :param gpu_id: CUDA device identifier.
         :param scatter_buffer: Decode staging-pool byte tensor.
         """
 
         self._device = torch.device(f"cuda:{gpu_id}")
-        self._failed_scatter_resources = []
+        self._failed_preparation_resources = []
         self._gpu_id = gpu_id
+        self._owner_token = object()
+        self._quarantined_scatter_copies = []
+        self._quarantined_source_copies = []
         self._scatter_buffer = scatter_buffer
         self._scatter_base_address = (
             scatter_buffer.data_ptr() if scatter_buffer is not None else None
@@ -3792,6 +3918,220 @@ class PackedCopyExecutor:
             device=self._device,
             priority=self._PROGRESS_STREAM_PRIORITY,
         )
+        self._preparation_stream = torch.cuda.Stream(
+            device=self._device,
+            priority=self._PROGRESS_STREAM_PRIORITY,
+        )
+
+    def prepare_source_copy(
+        self,
+        transfer: PackedSourceTransfer,
+        *,
+        terminal_binding_digest: bytes | None,
+    ) -> PackedPreparedSourceCopy:
+        """Construct source metadata after authenticated READY validation.
+
+        The returned event orders asynchronous metadata construction without a
+        host synchronization. The caller must retain the projection until the
+        request reaches terminal retirement or quarantine.
+
+        :param transfer: Exact canonical transfer produced by READY.
+        :param terminal_binding_digest: Exact terminal lifecycle, otherwise
+            ``None`` for legacy serving.
+        :returns: Immutable request-owned source metadata.
+        """
+
+        if type(transfer) is not PackedSourceTransfer:
+            raise TypeError("transfer must be PackedSourceTransfer")
+        if terminal_binding_digest is not None and (
+            type(terminal_binding_digest) is not bytes
+            or len(terminal_binding_digest) != 32
+        ):
+            raise ValueError("terminal_binding_digest must contain 32 bytes")
+        writer_layout = writer_layout_for(transfer.layout, transfer.writer_id)
+        groups, resources, ready_event = self._prepare_copy_groups(
+            copy_groups=writer_layout.copy_groups,
+            binding=transfer.source_binding,
+            endpoint=StagingEndpoint.SOURCE,
+        )
+        return PackedPreparedSourceCopy(
+            key=transfer.key,
+            layout=transfer.layout,
+            writer_id=transfer.writer_id,
+            source_binding=transfer.source_binding,
+            groups=groups,
+            ready_event=ready_event,
+            resources=resources,
+            terminal_binding_digest=terminal_binding_digest,
+            _transfer=transfer,
+            _owner_token=self._owner_token,
+        )
+
+    def prepare_scatter_copy(
+        self,
+        preparation: PackedScatterPreparation,
+    ) -> PackedPreparedScatterCopy:
+        """Construct destination metadata while publication is reversible.
+
+        :param preparation: Registered protocol geometry and destination binding.
+        :returns: Immutable request-owned destination metadata.
+        """
+
+        if type(preparation) is not PackedScatterPreparation:
+            raise TypeError("preparation must be PackedScatterPreparation")
+        copy_groups = tuple(
+            group
+            for writer_layout in preparation.layout.writers
+            for group in writer_layout.copy_groups
+        )
+        groups, resources, ready_event = self._prepare_copy_groups(
+            copy_groups=copy_groups,
+            binding=preparation.destination_binding,
+            endpoint=StagingEndpoint.DESTINATION,
+        )
+        return PackedPreparedScatterCopy(
+            key=preparation.key,
+            layout=preparation.layout,
+            destination_binding=preparation.destination_binding,
+            groups=groups,
+            ready_event=ready_event,
+            resources=resources,
+            _owner_token=self._owner_token,
+        )
+
+    def quarantine_source_copy(
+        self,
+        prepared_copy: PackedPreparedSourceCopy,
+    ) -> None:
+        """Retain source metadata whose terminal lifetime is ambiguous.
+
+        :param prepared_copy: Exact projection prepared by this executor.
+        """
+
+        if type(prepared_copy) is not PackedPreparedSourceCopy:
+            raise TypeError("prepared_copy must be PackedPreparedSourceCopy")
+        if prepared_copy._owner_token is not self._owner_token:
+            raise RuntimeError("prepared source copy belongs to another executor")
+        if any(
+            retained is prepared_copy for retained in self._quarantined_source_copies
+        ):
+            return
+        self._quarantined_source_copies.append(prepared_copy)
+
+    def quarantine_scatter_copy(
+        self,
+        prepared_copy: PackedPreparedScatterCopy,
+    ) -> None:
+        """Retain destination metadata whose terminal lifetime is ambiguous.
+
+        :param prepared_copy: Exact projection prepared by this executor.
+        """
+
+        if type(prepared_copy) is not PackedPreparedScatterCopy:
+            raise TypeError("prepared_copy must be PackedPreparedScatterCopy")
+        if prepared_copy._owner_token is not self._owner_token:
+            raise RuntimeError("prepared scatter copy belongs to another executor")
+        if any(
+            retained is prepared_copy for retained in self._quarantined_scatter_copies
+        ):
+            return
+        self._quarantined_scatter_copies.append(prepared_copy)
+
+    def _prepare_copy_groups(
+        self,
+        *,
+        copy_groups: tuple[StagingCopyGroup, ...],
+        binding: StagingEndpointBufferBinding,
+        endpoint: StagingEndpoint,
+    ) -> tuple[
+        tuple[PackedPreparedCopyGroup, ...],
+        tuple[torch.Tensor, ...],
+        torch.cuda.Event,
+    ]:
+        """Build and asynchronously publish device metadata for copy groups.
+
+        Entry-pointer tensors are shared across groups with identical component
+        geometry. Page tensors are shared by every group of the same component.
+
+        :param copy_groups: Canonically ordered copy geometry.
+        :param binding: Exact immutable endpoint binding.
+        :param endpoint: Source or destination index selection.
+        :returns: Prepared groups, unique retained tensors, and readiness event.
+        """
+
+        if type(binding) is not StagingEndpointBufferBinding:
+            raise TypeError("binding must be StagingEndpointBufferBinding")
+        if endpoint not in (StagingEndpoint.SOURCE, StagingEndpoint.DESTINATION):
+            raise ValueError("copy preparation requires a source or destination")
+        if binding.endpoint is not endpoint:
+            raise ValueError("copy preparation binding belongs to another endpoint")
+        pointer_tensors: dict[
+            tuple[StagingComponentId, tuple[int, ...]], torch.Tensor
+        ] = {}
+        page_tensors: dict[StagingComponentId, torch.Tensor] = {}
+        retained: list[torch.Tensor] = []
+        prepared_groups: list[PackedPreparedCopyGroup] = []
+        try:
+            with torch.cuda.stream(self._preparation_stream):
+                for group in copy_groups:
+                    active = binding.require(group.component_id)
+                    if active.page_count != group.page_count:
+                        raise ValueError(
+                            "prepared copy page count differs from canonical group"
+                        )
+                    entry_indices = (
+                        group.source_entry_indices
+                        if endpoint is StagingEndpoint.SOURCE
+                        else group.destination_entry_indices
+                    )
+                    pointer_key = (group.component_id, entry_indices)
+                    entry_ptrs = pointer_tensors.get(pointer_key)
+                    if entry_ptrs is None:
+                        entry_ptrs = torch.tensor(
+                            tuple(
+                                active.component.tensor_ptrs[entry_index]
+                                for entry_index in entry_indices
+                            ),
+                            dtype=torch.int64,
+                            device=self._device,
+                        )
+                        pointer_tensors[pointer_key] = entry_ptrs
+                        retained.append(entry_ptrs)
+                    page_indices = page_tensors.get(group.component_id)
+                    if page_indices is None:
+                        page_indices = torch.tensor(
+                            active.page_array,
+                            dtype=torch.int32,
+                            device=self._device,
+                        )
+                        page_tensors[group.component_id] = page_indices
+                        retained.append(page_indices)
+                    physical_tokens = group.page_count * active.component.page_size
+                    bytes_per_entry = physical_tokens * group.copy_bytes_per_token
+                    prepared_groups.append(
+                        PackedPreparedCopyGroup(
+                            group=group,
+                            entry_ptrs=entry_ptrs,
+                            page_indices=page_indices,
+                            physical_tokens=physical_tokens,
+                            bytes_per_entry=bytes_per_entry,
+                            grid=(
+                                len(entry_indices),
+                                triton.cdiv(bytes_per_entry, 256),
+                            ),
+                            page_size=active.component.page_size,
+                        )
+                    )
+                ready_event = torch.cuda.Event()
+                ready_event.record(self._preparation_stream)
+        except Exception:
+            self._failed_preparation_resources.append(tuple(retained))
+            logger.error(
+                "Packed copy metadata preparation failed:\n%s",
+                traceback.format_exc(),
+            )
+            raise
+        return tuple(prepared_groups), tuple(retained), ready_event
 
     @property
     def scatter_stream_handle(self) -> int:
@@ -3810,6 +4150,7 @@ class PackedCopyExecutor:
         self,
         *,
         transfer: PackedSourceTransfer,
+        prepared_copy: PackedPreparedSourceCopy,
         source_lane: PackedTransferLane,
         producer_event: torch.cuda.Event,
         binding_digest: bytes | None = None,
@@ -3821,6 +4162,7 @@ class PackedCopyExecutor:
         read.
 
         :param transfer: Canonical work produced by validated READY.
+        :param prepared_copy: Request-owned device metadata for this transfer.
         :param source_lane: Presized route-owned registered staging lane.
         :param producer_event: Event recorded after every source KV write.
         :param binding_digest: Exact terminal lifecycle authority, when the
@@ -3829,46 +4171,35 @@ class PackedCopyExecutor:
         :raises PackedGatherError: If no destination DMA was submitted.
         """
 
+        if type(prepared_copy) is not PackedPreparedSourceCopy:
+            raise TypeError("prepared_copy must be PackedPreparedSourceCopy")
+        prepared_copy.require_transfer(
+            transfer,
+            self._owner_token,
+            binding_digest,
+        )
         writer_layout = writer_layout_for(transfer.layout, transfer.writer_id)
         if transfer.length_bytes != writer_layout.length_bytes:
             raise ValueError("source transfer length differs from canonical writer")
         source_lane.reserve(transfer, binding_digest=binding_digest)
-        retained: list[torch.Tensor] = []
         try:
             with torch.cuda.stream(self._source_stream):
+                self._source_stream.wait_event(prepared_copy.ready_event)
                 self._source_stream.wait_event(producer_event)
                 source_lane.tensor[: writer_layout.length_bytes].zero_()
-                for group in writer_layout.copy_groups:
-                    active = transfer.source_binding.require(group.component_id)
-                    entry_ptrs = torch.tensor(
-                        [
-                            active.component.tensor_ptrs[entry_index]
-                            for entry_index in group.source_entry_indices
-                        ],
-                        dtype=torch.int64,
-                        device=self._device,
-                    )
-                    page_indices = torch.from_numpy(
-                        np.array(active.page_array, dtype=np.int32, copy=True)
-                    ).to(self._device)
-                    retained.extend((entry_ptrs, page_indices))
-                    physical_tokens = group.page_count * active.component.page_size
-                    bytes_per_entry = physical_tokens * group.copy_bytes_per_token
-                    grid = (
-                        len(group.source_entry_indices),
-                        triton.cdiv(bytes_per_entry, 256),
-                    )
-                    _gather_packed_bytes_kernel[grid](
-                        entry_ptrs,
-                        page_indices,
+                for prepared_group in prepared_copy.groups:
+                    group = prepared_group.group
+                    _gather_packed_bytes_kernel[prepared_group.grid](
+                        prepared_group.entry_ptrs,
+                        prepared_group.page_indices,
                         source_lane.tensor,
                         group.packed_offset - writer_layout.lease_offset,
-                        physical_tokens,
+                        prepared_group.physical_tokens,
                         group.source_token_bytes,
                         group.source_offset_bytes,
                         copy_bytes_per_token=group.copy_bytes_per_token,
-                        page_size=active.component.page_size,
-                        bytes_per_entry=bytes_per_entry,
+                        page_size=prepared_group.page_size,
+                        bytes_per_entry=prepared_group.bytes_per_entry,
                         block_size=256,
                     )
             self._source_stream.synchronize()
@@ -3883,6 +4214,7 @@ class PackedCopyExecutor:
                     "Packed source gather stream did not quiesce:\n%s",
                     traceback.format_exc(),
                 )
+                self.quarantine_source_copy(prepared_copy)
             outcome = source_lane.abort_before_submit(
                 "packed source gather failed",
                 source_stream_quiesced=source_stream_quiesced,
@@ -3894,14 +4226,19 @@ class PackedCopyExecutor:
         self,
         work: PackedScatterWork,
         visibility: tuple[PackedDestinationVisibilityProof, ...],
+        prepared_copy: PackedPreparedScatterCopy,
     ) -> PackedScatterSubmission:
         """Launch component-aware scatter without blocking the caller.
 
         :param work: Protocol-owned immutable scatter inputs.
         :param visibility: Per-writer CUDA consumer-visibility evidence.
-        :returns: Completion event and retained temporary tensors.
+        :param prepared_copy: Request-owned device metadata for this scatter.
+        :returns: Completion events retaining the exact prepared metadata.
         """
 
+        if type(prepared_copy) is not PackedPreparedScatterCopy:
+            raise TypeError("prepared_copy must be PackedPreparedScatterCopy")
+        prepared_copy.require_work(work, self._owner_token)
         visibility_by_writer = {evidence.writer_id: evidence for evidence in visibility}
         expected_writers = {
             writer_layout.writer_id for writer_layout in work.layout.writers
@@ -3924,45 +4261,26 @@ class PackedCopyExecutor:
         if lease_offset + work.lease.length_bytes > scatter_buffer.numel():
             raise ValueError("packed lease exceeds decode staging buffer")
 
-        retained: list[torch.Tensor] = []
         try:
             with torch.cuda.stream(self._scatter_stream):
+                self._scatter_stream.wait_event(prepared_copy.ready_event)
                 started_event = torch.cuda.Event(enable_timing=True)
                 started_event.record(self._scatter_stream)
-                for writer_layout in work.layout.writers:
-                    for group in writer_layout.copy_groups:
-                        active = work.destination_binding.require(group.component_id)
-                        entry_ptrs = torch.tensor(
-                            [
-                                active.component.tensor_ptrs[entry_index]
-                                for entry_index in group.destination_entry_indices
-                            ],
-                            dtype=torch.int64,
-                            device=self._device,
-                        )
-                        page_indices = torch.from_numpy(
-                            np.array(active.page_array, dtype=np.int32, copy=True)
-                        ).to(self._device)
-                        retained.extend((entry_ptrs, page_indices))
-                        physical_tokens = group.page_count * active.component.page_size
-                        bytes_per_entry = physical_tokens * group.copy_bytes_per_token
-                        grid = (
-                            len(group.destination_entry_indices),
-                            triton.cdiv(bytes_per_entry, 256),
-                        )
-                        _scatter_packed_bytes_kernel[grid](
-                            entry_ptrs,
-                            page_indices,
-                            scatter_buffer,
-                            lease_offset + group.packed_offset,
-                            physical_tokens,
-                            group.destination_token_bytes,
-                            group.destination_offset_bytes,
-                            copy_bytes_per_token=group.copy_bytes_per_token,
-                            page_size=active.component.page_size,
-                            bytes_per_entry=bytes_per_entry,
-                            block_size=256,
-                        )
+                for prepared_group in prepared_copy.groups:
+                    group = prepared_group.group
+                    _scatter_packed_bytes_kernel[prepared_group.grid](
+                        prepared_group.entry_ptrs,
+                        prepared_group.page_indices,
+                        scatter_buffer,
+                        lease_offset + group.packed_offset,
+                        prepared_group.physical_tokens,
+                        group.destination_token_bytes,
+                        group.destination_offset_bytes,
+                        copy_bytes_per_token=group.copy_bytes_per_token,
+                        page_size=prepared_group.page_size,
+                        bytes_per_entry=prepared_group.bytes_per_entry,
+                        block_size=256,
+                    )
                 event = torch.cuda.Event(enable_timing=True)
                 event.record(self._scatter_stream)
         except Exception:
@@ -3972,7 +4290,7 @@ class PackedCopyExecutor:
             try:
                 self._scatter_stream.synchronize()
             except Exception:  # noqa: BLE001
-                self._failed_scatter_resources.extend(retained)
+                self.quarantine_scatter_copy(prepared_copy)
                 logger.error(
                     "Packed destination scatter stream did not quiesce:\n%s",
                     traceback.format_exc(),
@@ -3981,12 +4299,13 @@ class PackedCopyExecutor:
         return PackedScatterSubmission(
             started_event=started_event,
             event=event,
-            resources=tuple(retained),
+            prepared_copy=prepared_copy,
         )
 
     def synchronize_scatter(self) -> None:
-        """Wait until every submitted scatter on the dedicated stream is terminal."""
+        """Wait until metadata preparation and destination scatter are terminal."""
 
+        self._preparation_stream.synchronize()
         self._scatter_stream.synchronize()
 
 
