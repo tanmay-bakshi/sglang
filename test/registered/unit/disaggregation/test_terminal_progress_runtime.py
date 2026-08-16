@@ -751,25 +751,33 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
                 actions.extend(current_actions)
             return tuple(actions)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        def submit_during_handoff() -> None:
+            """Submit later actions while the main-thread callback is blocked."""
+
+            try:
+                assert handoff_observed.wait(timeout=_WAIT_SECONDS)
+                for registration in registrations[1:]:
+                    runtime.submit(
+                        _LOCAL_PRODUCER_ID,
+                        registration.binding.digest,
+                        NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+                    )
+            finally:
+                release_initial_claim.set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             consumer_future = executor.submit(consume_all_gathers)
+            submitter_future = executor.submit(submit_during_handoff)
             sys.setswitchinterval(0.005)
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
                 registrations[0].binding.digest,
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             )
-            assert handoff_observed.wait(timeout=_WAIT_SECONDS)
-            for registration in registrations[1:]:
-                runtime.submit(
-                    _LOCAL_PRODUCER_ID,
-                    registration.binding.digest,
-                    NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
-                )
-            release_initial_claim.set()
             expires_at = time.monotonic() + 0.5
             while not consumer_future.done() and time.monotonic() < expires_at:
                 pass
+            submitter_future.result(timeout=_WAIT_SECONDS)
             actions = consumer_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
