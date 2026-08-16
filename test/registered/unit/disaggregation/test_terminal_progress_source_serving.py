@@ -2183,14 +2183,19 @@ def test_reclaim_last_retirement_waits_for_local_mirror_commit(
             "complete_scheduler_action",
             pause_after_native_completion,
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            completion = executor.submit(serving.drain_scheduler_at_loop_entry)
+        def observe_completion() -> None:
+            """Validate the paused join and release the scheduler thread."""
+
             assert completion_submitted.wait(timeout=_WAIT_SECONDS)
             try:
                 _assert_retirement_preclaimed_behind_fence(runtime)
             finally:
                 release_completion.set()
-            completion.result(timeout=_WAIT_SECONDS)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            observer = executor.submit(observe_completion)
+            serving.drain_scheduler_at_loop_entry()
+            observer.result(timeout=_WAIT_SECONDS)
 
         assert runtime.wait_for_output_projection(_WAIT_SECONDS)
         _pump(serving, runtime)

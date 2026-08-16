@@ -971,7 +971,7 @@ def _emit_source_ready_actions(
 def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Abort cannot enter between a work event and action retirement."""
+    """No contender can enter between a work event and action retirement."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -992,13 +992,14 @@ def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
                 runtime,
                 completion_patch,
             )
-            abort_started = threading.Event()
+            condition_attempted = threading.Event()
 
-            def begin_abort() -> None:
-                """Attempt fail-closed reconciliation during completion."""
+            def enter_runtime_condition() -> None:
+                """Attempt runtime reconciliation during completion."""
 
-                abort_started.set()
-                runtime.begin_abort("synthetic concurrent completion abort")
+                condition_attempted.set()
+                with runtime._condition:
+                    return
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 completion = executor.submit(
@@ -1015,16 +1016,16 @@ def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
                 )
                 try:
                     assert native_submitted.wait(timeout=_WAIT_SECONDS)
-                    abort = executor.submit(begin_abort)
-                    assert abort_started.wait(timeout=_WAIT_SECONDS)
+                    contender = executor.submit(enter_runtime_condition)
+                    assert condition_attempted.wait(timeout=_WAIT_SECONDS)
                     condition_available = runtime._condition.acquire(blocking=False)
                     if condition_available:
                         runtime._condition.release()
-                    assert not abort.done()
+                    assert not contender.done()
                 finally:
                     release_submit.set()
                 completion.result(timeout=_WAIT_SECONDS)
-                abort.result(timeout=_WAIT_SECONDS)
+                contender.result(timeout=_WAIT_SECONDS)
                 assert not condition_available
 
         with runtime._condition:
@@ -1032,9 +1033,29 @@ def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
             assert scheduler.action_id in runtime._consumer_pending
         assert (
             runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.ABORT_DRAINING
+            is NativeTerminalRuntimeDisposition.RUNNING
         )
-        assert not runtime.acknowledge_aborted_action_if_pending(publisher)
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                60,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+        runtime.stop_admission()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _drain_observations(runtime)
+        runtime.close_clean()
     finally:
         _finish_fail_closed(runtime)
 
@@ -1042,7 +1063,7 @@ def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
 def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Abort cannot enter between a scheduler event and action retirement."""
+    """No contender can enter between a scheduler event and retirement."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -1063,13 +1084,14 @@ def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomi
                 runtime,
                 completion_patch,
             )
-            abort_started = threading.Event()
+            condition_attempted = threading.Event()
 
-            def begin_abort() -> None:
-                """Attempt fail-closed reconciliation during completion."""
+            def enter_runtime_condition() -> None:
+                """Attempt runtime reconciliation during completion."""
 
-                abort_started.set()
-                runtime.begin_abort("synthetic concurrent completion abort")
+                condition_attempted.set()
+                with runtime._condition:
+                    return
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 completion = executor.submit(
@@ -1086,16 +1108,16 @@ def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomi
                 )
                 try:
                     assert native_submitted.wait(timeout=_WAIT_SECONDS)
-                    abort = executor.submit(begin_abort)
-                    assert abort_started.wait(timeout=_WAIT_SECONDS)
+                    contender = executor.submit(enter_runtime_condition)
+                    assert condition_attempted.wait(timeout=_WAIT_SECONDS)
                     condition_available = runtime._condition.acquire(blocking=False)
                     if condition_available:
                         runtime._condition.release()
-                    assert not abort.done()
+                    assert not contender.done()
                 finally:
                     release_submit.set()
                 completion.result(timeout=_WAIT_SECONDS)
-                abort.result(timeout=_WAIT_SECONDS)
+                contender.result(timeout=_WAIT_SECONDS)
                 assert not condition_available
 
         with runtime._condition:
@@ -1103,9 +1125,29 @@ def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomi
             assert publisher.action_id in runtime._consumer_pending
         assert (
             runtime.snapshot().disposition
-            is NativeTerminalRuntimeDisposition.ABORT_DRAINING
+            is NativeTerminalRuntimeDisposition.RUNNING
         )
-        assert not runtime.acknowledge_aborted_action_if_pending(scheduler)
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                63,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+        runtime.stop_admission()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _drain_observations(runtime)
+        runtime.close_clean()
     finally:
         _finish_fail_closed(runtime)
 
@@ -2767,6 +2809,10 @@ def test_gateway_result_lifetime_does_not_extend_launch_exclusion() -> None:
             registration,
             remote,
             nonce_value=104,
+        )
+        _wait_for_owner_inventory(
+            runtime._owner,
+            lambda inventory: inventory.pending_action_count == 0,
         )
         delivered = runtime.snapshot()
         assert delivered.owner.active_handoff_action_count == 0
