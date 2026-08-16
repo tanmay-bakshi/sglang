@@ -1,7 +1,9 @@
+import concurrent.futures
 import dataclasses
 import hashlib
 import inspect
 import logging
+import threading
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
@@ -43,6 +45,9 @@ from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptKind,
     TerminalReceiptOutcome,
 )
+from sglang.srt.disaggregation.terminal_progress.runtime import (
+    NativeTerminalSourceActionDeliveryFence,
+)
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
@@ -66,6 +71,7 @@ _LOCAL_RECEIPT_PRODUCER_ID = 11
 _DECODER_CONTROL_PRODUCER_ID = 12
 _DECODER_RECEIPT_PRODUCER_ID = 13
 _PUBLISHER_RECEIPT_PRODUCER_ID = 14
+_WAIT_SECONDS = 5.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -222,6 +228,7 @@ class _Runtime:
     fail_registration: bool
     fail_work_completion: bool
     fail_scheduler_completion: bool
+    _projection_lock: threading.Lock
 
     def __init__(
         self,
@@ -259,6 +266,7 @@ class _Runtime:
         self.fail_registration = False
         self.fail_work_completion = False
         self.fail_scheduler_completion = False
+        self._projection_lock = threading.Lock()
 
     def python_producer_id(
         self,
@@ -415,6 +423,16 @@ class _Runtime:
         """
 
         self.operations.append(("scheduler-failed", action, reason))
+
+    def source_action_delivery_fence(
+        self,
+    ) -> NativeTerminalSourceActionDeliveryFence:
+        """Return one projection fence over the fixture runtime.
+
+        :returns: Non-reentrant delivery fence sharing the process lock.
+        """
+
+        return NativeTerminalSourceActionDeliveryFence(self._projection_lock)
 
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Record one consumed terminal action.
@@ -1107,6 +1125,210 @@ def test_full_source_success_uses_runtime_completion_surfaces(
     assert len(samples) == 1
     assert samples[0].field.value == "gateway_publication_ms"
     assert samples[0].sample_key == "canonical-source-publisher"
+
+
+def test_publication_last_join_linearizes_before_native_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement cannot outrun the local publication join it proves."""
+
+    harness = _harness()
+    _ready(harness)
+    harness.wiring.consume_reclaim_authorized(
+        _action(harness, NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED, 80),
+        lambda submission: None,
+    )
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        81,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(
+        publication_action
+    )
+    assert publication is not None
+    result = _publication_result(harness, publication, success=True)
+    retired = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        82,
+    )
+    completion_submitted = threading.Event()
+    release_completion = threading.Event()
+    retired_submissions: list[PackedTerminalSourceSubmission] = []
+    original_completion = harness.runtime.complete_work_action
+
+    def pause_after_native_completion(
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Expose the native-submit to local-publication-commit interval.
+
+        :param producer_id: Exact producer identity.
+        :param action: Publication action being completed.
+        :param followup_kind: Earned publication event.
+        :param receipt: Exact publication receipt.
+        :param reason: Optional failure reason.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        original_completion(
+            producer_id,
+            action,
+            followup_kind,
+            receipt=receipt,
+            reason=reason,
+            enqueued_ns=enqueued_ns,
+        )
+        if followup_kind is not NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED:
+            return
+        completion_submitted.set()
+        if not release_completion.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("publication completion release was not delivered")
+
+    monkeypatch.setattr(
+        harness.runtime,
+        "complete_work_action",
+        pause_after_native_completion,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        publication_future = executor.submit(harness.wiring.publisher_result, result)
+        assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+
+        def project_retirement() -> PackedTerminalSourceSubmission | None:
+            """Model output projection followed by lifecycle consumption.
+
+            :returns: Retired immutable submission.
+            """
+
+            with harness.runtime.source_action_delivery_fence():
+                return harness.wiring.consume_terminal_action(
+                    retired,
+                    lambda submission, action: retired_submissions.append(submission),
+                )
+
+        retirement_future = executor.submit(
+            project_retirement,
+        )
+        _, pending = concurrent.futures.wait(
+            (retirement_future,),
+            timeout=0.05,
+        )
+        assert pending == {retirement_future}
+        release_completion.set()
+        publication_future.result(timeout=_WAIT_SECONDS)
+        assert retirement_future.result(timeout=_WAIT_SECONDS) == harness.submission
+
+    assert retired_submissions == [harness.submission]
+    assert harness.wiring.inventory().active_binding_digests == ()
+
+
+def test_reclaim_last_join_linearizes_before_native_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement cannot outrun the local reclaim join it proves."""
+
+    harness = _harness()
+    _ready(harness)
+    publication_action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        90,
+    )
+    publication = harness.wiring.consume_gateway_publication_ready(
+        publication_action
+    )
+    assert publication is not None
+    harness.wiring.publisher_result(
+        _publication_result(harness, publication, success=True)
+    )
+    reclaim = _action(
+        harness,
+        NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED,
+        91,
+    )
+    retired = _action(
+        harness,
+        NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        92,
+    )
+    completion_submitted = threading.Event()
+    release_completion = threading.Event()
+    retired_submissions: list[PackedTerminalSourceSubmission] = []
+    original_completion = harness.runtime.complete_scheduler_action
+
+    def pause_after_native_completion(
+        producer_id: int,
+        action: NativeTerminalOwnerAction,
+        followup_kind: NativeTerminalOwnerEventKind,
+        *,
+        completion_receipt: NativeTerminalReceipt | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Expose the native-submit to local-reclaim-commit interval.
+
+        :param producer_id: Exact producer identity.
+        :param action: Reclaim action being completed.
+        :param followup_kind: Earned reclaim event.
+        :param completion_receipt: Exact reclaim receipt.
+        :param enqueued_ns: Exact producer timestamp.
+        """
+
+        original_completion(
+            producer_id,
+            action,
+            followup_kind,
+            completion_receipt=completion_receipt,
+            enqueued_ns=enqueued_ns,
+        )
+        completion_submitted.set()
+        if not release_completion.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("reclaim completion release was not delivered")
+
+    monkeypatch.setattr(
+        harness.runtime,
+        "complete_scheduler_action",
+        pause_after_native_completion,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        reclaim_future = executor.submit(
+            harness.wiring.consume_reclaim_authorized,
+            reclaim,
+            lambda submission: None,
+        )
+        assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+
+        def project_retirement() -> PackedTerminalSourceSubmission | None:
+            """Model output projection followed by lifecycle consumption.
+
+            :returns: Retired immutable submission.
+            """
+
+            with harness.runtime.source_action_delivery_fence():
+                return harness.wiring.consume_terminal_action(
+                    retired,
+                    lambda submission, action: retired_submissions.append(submission),
+                )
+
+        retirement_future = executor.submit(
+            project_retirement,
+        )
+        _, pending = concurrent.futures.wait(
+            (retirement_future,),
+            timeout=0.05,
+        )
+        assert pending == {retirement_future}
+        release_completion.set()
+        reclaim_future.result(timeout=_WAIT_SECONDS)
+        assert retirement_future.result(timeout=_WAIT_SECONDS) == harness.submission
+
+    assert retired_submissions == [harness.submission]
+    assert harness.wiring.inventory().active_binding_digests == ()
 
 
 def test_retirement_side_effect_failure_retains_native_and_wiring_authority() -> None:

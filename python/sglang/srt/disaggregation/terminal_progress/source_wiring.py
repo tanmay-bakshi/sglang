@@ -4,6 +4,7 @@ import logging
 import threading
 import traceback
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
 from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
@@ -168,6 +169,12 @@ class NativeTerminalSourceRuntime(Protocol):
         :param followup_kind: Reclaim-consumed transition.
         :param completion_receipt: Scheduler-minted consumption authority.
         :param enqueued_ns: Optional exact native-clock timestamp.
+        """
+
+    def source_action_delivery_fence(self) -> AbstractContextManager[None]:
+        """Exclude source action projection across one joined-side-effect commit.
+
+        :returns: Non-reentrant process-lifetime delivery fence.
         """
 
     def fail_scheduler_action(
@@ -1087,15 +1094,26 @@ class PackedTerminalSourceWiring:
                 outcome=TerminalReceiptOutcome.SUCCESS,
                 terminal_timestamp_ns=self._clock_ns(),
             )
-            self._runtime.complete_scheduler_action(
-                self._local_receipt_producer_id,
-                action,
-                NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
-                completion_receipt=NativeTerminalReceipt.from_wire_receipt(
-                    issued.wire_receipt
-                ),
-                enqueued_ns=self._clock_ns(),
-            )
+            with self._runtime.source_action_delivery_fence():
+                self._runtime.complete_scheduler_action(
+                    self._local_receipt_producer_id,
+                    action,
+                    NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+                    completion_receipt=NativeTerminalReceipt.from_wire_receipt(
+                        issued.wire_receipt
+                    ),
+                    enqueued_ns=self._clock_ns(),
+                )
+                with self._lock:
+                    current = self._records.get(action.binding.digest)
+                    if current is not record:
+                        raise RuntimeError(
+                            "source request registry changed during reclaim"
+                        )
+                    # Native may earn REQUEST_RETIRED as soon as this event
+                    # lands. Action projection stays excluded until its local
+                    # side-effect mirror is committed under the wiring lock.
+                    current.reclaim_consumed = True
         except Exception as error:
             self._fail_scheduler_action(
                 action,
@@ -1103,11 +1121,6 @@ class PackedTerminalSourceWiring:
                 error,
             )
             raise
-        with self._lock:
-            current = self._records.get(action.binding.digest)
-            if current is not record:
-                raise RuntimeError("source request registry changed during reclaim")
-            current.reclaim_consumed = True
         self._emit_metric_once(
             action.binding.digest,
             NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
@@ -1838,14 +1851,33 @@ class PackedTerminalSourceWiring:
             NativeTerminalProcessIdentity.from_identity(receipt.authenticated_issuer),
         )
         try:
-            self._runtime.complete_work_action(
-                producer_id,
-                action,
-                kind,
-                receipt=NativeTerminalReceipt.from_wire_receipt(receipt.wire_receipt),
-                reason=receipt.reason,
-                enqueued_ns=self._clock_ns(),
-            )
+            with self._runtime.source_action_delivery_fence():
+                self._runtime.complete_work_action(
+                    producer_id,
+                    action,
+                    kind,
+                    receipt=NativeTerminalReceipt.from_wire_receipt(
+                        receipt.wire_receipt
+                    ),
+                    reason=receipt.reason,
+                    enqueued_ns=self._clock_ns(),
+                )
+                with self._lock:
+                    current = self._records.get(binding.digest)
+                    if current is not record:
+                        raise RuntimeError(
+                            "source request registry changed during publication"
+                        )
+                    if record.publication_action != action:
+                        raise RuntimeError(
+                            "publication action changed during result completion"
+                        )
+                    # A reclaim-first lifecycle can now mint REQUEST_RETIRED.
+                    # Publish the Python mirror before that action can leave
+                    # the process-wide output projection seam.
+                    record.publication_action = None
+                    record.publication_terminal = True
+                    record.publication_failed = publication_failed
         except Exception as error:
             self._complete_failed_work(
                 action=action,
@@ -1856,17 +1888,6 @@ class PackedTerminalSourceWiring:
             )
             self._mark_publication_action_failed(record, action)
             raise
-        with self._lock:
-            current = self._records.get(binding.digest)
-            if current is not record:
-                raise RuntimeError("source request registry changed during publication")
-            if record.publication_action != action:
-                raise RuntimeError(
-                    "publication action changed during result completion"
-                )
-            record.publication_action = None
-            record.publication_terminal = True
-            record.publication_failed = publication_failed
         self._emit_metric_once(binding.digest, kind)
 
     def _publication_receipt_event(
