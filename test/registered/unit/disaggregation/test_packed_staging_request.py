@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.packed_staging_protocol import (
     PackedReady,
     PackedRequestTeardown,
     PackedRequestTeardownAck,
+    PackedScatterPreparation,
     PackedTopology,
     PackedTransportPath,
     PackedWriterCompletionMechanism,
@@ -67,6 +68,7 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging import (
     MAIN_KV_COMPONENT,
+    PackedCopyExecutor,
     PackedDestinationOutcomeCoordinator,
     PackedDestinationVisibilityActionExecutor,
     PackedDestinationVisibilityPolicy,
@@ -74,6 +76,7 @@ from sglang.srt.disaggregation.nixl.packed_staging import (
     PackedGpuDirectFlushScope,
     PackedGpuDirectFlushTarget,
     PackedGpuDirectWritesOrdering,
+    PackedPreparedScatterCopy,
 )
 from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
@@ -287,6 +290,64 @@ class _VisibilityExecutor(PackedDestinationVisibilityActionExecutor):
         raise AssertionError("direct-event tests must not flush GPUDirect writes")
 
 
+class _CopyExecutor(PackedCopyExecutor):
+    """CPU-only prepared-scatter executor preserving production ownership."""
+
+    fail_on_preparation: int | None
+    preparations: list[PackedScatterPreparation]
+    prepared_copies: list[PackedPreparedScatterCopy]
+    quarantined_copies: list[PackedPreparedScatterCopy]
+
+    def __init__(self) -> None:
+        """Initialize deterministic request-local metadata ownership."""
+
+        self._owner_token = object()
+        self.fail_on_preparation = None
+        self.preparations = []
+        self.prepared_copies = []
+        self.quarantined_copies = []
+
+    def prepare_scatter_copy(
+        self,
+        preparation: PackedScatterPreparation,
+    ) -> PackedPreparedScatterCopy:
+        """Project protocol geometry without allocating CUDA resources.
+
+        :param preparation: Exact protocol-owned destination geometry.
+        :returns: Identity-bound prepared scatter metadata.
+        """
+
+        self.preparations.append(preparation)
+        if self.fail_on_preparation == len(self.preparations):
+            raise RuntimeError("injected prepared scatter construction failure")
+        prepared_copy = PackedPreparedScatterCopy(
+            key=preparation.key,
+            layout=preparation.layout,
+            destination_binding=preparation.destination_binding,
+            groups=(),
+            ready_event=object(),
+            resources=(),
+            _owner_token=self._owner_token,
+        )
+        self.prepared_copies.append(prepared_copy)
+        return prepared_copy
+
+    def quarantine_scatter_copy(
+        self,
+        prepared_copy: PackedPreparedScatterCopy,
+    ) -> None:
+        """Retain a projection whose construction lifetime became ambiguous.
+
+        :param prepared_copy: Exact projection created by this executor.
+        """
+
+        if prepared_copy._owner_token is not self._owner_token:
+            raise RuntimeError("prepared scatter copy belongs to another executor")
+        if any(retained is prepared_copy for retained in self.quarantined_copies):
+            return
+        self.quarantined_copies.append(prepared_copy)
+
+
 @dataclasses.dataclass
 class _Fixture:
     """Complete CPU-only packed request transaction inputs."""
@@ -299,6 +360,7 @@ class _Fixture:
     auxiliary_lease: PackedAuxiliaryAllocationLease
     coordinator: PackedDestinationOutcomeCoordinator
     consumer_authority: object
+    copy_executor: _CopyExecutor
     full_allocator: BaseTokenToKVPoolAllocator
     lifecycle_authority: object
     owner: _RequestOwner
@@ -585,6 +647,7 @@ def _fixture(
         protocol,
         _VisibilityExecutor(),
     )
+    copy_executor = _CopyExecutor()
     return _Fixture(
         allocation_authority=allocation_authority,
         allocation_lease=allocation_lease,
@@ -594,6 +657,7 @@ def _fixture(
         auxiliary_lease=auxiliary_lease,
         coordinator=coordinator,
         consumer_authority=consumer_authority,
+        copy_executor=copy_executor,
         full_allocator=full_allocator,
         lifecycle_authority=lifecycle_authority,
         owner=owner,
@@ -625,6 +689,7 @@ def _transaction(
         lifecycle_authority=fixture.lifecycle_authority,
         protocol=fixture.protocol,
         outcome_coordinator=fixture.coordinator,
+        copy_executor=fixture.copy_executor,
         chunk_plans=selected_plans,
         auxiliary_allocation_lease=fixture.auxiliary_lease,
         auxiliary_allocation_authority=fixture.auxiliary_authority,
@@ -1168,6 +1233,54 @@ def test_unpublished_cancellation_releases_pins_and_registrations() -> None:
     with pytest.raises(PackedAuxiliaryAllocationError, match="not registered"):
         fixture.auxiliary_authority.snapshot(fixture.auxiliary_lease)
     assert len(fixture.auxiliary_allocator.releases) == 1
+    for plan in fixture.plans:
+        with pytest.raises(PackedProtocolError, match="not registered"):
+            fixture.protocol.snapshot(plan.key)
+
+
+def test_transaction_prepares_scatter_metadata_before_publication() -> None:
+    """Each begun scatter retains its exact construction-time projection."""
+
+    fixture = _fixture()
+    transaction = _transaction(fixture)
+
+    assert len(fixture.copy_executor.preparations) == len(fixture.plans)
+    assert len(fixture.copy_executor.prepared_copies) == len(fixture.plans)
+    assert fixture.copy_executor.quarantined_copies == []
+
+    transaction.publish()
+    plan = fixture.plans[0]
+    digest, lease_id = _prepare_chunk(transaction, plan)
+    _complete_writers(transaction, plan, digest, lease_id)
+    scatter = transaction.begin_scatter(plan.key)
+    preparation = fixture.copy_executor.preparations[0]
+    prepared_copy = fixture.copy_executor.prepared_copies[0]
+
+    assert scatter.prepared_copy is prepared_copy
+    assert prepared_copy.key == preparation.key
+    assert prepared_copy.layout is preparation.layout
+    assert prepared_copy.destination_binding is preparation.destination_binding
+    assert scatter.work.layout is prepared_copy.layout
+    assert scatter.work.destination_binding is prepared_copy.destination_binding
+
+
+def test_construction_failure_quarantines_every_built_scatter_projection() -> None:
+    """A later registration failure cannot release earlier asynchronous metadata."""
+
+    fixture = _fixture()
+    fixture.copy_executor.fail_on_preparation = 2
+
+    with pytest.raises(
+        PackedRequestTransactionError,
+        match="chunk registration failed",
+    ):
+        _transaction(fixture)
+
+    assert len(fixture.copy_executor.preparations) == 2
+    assert len(fixture.copy_executor.prepared_copies) == 1
+    assert fixture.copy_executor.quarantined_copies == [
+        fixture.copy_executor.prepared_copies[0]
+    ]
     for plan in fixture.plans:
         with pytest.raises(PackedProtocolError, match="not registered"):
             fixture.protocol.snapshot(plan.key)

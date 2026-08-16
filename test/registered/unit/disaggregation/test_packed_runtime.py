@@ -59,11 +59,14 @@ from sglang.srt.disaggregation.nixl.packed_runtime import (
     encode_packed_control_frames,
 )
 from sglang.srt.disaggregation.nixl.packed_staging import (
+    PackedCopyExecutor,
     PackedDestinationRegistration,
     PackedNixlRuntimeArtifactCohort,
     PackedNixlRuntimeArtifactIdentity,
     PackedNixlRuntimeRoot,
     PackedPeerIdentity,
+    PackedPreparedScatterCopy,
+    PackedPreparedSourceCopy,
     PackedSourceTransfer,
     build_prefill_chunk,
 )
@@ -221,6 +224,47 @@ class _ReadyCoordinator:
         return self.transfer
 
 
+class _SourcePreparationExecutor:
+    """Prepare and retain source-copy sentinels without CUDA."""
+
+    preparations: list[tuple[object, bytes | None, PackedPreparedSourceCopy]]
+    quarantined: list[PackedPreparedSourceCopy]
+
+    def __init__(self) -> None:
+        """Initialize empty preparation and quarantine ledgers."""
+
+        self.preparations = []
+        self.quarantined = []
+
+    def prepare_source_copy(
+        self,
+        transfer: object,
+        *,
+        terminal_binding_digest: bytes | None,
+    ) -> PackedPreparedSourceCopy:
+        """Return one identity-stable request-owned projection.
+
+        :param transfer: Exact authenticated source transfer.
+        :param terminal_binding_digest: Terminal lifecycle identity, if any.
+        :returns: Synthetic prepared-copy projection.
+        """
+
+        prepared_copy = object.__new__(PackedPreparedSourceCopy)
+        self.preparations.append((transfer, terminal_binding_digest, prepared_copy))
+        return prepared_copy
+
+    def quarantine_source_copy(
+        self,
+        prepared_copy: PackedPreparedSourceCopy,
+    ) -> None:
+        """Retain an ambiguously exposed projection.
+
+        :param prepared_copy: Exact prepared-copy projection.
+        """
+
+        self.quarantined.append(prepared_copy)
+
+
 @dataclasses.dataclass(frozen=True)
 class _DecodeSnapshot:
     """Minimal transaction snapshot used by the runtime registry."""
@@ -345,6 +389,7 @@ class _Scatter:
 
     work: object
     proofs: tuple[object, ...]
+    prepared_copy: PackedPreparedScatterCopy
 
 
 class _Event:
@@ -387,7 +432,7 @@ class _CopyExecutor:
     """Record one actor-owned scatter submission."""
 
     event: _Event
-    submissions: list[tuple[object, tuple[object, ...]]]
+    submissions: list[tuple[object, tuple[object, ...], PackedPreparedScatterCopy]]
 
     def __init__(self, event: _Event) -> None:
         """Initialize the executor.
@@ -411,15 +456,17 @@ class _CopyExecutor:
         self,
         work: object,
         proofs: tuple[object, ...],
+        prepared_copy: PackedPreparedScatterCopy,
     ) -> _ScatterSubmission:
         """Record and return one asynchronous scatter.
 
         :param work: Opaque protocol scatter work.
         :param proofs: Opaque visibility proofs.
+        :param prepared_copy: Request-owned prepared scatter metadata.
         :returns: Fake asynchronous submission.
         """
 
-        self.submissions.append((work, proofs))
+        self.submissions.append((work, proofs, prepared_copy))
         return _ScatterSubmission(self.event)
 
 
@@ -560,7 +607,11 @@ class _DecodeLifecycleTransaction:
 
         assert key == self.ready.key
         self.chunk_state = PackedProtocolState.SCATTERING
-        return _Scatter(object(), ())
+        return _Scatter(
+            object(),
+            (),
+            object.__new__(PackedPreparedScatterCopy),
+        )
 
     def complete_scatter(self, scatter: _Scatter) -> None:
         """Record terminal scatter completion.
@@ -734,11 +785,35 @@ class _PackedLeaseAllocator:
         del lease
 
 
+class _PreparationCopyExecutor(PackedCopyExecutor):
+    """Prepare destination metadata sentinels without acquiring CUDA."""
+
+    preparations: list[object]
+
+    def __init__(self) -> None:
+        """Initialize an empty preparation ledger."""
+
+        self.preparations = []
+
+    def prepare_scatter_copy(self, preparation: object) -> PackedPreparedScatterCopy:
+        """Return one exact-type projection for transaction construction.
+
+        :param preparation: Protocol-owned destination geometry.
+        :returns: Synthetic prepared scatter projection.
+        """
+
+        self.preparations.append(preparation)
+        return object.__new__(PackedPreparedScatterCopy)
+
+
 @dataclasses.dataclass(frozen=True)
 class _PackedDecodeArena:
     """Expose the real protocol through the decode runtime arena surface."""
 
     protocol: PackedDecodeProtocol
+    copy_executor: PackedCopyExecutor = dataclasses.field(
+        default_factory=_PreparationCopyExecutor
+    )
 
 
 class _PackedDecodeManager:
@@ -1133,6 +1208,7 @@ def _terminal_prefill_actor_fixture() -> tuple[
     artifacts = _runtime_artifacts()
     policy = build_same_host_visibility_policy(artifacts)
     runtime = PackedPrefillRuntime(manager, artifacts, policy)
+    runtime._copy_executor = _SourcePreparationExecutor()
     peer = PackedPeerIdentity("decoder-agent", b"d" * 16)
     sent_messages: list[object] = []
     submission = _unvalidated_submission(
@@ -1213,6 +1289,8 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     producer_event = object()
     record = Mock()
     record.submission.producer_event = producer_event
+    prepared_copy = object.__new__(PackedPreparedSourceCopy)
+    record.prepared_source_copy = prepared_copy
     transfer = Mock(
         destination_address=0x200000,
         length_bytes=4096,
@@ -1251,6 +1329,7 @@ def test_main_transfer_initialization_failure_logs_native_traceback(
     )
     executor.gather.assert_called_once_with(
         transfer=transfer,
+        prepared_copy=prepared_copy,
         source_lane=lane,
         producer_event=producer_event,
     )
@@ -1336,9 +1415,10 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
     decode_kv_args = _packed_kv_args(item_length=1024)
     decode_manager = _PackedDecodeManager(decode_kv_args)
     protocol = PackedDecodeProtocol(_PackedLeaseAllocator())
+    arena = _PackedDecodeArena(protocol)
     decode_runtime = PackedDecodeRuntime(
         decode_manager,
-        _PackedDecodeArena(protocol),
+        arena,
         artifacts,
         policy,
     )
@@ -1357,6 +1437,9 @@ def test_cache_hit_swa_window_matches_decode_runtime_canonical_layout(
         lifecycle_authority=decode_manager,
         source_tp_size=source_tp_size,
     )
+    copy_executor = arena.copy_executor
+    assert type(copy_executor) is _PreparationCopyExecutor
+    assert len(copy_executor.preparations) == 1
     publication = transaction.publish()
     receipts = {
         receipt.component: receipt for receipt in allocation_snapshot.components
@@ -1563,6 +1646,8 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     artifacts = _runtime_artifacts()
     policy = build_same_host_visibility_policy(artifacts)
     runtime = PackedPrefillRuntime(manager, artifacts, policy)
+    copy_executor = _SourcePreparationExecutor()
+    runtime._copy_executor = copy_executor
     peer = PackedPeerIdentity("decoder-agent", b"p" * 16)
     sent_messages: list[object] = []
     control = PackedDecodeControlSender(
@@ -1635,6 +1720,10 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
     runtime.handle_control(peer, ready)
 
     assert record.source_transfer is source_transfer
+    assert record.prepared_source_copy is copy_executor.preparations[0][2]
+    assert copy_executor.preparations == [
+        (source_transfer, None, record.prepared_source_copy)
+    ]
     visibility = PackedWriterVisibilityEvidence(
         policy_digest=policy.digest,
         transport_path=policy.transport_path,
@@ -1702,6 +1791,128 @@ def test_prefill_ready_outcomes_teardown_releases_handles_and_acks(
         "source_gather_copy_duration=5.000ms, "
         "main_transport_duration=19.000ms)"
     ) in caplog.messages
+
+
+def test_prefill_terminal_ready_exposes_transfer_and_preparation_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hide both READY products until source metadata preparation succeeds."""
+
+    runtime, _, peer, _, _, identity, record = _terminal_prefill_actor_fixture()
+    transfer = object()
+    prepared_copy = object.__new__(PackedPreparedSourceCopy)
+    runtime._ready = _ReadyCoordinator(transfer)
+    copy_executor = runtime._copy_executor
+    assert type(copy_executor) is _SourcePreparationExecutor
+
+    def prepare_source_copy(
+        exact_transfer: object,
+        *,
+        terminal_binding_digest: bytes | None,
+    ) -> PackedPreparedSourceCopy:
+        """Observe the record while metadata construction owns no state.
+
+        :param exact_transfer: Authenticated READY product.
+        :param terminal_binding_digest: Exact source lifecycle binding.
+        :returns: Synthetic completed metadata projection.
+        """
+
+        assert exact_transfer is transfer
+        assert terminal_binding_digest == identity.local_binding.digest
+        assert record.source_transfer is None
+        assert record.prepared_source_copy is None
+        return prepared_copy
+
+    monkeypatch.setattr(copy_executor, "prepare_source_copy", prepare_source_copy)
+    ready = PackedReady(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        visibility_policy_digest=b"v" * 32,
+        lease_id=9,
+        lease_base_address=0x400000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+
+    assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
+    assert record.source_transfer is transfer
+    assert record.prepared_source_copy is prepared_copy
+
+
+def test_prefill_terminal_ready_rejects_invalid_preparation_before_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quarantine an invalid executor result without exposing half a pair."""
+
+    runtime, manager, peer, _, _, identity, record = _terminal_prefill_actor_fixture()
+    transfer = object()
+    runtime._ready = _ReadyCoordinator(transfer)
+    copy_executor = runtime._copy_executor
+    assert type(copy_executor) is _SourcePreparationExecutor
+
+    def prepare_invalid_source_copy(
+        exact_transfer: object,
+        *,
+        terminal_binding_digest: bytes | None,
+    ) -> object:
+        """Return a wrong-type result after validating the call boundary.
+
+        :param exact_transfer: Authenticated READY product.
+        :param terminal_binding_digest: Exact source lifecycle binding.
+        :returns: Deliberately invalid preparation result.
+        """
+
+        assert exact_transfer is transfer
+        assert terminal_binding_digest == identity.local_binding.digest
+        return object()
+
+    monkeypatch.setattr(
+        copy_executor,
+        "prepare_source_copy",
+        prepare_invalid_source_copy,
+    )
+    ready = PackedReady(
+        key=record.chunk_key,
+        writer_id=runtime.writer_id,
+        digest=b"d" * 32,
+        visibility_policy_digest=b"v" * 32,
+        lease_id=9,
+        lease_base_address=0x400000,
+        projection_offset=0,
+        projection_length=4096,
+    )
+
+    with pytest.raises(TypeError, match="invalid preparation"):
+        runtime.deliver_terminal_owner_ready(peer, ready)
+
+    assert record.source_transfer is None
+    assert record.prepared_source_copy is None
+    assert record.terminal_quarantined
+    assert manager.failures == [
+        (
+            identity.request_key.room_id,
+            "terminal READY validation or source preparation failed",
+        )
+    ]
+
+
+def test_prefill_legacy_failure_retains_prepared_source_copy() -> None:
+    """Keep asynchronously prepared metadata alive after legacy failure."""
+
+    runtime, _, _, _, submission, _, record = _terminal_prefill_actor_fixture()
+    record.terminal_identity = None
+    record.prepared_source_copy = object.__new__(PackedPreparedSourceCopy)
+    runtime._ready = Mock()
+
+    runtime._retire_failed_record(record)
+
+    runtime._ready.retire_pending.assert_called_once_with(
+        record.chunk_key,
+        submission.control.peer,
+    )
+    assert submission.plan.key not in runtime._records
+    assert runtime._failed_records == [record]
 
 
 def test_prefill_terminal_binding_publishes_prepare_without_blocking(
@@ -1842,6 +2053,15 @@ def test_prefill_terminal_ready_and_owner_gather_are_nonblocking(
     assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
     assert runtime.deliver_terminal_owner_ready(peer, ready) == identity.local_binding
     assert record.ready_wait_duration_ms == pytest.approx(125.0)
+    copy_executor = runtime._copy_executor
+    assert type(copy_executor) is _SourcePreparationExecutor
+    assert copy_executor.preparations == [
+        (
+            source_transfer,
+            identity.local_binding.digest,
+            record.prepared_source_copy,
+        )
+    ]
 
     main_handle = object()
     auxiliary_handle = object()
@@ -1908,6 +2128,7 @@ def test_prefill_terminal_quarantine_before_gather_blocks_all_side_effects() -> 
 
     runtime, _, _, _, _, identity, record = _terminal_prefill_actor_fixture()
     record.source_transfer = object()
+    record.prepared_source_copy = object.__new__(PackedPreparedSourceCopy)
     quarantine_action = _terminal_prefill_action(
         identity,
         NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
@@ -1939,6 +2160,7 @@ def test_prefill_terminal_quarantine_waits_for_running_gather_stability(
 
     runtime, manager, _, _, _, identity, record = _terminal_prefill_actor_fixture()
     record.source_transfer = object()
+    record.prepared_source_copy = object.__new__(PackedPreparedSourceCopy)
     gather_running = threading.Event()
     allow_gather = threading.Event()
     quarantine_marked = threading.Event()
@@ -2045,6 +2267,7 @@ def test_prefill_terminal_gather_failure_marks_stable_without_self_wait() -> Non
 
     runtime, _, _, _, _, identity, record = _terminal_prefill_actor_fixture()
     record.source_transfer = object()
+    record.prepared_source_copy = object.__new__(PackedPreparedSourceCopy)
 
     def fail_auxiliary(submission: PackedPrefillSubmission) -> object:
         """Fail from the gather worker before auxiliary ownership is installed.
@@ -2084,6 +2307,7 @@ def test_prefill_terminal_outcomes_retain_resources_until_ack(
         _terminal_prefill_actor_fixture()
     )
     record.source_transfer = Mock(layout=Mock(digest=b"d" * 32), lease_id=9)
+    record.prepared_source_copy = object.__new__(PackedPreparedSourceCopy)
     record.terminal_gather_phase = runtime_module._TerminalGatherPhase.STABLE
     record.terminal_gather_posted = True
     record.main_transport_started_at = runtime_module.time.perf_counter()
@@ -2428,6 +2652,10 @@ def test_decode_prepare_scatter_teardown_and_commit_dispatch(
     assert transaction.writer_outcomes == [(outcome, writer)]
     assert runtime.poll(transaction) == KVPoll.Transferring
     assert len(executor.submissions) == 1
+    scatter = record.scatters[chunk_key][0]
+    assert executor.submissions == [
+        (scatter.work, scatter.proofs, scatter.prepared_copy)
+    ]
     event.complete = True
 
     assert runtime.poll(transaction) == KVPoll.Transferring
@@ -2585,6 +2813,10 @@ def test_terminal_owner_drives_decode_actor_without_scheduler_polling(
     assert batch.chunk_keys == (chunk_key,)
     assert batch.stream_handle == executor.scatter_stream_handle
     assert len(executor.submissions) == 1
+    scatter = record.scatters[chunk_key][0]
+    assert executor.submissions == [
+        (scatter.work, scatter.proofs, scatter.prepared_copy)
+    ]
     event.complete = True
     runtime.confirm_terminal_owner_scatter_callback(transaction, batch)
     runtime.complete_terminal_owner_scatter(transaction)

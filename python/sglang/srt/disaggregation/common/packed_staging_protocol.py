@@ -1394,6 +1394,20 @@ class PackedProtocolError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class PackedScatterPreparation:
+    """Immutable destination geometry available before publication.
+
+    :ivar key: Request and chunk identity.
+    :ivar layout: Canonical packed layout.
+    :ivar destination_binding: Immutable destination page-array snapshots.
+    """
+
+    key: PackedChunkKey
+    layout: StagingChunkLayout
+    destination_binding: StagingEndpointBufferBinding
+
+
+@dataclasses.dataclass(frozen=True)
 class PackedScatterWork:
     """Immutable inputs for one asynchronous destination scatter.
 
@@ -1550,7 +1564,7 @@ class PackedDecodeProtocol:
         spec: PackedLayoutSpec,
         destination_registry: StagingComponentBufferRegistry,
         writer_visibility_policy_digests: dict[StagingWriterId, bytes],
-    ) -> StagingChunkLayout:
+    ) -> PackedScatterPreparation:
         """Register trusted decode-local geometry and destination bounds.
 
         The canonical layout is rebuilt locally and all destination page arrays
@@ -1561,7 +1575,7 @@ class PackedDecodeProtocol:
         :param spec: Trusted layout input assembled from bootstrap metadata.
         :param destination_registry: Decode-local registered buffers and pages.
         :param writer_visibility_policy_digests: Exact policy per writer route.
-        :returns: Canonical packed layout.
+        :returns: Exact immutable inputs for device metadata preparation.
         :raises ValueError: If identity, geometry, topology, or bounds are invalid.
         """
 
@@ -1602,7 +1616,11 @@ class PackedDecodeProtocol:
                 expected_writers=expected_writers,
                 writer_visibility_policy_digests=owned_policy_digests,
             )
-        return layout
+        return PackedScatterPreparation(
+            key=key,
+            layout=layout,
+            destination_binding=destination_binding,
+        )
 
     def handle_prepare(
         self,

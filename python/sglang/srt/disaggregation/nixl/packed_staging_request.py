@@ -51,10 +51,12 @@ from sglang.srt.disaggregation.common.staging_runtime import (
 )
 from sglang.srt.disaggregation.nixl.packed_staging import (
     MAIN_KV_COMPONENT,
+    PackedCopyExecutor,
     PackedDestinationOutcomeCoordinator,
     PackedDestinationVisibilityError,
     PackedDestinationVisibilityPolicy,
     PackedDestinationVisibilityProof,
+    PackedPreparedScatterCopy,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,9 +64,7 @@ logger = logging.getLogger(__name__)
 _SCATTER_CONSTRUCTION_SEAL = object()
 _COMMIT_CONSTRUCTION_SEAL = object()
 
-PackedTerminalAuxiliaryOutcome = (
-    PackedAuxiliaryOutcome | PackedDFlashBoundaryOutcome
-)
+PackedTerminalAuxiliaryOutcome = PackedAuxiliaryOutcome | PackedDFlashBoundaryOutcome
 
 
 class PackedRequestTransactionError(RuntimeError):
@@ -186,10 +186,17 @@ class PackedRequestPublication:
 class PackedRequestScatter:
     """Opaque ownership of one begun destination scatter."""
 
-    __slots__ = ("_token", "_transaction_nonce", "proofs", "work")
+    __slots__ = (
+        "_token",
+        "_transaction_nonce",
+        "prepared_copy",
+        "proofs",
+        "work",
+    )
 
     _transaction_nonce: object
     _token: object
+    prepared_copy: PackedPreparedScatterCopy
     proofs: tuple[PackedDestinationVisibilityProof, ...]
     work: PackedScatterWork
 
@@ -198,6 +205,7 @@ class PackedRequestScatter:
         transaction_nonce: object,
         token: object,
         work: PackedScatterWork,
+        prepared_copy: PackedPreparedScatterCopy,
         proofs: tuple[PackedDestinationVisibilityProof, ...],
         construction_seal: object,
     ) -> None:
@@ -206,15 +214,19 @@ class PackedRequestScatter:
         :param transaction_nonce: Exact issuing transaction.
         :param token: Transaction-private chunk record identity.
         :param work: Protocol-owned scatter work.
+        :param prepared_copy: Request-owned destination copy metadata.
         :param proofs: Exact canonical visibility proofs.
         :param construction_seal: Module-private construction authority.
         """
 
         if construction_seal is not _SCATTER_CONSTRUCTION_SEAL:
             raise TypeError("packed request scatters are transaction owned")
+        if type(prepared_copy) is not PackedPreparedScatterCopy:
+            raise TypeError("prepared_copy must be PackedPreparedScatterCopy")
         self._transaction_nonce = transaction_nonce
         self._token = token
         self.work = work
+        self.prepared_copy = prepared_copy
         self.proofs = tuple(proofs)
 
 
@@ -314,6 +326,7 @@ class _PackedRequestChunk:
 
     plan: PackedRequestChunkPlan
     token: object = dataclasses.field(default_factory=object)
+    prepared_copy: PackedPreparedScatterCopy | None = None
     scatter: PackedRequestScatter | None = None
     scatter_terminal: bool = False
     retired: bool = False
@@ -340,6 +353,7 @@ class PackedDecodeRequestTransaction:
     _chunks: tuple[_PackedRequestChunk, ...]
     _chunks_by_key: dict[PackedChunkKey, _PackedRequestChunk]
     _commit_receipt: PackedRequestCommitReceipt | None
+    _copy_executor: PackedCopyExecutor
     _lifecycle_authority: object
     _lock: threading.RLock
     _outcome_coordinator: PackedDestinationOutcomeCoordinator
@@ -366,6 +380,7 @@ class PackedDecodeRequestTransaction:
         lifecycle_authority: object,
         protocol: PackedDecodeProtocol,
         outcome_coordinator: PackedDestinationOutcomeCoordinator,
+        copy_executor: PackedCopyExecutor,
         chunk_plans: tuple[PackedRequestChunkPlan, ...],
         auxiliary_allocation_lease: PackedAuxiliaryAllocationLease,
         auxiliary_allocation_authority: PackedAuxiliaryAllocationLeaseAuthority,
@@ -383,6 +398,7 @@ class PackedDecodeRequestTransaction:
         :param lifecycle_authority: Exact authority bound to allocation transitions.
         :param protocol: Shared arena chunk protocol.
         :param outcome_coordinator: Shared destination visibility coordinator.
+        :param copy_executor: Shared arena destination copy executor.
         :param chunk_plans: Every fixed request chunk in canonical order.
         :param auxiliary_allocation_lease: Exact retained metadata-row lease.
         :param auxiliary_allocation_authority: Metadata lease authority.
@@ -419,6 +435,8 @@ class PackedDecodeRequestTransaction:
             raise TypeError(
                 "outcome_coordinator must be PackedDestinationOutcomeCoordinator"
             )
+        if not isinstance(copy_executor, PackedCopyExecutor):
+            raise TypeError("copy_executor must be PackedCopyExecutor")
         owner_thread_id = (
             threading.get_ident()
             if scheduler_thread_id is None
@@ -477,6 +495,7 @@ class PackedDecodeRequestTransaction:
         self._chunks = chunks
         self._chunks_by_key = {chunk.plan.key: chunk for chunk in chunks}
         self._commit_receipt = None
+        self._copy_executor = copy_executor
         self._lifecycle_authority = lifecycle_authority
         self._lock = threading.RLock()
         self._outcome_coordinator = outcome_coordinator
@@ -890,6 +909,11 @@ class PackedDecodeRequestTransaction:
                 raise PackedRequestTransactionError(
                     f"chunk {key.chunk_id} scatter already owns asynchronous work"
                 )
+            prepared_copy = chunk.prepared_copy
+            if prepared_copy is None:
+                failure_reason = "chunk scatter metadata was not prepared"
+                self._quarantine_locked(failure_reason)
+                raise PackedRequestTransactionError(failure_reason)
             proofs = self._outcome_coordinator.proofs(
                 key,
                 self._allocation_snapshot.writer_manifest.writers,
@@ -899,6 +923,7 @@ class PackedDecodeRequestTransaction:
                 self._transaction_nonce,
                 chunk.token,
                 work,
+                prepared_copy,
                 proofs,
                 _SCATTER_CONSTRUCTION_SEAL,
             )
@@ -1409,11 +1434,12 @@ class PackedDecodeRequestTransaction:
 
         protocol_registered: list[PackedChunkKey] = []
         coordinator_registered: list[PackedChunkKey] = []
+        prepared_copies: list[PackedPreparedScatterCopy] = []
         try:
             for chunk in self._chunks:
                 plan = chunk.plan
                 policies = plan.policy_map
-                self._protocol.register_chunk(
+                preparation = self._protocol.register_chunk(
                     plan.key,
                     plan.spec,
                     plan.destination_registry,
@@ -1425,15 +1451,53 @@ class PackedDecodeRequestTransaction:
                 protocol_registered.append(plan.key)
                 self._outcome_coordinator.register_chunk(plan.key, policies)
                 coordinator_registered.append(plan.key)
-        except (RuntimeError, TypeError, ValueError) as error:
-            try:
-                for key in reversed(coordinator_registered):
+                prepared_copy = self._copy_executor.prepare_scatter_copy(preparation)
+                if type(prepared_copy) is not PackedPreparedScatterCopy:
+                    raise TypeError(
+                        "copy executor returned an invalid prepared scatter copy"
+                    )
+                prepared_copies.append(prepared_copy)
+                chunk.prepared_copy = prepared_copy
+        except Exception as error:
+            logger.error(
+                "Packed request chunk registration failed:\n%s",
+                traceback.format_exc(),
+            )
+            cleanup_error: Exception | None = None
+            for prepared_copy in reversed(prepared_copies):
+                try:
+                    self._copy_executor.quarantine_scatter_copy(prepared_copy)
+                except Exception as candidate_error:
+                    logger.error(
+                        "Prepared scatter metadata quarantine failed:\n%s",
+                        traceback.format_exc(),
+                    )
+                    if cleanup_error is None:
+                        cleanup_error = candidate_error
+            for key in reversed(coordinator_registered):
+                try:
                     self._outcome_coordinator.cancel_unpublished_chunk(key)
-                coordinator_keys = set(coordinator_registered)
-                for key in reversed(protocol_registered):
-                    if key not in coordinator_keys:
-                        self._protocol.cancel_unpublished_chunk(key)
-            except (RuntimeError, TypeError, ValueError) as cleanup_error:
+                except Exception as candidate_error:
+                    logger.error(
+                        "Destination outcome registration cleanup failed:\n%s",
+                        traceback.format_exc(),
+                    )
+                    if cleanup_error is None:
+                        cleanup_error = candidate_error
+            coordinator_keys = set(coordinator_registered)
+            for key in reversed(protocol_registered):
+                if key in coordinator_keys:
+                    continue
+                try:
+                    self._protocol.cancel_unpublished_chunk(key)
+                except Exception as candidate_error:
+                    logger.error(
+                        "Packed protocol registration cleanup failed:\n%s",
+                        traceback.format_exc(),
+                    )
+                    if cleanup_error is None:
+                        cleanup_error = candidate_error
+            if cleanup_error is not None:
                 raise PackedRequestTransactionError(
                     "packed request registration cleanup failed"
                 ) from cleanup_error
