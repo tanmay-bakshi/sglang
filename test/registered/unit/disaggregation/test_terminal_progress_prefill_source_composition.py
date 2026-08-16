@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.common.packed_staging_protocol import PackedRequestKey
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.nixl.packed_runtime import (
@@ -17,6 +18,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     _TerminalPrefillBatchLeaseLedger,
+    _TerminalPrefillBatchPlan,
     _TerminalPrefillLaunch,
     _TerminalPrefillResultBinding,
 )
@@ -34,6 +36,10 @@ from sglang.srt.disaggregation.terminal_progress.output_projection import (
 )
 from sglang.srt.disaggregation.terminal_progress.publisher import (
     FrozenTerminalGatewayOutputProjection,
+)
+from sglang.srt.disaggregation.terminal_progress.result_authority import (
+    TerminalPrefillResultAuthority,
+    TerminalPrefillRowDisposition,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
@@ -560,9 +566,7 @@ def test_real_manager_fault_boundary_retains_exact_owner_partition(
         else 0
     )
     assert len(publication.bindings) == (
-        1
-        if fault_stage in ("publication", "retention", "prepare", "completion")
-        else 0
+        1 if fault_stage in ("publication", "retention", "prepare", "completion") else 0
     )
     assert len(actor.prepare_calls) == (
         1 if fault_stage in ("prepare", "completion") else 0
@@ -769,15 +773,18 @@ def test_scheduler_local_fake_prefill_never_builds_terminal_state() -> None:
     )
     request = SimpleNamespace(
         bootstrap_host=FAKE_BOOTSTRAP_HOST,
-        inflight_middle_chunks=0,
+        inflight_middle_chunks=4,
     )
 
-    launches = SchedulerDisaggregationPrefillMixin.build_terminal_prefill_launches(
+    plan = SchedulerDisaggregationPrefillMixin.build_terminal_prefill_batch_plan(
         scheduler,
-        SimpleNamespace(reqs=[request]),
+        SimpleNamespace(reqs=[request], chunked_req=None),
     )
 
-    assert launches == ()
+    assert plan.launches == ()
+    assert plan.result_authority.rows == (
+        TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL,
+    )
     manager.build_terminal_source_launch_plan.assert_not_called()
     manager.lease_terminal_dflash_source.assert_not_called()
 
@@ -785,6 +792,12 @@ def test_scheduler_local_fake_prefill_never_builds_terminal_state() -> None:
 def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
     """Complete only fake rows locally while retaining real owner state."""
 
+    fake_middle = SimpleNamespace(
+        rid="fake-middle",
+        bootstrap_host=FAKE_BOOTSTRAP_HOST,
+        inflight_middle_chunks=2,
+        time_stats=MagicMock(),
+    )
     fake = SimpleNamespace(
         rid="fake-warmup",
         bootstrap_host=FAKE_BOOTSTRAP_HOST,
@@ -804,16 +817,30 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
         inflight_middle_chunks=0,
         time_stats=MagicMock(),
     )
+    owned_middle = SimpleNamespace(
+        rid="owned-middle",
+        bootstrap_host="127.0.0.1",
+        inflight_middle_chunks=2,
+        time_stats=MagicMock(),
+    )
     batch = SimpleNamespace(
-        reqs=[fake, owned],
+        reqs=[fake_middle, fake, owned_middle, owned],
         prefill_stats=object(),
         dp_cooperation_info=object(),
     )
     result = SimpleNamespace(
-        next_token_ids=torch.tensor([31, 47], dtype=torch.int64),
+        next_token_ids=torch.tensor([11, 31, 37, 47], dtype=torch.int64),
         routed_experts_output=None,
         indexer_topk_output=None,
         can_run_cuda_graph=True,
+        terminal_prefill_result_authority=TerminalPrefillResultAuthority(
+            rows=(
+                TerminalPrefillRowDisposition.SCHEDULER_LOCAL_INTERMEDIATE,
+                TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL,
+                TerminalPrefillRowDisposition.OWNER_MANAGED_INTERMEDIATE,
+                TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL,
+            )
+        ),
     )
     binding = object()
     scheduler = SimpleNamespace(
@@ -831,18 +858,20 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
     def process_scheduler_local(
         active_batch: object,
         active_result: object,
-    ) -> tuple[bool, ...]:
+        result_authority: TerminalPrefillResultAuthority,
+    ) -> None:
         """Invoke the mixin helper on the scheduler fixture.
 
         :param active_batch: Exact fixture batch.
         :param active_result: Exact fixture model result.
-        :returns: Per-row scheduler-local classification.
+        :param result_authority: Frozen row authority for the fixture.
         """
 
-        return SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
+        SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
             scheduler,
             active_batch,
             active_result,
+            result_authority,
         )
 
     scheduler.process_scheduler_local_fake_prefill_results = process_scheduler_local
@@ -860,6 +889,10 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
         )
 
     assert fake.output_ids == [31]
+    assert fake_middle.inflight_middle_chunks == 1
+    assert owned_middle.inflight_middle_chunks == 1
+    fake_middle.time_stats.set_last_chunked_prefill_finish_time.assert_called_once_with()
+    owned_middle.time_stats.set_last_chunked_prefill_finish_time.assert_called_once_with()
     assert isinstance(fake.finished_reason, FINISH_LENGTH)
     fake.disagg_kv_sender.clear.assert_called_once_with()
     cache_request.assert_called_once_with(fake, scheduler.tree_cache)
@@ -871,6 +904,7 @@ def test_terminal_result_handles_mixed_fake_and_owned_requests() -> None:
     )
     assert scheduler.disagg_prefill_terminal_requests == {owned.rid: owned}
     assert scheduler.disagg_prefill_terminal_result_bindings == {}
+    assert result.terminal_prefill_result_authority is None
     owned.time_stats.set_prefill_finished_time.assert_called_once_with()
     owned.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
 
@@ -893,6 +927,9 @@ def test_terminal_result_binding_outlives_native_reclaim() -> None:
         routed_experts_output=None,
         indexer_topk_output=None,
         can_run_cuda_graph=True,
+        terminal_prefill_result_authority=TerminalPrefillResultAuthority(
+            rows=(TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL,)
+        ),
     )
     scheduler = SimpleNamespace(
         disagg_prefill_terminal_requests={},
@@ -901,8 +938,8 @@ def test_terminal_result_binding_outlives_native_reclaim() -> None:
             request.rid: _TerminalPrefillResultBinding(request, binding),
         },
         metrics_reporter=MagicMock(),
-        process_scheduler_local_fake_prefill_results=lambda active_batch, active_result: (
-            False,
+        process_scheduler_local_fake_prefill_results=(
+            lambda active_batch, active_result, result_authority: None
         ),
     )
 
@@ -915,6 +952,141 @@ def test_terminal_result_binding_outlives_native_reclaim() -> None:
     assert scheduler.disagg_prefill_terminal_result_bindings == {}
     request.time_stats.set_prefill_finished_time.assert_called_once_with()
     request.time_stats.set_prefill_transfer_queue_entry_time.assert_called_once_with()
+
+
+def test_delayed_terminal_intermediate_result_keeps_submitted_disposition() -> None:
+    """A later final submission cannot turn an older result into a final row."""
+
+    request = SimpleNamespace(
+        rid="advanced-to-final",
+        bootstrap_host="127.0.0.1",
+        inflight_middle_chunks=1,
+        time_stats=MagicMock(),
+    )
+    batch = SimpleNamespace(
+        reqs=[request],
+        prefill_stats=object(),
+        dp_cooperation_info=object(),
+    )
+    result = SimpleNamespace(
+        routed_experts_output=None,
+        indexer_topk_output=None,
+        can_run_cuda_graph=True,
+        terminal_prefill_result_authority=TerminalPrefillResultAuthority(
+            rows=(TerminalPrefillRowDisposition.OWNER_MANAGED_INTERMEDIATE,)
+        ),
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        disagg_prefill_terminal_bindings={},
+        disagg_prefill_terminal_result_bindings={},
+        metrics_reporter=MagicMock(),
+    )
+
+    def process_scheduler_local(
+        active_batch: object,
+        active_result: object,
+        result_authority: TerminalPrefillResultAuthority,
+    ) -> None:
+        """Run the production scheduler-local result path.
+
+        :param active_batch: Exact fixture batch.
+        :param active_result: Exact fixture model result.
+        :param result_authority: Frozen row authority for the fixture.
+        """
+
+        SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
+            scheduler,
+            active_batch,
+            active_result,
+            result_authority,
+        )
+
+    scheduler.process_scheduler_local_fake_prefill_results = process_scheduler_local
+
+    SchedulerDisaggregationPrefillMixin.process_batch_result_terminal_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
+
+    assert request.inflight_middle_chunks == 0
+    request.time_stats.set_last_chunked_prefill_finish_time.assert_called_once_with()
+    request.time_stats.set_prefill_finished_time.assert_not_called()
+
+
+def test_terminal_final_result_ignores_later_mutable_chunk_state() -> None:
+    """A submitted final row remains final after request bookkeeping changes."""
+
+    request = SimpleNamespace(
+        rid="submitted-final",
+        bootstrap_host="127.0.0.1",
+        inflight_middle_chunks=3,
+        time_stats=MagicMock(),
+    )
+    binding = object()
+    batch = SimpleNamespace(
+        reqs=[request],
+        prefill_stats=object(),
+        dp_cooperation_info=object(),
+    )
+    result = SimpleNamespace(
+        routed_experts_output=None,
+        indexer_topk_output=None,
+        can_run_cuda_graph=True,
+        terminal_prefill_result_authority=TerminalPrefillResultAuthority(
+            rows=(TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL,)
+        ),
+    )
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        disagg_prefill_terminal_bindings={request.rid: binding},
+        disagg_prefill_terminal_result_bindings={
+            request.rid: _TerminalPrefillResultBinding(request, binding),
+        },
+        metrics_reporter=MagicMock(),
+    )
+
+    def process_scheduler_local(
+        active_batch: object,
+        active_result: object,
+        result_authority: TerminalPrefillResultAuthority,
+    ) -> None:
+        """Run the production scheduler-local result path.
+
+        :param active_batch: Exact fixture batch.
+        :param active_result: Exact fixture model result.
+        :param result_authority: Frozen row authority for the fixture.
+        """
+
+        SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
+            scheduler,
+            active_batch,
+            active_result,
+            result_authority,
+        )
+
+    scheduler.process_scheduler_local_fake_prefill_results = process_scheduler_local
+
+    SchedulerDisaggregationPrefillMixin.process_batch_result_terminal_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
+
+    assert request.inflight_middle_chunks == 3
+    assert scheduler.disagg_prefill_terminal_result_bindings == {}
+    request.time_stats.set_prefill_finished_time.assert_called_once_with()
+    request.time_stats.set_last_chunked_prefill_finish_time.assert_not_called()
+    with pytest.raises(
+        RuntimeError,
+        match="terminal prefill result has no submission authority",
+    ):
+        SchedulerDisaggregationPrefillMixin.process_batch_result_terminal_disagg_prefill(
+            scheduler,
+            batch,
+            result,
+        )
 
 
 def test_scheduler_local_fake_prefill_validates_cohort_before_release() -> None:
@@ -942,15 +1114,19 @@ def test_scheduler_local_fake_prefill_validates_cohort_before_release() -> None:
         patch(
             "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
         ) as cache_request,
-        patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release_request,
+        patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release_request,
         pytest.raises(RuntimeError, match="retained a metadata row"),
     ):
         SchedulerDisaggregationPrefillMixin.process_scheduler_local_fake_prefill_results(
             scheduler,
             SimpleNamespace(reqs=[valid, invalid]),
             SimpleNamespace(next_token_ids=torch.tensor([31, 47], dtype=torch.int64)),
+            TerminalPrefillResultAuthority(
+                rows=(
+                    TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL,
+                    TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL,
+                )
+            ),
         )
 
     cache_request.assert_not_called()
@@ -1007,7 +1183,7 @@ def test_terminal_launch_freezes_before_every_model_submission(loop_name: str) -
     terminal_run = inspect.getsource(
         SchedulerDisaggregationPrefillMixin.run_terminal_prefill_batch
     )
-    freeze = terminal_run.index("build_terminal_prefill_launches(batch)")
+    freeze = terminal_run.index("build_terminal_prefill_batch_plan(batch)")
     submit = terminal_run.index("terminal_bind=terminal_bind")
     assert freeze < submit
     assert "functools.partial(" in terminal_run[freeze:submit]
@@ -1060,6 +1236,7 @@ def test_model_submit_failure_cancels_every_prelaunch_row_once() -> None:
     source = object()
     launch = object.__new__(_TerminalPrefillLaunch)
     object.__setattr__(launch, "dflash_source", source)
+    object.__setattr__(launch, "result_index", 0)
     bind_calls: list[object] = []
 
     def fail_model_submit(batch: object, *, terminal_bind: object) -> object:
@@ -1075,8 +1252,13 @@ def test_model_submit_failure_cancels_every_prelaunch_row_once() -> None:
 
     scheduler = SimpleNamespace(
         disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager),
-        build_terminal_prefill_launches=lambda batch: (launch,),
-        bind_terminal_prefill_launches=lambda owner, result: pytest.fail(
+        build_terminal_prefill_batch_plan=lambda batch: _TerminalPrefillBatchPlan(
+            launches=(launch,),
+            result_authority=TerminalPrefillResultAuthority(
+                rows=(TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL,)
+            ),
+        ),
+        bind_terminal_prefill_launches=lambda owner, authority, result: pytest.fail(
             "terminal bind callback must not run"
         ),
         run_batch=fail_model_submit,

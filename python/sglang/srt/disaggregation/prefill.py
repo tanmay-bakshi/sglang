@@ -45,16 +45,20 @@ from sglang.srt.disaggregation.nixl.packed_runtime import PackedPrefillLaunchPla
 from sglang.srt.disaggregation.terminal_progress.dflash_auxiliary import (
     DFlashBoundaryPrefillSource,
 )
+from sglang.srt.disaggregation.terminal_progress.identity import TerminalRequestBinding
 from sglang.srt.disaggregation.terminal_progress.output_projection import (
     FrozenPrefillGatewayOutputShell,
     PinnedTerminalGatewayResultSlot,
     PrefillTerminalGatewayOutputProjection,
     freeze_prefill_gateway_output_shell,
 )
+from sglang.srt.disaggregation.terminal_progress.result_authority import (
+    TerminalPrefillResultAuthority,
+    TerminalPrefillRowDisposition,
+)
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
     PackedTerminalSourceIdentityPlan,
 )
-from sglang.srt.disaggregation.terminal_progress.identity import TerminalRequestBinding
 from sglang.srt.disaggregation.terminal_progress.source_wiring import (
     PackedTerminalSourceSubmission,
 )
@@ -172,15 +176,48 @@ class _TerminalPrefillResultBinding:
     lifecycle: TerminalRequestBinding
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TerminalPrefillBatchPlan:
+    """Complete immutable scheduler authority for one model submission.
+
+    :ivar launches: Owner-managed final-row launch plans.
+    :ivar result_authority: Disposition of every submitted result row.
+    """
+
+    launches: tuple[_TerminalPrefillLaunch, ...]
+    result_authority: TerminalPrefillResultAuthority
+
+    def __post_init__(self) -> None:
+        """Validate launch coverage against exact result-row authority."""
+
+        if type(self.launches) is not tuple:
+            raise TypeError("terminal prefill launches must be a tuple")
+        if type(self.result_authority) is not TerminalPrefillResultAuthority:
+            raise TypeError("terminal prefill result authority is invalid")
+        launch_indices = tuple(launch.result_index for launch in self.launches)
+        if len(set(launch_indices)) != len(launch_indices):
+            raise ValueError("terminal prefill launch result indices are not unique")
+        final_indices = tuple(
+            index
+            for index, disposition in enumerate(self.result_authority.rows)
+            if disposition is TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL
+        )
+        if launch_indices != final_indices:
+            raise ValueError("terminal prefill launches do not cover final result rows")
+
+
 class _TerminalPrefillBatchLeaseLedger:
     """Track pre-model, CUDA-touched, and manager-owned DFlash rows."""
 
     _manager: CommonKVManager
     _unbound: dict[int, DFlashBoundaryPrefillSource]
-    _cuda_touched: tuple[
-        DFlashBoundaryPrefillSource,
-        PackedTerminalSourceSubmission,
-    ] | None
+    _cuda_touched: (
+        tuple[
+            DFlashBoundaryPrefillSource,
+            PackedTerminalSourceSubmission,
+        ]
+        | None
+    )
 
     def __init__(self, manager: CommonKVManager) -> None:
         """Create an empty batch-scope ownership ledger.
@@ -909,40 +946,58 @@ class SchedulerDisaggregationPrefillMixin:
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
-    def build_terminal_prefill_launches(
+    def build_terminal_prefill_batch_plan(
         self: Scheduler,
         batch: ScheduleBatch,
-    ) -> tuple[_TerminalPrefillLaunch, ...]:
-        """Freeze every final terminal request before the model submission.
+    ) -> _TerminalPrefillBatchPlan:
+        """Freeze every row's result disposition before model submission.
 
         Intermediate chunks intentionally produce no transport plan. Their
         pages remain owned by the request, so the final chunk projects the
         complete remaining migration range in one immutable submission.
 
         :param batch: Exact generation batch about to enter the model worker.
-        :returns: Rank-local final-request launch plans in result-row order.
+        :returns: Complete launch and result authority for the submission.
         """
 
         manager = self.disagg_prefill_bootstrap_queue.kv_manager
         if not manager.uses_terminal_source_publication():
-            return ()
+            raise RuntimeError("terminal source publication is not active")
         if not self.spec_algorithm.is_dflash():
             raise RuntimeError("terminal source requires the DFlash schema")
+        if batch.chunked_req is not None and not any(
+            req is batch.chunked_req for req in batch.reqs
+        ):
+            raise RuntimeError("terminal chunked request is absent from its batch")
 
         launches: list[_TerminalPrefillLaunch] = []
+        row_dispositions: list[TerminalPrefillRowDisposition] = []
         leased_sources: list[DFlashBoundaryPrefillSource] = []
         try:
             for result_index, req in enumerate(batch.reqs):
-                if _is_fake_transfer(req, self.server_args):
+                scheduler_local = _is_fake_transfer(req, self.server_args)
+                intermediate = req is batch.chunked_req
+                if scheduler_local:
+                    row_dispositions.append(
+                        TerminalPrefillRowDisposition.SCHEDULER_LOCAL_INTERMEDIATE
+                        if intermediate
+                        else TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL
+                    )
                     continue
-                if req.inflight_middle_chunks > 0:
+                if intermediate:
+                    row_dispositions.append(
+                        TerminalPrefillRowDisposition.OWNER_MANAGED_INTERMEDIATE
+                    )
                     continue
+                row_dispositions.append(
+                    TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL
+                )
                 if req.pending_bootstrap:
                     raise RuntimeError(
                         "terminal source admission preceded bootstrap readiness"
                     )
-                main_pages, state_indices = (
-                    self.freeze_disagg_prefill_final_geometry(req)
+                main_pages, state_indices = self.freeze_disagg_prefill_final_geometry(
+                    req
                 )
                 event_generation = uuid.uuid4().bytes
                 dflash_source: DFlashBoundaryPrefillSource | None = None
@@ -1005,22 +1060,33 @@ class SchedulerDisaggregationPrefillMixin:
                 formatted_traceback,
             )
             raise
-        return tuple(launches)
+        return _TerminalPrefillBatchPlan(
+            launches=tuple(launches),
+            result_authority=TerminalPrefillResultAuthority(
+                rows=tuple(row_dispositions)
+            ),
+        )
 
     def bind_terminal_prefill_launches(
         self: Scheduler,
         prelaunch_owner: _TerminalPrefillPrelaunchBatchOwner,
+        result_authority: TerminalPrefillResultAuthority,
         result: GenerationBatchResult,
     ) -> GenerationBatchResult:
         """Bind exact producer events and owner lifecycles after submission.
 
         :param prelaunch_owner: Batch owner retained across model submission.
+        :param result_authority: Immutable disposition of every submitted row.
         :param result: Device-resident generation result from that submission.
         :returns: The unchanged generation result for normal result handling.
         """
 
         if type(prelaunch_owner) is not _TerminalPrefillPrelaunchBatchOwner:
             raise TypeError("prelaunch_owner must own terminal prefill plans")
+        if type(result_authority) is not TerminalPrefillResultAuthority:
+            raise TypeError("result_authority must be TerminalPrefillResultAuthority")
+        if result.terminal_prefill_result_authority is not None:
+            raise RuntimeError("generation result already owns terminal authority")
         launches = prelaunch_owner.claim_for_bind()
         manager = self.disagg_prefill_bootstrap_queue.kv_manager
         lease_ledger = _TerminalPrefillBatchLeaseLedger(manager)
@@ -1136,10 +1202,7 @@ class SchedulerDisaggregationPrefillMixin:
                         raise RuntimeError(
                             "terminal prefill binding identity was reused"
                         )
-                    if (
-                        retained_req.rid
-                        in self.disagg_prefill_terminal_result_bindings
-                    ):
+                    if retained_req.rid in self.disagg_prefill_terminal_result_bindings:
                         raise RuntimeError(
                             "terminal prefill result identity was reused"
                         )
@@ -1197,6 +1260,7 @@ class SchedulerDisaggregationPrefillMixin:
                 formatted_traceback,
             )
             raise
+        result.terminal_prefill_result_authority = result_authority
         return result
 
     def run_terminal_prefill_batch(
@@ -1210,11 +1274,12 @@ class SchedulerDisaggregationPrefillMixin:
         """
 
         manager = self.disagg_prefill_bootstrap_queue.kv_manager
-        launches = self.build_terminal_prefill_launches(batch)
-        prelaunch_owner = _TerminalPrefillPrelaunchBatchOwner(manager, launches)
+        plan = self.build_terminal_prefill_batch_plan(batch)
+        prelaunch_owner = _TerminalPrefillPrelaunchBatchOwner(manager, plan.launches)
         terminal_bind = functools.partial(
             self.bind_terminal_prefill_launches,
             prelaunch_owner,
+            plan.result_authority,
         )
         try:
             return self.run_batch(batch, terminal_bind=terminal_bind)
@@ -1222,8 +1287,7 @@ class SchedulerDisaggregationPrefillMixin:
             cleanup_failures = prelaunch_owner.cancel_if_unclaimed()
             if len(cleanup_failures) > 0:
                 error.add_note(
-                    "terminal prelaunch cleanup failed:\n"
-                    + "\n".join(cleanup_failures)
+                    "terminal prelaunch cleanup failed:\n" + "\n".join(cleanup_failures)
                 )
             raise
 
@@ -1625,20 +1689,31 @@ class SchedulerDisaggregationPrefillMixin:
         :param result: Model result retained only for metrics and cleanup.
         """
 
+        result_authority = result.terminal_prefill_result_authority
+        if type(result_authority) is not TerminalPrefillResultAuthority:
+            raise RuntimeError("terminal prefill result has no submission authority")
+        if len(result_authority.rows) != len(batch.reqs):
+            raise RuntimeError("terminal prefill result authority has the wrong size")
+        result.terminal_prefill_result_authority = None
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
-        scheduler_local = self.process_scheduler_local_fake_prefill_results(
+        self.process_scheduler_local_fake_prefill_results(
             batch,
             result,
+            result_authority,
         )
-        for index, req in enumerate(batch.reqs):
-            if scheduler_local[index]:
+        for disposition, req in zip(
+            result_authority.rows,
+            batch.reqs,
+            strict=True,
+        ):
+            if disposition.is_scheduler_local:
                 continue
-            if req.inflight_middle_chunks <= 0:
+            if disposition is TerminalPrefillRowDisposition.OWNER_MANAGED_FINAL:
                 result_binding = self.disagg_prefill_terminal_result_bindings.pop(
                     req.rid,
                     None,
@@ -1656,6 +1731,13 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_finished_time()
                 req.time_stats.set_prefill_transfer_queue_entry_time()
                 continue
+            if (
+                disposition
+                is not TerminalPrefillRowDisposition.OWNER_MANAGED_INTERMEDIATE
+            ):
+                raise RuntimeError("terminal prefill result disposition is invalid")
+            if req.inflight_middle_chunks <= 0:
+                raise RuntimeError("terminal intermediate result has no inflight chunk")
             req.inflight_middle_chunks -= 1
             req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -1670,7 +1752,8 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-    ) -> tuple[bool, ...]:
+        result_authority: TerminalPrefillResultAuthority,
+    ) -> None:
         """Complete fake prefill warmups without publication state.
 
         Fake requests exercise model execution, then return their sampled token
@@ -1679,24 +1762,42 @@ class SchedulerDisaggregationPrefillMixin:
 
         :param batch: Exact prefill batch containing optional local warmups.
         :param result: Model result providing sampled warmup tokens.
-        :returns: Per-row mask identifying scheduler-local fake requests.
+        :param result_authority: Frozen disposition of every submitted row.
         """
 
-        scheduler_local = tuple(
-            _is_fake_transfer(req, self.server_args) for req in batch.reqs
-        )
+        if len(result_authority.rows) != len(batch.reqs):
+            raise RuntimeError("scheduler-local result authority has the wrong size")
+        for disposition, req in zip(
+            result_authority.rows,
+            batch.reqs,
+            strict=True,
+        ):
+            scheduler_local = _is_fake_transfer(req, self.server_args)
+            if scheduler_local != disposition.is_scheduler_local:
+                raise RuntimeError("scheduler-local result identity changed")
         final_indices = [
             index
-            for index, req in enumerate(batch.reqs)
-            if scheduler_local[index] and req.inflight_middle_chunks <= 0
+            for index, disposition in enumerate(result_authority.rows)
+            if disposition is TerminalPrefillRowDisposition.SCHEDULER_LOCAL_FINAL
         ]
         if len(final_indices) == 0:
-            for index, req in enumerate(batch.reqs):
-                if not scheduler_local[index]:
+            for disposition, req in zip(
+                result_authority.rows,
+                batch.reqs,
+                strict=True,
+            ):
+                if (
+                    disposition
+                    is not TerminalPrefillRowDisposition.SCHEDULER_LOCAL_INTERMEDIATE
+                ):
                     continue
+                if req.inflight_middle_chunks <= 0:
+                    raise RuntimeError(
+                        "scheduler-local intermediate result has no inflight chunk"
+                    )
                 req.inflight_middle_chunks -= 1
                 req.time_stats.set_last_chunked_prefill_finish_time()
-            return scheduler_local
+            return
         if type(result.next_token_ids) is not torch.Tensor:
             raise TypeError("fake prefill warmup requires device-resident token ids")
         for index in final_indices:
@@ -1713,10 +1814,19 @@ class SchedulerDisaggregationPrefillMixin:
         next_token_ids = result.next_token_ids[final_indices].tolist()
         completed: list[Req] = []
         token_by_index = dict(zip(final_indices, next_token_ids, strict=True))
-        for index, req in enumerate(batch.reqs):
-            if not scheduler_local[index]:
+        for index, (disposition, req) in enumerate(
+            zip(result_authority.rows, batch.reqs, strict=True)
+        ):
+            if not disposition.is_scheduler_local:
                 continue
-            if req.inflight_middle_chunks > 0:
+            if (
+                disposition
+                is TerminalPrefillRowDisposition.SCHEDULER_LOCAL_INTERMEDIATE
+            ):
+                if req.inflight_middle_chunks <= 0:
+                    raise RuntimeError(
+                        "scheduler-local intermediate result has no inflight chunk"
+                    )
                 req.inflight_middle_chunks -= 1
                 req.time_stats.set_last_chunked_prefill_finish_time()
                 continue
@@ -1752,7 +1862,6 @@ class SchedulerDisaggregationPrefillMixin:
                 any(req.return_logprob for req in completed),
                 None,
             )
-        return scheduler_local
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -2164,7 +2273,7 @@ class SchedulerDisaggregationPrefillMixin:
             for state_type in state_types
         ]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.start_send_idx:end_idx
+            req.req_pool_idx, req.start_send_idx : end_idx
         ]
         return kv_to_page_indices(kv_indices, page_size), state_indices
 
@@ -2220,9 +2329,7 @@ class SchedulerDisaggregationPrefillMixin:
             if metadata_buffers is None:
                 raise RuntimeError("legacy transfer has no metadata buffers")
             metadata_buffers.set_buf(req)
-            page_indices, state_indices = self.freeze_disagg_prefill_final_geometry(
-                req
-            )
+            page_indices, state_indices = self.freeze_disagg_prefill_final_geometry(req)
         else:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, start_idx:end_idx

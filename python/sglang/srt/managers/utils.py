@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.terminal_progress.result_authority import (
+    TerminalPrefillResultAuthority,
+)
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
@@ -51,6 +54,10 @@ class GenerationBatchResult:
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
     spec_draft_can_run_cuda_graph: Optional[bool] = None
+
+    # Exact terminal-prefill submission semantics. The scheduler consumes this
+    # once when the matching result leaves the overlap queue.
+    terminal_prefill_result_authority: TerminalPrefillResultAuthority | None = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
