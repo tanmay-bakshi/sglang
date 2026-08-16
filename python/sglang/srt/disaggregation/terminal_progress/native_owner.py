@@ -144,7 +144,7 @@ class _NativeTerminalOwnerBridge(Protocol):
         """
 
     def settle_forward_independent_handoff(self, action_id: int) -> None:
-        """Retire one claimed action after downstream work completes.
+        """Retire one launch exclusion after typed-inbox delivery.
 
         :param action_id: Exact forward-independent native action identity.
         """
@@ -786,9 +786,9 @@ class NativeTerminalOwner:
     def settle_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Retire one claimed action after its downstream effect completes.
+        """Retire one launch exclusion after typed-inbox delivery.
 
-        :param action: Forward-independent action with terminal downstream work.
+        :param action: Forward-independent action owned by its dedicated consumer.
         """
 
         if type(action) is not NativeTerminalOwnerAction:

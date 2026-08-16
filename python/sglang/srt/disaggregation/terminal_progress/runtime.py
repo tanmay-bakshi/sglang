@@ -1575,12 +1575,11 @@ class NativeTerminalRuntime:
             self._enter_runtime_fatal_locked(reason)
 
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
-        """Retire one non-scheduler action after downstream acceptance.
+        """Retire one non-scheduler action after downstream completion.
 
-        The dedicated consumer accepts either its source batch preclaim or its
-        decode publication preclaim while dequeuing the action. This method
-        releases the runtime's consumer-side generation accounting only after
-        the receiving component accepted the immutable action.
+        The dedicated consumer settles launch exclusion while dequeuing the
+        action. This method releases only the longer-lived functional and
+        lifecycle authority after the receiving component finishes its work.
 
         :param action: Action previously drained from a runtime inbox.
         """
@@ -1613,18 +1612,6 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action was acknowledged before inbox claim"
                 )
-            if (
-                self._forward_independent_handoff_enabled
-                and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-            ):
-                try:
-                    self._owner.settle_forward_independent_handoff(action)
-                except Exception as error:
-                    formatted_traceback = traceback.format_exc()
-                    self._enter_runtime_fatal_locked(formatted_traceback)
-                    raise NativeTerminalRuntimeError(
-                        "native forward-independent action settlement failed"
-                    ) from error
             del self._consumer_pending[action.action_id]
             self._inbox_claimed_action_ids.remove(action.action_id)
             if action.kind in (
@@ -2015,10 +2002,10 @@ class NativeTerminalRuntime:
 
         Source actions consume an atomically transferred batch preclaim.
         Decode actions consume the preclaim transferred with their durable
-        inbox publication. In both cases, the action remains in
-        ``_consumer_pending`` until downstream acknowledgement, preserving
-        resource and lifecycle authority across consumer work and recursive
-        native submissions.
+        inbox publication. Claiming the typed inbox settles only the native
+        scheduler-launch exclusion. The action remains in ``_consumer_pending``
+        until downstream acknowledgement, preserving resource and lifecycle
+        authority across consumer work and recursive native submissions.
 
         :param actions: Exact FIFO prefix removed from one runtime-owned inbox.
         :returns: Exact population newly claimed by this drain.
@@ -2091,6 +2078,22 @@ class NativeTerminalRuntime:
                     )
                 self._inbox_claimed_action_ids.add(action.action_id)
                 claimed_actions.append(action)
+                forward_independent = (
+                    self._forward_independent_handoff_enabled
+                    and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+                )
+                runtime_owns_settlement = self._disposition in (
+                    NativeTerminalRuntimeDisposition.RUNNING,
+                    NativeTerminalRuntimeDisposition.DRAINING,
+                )
+                if forward_independent and runtime_owns_settlement:
+                    try:
+                        self._owner.settle_forward_independent_handoff(action)
+                    except Exception:  # noqa: BLE001
+                        formatted_traceback = traceback.format_exc()
+                        if claim_failure is None:
+                            claim_failure = formatted_traceback
+                        self._enter_runtime_fatal_locked(formatted_traceback)
                 self._condition.notify_all()
         claimed = tuple(claimed_actions)
         if claim_failure is not None:

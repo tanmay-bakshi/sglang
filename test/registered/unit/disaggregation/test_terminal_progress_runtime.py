@@ -1143,6 +1143,8 @@ def test_source_batch_claim_does_not_borrow_downstream_lock() -> None:
             snapshot = runtime.snapshot()
             assert snapshot.owner.unclaimed_handoff_action_count == 0
             assert snapshot.owner.claimed_handoff_action_count == 1
+            assert snapshot.owner.active_handoff_action_count == 0
+            assert snapshot.owner.settled_handoff_action_count == 1
             assert snapshot.consumer_pending_count == 1
             scheduler_owned_lock.release()
             gather_future.result(timeout=_WAIT_SECONDS)
@@ -1602,8 +1604,8 @@ def test_production_handoff_has_no_pending_call_surface() -> None:
         assert all(token not in text for token in forbidden), source
 
 
-def test_scheduler_launch_handoff_waits_for_actual_action_completion() -> None:
-    """A preclaim cannot satisfy the next scheduler launch watermark."""
+def test_scheduler_launch_handoff_waits_for_typed_inbox_delivery() -> None:
+    """A launch waits for inbox claim, not downstream functional completion."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -1614,10 +1616,16 @@ def test_scheduler_launch_handoff_waits_for_actual_action_completion() -> None:
     try:
         runtime.register_lifecycle(registration)
         _submit_runtime_source_gather(runtime, registration)
-        gather = _drain_actions(runtime.source_gather_actions)[0]
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.source_gather_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
         preclaimed = runtime.snapshot().owner
         assert preclaimed.claimed_handoff_action_count == 1
         assert preclaimed.active_handoff_action_count == 1
+        assert runtime.source_gather_actions.snapshot().queued_count == 1
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             launch = executor.submit(runtime.begin_scheduler_launch_handoff)
@@ -1628,18 +1636,21 @@ def test_scheduler_launch_handoff_waits_for_actual_action_completion() -> None:
             assert inventory.scheduler_launch_handoff_begin_watermark is not None
             assert not launch.done()
 
-            runtime.complete_work_action(
-                _LOCAL_PRODUCER_ID,
-                gather,
-                NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
-            )
+            gather = _drain_actions(runtime.source_gather_actions)[0]
             token = launch.result(timeout=_WAIT_SECONDS)
 
         assert type(token) is int
-        completed = runtime.snapshot().owner
-        assert completed.active_handoff_action_count == 0
-        assert completed.settled_handoff_action_count == 1
+        delivered = runtime.snapshot()
+        assert delivered.owner.active_handoff_action_count == 0
+        assert delivered.owner.settled_handoff_action_count == 1
+        assert delivered.owner.pending_action_count == 0
+        assert delivered.consumer_pending_count == 1
         runtime.end_scheduler_launch_handoff(token)
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            gather,
+            NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+        )
     finally:
         _finish_handoff_runtime(runtime)
 
@@ -1657,7 +1668,13 @@ def test_action_emitted_during_launch_token_blocks_only_the_next_begin() -> None
         runtime.register_lifecycle(registration)
         token = runtime.begin_scheduler_launch_handoff()
         _submit_runtime_source_gather(runtime, registration)
-        gather = _drain_actions(runtime.source_gather_actions)[0]
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.source_gather_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.source_gather_actions.snapshot().queued_count == 1
         runtime.end_scheduler_launch_handoff(token)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -1669,10 +1686,15 @@ def test_action_emitted_during_launch_token_blocks_only_the_next_begin() -> None
             assert inventory.scheduler_launch_handoff_begin_watermark is not None
             assert not next_launch.done()
 
-            runtime.acknowledge_consumed_action(gather)
+            gather = _drain_actions(runtime.source_gather_actions)[0]
             next_token = next_launch.result(timeout=_WAIT_SECONDS)
 
         runtime.end_scheduler_launch_handoff(next_token)
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            gather,
+            NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+        )
     finally:
         _finish_handoff_runtime(runtime)
 
@@ -1693,7 +1715,13 @@ def test_newer_action_does_not_extend_a_captured_launch_watermark() -> None:
         for registration in registrations:
             runtime.register_lifecycle(registration)
         _submit_runtime_source_gather(runtime, registrations[0])
-        first = _drain_actions(runtime.source_gather_actions)[0]
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.source_gather_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.source_gather_actions.snapshot().queued_count == 1
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             launch = executor.submit(runtime.begin_scheduler_launch_handoff)
@@ -1703,13 +1731,20 @@ def test_newer_action_does_not_extend_a_captured_launch_watermark() -> None:
             )
             watermark = waiting.scheduler_launch_handoff_begin_watermark
             assert watermark is not None
-            assert first.action_id <= watermark
             assert not launch.done()
 
             _submit_runtime_source_gather(runtime, registrations[1])
-            second = _drain_actions(runtime.source_gather_actions)[0]
-            assert second.action_id > watermark
-            runtime.acknowledge_consumed_action(first)
+            expires_at = time.monotonic() + _WAIT_SECONDS
+            while (
+                runtime.source_gather_actions.snapshot().queued_count != 2
+                and time.monotonic() < expires_at
+            ):
+                pass
+            assert runtime.source_gather_actions.snapshot().queued_count == 2
+            first = runtime.source_gather_actions.drain(maximum_items=1)[0]
+            assert first.action_id <= watermark
+            second_inventory = runtime.snapshot().owner
+            assert second_inventory.active_handoff_action_count == 1
             token = launch.result(timeout=_WAIT_SECONDS)
 
         runtime.end_scheduler_launch_handoff(token)
@@ -1721,9 +1756,16 @@ def test_newer_action_does_not_extend_a_captured_launch_watermark() -> None:
             )
             assert inventory.scheduler_launch_handoff_begin_watermark is not None
             assert not next_launch.done()
-            runtime.acknowledge_consumed_action(second)
+            second = _drain_actions(runtime.source_gather_actions)[0]
+            assert second.action_id > watermark
             next_token = next_launch.result(timeout=_WAIT_SECONDS)
         runtime.end_scheduler_launch_handoff(next_token)
+        for action in (first, second):
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                action,
+                NativeTerminalOwnerEventKind.SOURCE_GATHER_POSTED,
+            )
     finally:
         _finish_handoff_runtime(runtime)
 
@@ -1814,6 +1856,176 @@ def test_scheduler_action_does_not_enter_the_native_launch_watermark() -> None:
         _finish_handoff_runtime(runtime)
 
 
+def test_gateway_result_lifetime_does_not_extend_launch_exclusion() -> None:
+    """A delivered publication action may await its result across a launch."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 102)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=104,
+        )
+        delivered = runtime.snapshot()
+        assert delivered.owner.active_handoff_action_count == 0
+        assert delivered.owner.pending_action_count == 0
+        assert delivered.consumer_pending_count == 2
+        with runtime._condition:
+            assert publisher.action_id in runtime._inbox_claimed_action_ids
+
+        token = runtime.begin_scheduler_launch_handoff()
+        runtime.end_scheduler_launch_handoff(token)
+        awaiting_result = runtime.snapshot()
+        assert awaiting_result.owner.pending_action_count == 0
+        assert awaiting_result.consumer_pending_count == 2
+
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                105,
+            ),
+        )
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                106,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_decode_scatter_lifetime_does_not_extend_launch_exclusion() -> None:
+    """Delivered scatter work retains decode authority without gating launch."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.DECODE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 103)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        _submit_runtime_decode_scatter(runtime, registration)
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.decode_scatter_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.decode_scatter_actions.snapshot().queued_count == 1
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            launch = executor.submit(runtime.begin_scheduler_launch_handoff)
+            _wait_for_owner_inventory(
+                runtime._owner,
+                lambda value: value.scheduler_launch_handoff_begin_active,
+            )
+            assert not launch.done()
+            scatter = _drain_actions(runtime.decode_scatter_actions)[0]
+            token = launch.result(timeout=_WAIT_SECONDS)
+
+        delivered = runtime.snapshot()
+        assert delivered.owner.active_handoff_action_count == 0
+        assert delivered.owner.pending_action_count == 0
+        assert delivered.consumer_pending_count == 1
+        assert delivered.scheduler_live_count == 1
+        runtime.end_scheduler_launch_handoff(token)
+        runtime.complete_work_action(
+            _LOCAL_PRODUCER_ID,
+            scatter,
+            NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+        )
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
+def test_clean_close_rejects_delivered_consumer_authority() -> None:
+    """A settled launch exclusion does not make consumer work disposable."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 104)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=107,
+        )
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                108,
+            ),
+        )
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                109,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)[0]
+        delivered = runtime.snapshot()
+        assert delivered.owner.active_handoff_action_count == 0
+        assert delivered.consumer_pending_count == 1
+
+        runtime.stop_admission()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _drain_observations(runtime)
+        with pytest.raises(
+            NativeTerminalRuntimeError,
+            match="consumer authority",
+        ):
+            runtime.close_clean()
+
+        runtime.acknowledge_consumed_action(retired)
+        runtime.close_clean()
+        assert (
+            runtime.snapshot().disposition
+            is NativeTerminalRuntimeDisposition.STOPPED
+        )
+    finally:
+        _finish_handoff_runtime(runtime)
+
+
 def test_abort_settles_a_blocked_scheduler_launch_handoff() -> None:
     """Fail-closed transition wakes a waiter without authorizing a launch."""
 
@@ -1826,7 +2038,13 @@ def test_abort_settles_a_blocked_scheduler_launch_handoff() -> None:
     try:
         runtime.register_lifecycle(registration)
         _submit_runtime_source_gather(runtime, registration)
-        gather = _drain_actions(runtime.source_gather_actions)[0]
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.source_gather_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.source_gather_actions.snapshot().queued_count == 1
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             launch = executor.submit(runtime.begin_scheduler_launch_handoff)
@@ -1839,6 +2057,13 @@ def test_abort_settles_a_blocked_scheduler_launch_handoff() -> None:
             with pytest.raises(RuntimeError, match="interrupted"):
                 launch.result(timeout=_WAIT_SECONDS)
 
+        aborted = runtime.snapshot()
+        assert aborted.owner.active_handoff_action_count == 0
+        assert aborted.owner.settled_handoff_action_count == 1
+        gather = _drain_actions(runtime.source_gather_actions)[0]
+        claimed_after_abort = runtime.snapshot()
+        assert claimed_after_abort.owner.active_handoff_action_count == 0
+        assert claimed_after_abort.owner.settled_handoff_action_count == 1
         runtime.acknowledge_aborted_action(gather)
     finally:
         _finish_handoff_runtime(runtime)
@@ -2036,6 +2261,8 @@ def test_post_claim_abort_preserves_downstream_authority_without_replay() -> Non
         claimed = runtime.snapshot()
         assert claimed.owner.unclaimed_handoff_action_count == 0
         assert claimed.owner.claimed_handoff_action_count == 1
+        assert claimed.owner.active_handoff_action_count == 0
+        assert claimed.owner.settled_handoff_action_count == 1
         assert claimed.consumer_pending_count == 1
 
         runtime.begin_abort("synthetic downstream failure after inbox claim")
@@ -2048,6 +2275,8 @@ def test_post_claim_abort_preserves_downstream_authority_without_replay() -> Non
         before_acknowledgement = runtime.snapshot()
         assert before_acknowledgement.owner.claimed_handoff_action_count == 1
         assert before_acknowledgement.owner.unclaimed_handoff_action_count == 0
+        assert before_acknowledgement.owner.active_handoff_action_count == 0
+        assert before_acknowledgement.owner.settled_handoff_action_count == 1
         assert before_acknowledgement.consumer_pending_count == 2
 
         runtime.acknowledge_aborted_action(gather)
@@ -2109,6 +2338,8 @@ def test_failed_claim_excludes_preclaimed_duplicate_from_local_authority() -> No
         assert error.locally_claimed_actions == (error.removed_actions[0],)
         assert already_claimed not in error.locally_claimed_actions
         snapshot = runtime.snapshot()
+        assert snapshot.owner.active_handoff_action_count == 0
+        assert snapshot.owner.settled_handoff_action_count == 2
         assert snapshot.consumer_pending_count == 2
         with runtime._condition:
             assert runtime._inbox_claimed_action_ids == {

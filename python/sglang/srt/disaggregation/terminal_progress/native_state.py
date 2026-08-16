@@ -1479,11 +1479,11 @@ class NativeTerminalOwnerInventory:
     :ivar source_batch_handoff_action_count: Source actions claimed through
         synchronous exact-batch transfers.
     :ivar registered_handoff_action_count: Forward-independent actions entered
-        into native downstream-lifetime authority.
-    :ivar active_handoff_action_count: Registered actions whose downstream
-        work has not settled.
+        into native launch-exclusion authority.
+    :ivar active_handoff_action_count: Registered actions not yet claimed from
+        their typed consumer inbox.
     :ivar settled_handoff_action_count: Registered actions retired by exact
-        settlement, failed delivery, or abort.
+        inbox delivery, failed delivery, or abort.
     :ivar scheduler_launch_handoff_begin_count: Bounded scheduler launch lease
         acquisitions begun at the native boundary.
     :ivar scheduler_launch_handoff_acquisition_count: Exact scheduler launch
