@@ -571,6 +571,7 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
     registration = _registration(owner, remote, 61)
     runtime.start()
     previous_switch_interval = sys.getswitchinterval()
+    scheduler_hot = threading.Event()
     try:
         runtime.register_lifecycle(registration)
 
@@ -580,9 +581,8 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
             runtime.acknowledge_consumed_action(action)
             return action
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            gather_future = executor.submit(consume_gather)
-            sys.setswitchinterval(0.005)
+        def submit_gather() -> None:
+            assert scheduler_hot.wait(timeout=_WAIT_SECONDS)
             runtime.submit(
                 _LOCAL_PRODUCER_ID,
                 registration.binding.digest,
@@ -593,11 +593,18 @@ def test_pending_call_releases_a_gil_hog_until_exact_consumer_completion() -> No
                 registration.binding.digest,
                 NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
             )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            gather_future = executor.submit(consume_gather)
+            producer_future = executor.submit(submit_gather)
+            sys.setswitchinterval(0.005)
+            scheduler_hot.set()
             expires_at = time.monotonic() + 0.5
             scheduler_iterations = 0
             while not gather_future.done() and time.monotonic() < expires_at:
                 scheduler_iterations += 1
             action = gather_future.result(timeout=_WAIT_SECONDS)
+            producer_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
             assert scheduler_iterations > 0
