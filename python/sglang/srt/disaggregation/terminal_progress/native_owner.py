@@ -193,7 +193,7 @@ class _NativeTerminalOwnerBridge(Protocol):
         """
 
     def stop_admission(self) -> None:
-        """Close lifecycle and event admission."""
+        """Close lifecycle admission."""
 
     def retire_python_producer(self, producer_id: int) -> int:
         """Order one Python producer's retirement behind accepted events.
@@ -216,6 +216,17 @@ class _NativeTerminalOwnerBridge(Protocol):
         """Verify that every registered producer retired.
 
         :returns: Whether the complete producer registry is retired.
+        """
+
+    def wait_for_output_projection(self, timeout_seconds: float) -> bool:
+        """Wait for accepted input to finish native output projection.
+
+        This fence does not require producer join. It exists for shutdown
+        sequences which drain an output-owned worker before retiring the
+        downstream producer that worker can still use.
+
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether no queued, swapped, or unacknowledged output remains.
         """
 
     def wait_for_output_quiescence(self, timeout_seconds: float) -> bool:
@@ -855,6 +866,18 @@ class NativeTerminalOwner:
         """
 
         return bool(self._native.join_producers())
+
+    def wait_for_output_projection(self, timeout_seconds: float) -> bool:
+        """Wait for accepted input to finish native output projection.
+
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether output projection became idle without requiring
+            producer join.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native.wait_for_output_projection(timeout_seconds))
 
     def wait_for_output_quiescence(self, timeout_seconds: float) -> bool:
         """Wait for the sole output consumer to finish native routing.

@@ -359,7 +359,8 @@ class NativeTerminalRuntimeSnapshot:
     :ivar coordinator: Request-coordinator action queue state.
     :ivar lifecycle: Teardown and health action queue state.
     :ivar source_work: Source gather, outcome, and ACK work queue state.
-    :ivar decode_work: Decode scatter and teardown work queue state.
+    :ivar decode_scatter: Decode scatter queue owned by its execution thread.
+    :ivar decode_work: Decode teardown work queue state.
     :ivar publisher: Gateway publication work queue state.
     :ivar observations: Non-authoritative observation queue state.
     :ivar scheduler_live_count: Exact request generations awaiting scheduler
@@ -383,6 +384,7 @@ class NativeTerminalRuntimeSnapshot:
     coordinator: NativeTerminalActionInboxSnapshot
     lifecycle: NativeTerminalActionInboxSnapshot
     source_work: NativeTerminalActionInboxSnapshot
+    decode_scatter: NativeTerminalActionInboxSnapshot
     decode_work: NativeTerminalActionInboxSnapshot
     publisher: NativeTerminalActionInboxSnapshot
     observations: NativeTerminalActionInboxSnapshot
@@ -407,6 +409,7 @@ class NativeTerminalRuntimeSnapshot:
             self.coordinator,
             self.lifecycle,
             self.source_work,
+            self.decode_scatter,
             self.decode_work,
             self.publisher,
             self.observations,
@@ -465,12 +468,10 @@ _SOURCE_WORK_ACTIONS = frozenset(
         NativeTerminalOwnerActionKind.SOURCE_ACK_READY,
     )
 )
-_DECODE_WORK_ACTIONS = frozenset(
-    (
-        NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,
-        NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,
-    )
+_DECODE_SCATTER_ACTIONS = frozenset(
+    (NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,)
 )
+_DECODE_WORK_ACTIONS = frozenset((NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY,))
 _PUBLISHER_ACTIONS = frozenset(
     (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,)
 )
@@ -524,6 +525,7 @@ class NativeTerminalRuntime:
     _coordinator_actions: NativeTerminalActionInbox
     _lifecycle_actions: NativeTerminalActionInbox
     _source_work_actions: NativeTerminalActionInbox
+    _decode_scatter_actions: NativeTerminalActionInbox
     _decode_work_actions: NativeTerminalActionInbox
     _publisher_actions: NativeTerminalActionInbox
     _observations: NativeTerminalObservationInbox
@@ -558,6 +560,7 @@ class NativeTerminalRuntime:
         coordinator_capacity: int,
         lifecycle_capacity: int,
         source_work_capacity: int,
+        decode_scatter_capacity: int,
         decode_work_capacity: int,
         publisher_capacity: int,
         observation_capacity: int,
@@ -576,7 +579,8 @@ class NativeTerminalRuntime:
         :param coordinator_capacity: Request-coordinator inbox capacity.
         :param lifecycle_capacity: Teardown and health inbox capacity.
         :param source_work_capacity: Source continuation inbox capacity.
-        :param decode_work_capacity: Decode continuation inbox capacity.
+        :param decode_scatter_capacity: Blocking decode scatter inbox capacity.
+        :param decode_work_capacity: Decode teardown inbox capacity.
         :param publisher_capacity: Gateway publication inbox capacity.
         :param observation_capacity: Non-gating metrics queue capacity.
         """
@@ -600,6 +604,7 @@ class NativeTerminalRuntime:
             coordinator_capacity,
             lifecycle_capacity,
             source_work_capacity,
+            decode_scatter_capacity,
             decode_work_capacity,
             publisher_capacity,
             observation_capacity,
@@ -674,6 +679,9 @@ class NativeTerminalRuntime:
         )
         self._source_work_actions = NativeTerminalActionInbox(
             "packed-terminal-source-work-actions", source_work_capacity
+        )
+        self._decode_scatter_actions = NativeTerminalActionInbox(
+            "packed-terminal-decode-scatter-actions", decode_scatter_capacity
         )
         self._decode_work_actions = NativeTerminalActionInbox(
             "packed-terminal-decode-work-actions", decode_work_capacity
@@ -767,12 +775,21 @@ class NativeTerminalRuntime:
 
     @property
     def decode_work_actions(self) -> NativeTerminalActionInbox:
-        """Return owner-earned decode scatter and teardown work.
+        """Return owner-earned decode teardown work.
 
-        :returns: Bounded fd-signalled decode worker queue.
+        :returns: Bounded fd-signalled decode reactor queue.
         """
 
         return self._decode_work_actions
+
+    @property
+    def decode_scatter_actions(self) -> NativeTerminalActionInbox:
+        """Return decode scatters owned by their dedicated execution thread.
+
+        :returns: Bounded fd-signalled decode scatter queue.
+        """
+
+        return self._decode_scatter_actions
 
     @property
     def publisher_actions(self) -> NativeTerminalActionInbox:
@@ -1146,26 +1163,70 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "aborted action acknowledgement requires fail-closed state"
                 )
-            pending = self._consumer_pending.get(action.action_id)
-            if pending != action:
+            if not self._discard_aborted_action_locked(action):
                 raise NativeTerminalRuntimeError(
                     "aborted action is absent, stale, or already acknowledged"
                 )
-            del self._consumer_pending[action.action_id]
-            binding_digest = action.binding.digest
-            if action.kind in _SCHEDULER_ACTIONS:
-                self._scheduler_pending.pop(binding_digest, None)
-            if action.kind in (
-                NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
-                NativeTerminalOwnerActionKind.PROCESS_FATAL,
+
+    def acknowledge_aborted_action_if_pending(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> bool:
+        """Discard an action only when fail-closed ownership remains pending.
+
+        A blocking consumer can race a process-fatal transition after its side
+        effect returns but before its follow-up commits. The original action
+        remains pending only when the follow-up did not win that race.
+
+        :param action: Exact consumer action being reconciled after abort.
+        :returns: Whether pending consumer ownership was discarded.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        with self._condition:
+            if self._disposition not in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
             ):
-                self._quarantined_bindings.add(binding_digest)
-            if (
-                binding_digest in self._quarantined_bindings
-                and binding_digest not in self._scheduler_pending
-            ):
-                self._scheduler_live.pop(binding_digest, None)
-            self._condition.notify_all()
+                raise NativeTerminalRuntimeError(
+                    "conditional abort acknowledgement requires fail-closed state"
+                )
+            return self._discard_aborted_action_locked(action)
+
+    def _discard_aborted_action_locked(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> bool:
+        """Discard pending consumer authority while the runtime lock is held.
+
+        :param action: Exact action being reconciled during fail-closed drain.
+        :returns: Whether the action still owned pending consumer authority.
+        """
+
+        pending = self._consumer_pending.get(action.action_id)
+        if pending is None:
+            return False
+        if pending != action:
+            raise NativeTerminalRuntimeError(
+                "consumer action identity aliases another pending action"
+            )
+        del self._consumer_pending[action.action_id]
+        binding_digest = action.binding.digest
+        if action.kind in _SCHEDULER_ACTIONS:
+            self._scheduler_pending.pop(binding_digest, None)
+        if action.kind in (
+            NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
+            NativeTerminalOwnerActionKind.PROCESS_FATAL,
+        ):
+            self._quarantined_bindings.add(binding_digest)
+        if (
+            binding_digest in self._quarantined_bindings
+            and binding_digest not in self._scheduler_pending
+        ):
+            self._scheduler_live.pop(binding_digest, None)
+        self._condition.notify_all()
+        return True
 
     def complete_work_action(
         self,
@@ -1323,6 +1384,7 @@ class NativeTerminalRuntime:
                 coordinator=self._coordinator_actions.snapshot(),
                 lifecycle=self._lifecycle_actions.snapshot(),
                 source_work=self._source_work_actions.snapshot(),
+                decode_scatter=self._decode_scatter_actions.snapshot(),
                 decode_work=self._decode_work_actions.snapshot(),
                 publisher=self._publisher_actions.snapshot(),
                 observations=self._observations.snapshot(),
@@ -1335,6 +1397,31 @@ class NativeTerminalRuntime:
                 dropped_observation_count=self._dropped_observation_count,
                 fatal_reason=self._fatal_reason,
             )
+
+    def wait_for_output_projection(self, timeout_seconds: float) -> bool:
+        """Fence accepted native input through its Python-owned inbox.
+
+        Unlike final quiescence, this fence does not require producer join. A
+        decode rank uses it before draining the scatter worker whose actions
+        still need the live CUDA-scatter producer.
+
+        :param timeout_seconds: Positive bound shared by ownership domains.
+        :returns: Whether accepted native work reached its consumer inbox.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("output projection timeout must be a positive float")
+        deadline = time.monotonic() + timeout_seconds
+        if not self._owner.wait_for_output_projection(timeout_seconds):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        acquired = self._output_projection_lock.acquire(timeout=remaining)
+        if not acquired:
+            return False
+        self._output_projection_lock.release()
+        return True
 
     def wait_for_output_projection_quiescence(self, timeout_seconds: float) -> bool:
         """Fence native output through the complete Python projection.
@@ -1373,6 +1460,7 @@ class NativeTerminalRuntime:
             self._coordinator_actions,
             self._lifecycle_actions,
             self._source_work_actions,
+            self._decode_scatter_actions,
             self._decode_work_actions,
             self._publisher_actions,
         )
@@ -1419,8 +1507,14 @@ class NativeTerminalRuntime:
             self._disposition = NativeTerminalRuntimeDisposition.STOPPED
             self._condition.notify_all()
 
-    def begin_abort(self) -> None:
-        """Publish final quarantine authority while consumers remain alive."""
+    def begin_abort(self, reason: str | None = None) -> None:
+        """Publish final quarantine authority while consumers remain alive.
+
+        :param reason: Optional originating process-fatal evidence.
+        """
+
+        if reason is not None and (type(reason) is not str or len(reason) == 0):
+            raise ValueError("abort reason must be a non-empty string")
 
         with self._condition:
             if self._disposition is NativeTerminalRuntimeDisposition.STOPPED:
@@ -1432,7 +1526,7 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
             else:
                 self._enter_runtime_fatal_locked(
-                    self._fatal_reason or "runtime aborted before clean close"
+                    self._fatal_reason or reason or "runtime aborted before clean close"
                 )
                 self._disposition = NativeTerminalRuntimeDisposition.ABORT_DRAINING
         self._owner.begin_abort()
@@ -1456,6 +1550,7 @@ class NativeTerminalRuntime:
             self._coordinator_actions,
             self._lifecycle_actions,
             self._source_work_actions,
+            self._decode_scatter_actions,
             self._decode_work_actions,
             self._publisher_actions,
         )
@@ -1609,7 +1704,8 @@ class NativeTerminalRuntime:
                     except Exception:  # noqa: BLE001
                         formatted_traceback = traceback.format_exc()
                         logger.error(
-                            "Native observation drain failed without gating lifecycle: %s",
+                            "Native observation drain failed without gating "
+                            "lifecycle: %s",
                             formatted_traceback,
                         )
                         try:
@@ -1785,6 +1881,9 @@ class NativeTerminalRuntime:
         if action.kind in _SOURCE_WORK_ACTIONS:
             self._enqueue_consumer_action(self._source_work_actions, action)
             return
+        if action.kind in _DECODE_SCATTER_ACTIONS:
+            self._enqueue_consumer_action(self._decode_scatter_actions, action)
+            return
         if action.kind in _DECODE_WORK_ACTIONS:
             self._enqueue_consumer_action(self._decode_work_actions, action)
             return
@@ -1887,6 +1986,7 @@ class NativeTerminalRuntime:
         self._coordinator_actions._mark_fatal(self._fatal_reason)
         self._lifecycle_actions._mark_fatal(self._fatal_reason)
         self._source_work_actions._mark_fatal(self._fatal_reason)
+        self._decode_scatter_actions._mark_fatal(self._fatal_reason)
         self._decode_work_actions._mark_fatal(self._fatal_reason)
         self._publisher_actions._mark_fatal(self._fatal_reason)
         self._observations._mark_fatal(self._fatal_reason)
@@ -1949,6 +2049,7 @@ class NativeTerminalRuntime:
         self._coordinator_actions._close(require_empty=require_empty)
         self._lifecycle_actions._close(require_empty=require_empty)
         self._source_work_actions._close(require_empty=require_empty)
+        self._decode_scatter_actions._close(require_empty=require_empty)
         self._decode_work_actions._close(require_empty=require_empty)
         self._publisher_actions._close(require_empty=require_empty)
         dropped_count = self._observations._close(require_empty=False)

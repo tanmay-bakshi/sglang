@@ -3,7 +3,6 @@ import hashlib
 import uuid
 
 import pytest
-
 from sglang.srt.disaggregation.terminal_progress import (
     runtime_enrollment as enrollment_module,
 )
@@ -65,6 +64,7 @@ class _FakeRuntime:
         coordinator_capacity: int,
         lifecycle_capacity: int,
         source_work_capacity: int,
+        decode_scatter_capacity: int,
         decode_work_capacity: int,
         publisher_capacity: int,
         observation_capacity: int,
@@ -81,6 +81,7 @@ class _FakeRuntime:
         :param coordinator_capacity: Coordinator inbox capacity.
         :param lifecycle_capacity: Lifecycle inbox capacity.
         :param source_work_capacity: Source work inbox capacity.
+        :param decode_scatter_capacity: Decode scatter inbox capacity.
         :param decode_work_capacity: Decode work inbox capacity.
         :param publisher_capacity: Publisher inbox capacity.
         :param observation_capacity: Observation inbox capacity.
@@ -97,6 +98,7 @@ class _FakeRuntime:
             coordinator_capacity,
             lifecycle_capacity,
             source_work_capacity,
+            decode_scatter_capacity,
             decode_work_capacity,
             publisher_capacity,
             observation_capacity,
@@ -305,9 +307,10 @@ def _config() -> TerminalRankRuntimeConfig:
         coordinator_capacity=105,
         lifecycle_capacity=106,
         source_work_capacity=107,
-        decode_work_capacity=108,
-        publisher_capacity=109,
-        observation_capacity=110,
+        decode_scatter_capacity=108,
+        decode_work_capacity=109,
+        publisher_capacity=110,
+        observation_capacity=111,
         native_producer_retirement_timeout_seconds=3.0,
     )
 
@@ -459,7 +462,7 @@ def test_factory_constructs_one_dormant_role_exact_runtime(
         tuple(spec.registration.producer_id for spec in factory.native_plan.specs)
         == expected_native_ids
     )
-    assert runtime.capacities == tuple(range(101, 111))
+    assert runtime.capacities == tuple(range(101, 112))
     assert runtime.disposition is NativeTerminalRuntimeDisposition.CREATED
     assert runtime.start_calls == 0
     has_source_cuda = binding.advertisement.role is TerminalOwnerRole.SOURCE
