@@ -1439,6 +1439,7 @@ def test_sibling_routing_failure_preserves_decode_retirement_preclaim(
             _LOCAL_PRODUCER_ID,
             registration.binding.digest,
             NativeTerminalOwnerEventKind.DECODE_CANCEL_UNPUBLISHED,
+            reason="synthetic cancellation before publication",
         )
         assert runtime.wait_for_output_projection(_WAIT_SECONDS)
 
