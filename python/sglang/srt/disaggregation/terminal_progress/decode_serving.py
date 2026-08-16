@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from typing import TypeVar
@@ -33,6 +34,10 @@ from sglang.srt.disaggregation.terminal_progress.cuda_owner_producer import (
 from sglang.srt.disaggregation.terminal_progress.deadlines import (
     TerminalDeadlineKind,
     terminal_deadline_spec,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_scatter_worker import (
+    PackedTerminalDecodeScatterWorker,
+    PackedTerminalDecodeScatterWorkerInventory,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerInventory,
@@ -182,6 +187,7 @@ class PackedTerminalDecodeServingInventory:
 
     :ivar runtime: Authoritative process-lifetime runtime snapshot.
     :ivar actor: Packed decode actor resource inventory.
+    :ivar scatter_worker: Dedicated decode scatter execution ownership.
     :ivar scheduler_consumer: Scheduler-affine request ownership.
     :ivar scheduler_serving: Qualified scheduler receipt ownership.
     :ivar active_binding_digests: Composition-owned immutable request records.
@@ -194,6 +200,7 @@ class PackedTerminalDecodeServingInventory:
 
     runtime: NativeTerminalRuntimeSnapshot
     actor: PackedDecodeOwnerInventory
+    scatter_worker: PackedTerminalDecodeScatterWorkerInventory
     scheduler_consumer: PackedTerminalDecodeSchedulerInventory
     scheduler_serving: TerminalSchedulerServingInventory
     active_binding_digests: tuple[bytes, ...]
@@ -210,6 +217,10 @@ class PackedTerminalDecodeServingInventory:
             raise TypeError("runtime must be NativeTerminalRuntimeSnapshot")
         if type(self.actor) is not PackedDecodeOwnerInventory:
             raise TypeError("actor must be PackedDecodeOwnerInventory")
+        if type(self.scatter_worker) is not PackedTerminalDecodeScatterWorkerInventory:
+            raise TypeError(
+                "scatter_worker must be PackedTerminalDecodeScatterWorkerInventory"
+            )
         if type(self.scheduler_consumer) is not PackedTerminalDecodeSchedulerInventory:
             raise TypeError(
                 "scheduler_consumer must be PackedTerminalDecodeSchedulerInventory"
@@ -258,6 +269,7 @@ class PackedTerminalDecodeServingInventory:
             runtime.lifecycle,
             runtime.source_gather,
             runtime.source_work,
+            runtime.decode_scatter,
             runtime.decode_work,
             runtime.publisher,
         )
@@ -282,6 +294,7 @@ class PackedTerminalDecodeServingInventory:
                 len(self.actor.quarantined_bindings),
                 self.actor.in_flight_scatter_count,
                 self.actor.pending_adoption_count,
+                self.scatter_worker.retained_action_count,
                 len(self.scheduler_consumer.active_binding_digests),
                 self.scheduler_serving.inbox.live_count,
                 len(self.scheduler_serving.retained_action_ids),
@@ -323,6 +336,7 @@ class PackedTerminalDecodeServing:
     _wiring: PackedTerminalDecodeWiring
     _decode_composition: PackedTerminalDecodeServingComposition
     _scheduler_serving: TerminalSchedulerServing
+    _scatter_worker: PackedTerminalDecodeScatterWorker
     _coordinator_issuer: TerminalWireReceiptIssuer | None
     _coordinator_importers: tuple[TerminalWireReceiptImportNamespace, ...]
     _clock_ns: Callable[[], int]
@@ -352,6 +366,7 @@ class PackedTerminalDecodeServing:
         physical_capacity: int,
         process_fatal_handler: Callable[[SchedulerReceiptInboxInventory], None],
         work: PackedTerminalDecodeWork,
+        bind_scatter_cuda_device: Callable[[], None],
         retire_native_producers: Callable[[], None],
     ) -> None:
         """Construct a dormant decode serving composition.
@@ -366,6 +381,7 @@ class PackedTerminalDecodeServing:
         :param physical_capacity: Maximum configured in-flight generations.
         :param process_fatal_handler: Scheduler-affine fail-closed handler.
         :param work: Point-to-point delivery and observation callbacks.
+        :param bind_scatter_cuda_device: Scatter-thread CUDA device binding.
         :param retire_native_producers: Native event-channel retirement fence.
         """
 
@@ -390,6 +406,8 @@ class PackedTerminalDecodeServing:
             raise TypeError("process_fatal_handler must be callable")
         if type(work) is not PackedTerminalDecodeWork:
             raise TypeError("work must be PackedTerminalDecodeWork")
+        if not callable(bind_scatter_cuda_device):
+            raise TypeError("bind_scatter_cuda_device must be callable")
         if not callable(retire_native_producers):
             raise TypeError("retire_native_producers must be callable")
         self._validate_coordinator_authority(
@@ -430,6 +448,17 @@ class PackedTerminalDecodeServing:
         self._started = False
         self._closed = False
         self._lock = threading.RLock()
+        if runtime.decode_scatter_actions.snapshot().capacity != physical_capacity:
+            raise ValueError(
+                "decode scatter inbox capacity must equal physical request capacity"
+            )
+        self._scatter_worker = PackedTerminalDecodeScatterWorker(
+            runtime=runtime,
+            consume_action=self._consume_scatter_action,
+            bind_cuda_device=bind_scatter_cuda_device,
+            fatal_listener=self._scatter_worker_failed,
+            clock_ns=clock_ns,
+        )
 
     @property
     def wiring(self) -> PackedTerminalDecodeWiring:
@@ -495,13 +524,36 @@ class PackedTerminalDecodeServing:
         return min(deadlines)
 
     def start(self) -> None:
-        """Start the sole native runtime exactly once."""
+        """Start the native runtime and dedicated scatter execution owner."""
 
         with self._lock:
             if self._started or self._closed:
                 raise RuntimeError("decode serving cannot restart")
-            self._runtime.start()
             self._started = True
+        try:
+            self._runtime.start()
+            self._scatter_worker.start()
+        except BaseException:
+            startup_traceback = traceback.format_exc()
+            try:
+                self._runtime.begin_abort("decode serving startup failed")
+            except BaseException:  # noqa: BLE001
+                logger.critical(
+                    "Decode runtime abort after startup failure also failed:\n%s",
+                    traceback.format_exc(),
+                )
+            try:
+                self._mark_owner_dead()
+            except BaseException:  # noqa: BLE001
+                logger.critical(
+                    "Decode owner-death wake after startup failure also failed:\n%s",
+                    traceback.format_exc(),
+                )
+            logger.critical(
+                "Decode serving failed during startup:\n%s",
+                startup_traceback,
+            )
+            raise
 
     def register_request(
         self,
@@ -784,7 +836,7 @@ class PackedTerminalDecodeServing:
         return len(actions)
 
     def drain_decode_work_actions(self) -> int:
-        """Execute scatter and teardown continuations off the scheduler loop.
+        """Execute callback-earned teardown while scatter remains isolated.
 
         :returns: Number of decode work actions consumed or aborted.
         """
@@ -796,12 +848,12 @@ class PackedTerminalDecodeServing:
                 self._runtime.acknowledge_aborted_action(action)
                 continue
             try:
-                if action.kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY:
-                    self._wiring.consume_scatter_action(action)
-                elif action.kind is NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY:
-                    self._wiring.consume_teardown_action(action)
-                else:
+                if (
+                    action.kind
+                    is not NativeTerminalOwnerActionKind.DECODE_TEARDOWN_READY
+                ):
                     raise RuntimeError("decode work inbox carried another action kind")
+                self._wiring.consume_teardown_action(action)
             except Exception:
                 self._component_failed("decode work action failed")
                 raise
@@ -955,6 +1007,7 @@ class PackedTerminalDecodeServing:
         return PackedTerminalDecodeServingInventory(
             runtime=self._runtime.snapshot(),
             actor=self._actor.terminal_owner_inventory(),
+            scatter_worker=self._scatter_worker.inventory(),
             scheduler_consumer=self._decode_composition.consumer.inventory(),
             scheduler_serving=self._scheduler_serving.inventory(),
             active_binding_digests=active,
@@ -966,10 +1019,41 @@ class PackedTerminalDecodeServing:
         )
 
     def stop_admission_and_retire_producers(self) -> None:
-        """Close admission and join every native and Python producer context."""
+        """Drain scatter ownership before retiring its CUDA producer.
+
+        The control receiver has already joined at this boundary. Closing
+        lifecycle admission and fencing native projection therefore makes the
+        direct scatter inbox a complete population. The worker must drain that
+        population before native producer retirement can stop callback
+        admission; reversing those steps strands unarmed scatter authority.
+        """
 
         self._require_open()
         self._runtime.stop_admission()
+        shutdown_timeout = terminal_deadline_spec(
+            TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
+        ).seconds
+        deadline = time.monotonic() + shutdown_timeout
+        if not self._runtime.wait_for_output_projection(shutdown_timeout):
+            self._runtime.begin_abort("decode scatter projection fence timed out")
+            raise RuntimeError(
+                "decode shutdown retained native output before scatter drain"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            self._runtime.begin_abort("decode scatter drain deadline expired")
+            raise RuntimeError("decode scatter drain deadline expired")
+        self._scatter_worker.stop_and_join(float(remaining), abort=False)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0 or not self._runtime.wait_for_output_projection(
+            float(remaining)
+        ):
+            self._runtime.begin_abort("post-scatter projection fence timed out")
+            raise RuntimeError("decode post-scatter projection fence timed out")
+        scatter_inventory = self._scatter_worker.inventory()
+        if scatter_inventory.retained_action_count != 0:
+            self._runtime.begin_abort("decode scatter drain retained authority")
+            raise RuntimeError("decode scatter worker retained authority after drain")
         self._retire_all_producers()
 
     def close_clean(self, timeout_seconds: float) -> None:
@@ -1007,12 +1091,13 @@ class PackedTerminalDecodeServing:
         """
 
         self._require_open()
-        self._runtime.begin_abort()
-        self._retire_all_producers()
-        self._mark_owner_dead()
+        self._runtime.begin_abort("decode serving abort requested")
         shutdown_timeout = terminal_deadline_spec(
             TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
         ).seconds
+        self._scatter_worker.stop_and_join(shutdown_timeout, abort=True)
+        self._retire_all_producers()
+        self._mark_owner_dead()
         if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
             raise RuntimeError("abort retained unrouted decode terminal authority")
         self.drain_runtime_actions()
@@ -1272,6 +1357,35 @@ class PackedTerminalDecodeServing:
                 "Decode runtime abort entry also failed:\n%s",
                 traceback.format_exc(),
             )
+
+    def _consume_scatter_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Submit one scatter on the dedicated CUDA-bound execution thread.
+
+        :param action: Exact native ``DECODE_SCATTER_READY`` authority.
+        """
+
+        self._wiring.consume_scatter_action(action)
+
+    def _scatter_worker_failed(
+        self,
+        reason: str,
+        formatted_traceback: str | None,
+    ) -> None:
+        """Publish scatter-owner death into scheduler fail-closed handling.
+
+        :param reason: Stable scatter worker failure evidence.
+        :param formatted_traceback: Complete worker traceback, if available.
+        """
+
+        traceback_text = formatted_traceback
+        if traceback_text is None:
+            traceback_text = "no traceback available"
+        logger.critical(
+            "Decode scatter worker entered process-fatal state: %s\n%s",
+            reason,
+            traceback_text,
+        )
+        self._mark_owner_dead()
 
     def _mark_owner_dead(self) -> None:
         """Publish one sticky scheduler wake for owner or component death."""

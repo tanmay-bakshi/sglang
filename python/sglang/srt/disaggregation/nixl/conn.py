@@ -2585,6 +2585,7 @@ class NixlKVManager(CommonKVManager):
             lifecycle_capacity=physical_capacity * 2,
             source_gather_capacity=physical_capacity,
             source_work_capacity=physical_capacity * 2,
+            decode_scatter_capacity=physical_capacity,
             decode_work_capacity=physical_capacity,
             publisher_capacity=physical_capacity,
             observation_capacity=physical_capacity * event_population,
@@ -3124,6 +3125,12 @@ class NixlKVManager(CommonKVManager):
             if local_identity.tp_rank == 0
             else None
         )
+
+        def bind_scatter_cuda_device() -> None:
+            """Bind the dedicated decode scatter worker to this rank's device."""
+
+            torch.cuda.set_device(self.kv_args.gpu_id)
+
         terminal_clock_ns = SystemTerminalOwnerClock().now_ns
         return PackedTerminalDecodeServing(
             actor=controller.terminal_runtime,
@@ -3139,6 +3146,7 @@ class NixlKVManager(CommonKVManager):
                 send_delivery=self._send_terminal_decode_delivery,
                 observe_output=self._observe_terminal_output,
             ),
+            bind_scatter_cuda_device=bind_scatter_cuda_device,
             retire_native_producers=enrollment.retire_native_producers,
         )
 

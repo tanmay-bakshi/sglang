@@ -313,6 +313,7 @@ class PackedTerminalSourceServingInventory:
             runtime.lifecycle,
             runtime.source_gather,
             runtime.source_work,
+            runtime.decode_scatter,
             runtime.decode_work,
             runtime.publisher,
         )

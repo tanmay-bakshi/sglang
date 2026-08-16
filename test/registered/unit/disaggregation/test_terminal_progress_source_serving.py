@@ -406,6 +406,7 @@ def _runtime(identity: PackedTerminalSourceIdentityPlan) -> NativeTerminalRuntim
         lifecycle_capacity=8,
         source_gather_capacity=8,
         source_work_capacity=8,
+        decode_scatter_capacity=8,
         decode_work_capacity=8,
         publisher_capacity=8,
         observation_capacity=64,

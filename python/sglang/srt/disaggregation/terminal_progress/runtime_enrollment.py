@@ -59,7 +59,8 @@ class TerminalRankRuntimeConfig:
     :ivar lifecycle_capacity: Teardown and health inbox capacity.
     :ivar source_gather_capacity: Blocking source gather inbox capacity.
     :ivar source_work_capacity: Source outcome and ACK inbox capacity.
-    :ivar decode_work_capacity: Decode continuation inbox capacity.
+    :ivar decode_scatter_capacity: Decode scatter inbox capacity.
+    :ivar decode_work_capacity: Decode teardown inbox capacity.
     :ivar publisher_capacity: Gateway publication inbox capacity.
     :ivar observation_capacity: Non-gating observation inbox capacity.
     :ivar native_producer_retirement_timeout_seconds: One absolute bound shared
@@ -74,6 +75,7 @@ class TerminalRankRuntimeConfig:
     lifecycle_capacity: int
     source_gather_capacity: int
     source_work_capacity: int
+    decode_scatter_capacity: int
     decode_work_capacity: int
     publisher_capacity: int
     observation_capacity: int
@@ -91,6 +93,7 @@ class TerminalRankRuntimeConfig:
             self.lifecycle_capacity,
             self.source_gather_capacity,
             self.source_work_capacity,
+            self.decode_scatter_capacity,
             self.decode_work_capacity,
             self.publisher_capacity,
             self.observation_capacity,
@@ -610,6 +613,7 @@ class TerminalRankRuntimeEnrollmentFactory:
                 lifecycle_capacity=config.lifecycle_capacity,
                 source_gather_capacity=config.source_gather_capacity,
                 source_work_capacity=config.source_work_capacity,
+                decode_scatter_capacity=config.decode_scatter_capacity,
                 decode_work_capacity=config.decode_work_capacity,
                 publisher_capacity=config.publisher_capacity,
                 observation_capacity=config.observation_capacity,

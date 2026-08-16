@@ -1,10 +1,14 @@
+import contextlib
 import dataclasses
 import inspect
+import json
 import logging
 import select
 import sys
 import threading
+import time
 import types
+from collections.abc import Callable
 
 import pytest
 from sglang.srt.disaggregation.common.packed_staging_protocol import (
@@ -23,11 +27,19 @@ from sglang.srt.disaggregation.nixl.packed_staging_request import (
     PackedDecodeRequestTransaction,
     PackedRequestTransactionState,
 )
+from sglang.srt.disaggregation.terminal_progress.clock import SystemTerminalOwnerClock
 from sglang.srt.disaggregation.terminal_progress.coordinator import (
     TerminalRequestCoordinatorManifest,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_adoption import (
     TerminalDFlashDecodeAdoption,
+)
+from sglang.srt.disaggregation.terminal_progress.decode_scatter_worker import (
+    TERMINAL_DECODE_SCATTER_TIMING_LOG_PREFIX,
+    PackedTerminalDecodeScatterWorker,
+    PackedTerminalDecodeScatterWorkerDisposition,
+    PackedTerminalDecodeScatterWorkerError,
+    PackedTerminalDecodeScatterWorkerInventory,
 )
 from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer import (
     PackedTerminalDecodeSchedulerRegistration,
@@ -35,6 +47,7 @@ from sglang.srt.disaggregation.terminal_progress.decode_scheduler_consumer impor
 from sglang.srt.disaggregation.terminal_progress.decode_serving import (
     PackedTerminalDecodeDeliveryTarget,
     PackedTerminalDecodeServing,
+    PackedTerminalDecodeServingInventory,
     PackedTerminalDecodeWireDelivery,
     PackedTerminalDecodeWork,
 )
@@ -48,12 +61,15 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NativeTerminalOwnerAction,
+    NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
     NativeTerminalProducerRegistration,
+    NativeTerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.receipts import (
     TerminalReceiptKind,
@@ -62,6 +78,8 @@ from sglang.srt.disaggregation.terminal_progress.receipts import (
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalProducerDelivery,
     NativeTerminalRuntime,
+    NativeTerminalRuntimeDisposition,
+    NativeTerminalRuntimeOverflowError,
     NativeTerminalRuntimeProducerSpec,
 )
 from sglang.srt.disaggregation.terminal_progress.source_plan import (
@@ -130,6 +148,11 @@ class _ActorState:
     :ivar quarantined: Ambiguous actor identities retained against reuse.
     :ivar events: Ordered actor side effects.
     :ivar control_kinds: Native transitions earned by successive controls.
+    :ivar scatter_entered: Set when the dedicated worker starts submission.
+    :ivar scatter_release: Optional test barrier for a blocking submission.
+    :ivar scatter_thread_ids: Threads which executed scatter submission.
+    :ivar cuda_binding_thread_ids: Threads which established CUDA affinity.
+    :ivar retirement_worker_inventories: Worker state at CUDA retirement.
     """
 
     source_plan: PackedTerminalSourcePlan
@@ -150,6 +173,19 @@ class _ActorState:
         ]
     )
     fail_adoption: bool = False
+    fail_scatter: bool = False
+    block_scatter: bool = False
+    scatter_entered: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    scatter_release: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    scatter_thread_ids: list[int] = dataclasses.field(default_factory=list)
+    cuda_binding_thread_ids: list[int] = dataclasses.field(default_factory=list)
+    retirement_worker_inventories: list[PackedTerminalDecodeScatterWorkerInventory] = (
+        dataclasses.field(default_factory=list)
+    )
 
 
 class _CudaCompletion:
@@ -399,6 +435,12 @@ def _actor(
     ) -> PackedDecodeScatterBatch:
         del self
         binding = state.transaction_bindings[id(transaction)]
+        state.scatter_thread_ids.append(threading.get_ident())
+        state.scatter_entered.set()
+        if state.block_scatter and not state.scatter_release.wait(_WAIT_SECONDS):
+            raise TimeoutError("test scatter release timed out")
+        if state.fail_scatter:
+            raise RuntimeError("injected decode scatter failure")
         state.events.append("scatter")
         return PackedDecodeScatterBatch(
             binding_digest=binding.digest,
@@ -594,10 +636,92 @@ def _runtime(
         lifecycle_capacity=8,
         source_gather_capacity=8,
         source_work_capacity=8,
+        decode_scatter_capacity=8,
         decode_work_capacity=8,
         publisher_capacity=8,
         observation_capacity=64,
     )
+
+
+def _standalone_scatter_runtime() -> tuple[
+    NativeTerminalRuntime,
+    TerminalRequestBinding,
+]:
+    """Start one runtime for direct scatter-worker lifecycle qualification.
+
+    :returns: Running runtime and its stable decode binding fixture.
+    """
+
+    bindings, source_plan, _ = _identity_graph(1)
+    runtime = _runtime(
+        bindings[0].owner,
+        source_plan.writers[0].process_identity,
+    )
+    runtime.start()
+    return runtime, bindings[0]
+
+
+def _scatter_action(
+    binding: TerminalRequestBinding,
+    *,
+    action_id: int,
+    commit_timestamp_ns: int,
+) -> NativeTerminalOwnerAction:
+    """Build one direct-inbox scatter authority.
+
+    :param binding: Exact decode request binding.
+    :param action_id: Globally unique native action identity.
+    :param commit_timestamp_ns: Native action commit timestamp.
+    :returns: Immutable decode scatter action.
+    """
+
+    return NativeTerminalOwnerAction(
+        action_id=action_id,
+        kind=NativeTerminalOwnerActionKind.DECODE_SCATTER_READY,
+        binding=NativeTerminalRequestBinding.from_binding(binding),
+        commit_timestamp_ns=commit_timestamp_ns,
+        receipt=None,
+    )
+
+
+def _enqueue_scatter_action(
+    runtime: NativeTerminalRuntime,
+    action: NativeTerminalOwnerAction,
+) -> None:
+    """Publish an action through the runtime's authoritative retention order.
+
+    :param runtime: Runtime owning the direct scatter inbox.
+    :param action: Exact one-shot scatter authority.
+    """
+
+    runtime._enqueue_consumer_action(runtime.decode_scatter_actions, action)
+
+
+def _close_standalone_runtime(
+    runtime: NativeTerminalRuntime,
+    *,
+    abort: bool,
+) -> None:
+    """Retire every fixture producer and close an already-drained runtime.
+
+    :param runtime: Runtime whose worker inbox owns exact zero actions.
+    :param abort: Whether the runtime is closing fail closed.
+    """
+
+    if runtime.disposition is NativeTerminalRuntimeDisposition.STOPPED:
+        return
+    if abort:
+        runtime.begin_abort("standalone scatter worker fixture abort")
+    else:
+        runtime.stop_admission()
+    for producer_id in runtime.python_producer_ids:
+        runtime.retire_python_producer(producer_id)
+    runtime._owner.retire_python_producer(_NATIVE_PRODUCER_ID)
+    runtime.join_producers()
+    if abort:
+        runtime.finish_abort_close()
+    else:
+        runtime.close_clean()
 
 
 def _registration(
@@ -666,6 +790,16 @@ def _serving(
     deliveries: list[PackedTerminalDecodeWireDelivery] = []
     scheduler_events: list[str] = []
     fatal_inventories: list[object] = []
+    clock_ns = SystemTerminalOwnerClock().now_ns
+    serving: PackedTerminalDecodeServing
+
+    def retire_native_producers() -> None:
+        """Retire CUDA authority only after scatter ownership is exact zero."""
+
+        state = actor_state
+        state.retirement_worker_inventories.append(serving.inventory().scatter_worker)
+        runtime._owner.retire_python_producer(_NATIVE_PRODUCER_ID)
+
     serving = PackedTerminalDecodeServing(
         actor=actor,
         runtime=runtime,
@@ -675,16 +809,17 @@ def _serving(
         coordinator_importers=tuple(
             TerminalWireReceiptImportNamespace(binding.owner) for binding in bindings
         ),
-        clock_ns=lambda: 10_000,
+        clock_ns=clock_ns,
         physical_capacity=8,
         process_fatal_handler=fatal_inventories.append,
         work=PackedTerminalDecodeWork(
             send_delivery=deliveries.append,
             observe_output=lambda output: None,
         ),
-        retire_native_producers=lambda: runtime._owner.retire_python_producer(
-            _NATIVE_PRODUCER_ID
+        bind_scatter_cuda_device=lambda: actor_state.cuda_binding_thread_ids.append(
+            threading.get_ident()
         ),
+        retire_native_producers=retire_native_producers,
     )
     registration = _registration(bindings[0], source_plan, scheduler_events)
     return (
@@ -718,14 +853,42 @@ def _pump(serving: PackedTerminalDecodeServing) -> int:
     return serving.drain_runtime_actions()
 
 
+def _pump_until(
+    serving: PackedTerminalDecodeServing,
+    predicate: Callable[[PackedTerminalDecodeServingInventory], bool],
+) -> None:
+    """Drain asynchronous runtime waves until one inventory fact is true.
+
+    :param serving: Open decode composition.
+    :param predicate: Exact post-drain state required by the caller.
+    """
+
+    deadline = time.monotonic() + _WAIT_SECONDS
+    while not predicate(serving.inventory()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError("decode composition state predicate expired")
+        readable, _, _ = select.select(
+            list(serving.runtime_filenos),
+            [],
+            [],
+            remaining,
+        )
+        if len(readable) == 0:
+            raise TimeoutError("decode composition state predicate did not wake")
+        serving.drain_runtime_actions()
+
+
 def _drive_to_adoption(
     serving: PackedTerminalDecodeServing,
     registration: PackedTerminalDecodeSchedulerRegistration,
+    actor_state: _ActorState,
 ) -> None:
     """Drive allocation, authenticated control, scatter, and ACK completion.
 
     :param serving: Open composition carrying the registered request.
     :param registration: Exact scheduler and packed-actor ownership.
+    :param actor_state: Mutable actor evidence advanced by worker and reactor.
     """
 
     serving.allocation_published(
@@ -736,11 +899,16 @@ def _drive_to_adoption(
     writer_id = registration.source_plan.writers[0].writer_id
     serving.control_received(writer_id, object())
     serving.control_received(writer_id, object())
-    _pump(serving)
-    _pump(serving)
+    _pump_until(
+        serving,
+        lambda inventory: "teardown" in actor_state.events,
+    )
     serving.control_received(writer_id, object())
     serving.control_received(writer_id, object())
-    _pump(serving)
+    _pump_until(
+        serving,
+        lambda inventory: len(inventory.scheduler_serving.retained_action_ids) == 1,
+    )
 
 
 def test_tp1_full_success_retires_every_authority_exactly_once(
@@ -772,7 +940,7 @@ def test_tp1_full_success_retires_every_authority_exactly_once(
             assert registered.scheduler_serving.inbox.live_bindings == (
                 registration.binding,
             )
-            _drive_to_adoption(serving, registration)
+            _drive_to_adoption(serving, registration, actor_state)
             serving.drain_scheduler_at_loop_entry()
             _pump(serving)
             _pump(serving)
@@ -802,6 +970,10 @@ def test_tp1_full_success_retires_every_authority_exactly_once(
                 "metadata",
                 "retired",
             ]
+            assert actor_state.scatter_thread_ids == (
+                actor_state.cuda_binding_thread_ids
+            )
+            assert actor_state.scatter_thread_ids != [threading.get_ident()]
             assert len(deliveries) == 1
             assert deliveries[0].target is PackedTerminalDecodeDeliveryTarget.OWNER
             assert deliveries[0].recipient.role is TerminalOwnerRole.SOURCE
@@ -827,6 +999,10 @@ def test_tp1_full_success_retires_every_authority_exactly_once(
             assert {sample.sample_key for sample in timing_samples} == {"decode-rank-0"}
 
             serving.stop_admission_and_retire_producers()
+            assert len(actor_state.retirement_worker_inventories) == 1
+            retirement_worker = actor_state.retirement_worker_inventories[0]
+            assert not retirement_worker.thread_alive
+            assert retirement_worker.retained_action_count == 0
             serving.close_clean(_WAIT_SECONDS)
         finally:
             if runtime.disposition.value != "stopped":
@@ -856,6 +1032,445 @@ def test_runtime_fds_and_launch_binding_are_stable() -> None:
     finally:
         serving.abort_and_close()
         assert runtime.disposition.value == "stopped"
+
+
+def test_scatter_submission_isolated_and_drains_before_cuda_retirement() -> None:
+    """A blocked host submission cannot occupy the decode serving reactor."""
+
+    (
+        serving,
+        runtime,
+        _,
+        actor_state,
+        registration,
+        manifest,
+        _,
+        _,
+        _,
+    ) = _serving(1)
+    actor_state.block_scatter = True
+    projection_states: list[PackedTerminalDecodeScatterWorkerInventory] = []
+    original_projection_fence = runtime.wait_for_output_projection
+
+    def record_projection_fence(timeout_seconds: float) -> bool:
+        """Capture worker ownership at each native output fence.
+
+        :param timeout_seconds: Production shutdown bound.
+        :returns: Whether the original fence reached quiescence.
+        """
+
+        projection_states.append(serving.inventory().scatter_worker)
+        return original_projection_fence(timeout_seconds)
+
+    runtime.wait_for_output_projection = record_projection_fence
+    serving.start()
+    try:
+        serving.register_request(registration, manifest)
+        serving.allocation_published(
+            registration.transaction,
+            object.__new__(object),
+            (),
+        )
+        writer_id = registration.source_plan.writers[0].writer_id
+        serving.control_received(writer_id, object())
+        serving.control_received(writer_id, object())
+        assert actor_state.scatter_entered.wait(_WAIT_SECONDS)
+
+        worker_inventory = serving.inventory().scatter_worker
+        assert worker_inventory.active_binding_digest == registration.binding.digest
+        assert worker_inventory.thread_alive
+        assert actor_state.scatter_thread_ids == actor_state.cuda_binding_thread_ids
+        assert runtime.decode_scatter_actions.fileno() not in serving.runtime_filenos
+        assert serving.drain_decode_work_actions() == 0
+
+        shutdown_finished = threading.Event()
+        shutdown_error: list[BaseException] = []
+
+        def stop_serving() -> None:
+            """Drive the production shutdown boundary from another owner."""
+
+            try:
+                serving.stop_admission_and_retire_producers()
+            except BaseException as error:  # noqa: BLE001
+                shutdown_error.append(error)
+            finally:
+                shutdown_finished.set()
+
+        shutdown_thread = threading.Thread(target=stop_serving, daemon=False)
+        shutdown_thread.start()
+        assert not shutdown_finished.wait(0.05)
+        assert actor_state.retirement_worker_inventories == []
+
+        actor_state.scatter_release.set()
+        shutdown_thread.join(timeout=_WAIT_SECONDS)
+        assert not shutdown_thread.is_alive()
+        assert shutdown_error == []
+        assert len(actor_state.retirement_worker_inventories) == 1
+        retired_worker = actor_state.retirement_worker_inventories[0]
+        assert retired_worker.retained_action_count == 0
+        assert not retired_worker.thread_alive
+        assert retired_worker.completed_action_count == 1
+        assert retired_worker.last_queue_residence_ns is not None
+        assert retired_worker.last_submission_duration_ns is not None
+        assert len(projection_states) == 2
+        assert projection_states[0].active_binding_digest == (
+            registration.binding.digest
+        )
+        assert projection_states[0].thread_alive
+        assert projection_states[1].retained_action_count == 0
+        assert not projection_states[1].thread_alive
+    finally:
+        actor_state.scatter_release.set()
+        if runtime.disposition.value != "stopped":
+            serving.abort_and_close()
+
+
+def test_scatter_worker_accounts_and_logs_queue_and_submission_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One direct action exposes exact inventory and parser-stable timing."""
+
+    runtime, binding = _standalone_scatter_runtime()
+    action = _scatter_action(binding, action_id=701, commit_timestamp_ns=100)
+    clock_values = iter((125, 425))
+    consumed_actions: list[NativeTerminalOwnerAction] = []
+
+    def consume_action(value: NativeTerminalOwnerAction) -> None:
+        """Complete the runtime authority after deterministic submission.
+
+        :param value: Exact worker-owned action.
+        """
+
+        consumed_actions.append(value)
+        runtime.acknowledge_consumed_action(value)
+
+    worker = PackedTerminalDecodeScatterWorker(
+        runtime=runtime,
+        consume_action=consume_action,
+        bind_cuda_device=lambda: None,
+        fatal_listener=lambda reason, formatted_traceback: None,
+        clock_ns=lambda: next(clock_values),
+    )
+    worker.start()
+    try:
+        with caplog.at_level(logging.INFO):
+            _enqueue_scatter_action(runtime, action)
+            inventory = worker.stop_and_join(_WAIT_SECONDS, abort=False)
+
+        assert consumed_actions == [action]
+        assert inventory.disposition is (
+            PackedTerminalDecodeScatterWorkerDisposition.STOPPED
+        )
+        assert inventory.completed_action_count == 1
+        assert inventory.aborted_action_count == 0
+        assert inventory.last_queue_residence_ns == 25
+        assert inventory.maximum_queue_residence_ns == 25
+        assert inventory.last_submission_duration_ns == 300
+        assert inventory.maximum_submission_duration_ns == 300
+        records = tuple(
+            record.getMessage()
+            for record in caplog.records
+            if TERMINAL_DECODE_SCATTER_TIMING_LOG_PREFIX in record.getMessage()
+        )
+        assert len(records) == 1
+        payload = json.loads(
+            records[0].split(TERMINAL_DECODE_SCATTER_TIMING_LOG_PREFIX, 1)[1]
+        )
+        assert payload == {
+            "binding_digest": binding.digest.hex(),
+            "host_submission_ms": 0.0003,
+            "queue_residence_ms": 0.000025,
+        }
+        _close_standalone_runtime(runtime, abort=False)
+    finally:
+        if runtime.disposition is not NativeTerminalRuntimeDisposition.STOPPED:
+            worker.stop_and_join(_WAIT_SECONDS, abort=True)
+            _close_standalone_runtime(runtime, abort=True)
+
+
+def test_scatter_worker_action_failure_is_process_fatal_and_clears_active() -> None:
+    """A failed scatter preserves its first cause and loses no authority."""
+
+    runtime, binding = _standalone_scatter_runtime()
+    action = _scatter_action(binding, action_id=702, commit_timestamp_ns=100)
+    failure_published = threading.Event()
+    failures: list[tuple[str, str | None]] = []
+
+    def fail_action(value: NativeTerminalOwnerAction) -> None:
+        """Raise from the exact worker execution boundary.
+
+        :param value: Expected scatter action.
+        """
+
+        assert value == action
+        raise RuntimeError("injected direct scatter failure")
+
+    def record_failure(reason: str, formatted_traceback: str | None) -> None:
+        """Capture the process-fatal worker notification.
+
+        :param reason: Stable first-cause text.
+        :param formatted_traceback: Complete originating traceback.
+        """
+
+        failures.append((reason, formatted_traceback))
+        failure_published.set()
+
+    worker = PackedTerminalDecodeScatterWorker(
+        runtime=runtime,
+        consume_action=fail_action,
+        bind_cuda_device=lambda: None,
+        fatal_listener=record_failure,
+        clock_ns=lambda: 125,
+    )
+    worker.start()
+    try:
+        _enqueue_scatter_action(runtime, action)
+        assert failure_published.wait(_WAIT_SECONDS)
+        inventory = worker.stop_and_join(_WAIT_SECONDS, abort=True)
+
+        assert len(failures) == 1
+        assert failures[0][0] == "decode scatter action failed"
+        assert failures[0][1] is not None
+        assert "injected direct scatter failure" in failures[0][1]
+        assert inventory.disposition is (
+            PackedTerminalDecodeScatterWorkerDisposition.PROCESS_FATAL
+        )
+        assert inventory.active_action_id is None
+        assert inventory.retained_action_count == 0
+        assert inventory.completed_action_count == 0
+        assert inventory.aborted_action_count == 1
+        assert runtime.snapshot().consumer_pending_count == 0
+    finally:
+        if worker.inventory().thread_alive:
+            worker.stop_and_join(_WAIT_SECONDS, abort=True)
+        _close_standalone_runtime(runtime, abort=True)
+
+
+def test_scatter_worker_clock_and_abort_ack_failures_preserve_first_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A secondary abort failure cannot hide timing failure or active state."""
+
+    runtime, binding = _standalone_scatter_runtime()
+    action = _scatter_action(binding, action_id=703, commit_timestamp_ns=100)
+    failure_published = threading.Event()
+    failures: list[str] = []
+    original_acknowledge = runtime.acknowledge_aborted_action_if_pending
+
+    def fail_clock() -> int:
+        """Fail at the first worker timing boundary.
+
+        :returns: This function does not return.
+        :raises RuntimeError: Always.
+        """
+
+        raise RuntimeError("injected worker clock failure")
+
+    def fail_acknowledgement(value: NativeTerminalOwnerAction) -> bool:
+        """Fail reconciliation after the timing failure is already sticky.
+
+        :param value: Exact action awaiting fail-closed reconciliation.
+        :returns: This function does not return.
+        :raises RuntimeError: Always.
+        """
+
+        assert value == action
+        raise RuntimeError("injected abort acknowledgement failure")
+
+    def record_failure(reason: str, formatted_traceback: str | None) -> None:
+        """Retain the first worker failure notification.
+
+        :param reason: Stable first-cause text.
+        :param formatted_traceback: Complete first-cause traceback.
+        """
+
+        del formatted_traceback
+        failures.append(reason)
+        failure_published.set()
+
+    runtime.acknowledge_aborted_action_if_pending = fail_acknowledgement
+    worker = PackedTerminalDecodeScatterWorker(
+        runtime=runtime,
+        consume_action=lambda value: None,
+        bind_cuda_device=lambda: None,
+        fatal_listener=record_failure,
+        clock_ns=fail_clock,
+    )
+    worker.start()
+    try:
+        with caplog.at_level(logging.CRITICAL):
+            _enqueue_scatter_action(runtime, action)
+            assert failure_published.wait(_WAIT_SECONDS)
+            inventory = worker.stop_and_join(_WAIT_SECONDS, abort=True)
+
+        assert failures == ["decode scatter worker timing or ownership failed"]
+        assert inventory.fatal_reason == failures[0]
+        assert inventory.active_action_id is None
+        assert inventory.retained_action_count == 0
+        assert runtime.snapshot().consumer_pending_count == 1
+        messages = tuple(record.getMessage() for record in caplog.records)
+        assert any("injected worker clock failure" in message for message in messages)
+        assert any(
+            "injected abort acknowledgement failure" in message for message in messages
+        )
+
+        runtime.acknowledge_aborted_action_if_pending = original_acknowledge
+        assert runtime.acknowledge_aborted_action_if_pending(action)
+        assert runtime.snapshot().consumer_pending_count == 0
+    finally:
+        runtime.acknowledge_aborted_action_if_pending = original_acknowledge
+        if worker.inventory().thread_alive:
+            worker.stop_and_join(_WAIT_SECONDS, abort=True)
+        if runtime.snapshot().consumer_pending_count != 0:
+            runtime.acknowledge_aborted_action_if_pending(action)
+        _close_standalone_runtime(runtime, abort=True)
+
+
+def test_scatter_worker_unexpected_exit_is_process_fatal() -> None:
+    """A live worker cannot disappear outside explicit drain ownership."""
+
+    runtime, _ = _standalone_scatter_runtime()
+    failure_published = threading.Event()
+    failures: list[str] = []
+    worker = PackedTerminalDecodeScatterWorker(
+        runtime=runtime,
+        consume_action=lambda action: None,
+        bind_cuda_device=lambda: None,
+        fatal_listener=lambda reason, formatted_traceback: (
+            failures.append(reason),
+            failure_published.set(),
+        ),
+        clock_ns=lambda: 0,
+    )
+
+    def exit_without_drain(
+        self: PackedTerminalDecodeScatterWorker,
+        selector: object,
+    ) -> None:
+        """Return from the owner loop without a lifecycle request.
+
+        :param self: Exact worker fixture.
+        :param selector: Worker-owned selector.
+        """
+
+        del self, selector
+
+    worker._run_loop = types.MethodType(exit_without_drain, worker)
+    try:
+        with contextlib.suppress(PackedTerminalDecodeScatterWorkerError):
+            worker.start()
+        assert failure_published.wait(_WAIT_SECONDS)
+        inventory = worker.stop_and_join(_WAIT_SECONDS, abort=True)
+
+        assert failures == ["decode scatter worker exited without a shutdown request"]
+        assert inventory.fatal_reason == failures[0]
+        assert not inventory.thread_alive
+    finally:
+        if worker.inventory().thread_alive:
+            worker.stop_and_join(_WAIT_SECONDS, abort=True)
+        _close_standalone_runtime(runtime, abort=True)
+
+
+def test_scatter_worker_bounded_inbox_abort_drains_active_and_queued() -> None:
+    """The physical bound rejects overflow and abort drains exact ownership."""
+
+    runtime, binding = _standalone_scatter_runtime()
+    release_active = threading.Event()
+    active_entered = threading.Event()
+    consumed_count = 0
+
+    def consume_action(action: NativeTerminalOwnerAction) -> None:
+        """Block the first action while the direct inbox reaches capacity.
+
+        :param action: Exact action retained by the worker.
+        """
+
+        nonlocal consumed_count
+        consumed_count += 1
+        if consumed_count == 1:
+            active_entered.set()
+            if not release_active.wait(_WAIT_SECONDS):
+                raise TimeoutError("active scatter was not released")
+        runtime.acknowledge_consumed_action(action)
+
+    worker = PackedTerminalDecodeScatterWorker(
+        runtime=runtime,
+        consume_action=consume_action,
+        bind_cuda_device=lambda: None,
+        fatal_listener=lambda reason, formatted_traceback: None,
+        clock_ns=SystemTerminalOwnerClock().now_ns,
+    )
+    worker.start()
+    shutdown_finished = threading.Event()
+    shutdown_results: list[PackedTerminalDecodeScatterWorkerInventory] = []
+    shutdown_errors: list[BaseException] = []
+    try:
+        first = _scatter_action(
+            binding,
+            action_id=800,
+            commit_timestamp_ns=0,
+        )
+        _enqueue_scatter_action(runtime, first)
+        assert active_entered.wait(_WAIT_SECONDS)
+        for offset in range(8):
+            _enqueue_scatter_action(
+                runtime,
+                _scatter_action(
+                    binding,
+                    action_id=801 + offset,
+                    commit_timestamp_ns=0,
+                ),
+            )
+        assert runtime.decode_scatter_actions.snapshot().queued_count == 8
+        with pytest.raises(
+            NativeTerminalRuntimeOverflowError,
+            match="exceeded capacity 8",
+        ):
+            _enqueue_scatter_action(
+                runtime,
+                _scatter_action(
+                    binding,
+                    action_id=809,
+                    commit_timestamp_ns=0,
+                ),
+            )
+
+        runtime.begin_abort("decode scatter direct inbox overflow")
+
+        def stop_worker() -> None:
+            """Join the abort drain while the first action remains blocked."""
+
+            try:
+                shutdown_results.append(worker.stop_and_join(_WAIT_SECONDS, abort=True))
+            except BaseException as error:  # noqa: BLE001
+                shutdown_errors.append(error)
+            finally:
+                shutdown_finished.set()
+
+        shutdown_thread = threading.Thread(target=stop_worker, daemon=False)
+        shutdown_thread.start()
+        with worker._condition:
+            assert worker._condition.wait_for(
+                lambda: worker._admission_closed,
+                timeout=_WAIT_SECONDS,
+            )
+        assert not shutdown_finished.is_set()
+
+        release_active.set()
+        shutdown_thread.join(timeout=_WAIT_SECONDS)
+        assert not shutdown_thread.is_alive()
+        assert shutdown_errors == []
+        assert len(shutdown_results) == 1
+        inventory = shutdown_results[0]
+        assert inventory.retained_action_count == 0
+        assert inventory.completed_action_count == 1
+        assert inventory.aborted_action_count == 8
+        assert runtime.snapshot().consumer_pending_count == 0
+    finally:
+        release_active.set()
+        if worker.inventory().thread_alive:
+            worker.stop_and_join(_WAIT_SECONDS, abort=True)
+        _close_standalone_runtime(runtime, abort=True)
 
 
 def test_serving_control_paths_contain_no_polling_sleep_or_collective() -> None:
@@ -976,7 +1591,7 @@ def test_scheduler_adoption_failure_aborts_and_quarantines_exact_request() -> No
     actor_state.fail_adoption = True
     serving.start()
     serving.register_request(registration, manifest)
-    _drive_to_adoption(serving, registration)
+    _drive_to_adoption(serving, registration, actor_state)
 
     with pytest.raises(RuntimeError, match="injected scheduler adoption failure"):
         serving.drain_scheduler_at_loop_entry()
@@ -1000,7 +1615,7 @@ def test_scheduler_callback_failure_after_native_completion_stays_fail_closed() 
         serving,
         runtime,
         _,
-        _,
+        actor_state,
         registration,
         manifest,
         _,
@@ -1021,7 +1636,7 @@ def test_scheduler_callback_failure_after_native_completion_stays_fail_closed() 
     registration = dataclasses.replace(registration, adopt_request=fail_adoption)
     serving.start()
     serving.register_request(registration, manifest)
-    _drive_to_adoption(serving, registration)
+    _drive_to_adoption(serving, registration, actor_state)
 
     with pytest.raises(RuntimeError, match="injected scheduler callback failure"):
         serving.drain_scheduler_at_loop_entry()

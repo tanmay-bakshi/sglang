@@ -167,6 +167,7 @@ def _runtime(
         lifecycle_capacity=16,
         source_gather_capacity=16,
         source_work_capacity=16,
+        decode_scatter_capacity=16,
         decode_work_capacity=16,
         publisher_capacity=16,
         observation_capacity=observation_capacity,
@@ -319,6 +320,7 @@ def _finish_fail_closed(runtime: NativeTerminalRuntime) -> None:
         runtime.lifecycle_actions,
         runtime.source_gather_actions,
         runtime.source_work_actions,
+        runtime.decode_scatter_actions,
         runtime.decode_work_actions,
         runtime.publisher_actions,
     )
@@ -622,7 +624,7 @@ def test_runtime_routes_decode_work_adoption_and_request_coordination() -> None:
             binding_digest,
             NativeTerminalOwnerEventKind.DECODE_WRITER_MANIFEST_COMPLETED,
         )
-        scatter = _drain_actions(runtime.decode_work_actions)
+        scatter = _drain_actions(runtime.decode_scatter_actions)
         assert scatter[0].kind is NativeTerminalOwnerActionKind.DECODE_SCATTER_READY
         runtime.complete_work_action(
             _LOCAL_PRODUCER_ID,
