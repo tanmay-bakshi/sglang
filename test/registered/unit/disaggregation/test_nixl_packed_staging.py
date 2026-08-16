@@ -10,7 +10,7 @@ import threading
 import weakref
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -107,6 +107,35 @@ KEY = PackedChunkKey(
     chunk_id=2,
     request_generation=REQUEST_GENERATION,
 )
+
+
+def test_packed_copy_executor_prioritizes_completion_progress() -> None:
+    """Gather and scatter remain schedulable across model forwards."""
+
+    source_stream = object()
+    scatter_stream = object()
+    with (
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.device",
+            return_value="cuda-device",
+        ),
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.set_device"
+        ) as set_device,
+        patch(
+            "sglang.srt.disaggregation.nixl.packed_staging.torch.cuda.Stream",
+            side_effect=(source_stream, scatter_stream),
+        ) as stream,
+    ):
+        executor = PackedCopyExecutor(gpu_id=3)
+
+    assert executor._source_stream is source_stream
+    assert executor._scatter_stream is scatter_stream
+    set_device.assert_called_once_with(3)
+    assert stream.call_args_list == [
+        call(device="cuda-device", priority=-1),
+        call(device="cuda-device", priority=-1),
+    ]
 
 
 def test_packed_gather_waits_on_exact_producer_event() -> None:

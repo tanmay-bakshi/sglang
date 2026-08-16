@@ -6,7 +6,7 @@ import os
 import threading
 import traceback
 from collections.abc import Callable
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -3747,6 +3747,8 @@ class PackedScatterSubmission:
 class PackedCopyExecutor:
     """Component-aware raw-byte gather and scatter kernel dispatcher."""
 
+    _PROGRESS_STREAM_PRIORITY: ClassVar[int] = -1
+
     _device: torch.device
     _failed_scatter_resources: list[torch.Tensor]
     _gpu_id: int
@@ -3775,8 +3777,18 @@ class PackedCopyExecutor:
             scatter_buffer.data_ptr() if scatter_buffer is not None else None
         )
         torch.cuda.set_device(gpu_id)
-        self._source_stream = torch.cuda.Stream(device=self._device)
-        self._scatter_stream = torch.cuda.Stream(device=self._device)
+        # Completion progress must remain schedulable while the model launches
+        # the next forward. Default-priority copy streams can otherwise sit
+        # behind an entire prefill graph and turn independent ownership into
+        # one-forward-scale latency.
+        self._source_stream = torch.cuda.Stream(
+            device=self._device,
+            priority=self._PROGRESS_STREAM_PRIORITY,
+        )
+        self._scatter_stream = torch.cuda.Stream(
+            device=self._device,
+            priority=self._PROGRESS_STREAM_PRIORITY,
+        )
 
     @property
     def scatter_stream_handle(self) -> int:
