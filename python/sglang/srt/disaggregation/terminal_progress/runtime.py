@@ -153,6 +153,7 @@ class _BoundedFdInbox[ValueT]:
     _wake_armed: bool
     _closed: bool
     _fatal_reason: str | None
+    _forward_independent_handoff_enabled: bool
     _lock: threading.Lock
 
     def __init__(self, name: str, capacity: int) -> None:
@@ -569,6 +570,7 @@ class NativeTerminalRuntime:
         decode_work_capacity: int,
         publisher_capacity: int,
         observation_capacity: int,
+        enable_forward_independent_handoff: bool,
     ) -> None:
         """Construct a dormant runtime and every process-lifetime queue.
 
@@ -589,6 +591,8 @@ class NativeTerminalRuntime:
         :param decode_work_capacity: Decode teardown inbox capacity.
         :param publisher_capacity: Gateway publication inbox capacity.
         :param observation_capacity: Non-gating metrics queue capacity.
+        :param enable_forward_independent_handoff: Whether forward-independent
+            actions may park the scheduler while their Python owners run.
         """
 
         if type(owner_identity) is not NativeTerminalProcessIdentity:
@@ -618,6 +622,8 @@ class NativeTerminalRuntime:
         )
         if any(type(value) is not int or value <= 0 for value in capacities):
             raise ValueError("runtime capacities must be positive integers")
+        if type(enable_forward_independent_handoff) is not bool:
+            raise TypeError("enable_forward_independent_handoff must be bool")
         producers: dict[int, _RuntimeProducer] = {}
         producer_ids_by_name: dict[str, int] = {}
         python_producer_ids_by_authority: dict[
@@ -663,6 +669,8 @@ class NativeTerminalRuntime:
         )
         for spec in producer_specs:
             owner.register_producer(spec.registration)
+        if enable_forward_independent_handoff:
+            owner.enable_forward_independent_handoff()
         stop_read_fd, stop_write_fd = os.pipe()
         os.set_blocking(stop_read_fd, False)
         os.set_blocking(stop_write_fd, False)
@@ -711,6 +719,9 @@ class NativeTerminalRuntime:
         self._output_projection_lock = threading.Lock()
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
+        self._forward_independent_handoff_enabled = (
+            enable_forward_independent_handoff
+        )
         self._output_reactor_alive = False
         self._producers_joined = False
         self._native_observation_delivery_count = 0
@@ -1155,6 +1166,7 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "consumer action is absent, stale, or already acknowledged"
                 )
+            self._complete_forward_independent_handoff_locked(action)
             del self._consumer_pending[action.action_id]
             if action.kind in (
                 NativeTerminalOwnerActionKind.REQUEST_QUARANTINED,
@@ -1231,6 +1243,8 @@ class NativeTerminalRuntime:
             raise NativeTerminalRuntimeError(
                 "consumer action identity aliases another pending action"
             )
+        if action.kind not in _SCHEDULER_ACTIONS:
+            self._complete_forward_independent_handoff_locked(action)
         del self._consumer_pending[action.action_id]
         binding_digest = action.binding.digest
         if action.kind in _SCHEDULER_ACTIONS:
@@ -1247,6 +1261,27 @@ class NativeTerminalRuntime:
             self._scheduler_live.pop(binding_digest, None)
         self._condition.notify_all()
         return True
+
+    def _complete_forward_independent_handoff_locked(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Complete native handoff authority under the consumer ledger lock.
+
+        :param action: Exact non-scheduler action accepted by its sole owner.
+        """
+
+        if not self._forward_independent_handoff_enabled:
+            return
+        if action.kind in _SCHEDULER_ACTIONS:
+            raise NativeTerminalRuntimeError(
+                "scheduler action cannot complete a forward-independent handoff"
+            )
+        try:
+            self._owner.complete_forward_independent_handoff(action)
+        except Exception:  # noqa: BLE001
+            formatted_traceback = traceback.format_exc()
+            self._enter_runtime_fatal_locked(formatted_traceback)
+            raise
 
     def complete_work_action(
         self,

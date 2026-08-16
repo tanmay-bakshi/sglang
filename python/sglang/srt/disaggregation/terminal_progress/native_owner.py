@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 class _NativeTerminalOwnerBridge(Protocol):
     """Typed boundary implemented by the native terminal-owner extension."""
 
+    def enable_forward_independent_handoff(self) -> None:
+        """Enable the process-lifetime CPython scheduler handoff."""
+
     def register_producer(
         self,
         producer_id: int,
@@ -116,6 +119,12 @@ class _NativeTerminalOwnerBridge(Protocol):
         """Consume one exact production action identity.
 
         :param action_id: One-shot native action identity.
+        """
+
+    def complete_forward_independent_handoff(self, action_id: int) -> None:
+        """Complete one action at its owning Python consumer boundary.
+
+        :param action_id: Exact forward-independent native action identity.
         """
 
     def fail_action_delivery(self, action_id: int, reason: str) -> None:
@@ -506,6 +515,11 @@ class NativeTerminalOwner:
             issuer,
         )
 
+    def enable_forward_independent_handoff(self) -> None:
+        """Enable the scheduler GIL handoff before native owner startup."""
+
+        self._native.enable_forward_independent_handoff()
+
     def register_lifecycle(
         self, registration: NativeTerminalLifecycleRegistration
     ) -> None:
@@ -673,6 +687,18 @@ class NativeTerminalOwner:
         if type(action) is not NativeTerminalOwnerAction:
             raise TypeError("action must be NativeTerminalOwnerAction")
         self._native.acknowledge_action(action.action_id)
+
+    def complete_forward_independent_handoff(
+        self, action: NativeTerminalOwnerAction
+    ) -> None:
+        """Release one captured scheduler watermark at exact consumption.
+
+        :param action: Forward-independent action completed by its sole owner.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        self._native.complete_forward_independent_handoff(action.action_id)
 
     def fail_action_delivery(
         self, action: NativeTerminalOwnerAction, reason: str

@@ -640,6 +640,7 @@ def _runtime(
         decode_work_capacity=8,
         publisher_capacity=8,
         observation_capacity=64,
+        enable_forward_independent_handoff=False,
     )
 
 

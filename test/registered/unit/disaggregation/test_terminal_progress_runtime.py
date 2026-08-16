@@ -171,6 +171,7 @@ def _runtime(
         decode_work_capacity=16,
         publisher_capacity=16,
         observation_capacity=observation_capacity,
+        enable_forward_independent_handoff=False,
     )
     return runtime, owner, remote
 

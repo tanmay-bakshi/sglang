@@ -617,6 +617,7 @@ class TerminalRankRuntimeEnrollmentFactory:
                 decode_work_capacity=config.decode_work_capacity,
                 publisher_capacity=config.publisher_capacity,
                 observation_capacity=config.observation_capacity,
+                enable_forward_independent_handoff=True,
             )
             cuda_source: CudaTerminalProducer | None = None
             cuda_scatter: CudaTerminalProducer | None = None
