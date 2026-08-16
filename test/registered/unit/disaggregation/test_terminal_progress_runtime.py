@@ -280,6 +280,9 @@ def _submit_direct_source_gather(
 ) -> None:
     """Earn one source-gather action through the real native reducer.
 
+    Event enqueue time ends at the frozen owner clock so native completion
+    remains causally ordered without advancing the timeout test's clock.
+
     :param owner: Running deterministic source owner.
     :param registration: Exact source lifecycle.
     """
@@ -295,7 +298,7 @@ def _submit_direct_source_gather(
                 producer_id=_LOCAL_PRODUCER_ID,
                 binding_digest=registration.binding.digest,
                 kind=kind,
-                enqueued_ns=_TEST_CLOCK_NS + offset,
+                enqueued_ns=_TEST_CLOCK_NS - 1 + offset,
             )
         )
 
