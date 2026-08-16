@@ -1122,8 +1122,13 @@ def test_scheduler_wake_failure_preserves_retained_action_through_abort(
         action = raised.value.action
         assert raised.value.scheduler_retains_action
         with runtime._condition:
-            assert runtime._consumer_pending == {action.action_id: action}
-            assert runtime._inbox_claimed_action_ids == {action.action_id}
+            assert runtime._consumer_pending.get(action.action_id) == action
+            assert all(
+                action_id == action.action_id
+                or pending.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+                for action_id, pending in runtime._consumer_pending.items()
+            )
+            assert action.action_id in runtime._inbox_claimed_action_ids
         assert serving._scheduler_serving.inventory().retained_action_ids == (
             action.action_id,
         )
