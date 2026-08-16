@@ -1,3 +1,4 @@
+import abc
 import collections
 import dataclasses
 import enum
@@ -10,6 +11,7 @@ import time
 import traceback
 from collections.abc import Callable, Sequence
 from types import TracebackType
+from typing import final
 
 from sglang.srt.disaggregation.terminal_progress.native_owner import (
     NativeTerminalOwner,
@@ -45,6 +47,45 @@ class NativeTerminalRuntimeClosedError(NativeTerminalRuntimeError):
 
 class NativeTerminalRuntimeOverflowError(NativeTerminalRuntimeError):
     """A bounded runtime-owned action queue crossed its frozen capacity."""
+
+
+class NativeTerminalDeliveryLeaseDisposition(enum.StrEnum):
+    """Result of establishing source delivery authority before native claim."""
+
+    ACQUIRED = "acquired"
+    SCHEDULER_FATAL_DRAIN = "scheduler_fatal_drain"
+
+
+class NativeTerminalSourceDeliveryAuthority(abc.ABC):
+    """Atomic source authority for delivery leases and functional admission."""
+
+    _functional_admission_closed: bool
+    _lock: threading.Lock
+
+    def __init__(self) -> None:
+        """Construct one open source delivery authority."""
+
+        self._functional_admission_closed = False
+        self._lock = threading.Lock()
+
+    @abc.abstractmethod
+    def acquire_for_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalDeliveryLeaseDisposition:
+        """Establish source delivery authority before native claim.
+
+        :param actions: Exact action population about to cross inbox delivery.
+        :returns: Whether normal lease authority or scheduler-fatal drain owns
+            the population.
+        """
+
+    @final
+    def close_functional_admission(self) -> None:
+        """Prevent another source side effect from crossing functional start."""
+
+        with self._lock:
+            self._functional_admission_closed = True
 
 
 class NativeTerminalActionClaimError(NativeTerminalRuntimeError):
@@ -754,9 +795,7 @@ class NativeTerminalRuntime:
     _disposition: NativeTerminalRuntimeDisposition
     _fatal_reason: str | None
     _forward_independent_handoff_enabled: bool
-    _source_delivery_lease_acquirer: (
-        Callable[[tuple[NativeTerminalOwnerAction, ...]], None] | None
-    )
+    _source_delivery_authority: NativeTerminalSourceDeliveryAuthority | None
     _output_reactor_alive: bool
     _producers_joined: bool
     _native_observation_delivery_count: int
@@ -958,7 +997,7 @@ class NativeTerminalRuntime:
         self._disposition = NativeTerminalRuntimeDisposition.CREATED
         self._fatal_reason = None
         self._forward_independent_handoff_enabled = enable_forward_independent_handoff
-        self._source_delivery_lease_acquirer = None
+        self._source_delivery_authority = None
         self._output_reactor_alive = False
         self._producers_joined = False
         self._native_observation_delivery_count = 0
@@ -1136,32 +1175,32 @@ class NativeTerminalRuntime:
 
         return self._forward_independent_handoff_enabled
 
-    def bind_source_delivery_lease_acquirer(
+    def bind_source_delivery_authority(
         self,
-        acquirer: Callable[[tuple[NativeTerminalOwnerAction, ...]], None],
+        authority: NativeTerminalSourceDeliveryAuthority,
     ) -> None:
-        """Bind the source launch-exclusion owner before runtime start.
+        """Bind the atomic source delivery owner before runtime start.
 
-        :param acquirer: Batch boundary which establishes every request lease
-            before the corresponding native handoff claims are released.
+        :param authority: One owner for both causal leases and the functional
+            admission gate closed by runtime fatality.
         """
 
-        if not callable(acquirer):
-            raise TypeError("acquirer must be callable")
+        if not isinstance(authority, NativeTerminalSourceDeliveryAuthority):
+            raise TypeError("authority must be NativeTerminalSourceDeliveryAuthority")
         with self._condition:
             if self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE:
                 raise NativeTerminalRuntimeError(
-                    "source delivery leases require a source runtime"
+                    "source delivery authority requires a source runtime"
                 )
             if self._disposition is not NativeTerminalRuntimeDisposition.CREATED:
                 raise NativeTerminalRuntimeClosedError(
-                    "source delivery lease owner must bind before start"
+                    "source delivery authority must bind before start"
                 )
-            if self._source_delivery_lease_acquirer is not None:
+            if self._source_delivery_authority is not None:
                 raise NativeTerminalRuntimeError(
-                    "source delivery lease owner was already bound"
+                    "source delivery authority was already bound"
                 )
-            self._source_delivery_lease_acquirer = acquirer
+            self._source_delivery_authority = authority
 
     def start(self) -> None:
         """Start the native owner and its sole output consumer exactly once."""
@@ -1169,13 +1208,13 @@ class NativeTerminalRuntime:
         with self._condition:
             if self._disposition is not NativeTerminalRuntimeDisposition.CREATED:
                 raise NativeTerminalRuntimeClosedError("runtime cannot restart")
-            if (
+            source_handoff = (
                 self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
                 and self._forward_independent_handoff_enabled
-                and self._source_delivery_lease_acquirer is None
-            ):
+            )
+            if source_handoff and self._source_delivery_authority is None:
                 raise NativeTerminalRuntimeError(
-                    "source runtime lacks a causal delivery lease owner"
+                    "source runtime lacks a delivery authority"
                 )
             self._owner.start()
             self._disposition = NativeTerminalRuntimeDisposition.RUNNING
@@ -1864,17 +1903,31 @@ class NativeTerminalRuntime:
             and self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
             and self._forward_independent_handoff_enabled
         ):
-            acquirer = self._source_delivery_lease_acquirer
-            if acquirer is None:
+            authority = self._source_delivery_authority
+            if authority is None:
                 claim_error = NativeTerminalRuntimeError(
-                    "source delivery lease owner disappeared after startup"
+                    "source delivery authority disappeared after startup"
                 )
                 claim_traceback = str(claim_error)
                 with self._condition:
                     self._enter_runtime_fatal_locked(claim_traceback)
             else:
                 try:
-                    acquirer(lease_actions)
+                    lease_disposition = authority.acquire_for_actions(lease_actions)
+                    if type(lease_disposition) is not (
+                        NativeTerminalDeliveryLeaseDisposition
+                    ):
+                        raise TypeError(
+                            "source delivery lease owner returned an invalid "
+                            "disposition"
+                        )
+                    if lease_disposition is (
+                        NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
+                    ):
+                        with self._condition:
+                            self._enter_runtime_fatal_locked(
+                                "source delivery entered scheduler-fatal drain"
+                            )
                 except Exception as error:  # noqa: BLE001
                     claim_error = error
                     claim_traceback = traceback.format_exc()
@@ -2794,6 +2847,14 @@ class NativeTerminalRuntime:
         """
 
         if self._fatal_reason is None:
+            authority = self._source_delivery_authority
+            if authority is not None:
+                # This sealed base operation takes only the authority lock.
+                # Closing it before fatal publication makes callback start and
+                # fatal transition one linearizable decision.
+                NativeTerminalSourceDeliveryAuthority.close_functional_admission(
+                    authority
+                )
             self._fatal_reason = reason
         if self._disposition is not NativeTerminalRuntimeDisposition.ABORT_DRAINING:
             self._disposition = NativeTerminalRuntimeDisposition.PROCESS_FATAL

@@ -476,6 +476,28 @@ def test_delivery_intent_uses_independent_lock_and_rejects_forgery() -> None:
     inbox.close_fail_closed()
 
 
+def test_delivery_intent_may_outlive_reclaim_consumption() -> None:
+    """Post-reclaim delivery remains a valid launch exclusion and inventory."""
+
+    inbox = TerminalReceiptInbox(physical_capacity=1)
+    binding = _binding(room_id=65, marker=25)
+    receipt = _receipt(binding, marker=35)
+    inbox.register_live(binding)
+    intent = inbox.begin_delivery_intent(binding)
+    inbox.publish(receipt)
+
+    assert inbox.drain_at_loop_entry(lambda value: None) == (receipt,)
+    inventory = inbox.inventory()
+    assert inventory.live_bindings == ()
+    assert inventory.active_delivery_intents == (intent,)
+
+    fatal_inventory = inbox.mark_owner_dead()
+    assert fatal_inventory.fatal_cause is SchedulerInboxFatalCause.OWNER_DEATH
+    assert fatal_inventory.active_delivery_intents == (intent,)
+    inbox.complete_delivery_intent(intent)
+    inbox.close_fail_closed()
+
+
 def test_owner_death_releases_blocked_launch_into_fatal_without_submission() -> None:
     """A fatal owner wakes an excluded launch into the sticky fatal path."""
 

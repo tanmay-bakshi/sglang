@@ -872,6 +872,7 @@ def test_manager_owned_fatal_teardown_detaches_scheduler_poll_target() -> None:
     order: list[str] = []
     manager = _ManagerOwnedClose(serving, order, sleeper)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_source_serving = None
     scheduler.terminal_scheduler_serving = serving
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = sleeper
@@ -902,6 +903,7 @@ def test_scheduler_release_orders_manager_metrics_and_host_resources() -> None:
     order: list[str] = []
     manager = _ManagerOwnedClose(serving, order)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_source_serving = None
     scheduler.terminal_scheduler_serving = serving
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = None
@@ -937,6 +939,7 @@ def test_fatal_scheduler_release_retains_host_resources() -> None:
     order: list[str] = []
     manager = _ManagerOwnedClose(serving, order)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_source_serving = None
     scheduler.terminal_scheduler_serving = serving
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = None
@@ -968,6 +971,7 @@ def test_terminal_close_failure_still_stops_metrics_and_skips_host_release() -> 
     order: list[str] = []
     manager = _FailingManagerClose(order)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_source_serving = None
     scheduler.terminal_scheduler_serving = None
     scheduler.terminal_decode_serving_composition = None
     scheduler.idle_sleeper = None
@@ -1130,12 +1134,37 @@ def test_scheduler_source_binder_selects_serving_scheduler_boundary() -> None:
     serving._scheduler_serving = scheduler_serving
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+    scheduler.terminal_source_serving = None
     scheduler.terminal_scheduler_serving = None
     scheduler.idle_sleeper = None
 
     Scheduler.bind_terminal_source_serving(scheduler, serving)
 
+    assert scheduler.terminal_source_serving is serving
     assert scheduler.terminal_scheduler_serving is scheduler_serving
+
+
+def test_production_source_owner_death_callback_enters_composed_abort() -> None:
+    """The installed source callback makes runtime abort precede scheduler death."""
+
+    source_serving = MagicMock(spec=PackedTerminalSourceServing)
+    scheduler_serving = MagicMock(spec=TerminalSchedulerServing)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.terminal_source_serving = source_serving
+    scheduler.terminal_scheduler_serving = scheduler_serving
+    installation = NixlTerminalRuntimeInstallation(
+        terminal_request_capacity=1,
+        gateway_endpoint=None,
+        bind_source_serving=None,
+        bind_decode_serving=None,
+        scheduler_process_fatal_handler=lambda inventory: None,
+        owner_dead_handler=scheduler.mark_terminal_owner_dead,
+    )
+
+    installation.owner_dead_handler()
+
+    source_serving.begin_fail_closed_abort.assert_called_once_with()
+    scheduler_serving.mark_owner_dead.assert_not_called()
 
 
 def test_scheduler_decode_binder_composes_queue_and_scheduler_atomically() -> None:

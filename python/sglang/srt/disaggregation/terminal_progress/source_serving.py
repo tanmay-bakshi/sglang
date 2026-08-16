@@ -32,10 +32,12 @@ from sglang.srt.disaggregation.terminal_progress.publisher import (
 from sglang.srt.disaggregation.terminal_progress.receipts import TerminalReceipt
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalActionClaimError,
+    NativeTerminalDeliveryLeaseDisposition,
     NativeTerminalObservation,
     NativeTerminalRuntime,
     NativeTerminalRuntimeDisposition,
     NativeTerminalRuntimeSnapshot,
+    NativeTerminalSourceDeliveryAuthority,
 )
 from sglang.srt.disaggregation.terminal_progress.scheduler_inbox import (
     SchedulerReceiptInboxInventory,
@@ -49,6 +51,7 @@ from sglang.srt.disaggregation.terminal_progress.scheduler_serving import (
     TerminalSchedulerServingRole,
 )
 from sglang.srt.disaggregation.terminal_progress.source_gather_worker import (
+    PackedTerminalSourceGatherConsumptionDisposition,
     PackedTerminalSourceGatherWorker,
     PackedTerminalSourceGatherWorkerInventory,
 )
@@ -78,6 +81,9 @@ _SOURCE_CAUSAL_DELIVERY_ACTIONS = frozenset(
         NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY,
         NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
     )
+)
+_SOURCE_FUNCTIONAL_ACTIONS = _SOURCE_CAUSAL_DELIVERY_ACTIONS | frozenset(
+    (NativeTerminalOwnerActionKind.SOURCE_ACK_READY,)
 )
 
 
@@ -263,11 +269,14 @@ class PackedTerminalSourceDeliveryLeaseInventory:
     :ivar outcomes_sent_binding_digests: Active requests with durable outcomes.
     :ivar publication_owned_binding_digests: Active requests whose publication
         has a durable owner.
+    :ivar active_functional_actions: Exact actions whose side effects won the
+        linearizable functional-start boundary and have not returned.
     """
 
     active_binding_digests: tuple[bytes, ...]
     outcomes_sent_binding_digests: tuple[bytes, ...]
     publication_owned_binding_digests: tuple[bytes, ...]
+    active_functional_actions: tuple[NativeTerminalOwnerAction, ...]
 
     def __post_init__(self) -> None:
         """Validate one exact causal-delivery inventory."""
@@ -294,6 +303,29 @@ class PackedTerminalSourceDeliveryLeaseInventory:
             raise ValueError("outcome milestones require active delivery leases")
         if not set(self.publication_owned_binding_digests).issubset(active):
             raise ValueError("publication milestones require active delivery leases")
+        if type(self.active_functional_actions) is not tuple or any(
+            type(action) is not NativeTerminalOwnerAction
+            for action in self.active_functional_actions
+        ):
+            raise TypeError(
+                "active_functional_actions must contain native terminal actions"
+            )
+        action_ids = tuple(
+            action.action_id for action in self.active_functional_actions
+        )
+        if action_ids != tuple(sorted(set(action_ids))):
+            raise ValueError("active functional action identities must be unique")
+        if any(
+            action.kind not in _SOURCE_FUNCTIONAL_ACTIONS
+            for action in self.active_functional_actions
+        ):
+            raise ValueError("active functional inventory contains another action kind")
+        if any(
+            action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS
+            and action.binding.digest not in active
+            for action in self.active_functional_actions
+        ):
+            raise ValueError("causal functional action lacks an active delivery lease")
 
 
 @dataclasses.dataclass(slots=True)
@@ -304,12 +336,16 @@ class _PackedTerminalSourceDeliveryLeaseRecord:
     :ivar lease: Take-once scheduler launch exclusion.
     :ivar outcomes_sent: Whether ``SOURCE_OUTCOMES_SENT`` committed.
     :ivar publication_owned: Whether gateway publication has a durable owner.
+    :ivar active_action_ids: Causal side effects which crossed functional start.
+    :ivar release_requested: Whether fail-closed ownership supersedes milestones.
     """
 
     binding: TerminalRequestBinding
     lease: TerminalSchedulerDeliveryLease
     outcomes_sent: bool = False
     publication_owned: bool = False
+    active_action_ids: set[int] = dataclasses.field(default_factory=set)
+    release_requested: bool = False
 
     def __post_init__(self) -> None:
         """Validate one live source delivery record."""
@@ -324,13 +360,22 @@ class _PackedTerminalSourceDeliveryLeaseRecord:
             raise TypeError("outcomes_sent must be bool")
         if type(self.publication_owned) is not bool:
             raise TypeError("publication_owned must be bool")
+        if type(self.active_action_ids) is not set or any(
+            type(action_id) is not int or action_id < 0
+            for action_id in self.active_action_ids
+        ):
+            raise TypeError("active_action_ids must contain non-negative integers")
+        if type(self.release_requested) is not bool:
+            raise TypeError("release_requested must be bool")
 
 
-class _PackedTerminalSourceDeliveryLeases:
+class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority):
     """Transfer native handoff authority into request-scoped launch intents."""
 
     _scheduler_serving: TerminalSchedulerServing
     _records: dict[PackedRequestKey, _PackedTerminalSourceDeliveryLeaseRecord]
+    _active_functional_actions: dict[int, NativeTerminalOwnerAction]
+    _functional_admission_closed: bool
     _process_fatal: bool
     _scheduler_fatal: bool
     _lock: threading.Lock
@@ -345,19 +390,22 @@ class _PackedTerminalSourceDeliveryLeases:
             raise TypeError("scheduler_serving must be TerminalSchedulerServing")
         if scheduler_serving.role is not TerminalSchedulerServingRole.SOURCE:
             raise ValueError("source delivery leases require source scheduler serving")
+        super().__init__()
         self._scheduler_serving = scheduler_serving
         self._records = {}
+        self._active_functional_actions = {}
         self._process_fatal = False
         self._scheduler_fatal = False
-        self._lock = threading.Lock()
 
     def acquire_for_actions(
         self,
         actions: tuple[NativeTerminalOwnerAction, ...],
-    ) -> None:
+    ) -> NativeTerminalDeliveryLeaseDisposition:
         """Establish every request intent before native claims are released.
 
         :param actions: Exact action population about to cross inbox delivery.
+        :returns: Whether normal lease authority or scheduler-fatal drain owns
+            the population.
         """
 
         if type(actions) is not tuple or any(
@@ -365,7 +413,7 @@ class _PackedTerminalSourceDeliveryLeases:
         ):
             raise TypeError("actions must contain native terminal actions")
         try:
-            self._acquire_for_actions(actions)
+            return self._acquire_for_actions(actions)
         except Exception as error:
             formatted_traceback = traceback.format_exc()
             try:
@@ -382,10 +430,12 @@ class _PackedTerminalSourceDeliveryLeases:
     def _acquire_for_actions(
         self,
         actions: tuple[NativeTerminalOwnerAction, ...],
-    ) -> None:
+    ) -> NativeTerminalDeliveryLeaseDisposition:
         """Allocate one prevalidated request batch under the registry lock.
 
         :param actions: Exact action population about to cross inbox delivery.
+        :returns: Whether normal lease authority or scheduler-fatal drain owns
+            the population.
         """
 
         bindings: dict[PackedRequestKey, TerminalRequestBinding] = {}
@@ -403,11 +453,13 @@ class _PackedTerminalSourceDeliveryLeases:
                 raise RuntimeError("delivery batch aliases a request generation")
             bindings[request_key] = binding
             action_kinds.setdefault(request_key, set()).add(action.kind)
-        if len(bindings) == 0:
-            return
         with self._lock:
+            if self._scheduler_fatal:
+                return NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
             if self._process_fatal:
                 raise RuntimeError("source delivery lease owner is process-fatal")
+            if len(bindings) == 0:
+                return NativeTerminalDeliveryLeaseDisposition.ACQUIRED
             for request_key, binding in bindings.items():
                 existing = self._records.get(request_key)
                 if existing is not None and existing.binding != binding:
@@ -444,6 +496,7 @@ class _PackedTerminalSourceDeliveryLeases:
                             allocated.lease.complete()
                     raise RuntimeError("delivery lease changed during allocation")
                 self._records[request_key] = record
+            return NativeTerminalDeliveryLeaseDisposition.ACQUIRED
 
     def _retain_failure_barrier(
         self,
@@ -464,15 +517,16 @@ class _PackedTerminalSourceDeliveryLeases:
             for action in actions
             if action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS
         )
-        if len(causal) == 0:
-            raise RuntimeError("delivery failure lacks a causal source action")
-        binding = causal[0].binding.to_binding()
         with self._lock:
             if self._scheduler_fatal:
                 return
+            self._functional_admission_closed = True
             self._process_fatal = True
             if len(self._records) > 0:
                 return
+            if len(causal) == 0:
+                raise RuntimeError("delivery failure lacks a causal source action")
+            binding = causal[0].binding.to_binding()
             self._records[binding.request_key] = (
                 _PackedTerminalSourceDeliveryLeaseRecord(
                     binding=binding,
@@ -492,6 +546,54 @@ class _PackedTerminalSourceDeliveryLeases:
                 raise RuntimeError("source delivery outcomes committed twice")
             record.outcomes_sent = True
             self._complete_ready_locked(record)
+
+    def begin_functional_action(self, action: NativeTerminalOwnerAction) -> bool:
+        """Linearize one side-effect start against scheduler-fatal ownership.
+
+        :param action: Exact action about to invoke a functional callback.
+        :returns: Whether functional work owns the action and may begin.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be a native terminal action")
+        if action.kind not in _SOURCE_FUNCTIONAL_ACTIONS:
+            raise ValueError("action kind has no source functional side effect")
+        with self._lock:
+            if self._functional_admission_closed or self._scheduler_fatal:
+                return False
+            if self._process_fatal:
+                raise RuntimeError("source delivery lease owner is process-fatal")
+            if action.action_id in self._active_functional_actions:
+                raise RuntimeError("source functional action started twice")
+            if action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS:
+                record = self._require_record_locked(action.binding.to_binding())
+                record.active_action_ids.add(action.action_id)
+            self._active_functional_actions[action.action_id] = action
+            return True
+
+    def finish_functional_action(self, action: NativeTerminalOwnerAction) -> None:
+        """Release exact in-flight authority after its callback returns.
+
+        :param action: Exact action whose functional callback reached terminality.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be a native terminal action")
+        with self._lock:
+            active = self._active_functional_actions.get(action.action_id)
+            if active != action:
+                raise RuntimeError("source functional action is not active")
+            if action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS:
+                record = self._require_record_locked(action.binding.to_binding())
+                if action.action_id not in record.active_action_ids:
+                    raise RuntimeError(
+                        "causal delivery record lost functional authority"
+                    )
+                record.active_action_ids.remove(action.action_id)
+                del self._active_functional_actions[action.action_id]
+                self._complete_ready_locked(record)
+                return
+            del self._active_functional_actions[action.action_id]
 
     def mark_publication_owned(self, binding: TerminalRequestBinding) -> None:
         """Commit durable gateway ownership and release a complete join.
@@ -521,21 +623,21 @@ class _PackedTerminalSourceDeliveryLeases:
                 return False
             if record.binding != binding:
                 raise RuntimeError("quarantine aliases a delivery lease generation")
-            record.lease.complete()
-            del self._records[binding.request_key]
+            record.release_requested = True
+            self._complete_ready_locked(record)
             return True
 
     def release_process_fatal(self) -> None:
         """Release every intent after scheduler process-fatal became sticky."""
 
         with self._lock:
+            self._functional_admission_closed = True
             self._process_fatal = True
             self._scheduler_fatal = True
             records = tuple(self._records.values())
             for record in records:
-                if record.lease.active:
-                    record.lease.complete()
-            self._records.clear()
+                record.release_requested = True
+                self._complete_ready_locked(record)
 
     def inventory(self) -> PackedTerminalSourceDeliveryLeaseInventory:
         """Return every active request and committed join milestone.
@@ -545,6 +647,12 @@ class _PackedTerminalSourceDeliveryLeases:
 
         with self._lock:
             records = tuple(self._records.values())
+            functional_actions = tuple(
+                sorted(
+                    self._active_functional_actions.values(),
+                    key=lambda action: action.action_id,
+                )
+            )
         return PackedTerminalSourceDeliveryLeaseInventory(
             active_binding_digests=tuple(
                 sorted(record.binding.digest for record in records)
@@ -561,6 +669,7 @@ class _PackedTerminalSourceDeliveryLeases:
                     if record.publication_owned
                 )
             ),
+            active_functional_actions=functional_actions,
         )
 
     def _require_record_locked(
@@ -589,7 +698,11 @@ class _PackedTerminalSourceDeliveryLeases:
         :param record: Exact active delivery record.
         """
 
-        if not record.outcomes_sent or not record.publication_owned:
+        if len(record.active_action_ids) > 0:
+            return
+        if not record.release_requested and (
+            not record.outcomes_sent or not record.publication_owned
+        ):
             return
         record.lease.complete()
         del self._records[record.binding.request_key]
@@ -849,6 +962,7 @@ class PackedTerminalSourceServingInventory:
                 self.scheduler_serving.inbox.live_count,
                 len(self.scheduler_serving.retained_action_ids),
                 len(self.delivery_leases.active_binding_digests),
+                len(self.delivery_leases.active_functional_actions),
                 self.gather_worker.retained_action_count,
                 int(self.gather_worker.fatal_reason is not None),
                 self.grouped_nixl.active_group_count,
@@ -1004,7 +1118,7 @@ class PackedTerminalSourceServing:
             source_consumer=scheduler_consumer,
         )
         delivery_leases = _PackedTerminalSourceDeliveryLeases(scheduler_serving)
-        runtime.bind_source_delivery_lease_acquirer(delivery_leases.acquire_for_actions)
+        runtime.bind_source_delivery_authority(delivery_leases)
         self._runtime = runtime
         self._wiring = wiring
         self._scheduler_consumer = scheduler_consumer
@@ -1138,8 +1252,7 @@ class PackedTerminalSourceServing:
                 self._scheduler_consumer.cancel_unpublished(binding)
                 self._scheduler_serving.cancel_unpublished_request(binding)
                 raise
-            self._mark_owner_dead()
-            self._runtime.begin_abort()
+            self.begin_fail_closed_abort()
             raise
 
     def attach_producer_completion(
@@ -1171,6 +1284,14 @@ class PackedTerminalSourceServing:
         """
 
         self._require_open()
+        return self._drain_runtime_actions()
+
+    def _drain_runtime_actions(self) -> int:
+        """Drain runtime authority while normal or fail-closed ownership is live.
+
+        :returns: Total immutable actions and observations consumed.
+        """
+
         actions: _PackedTerminalSourceRuntimeActionBatch | None = None
         execution: _PackedTerminalSourceRuntimeActionExecution | None = None
         try:
@@ -1434,7 +1555,7 @@ class PackedTerminalSourceServing:
         :returns: Final combined fail-closed inventory before descriptors close.
         """
 
-        self._require_open()
+        self._require_not_closed()
         self._runtime.begin_abort()
         shutdown_timeout: float = terminal_deadline_spec(
             TerminalDeadlineKind.OWNER_SHUTDOWN_DRAIN
@@ -1457,7 +1578,7 @@ class PackedTerminalSourceServing:
         self._mark_owner_dead()
         if not self._runtime.wait_for_output_projection_quiescence(shutdown_timeout):
             raise RuntimeError("abort retained unrouted source terminal authority")
-        self.drain_runtime_actions()
+        self._drain_runtime_actions()
         scheduler_closure = self._scheduler_serving.close_fail_closed()
         wiring_closure = self._wiring.take_fail_closed_closure()
         self._surrender_fail_closed_downstream_actions(
@@ -1534,7 +1655,9 @@ class PackedTerminalSourceServing:
         preserves every live request for process teardown quarantine.
         """
 
-        self._require_open()
+        self._require_not_closed()
+        if self._runtime.forward_independent_handoff_enabled:
+            self._delivery_leases.close_functional_admission()
         self._runtime.begin_abort()
         self._mark_owner_dead()
 
@@ -1660,7 +1783,6 @@ class PackedTerminalSourceServing:
                 if not error.scheduler_retains_action:
                     self._runtime.fail_scheduler_action(action, reason)
                 execution.transfer(action)
-                self._mark_owner_dead()
                 raise
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 reason = (
@@ -1669,27 +1791,8 @@ class PackedTerminalSourceServing:
                 )
                 self._runtime.fail_scheduler_action(action, reason)
                 execution.transfer(action)
-                self._mark_owner_dead()
                 raise
             execution.transfer(action)
-
-    def _drain_source_work_actions(self) -> int:
-        """Execute ACKs before outcomes on the forward-independent reactor.
-
-        :returns: Number of actions consumed or aborted.
-        """
-
-        actions = self._runtime.source_work_actions.drain()
-        execution = _PackedTerminalSourceRuntimeActionExecution(
-            _PackedTerminalSourceRuntimeActionBatch(
-                scheduler=(),
-                source_work=actions,
-                publisher=(),
-                lifecycle=(),
-            )
-        )
-        self._consume_source_work_actions(actions, execution)
-        return len(actions)
 
     def _consume_source_work_actions(
         self,
@@ -1719,7 +1822,16 @@ class PackedTerminalSourceServing:
                 self._runtime.acknowledge_aborted_action(action)
                 execution.transfer(action)
                 continue
+            functional_started = False
             try:
+                if self._runtime.forward_independent_handoff_enabled:
+                    functional_started = self._delivery_leases.begin_functional_action(
+                        action
+                    )
+                    if not functional_started:
+                        self._runtime.acknowledge_aborted_action(action)
+                        execution.transfer(action)
+                        continue
                 if action.kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
                     self._wiring.consume_outcome_ready(action, self._work.send_outcomes)
                     if self._runtime.forward_independent_handoff_enabled:
@@ -1732,18 +1844,32 @@ class PackedTerminalSourceServing:
                     raise RuntimeError("source work inbox carried another action kind")
             except (OSError, RuntimeError, TypeError, ValueError):
                 logger.error("Source work action failed:\n%s", traceback.format_exc())
-                self._mark_owner_dead()
-                self._runtime.begin_abort()
                 raise
+            finally:
+                if functional_started:
+                    self._delivery_leases.finish_functional_action(action)
             execution.transfer(action)
 
-    def _consume_gather_action(self, action: NativeTerminalOwnerAction) -> None:
+    def _consume_gather_action(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> PackedTerminalSourceGatherConsumptionDisposition:
         """Consume one direct-inbox gather on its dedicated worker thread.
 
         :param action: Exact native ``SOURCE_GATHER_READY`` authority.
+        :returns: Whether the callback ran or fail-closed admission won.
         """
 
-        self._wiring.consume_gather_ready(action, self._work.post_gather)
+        if not self._runtime.forward_independent_handoff_enabled:
+            self._wiring.consume_gather_ready(action, self._work.post_gather)
+            return PackedTerminalSourceGatherConsumptionDisposition.CONSUMED
+        if not self._delivery_leases.begin_functional_action(action):
+            return PackedTerminalSourceGatherConsumptionDisposition.ABORTED
+        try:
+            self._wiring.consume_gather_ready(action, self._work.post_gather)
+        finally:
+            self._delivery_leases.finish_functional_action(action)
+        return PackedTerminalSourceGatherConsumptionDisposition.CONSUMED
 
     def _gather_worker_failed(
         self,
@@ -1786,8 +1912,6 @@ class PackedTerminalSourceServing:
                     "Grouped NIXL lifecycle ingress failed:\n%s",
                     traceback.format_exc(),
                 )
-                self._mark_owner_dead()
-                self._runtime.begin_abort()
                 raise
         return len(results)
 
@@ -1807,7 +1931,16 @@ class PackedTerminalSourceServing:
                 self._runtime.acknowledge_aborted_action(action)
                 execution.transfer(action)
                 continue
+            functional_started = False
             try:
+                if self._runtime.forward_independent_handoff_enabled:
+                    functional_started = self._delivery_leases.begin_functional_action(
+                        action
+                    )
+                    if not functional_started:
+                        self._runtime.acknowledge_aborted_action(action)
+                        execution.transfer(action)
+                        continue
                 self._wiring.consume_gateway_publication_ready(action)
                 execution.transfer(action)
                 if self._runtime.forward_independent_handoff_enabled:
@@ -1820,16 +1953,15 @@ class PackedTerminalSourceServing:
                     "Source publication retained exact authority on failure:\n%s",
                     traceback.format_exc(),
                 )
-                self._mark_owner_dead()
-                self._runtime.begin_abort()
                 raise
             except (OSError, RuntimeError, TypeError, ValueError):
                 logger.error(
                     "Source publication action failed:\n%s", traceback.format_exc()
                 )
-                self._mark_owner_dead()
-                self._runtime.begin_abort()
                 raise
+            finally:
+                if functional_started:
+                    self._delivery_leases.finish_functional_action(action)
 
     def _consume_lifecycle_actions(
         self,
@@ -1867,16 +1999,12 @@ class PackedTerminalSourceServing:
                         "Source lifecycle quarantine retained exact authority:\n%s",
                         traceback.format_exc(),
                     )
-                    self._mark_owner_dead()
-                    self._runtime.begin_abort()
                     raise
                 except (OSError, RuntimeError, TypeError, ValueError):
                     logger.error(
                         "Source lifecycle quarantine failed:\n%s",
                         traceback.format_exc(),
                     )
-                    self._mark_owner_dead()
-                    self._runtime.begin_abort()
                     raise
                 execution.transfer(action)
                 continue
@@ -1894,8 +2022,6 @@ class PackedTerminalSourceServing:
                     "Source lifecycle retirement failed:\n%s",
                     traceback.format_exc(),
                 )
-                self._mark_owner_dead()
-                self._runtime.begin_abort()
                 raise
             execution.transfer(action)
 
@@ -1932,11 +2058,17 @@ class PackedTerminalSourceServing:
             self._mark_owner_dead()
 
     def _mark_owner_dead(self) -> None:
-        """Publish one sticky scheduler wake for runtime or component death."""
+        """Publish scheduler death only after runtime abort is irrevocable."""
 
+        if not self._aborting:
+            raise RuntimeError(
+                "source owner death cannot precede runtime fail-closed state"
+            )
         with self._lock:
             if self._owner_dead_marked:
                 return
+            if self._runtime.forward_independent_handoff_enabled:
+                self._delivery_leases.close_functional_admission()
             self._scheduler_serving.mark_owner_dead()
             if self._runtime.forward_independent_handoff_enabled:
                 self._delivery_leases.release_process_fatal()
@@ -1948,3 +2080,10 @@ class PackedTerminalSourceServing:
         with self._lock:
             if not self._started or self._closed:
                 raise RuntimeError("source serving is not open")
+
+    def _require_not_closed(self) -> None:
+        """Require a constructed composition whose owners remain closeable."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("source serving is closed")

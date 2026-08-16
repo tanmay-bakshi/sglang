@@ -59,7 +59,9 @@ class SchedulerReceiptInboxInventory:
     :ivar pending_request_keys: FIFO request generations queued for handling.
     :ivar consuming_request_keys: Request generations inside the consumer call.
     :ivar outstanding_publications: Producer calls announced but not returned.
-    :ivar active_delivery_intents: Exact external launch exclusions.
+    :ivar active_delivery_intents: Exact external launch exclusions. An intent
+        may outlive its scheduler-live generation after reclaim consumption and
+        until the independent delivery owner commits its terminal milestone.
     :ivar wake_armed: Whether the readable fd carries an unconsumed wake hint.
     :ivar fatal_cause: First process-fatal invariant violation, when present.
     :ivar closed: Whether the runtime descriptors are closed.
@@ -134,8 +136,6 @@ class SchedulerReceiptInboxInventory:
             raise ValueError("delivery intent identities must be unique")
         if len(set(delivery_keys)) != len(delivery_keys):
             raise ValueError("delivery request generations must be unique")
-        if not set(delivery_keys).issubset(set(live_keys)):
-            raise ValueError("every delivery request generation must be live")
         if len(delivery_keys) > self.physical_capacity:
             raise ValueError("delivery intents exceed physical capacity")
 

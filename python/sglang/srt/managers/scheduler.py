@@ -510,6 +510,7 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        self.terminal_source_serving: PackedTerminalSourceServing | None = None
         self.terminal_scheduler_serving: TerminalSchedulerServing | None = None
         self.terminal_decode_serving_composition: (
             PackedTerminalDecodeServingComposition | None
@@ -1587,7 +1588,10 @@ class Scheduler(
             raise TypeError("serving must be PackedTerminalSourceServing")
         if self.disaggregation_mode is not DisaggregationMode.PREFILL:
             raise RuntimeError("source serving requires prefill mode")
+        if self.terminal_source_serving is not None:
+            raise RuntimeError("source serving is already bound")
         self.bind_terminal_scheduler_serving(serving.scheduler_serving)
+        self.terminal_source_serving = serving
 
     def bind_terminal_decode_serving(
         self,
@@ -1763,6 +1767,10 @@ class Scheduler(
     def mark_terminal_owner_dead(self) -> None:
         """Wake the scheduler into sticky fail-closed owner-death state."""
 
+        source_serving = self.terminal_source_serving
+        if source_serving is not None:
+            source_serving.begin_fail_closed_abort()
+            return
         serving = self.terminal_scheduler_serving
         if serving is None:
             raise RuntimeError("terminal scheduler serving is not bound")
@@ -1985,6 +1993,9 @@ class Scheduler(
         composition = self.terminal_decode_serving_composition
         if composition is not None and composition.scheduler_serving is serving:
             self.terminal_decode_serving_composition = None
+        source_serving = self.terminal_source_serving
+        if source_serving is not None and source_serving.scheduler_serving is serving:
+            self.terminal_source_serving = None
         self.terminal_scheduler_serving = None
         if unregister_error is not None:
             raise RuntimeError(

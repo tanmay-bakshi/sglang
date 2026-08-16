@@ -4,6 +4,7 @@ import selectors
 import sys
 import threading
 import time
+from collections.abc import Callable
 from unittest import mock
 
 import pytest
@@ -40,6 +41,7 @@ from sglang.srt.disaggregation.terminal_progress.native_state import (
 from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalActionClaimError,
     NativeTerminalActionInbox,
+    NativeTerminalDeliveryLeaseDisposition,
     NativeTerminalObservationInbox,
     NativeTerminalProducerDelivery,
     NativeTerminalRuntime,
@@ -47,6 +49,7 @@ from sglang.srt.disaggregation.terminal_progress.runtime import (
     NativeTerminalRuntimeDisposition,
     NativeTerminalRuntimeError,
     NativeTerminalRuntimeProducerSpec,
+    NativeTerminalSourceDeliveryAuthority,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,6 +64,68 @@ _REMOTE_RECEIPT_PRODUCER_ID = 3
 _REMOTE_CONTROL_PRODUCER_ID = 4
 _NATIVE_PRODUCER_ID = 5
 _TEST_CLOCK_NS = 1_000_000_000
+
+
+def _acquire_test_source_delivery(
+    actions: tuple[NativeTerminalOwnerAction, ...],
+) -> NativeTerminalDeliveryLeaseDisposition:
+    """Return normal delivery authority for a fixture action population.
+
+    :param actions: Exact action population crossing native ownership.
+    :returns: Normal acquired delivery disposition.
+    """
+
+    assert type(actions) is tuple
+    return NativeTerminalDeliveryLeaseDisposition.ACQUIRED
+
+
+class _TestSourceDeliveryAuthority(NativeTerminalSourceDeliveryAuthority):
+    """Configurable atomic source delivery authority for runtime tests."""
+
+    _acquire: Callable[
+        [tuple[NativeTerminalOwnerAction, ...]],
+        NativeTerminalDeliveryLeaseDisposition,
+    ]
+
+    def __init__(
+        self,
+        acquire: Callable[
+            [tuple[NativeTerminalOwnerAction, ...]],
+            NativeTerminalDeliveryLeaseDisposition,
+        ]
+        | None = None,
+    ) -> None:
+        """Construct one authority with an optional acquisition observer.
+
+        :param acquire: Exact acquisition implementation used by the test.
+        """
+
+        super().__init__()
+        if acquire is None:
+            acquire = _acquire_test_source_delivery
+        self._acquire = acquire
+
+    def acquire_for_actions(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalDeliveryLeaseDisposition:
+        """Run the configured acquisition implementation.
+
+        :param actions: Exact action population crossing native ownership.
+        :returns: Configured delivery disposition.
+        """
+
+        return self._acquire(actions)
+
+    @property
+    def functional_admission_closed(self) -> bool:
+        """Return whether runtime fatality closed functional admission.
+
+        :returns: Current functional-admission disposition.
+        """
+
+        with self._lock:
+            return self._functional_admission_closed
 
 
 def _process_identity(
@@ -89,7 +154,7 @@ def _runtime(
     output_capacity: int = 64,
     maximum_live_lifecycles: int = 16,
     enable_forward_independent_handoff: bool = False,
-    bind_source_delivery_lease_acquirer: bool = True,
+    bind_source_delivery_authority: bool = True,
 ) -> tuple[
     NativeTerminalRuntime,
     NativeTerminalProcessIdentity,
@@ -104,8 +169,8 @@ def _runtime(
     :param maximum_live_lifecycles: Admission and fail-closed reserve bound.
     :param enable_forward_independent_handoff: Whether this runtime exercises
         the CPython scheduler handoff.
-    :param bind_source_delivery_lease_acquirer: Whether an enabled source
-        runtime receives its fixture delivery boundary before start.
+    :param bind_source_delivery_authority: Whether an enabled source runtime
+        receives its atomic fixture delivery owner before start.
     :returns: Runtime, owner identity, and remote peer identity.
     """
 
@@ -189,9 +254,12 @@ def _runtime(
         observation_capacity=observation_capacity,
         enable_forward_independent_handoff=enable_forward_independent_handoff,
     )
-    if role is TerminalOwnerRole.SOURCE and enable_forward_independent_handoff:
-        if bind_source_delivery_lease_acquirer:
-            runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+    if (
+        role is TerminalOwnerRole.SOURCE
+        and enable_forward_independent_handoff
+        and bind_source_delivery_authority
+    ):
+        runtime.bind_source_delivery_authority(_TestSourceDeliveryAuthority())
     return runtime, owner, remote
 
 
@@ -600,36 +668,106 @@ def _emit_source_ready_actions(
     return scheduler, publisher
 
 
-def test_source_handoff_requires_one_prestart_delivery_lease_owner() -> None:
-    """Source interrupt delivery cannot start without its causal launch gate."""
+def test_source_handoff_requires_one_atomic_prestart_delivery_authority() -> None:
+    """Source interrupt delivery requires one owner for leases and closure."""
 
     runtime, _, _ = _runtime(
         TerminalOwnerRole.SOURCE,
         enable_forward_independent_handoff=True,
-        bind_source_delivery_lease_acquirer=False,
+        bind_source_delivery_authority=False,
     )
     with pytest.raises(
         NativeTerminalRuntimeError,
-        match="lacks a causal delivery lease owner",
+        match="lacks a delivery authority",
     ):
         runtime.start()
 
-    runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+    authority = _TestSourceDeliveryAuthority()
+    runtime.bind_source_delivery_authority(authority)
     with pytest.raises(NativeTerminalRuntimeError, match="already bound"):
-        runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+        runtime.bind_source_delivery_authority(_TestSourceDeliveryAuthority())
     runtime.start()
+    runtime.begin_abort("test fatal")
+    assert authority.functional_admission_closed
     with pytest.raises(NativeTerminalRuntimeClosedError, match="before start"):
-        runtime.bind_source_delivery_lease_acquirer(lambda actions: None)
+        runtime.bind_source_delivery_authority(_TestSourceDeliveryAuthority())
     _finish_handoff_runtime(runtime)
 
     decode, _, _ = _runtime(
         TerminalOwnerRole.DECODE,
         enable_forward_independent_handoff=True,
     )
-    with pytest.raises(NativeTerminalRuntimeError, match="require a source runtime"):
-        decode.bind_source_delivery_lease_acquirer(lambda actions: None)
+    with pytest.raises(NativeTerminalRuntimeError, match="requires a source runtime"):
+        decode.bind_source_delivery_authority(_TestSourceDeliveryAuthority())
     decode.start()
     _finish_handoff_runtime(decode)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_runtime_fatal"),
+    (
+        (NativeTerminalDeliveryLeaseDisposition.ACQUIRED, False),
+        (NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN, True),
+    ),
+)
+def test_delivery_disposition_precedes_native_handoff_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    disposition: NativeTerminalDeliveryLeaseDisposition,
+    expected_runtime_fatal: bool,
+) -> None:
+    """Lease state is settled before each action crosses the native handoff."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+        bind_source_delivery_authority=False,
+    )
+    registration = _registration(owner, remote, 60)
+    ordering: list[str] = []
+
+    def acquire(
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalDeliveryLeaseDisposition:
+        """Record the lease decision for one exact action population.
+
+        :param actions: Actions about to cross native ownership.
+        :returns: Parameterized lease disposition.
+        """
+
+        assert len(actions) == 1
+        ordering.append("acquire")
+        return disposition
+
+    def claim(action: NativeTerminalOwnerAction) -> None:
+        """Record the native-claim boundary without requiring native fixture state.
+
+        :param action: Exact action crossing the handoff.
+        """
+
+        ordering.append("claim")
+
+    runtime.bind_source_delivery_authority(_TestSourceDeliveryAuthority(acquire))
+    monkeypatch.setattr(runtime, "_claim_forward_independent_handoff", claim)
+    runtime.start()
+    action = NativeTerminalOwnerAction(
+        action_id=60,
+        kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
+        binding=registration.binding,
+        commit_timestamp_ns=_TEST_CLOCK_NS,
+        receipt=None,
+    )
+    try:
+        runtime._route_action(action)
+        assert runtime.source_gather_actions.drain() == (action,)
+        assert ordering == ["acquire", "claim"]
+        snapshot = runtime.snapshot()
+        assert (snapshot.fatal_reason is not None) is expected_runtime_fatal
+        if expected_runtime_fatal:
+            runtime.acknowledge_aborted_action(action)
+        else:
+            runtime.acknowledge_consumed_action(action)
+    finally:
+        _finish_handoff_runtime(runtime)
 
 
 def test_pending_call_returns_at_inbox_claim_before_downstream_lock() -> None:
@@ -800,6 +938,7 @@ def test_active_handoff_coalesces_new_actions_into_one_later_watermark() -> None
                         registration.binding.digest,
                         NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
                     )
+                assert runtime.wait_for_output_projection(_WAIT_SECONDS)
             finally:
                 release_initial_claim.set()
 

@@ -33,6 +33,13 @@ class PackedTerminalSourceGatherWorkerDisposition(enum.StrEnum):
     PROCESS_FATAL = "process_fatal"
 
 
+class PackedTerminalSourceGatherConsumptionDisposition(enum.StrEnum):
+    """Result of the final functional-admission boundary for one gather."""
+
+    CONSUMED = "consumed"
+    ABORTED = "aborted"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class PackedTerminalSourceGatherWorkerInventory:
     """Exact liveness and retained authority of one source gather worker.
@@ -121,7 +128,10 @@ class PackedTerminalSourceGatherWorker:
 
     _runtime: NativeTerminalRuntime
     _inbox: NativeTerminalActionInbox
-    _consume_action: Callable[[NativeTerminalOwnerAction], None]
+    _consume_action: Callable[
+        [NativeTerminalOwnerAction],
+        PackedTerminalSourceGatherConsumptionDisposition,
+    ]
     _bind_cuda_device: Callable[[], None]
     _fatal_listener: Callable[[str, str | None], None]
     _control_read_fd: int
@@ -146,7 +156,10 @@ class PackedTerminalSourceGatherWorker:
         self,
         *,
         runtime: NativeTerminalRuntime,
-        consume_action: Callable[[NativeTerminalOwnerAction], None],
+        consume_action: Callable[
+            [NativeTerminalOwnerAction],
+            PackedTerminalSourceGatherConsumptionDisposition,
+        ],
         bind_cuda_device: Callable[[], None],
         fatal_listener: Callable[[str, str | None], None],
         thread_name: str = "packed-terminal-source-gather-worker",
@@ -417,6 +430,7 @@ class PackedTerminalSourceGatherWorker:
             raise
         if len(actions) == 0:
             return
+        self._synchronize_runtime_abort()
         action = actions[0]
         if action.kind is not NativeTerminalOwnerActionKind.SOURCE_GATHER_READY:
             raise RuntimeError("source gather inbox carried another action kind")
@@ -433,7 +447,20 @@ class PackedTerminalSourceGatherWorker:
                     self._aborted_action_count += 1
                 return
             try:
-                self._consume_action(action)
+                disposition = self._consume_action(action)
+                if type(disposition) is not (
+                    PackedTerminalSourceGatherConsumptionDisposition
+                ):
+                    raise TypeError(
+                        "source gather consumer returned an invalid disposition"
+                    )
+                if disposition is (
+                    PackedTerminalSourceGatherConsumptionDisposition.ABORTED
+                ):
+                    if self._runtime.acknowledge_aborted_action_if_pending(action):
+                        with self._condition:
+                            self._aborted_action_count += 1
+                    return
             except BaseException:  # noqa: BLE001
                 formatted_traceback = traceback.format_exc()
                 self._enter_fatal(
