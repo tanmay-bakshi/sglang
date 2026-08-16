@@ -1094,7 +1094,14 @@ class PackedTerminalSourceWiring:
                 outcome=TerminalReceiptOutcome.SUCCESS,
                 terminal_timestamp_ns=self._clock_ns(),
             )
-            with self._runtime.source_action_delivery_fence():
+            # Native submission is queue-only and cannot call back into wiring;
+            # this lock order makes the event and its local mirror indivisible.
+            with self._runtime.source_action_delivery_fence(), self._lock:
+                current = self._records.get(action.binding.digest)
+                if current is not record:
+                    raise RuntimeError(
+                        "source request registry changed during reclaim"
+                    )
                 self._runtime.complete_scheduler_action(
                     self._local_receipt_producer_id,
                     action,
@@ -1104,16 +1111,10 @@ class PackedTerminalSourceWiring:
                     ),
                     enqueued_ns=self._clock_ns(),
                 )
-                with self._lock:
-                    current = self._records.get(action.binding.digest)
-                    if current is not record:
-                        raise RuntimeError(
-                            "source request registry changed during reclaim"
-                        )
-                    # Native may earn REQUEST_RETIRED as soon as this event
-                    # lands. Action projection stays excluded until its local
-                    # side-effect mirror is committed under the wiring lock.
-                    current.reclaim_consumed = True
+                # Native may earn REQUEST_RETIRED as soon as this event lands.
+                # Action projection stays excluded until its local side-effect
+                # mirror is committed under the wiring lock.
+                current.reclaim_consumed = True
         except Exception as error:
             self._fail_scheduler_action(
                 action,
@@ -1851,7 +1852,18 @@ class PackedTerminalSourceWiring:
             NativeTerminalProcessIdentity.from_identity(receipt.authenticated_issuer),
         )
         try:
-            with self._runtime.source_action_delivery_fence():
+            # Native submission is queue-only and cannot call back into wiring;
+            # this lock order makes the event and its local mirror indivisible.
+            with self._runtime.source_action_delivery_fence(), self._lock:
+                current = self._records.get(binding.digest)
+                if current is not record:
+                    raise RuntimeError(
+                        "source request registry changed during publication"
+                    )
+                if record.publication_action != action:
+                    raise RuntimeError(
+                        "publication action changed during result completion"
+                    )
                 self._runtime.complete_work_action(
                     producer_id,
                     action,
@@ -1862,22 +1874,12 @@ class PackedTerminalSourceWiring:
                     reason=receipt.reason,
                     enqueued_ns=self._clock_ns(),
                 )
-                with self._lock:
-                    current = self._records.get(binding.digest)
-                    if current is not record:
-                        raise RuntimeError(
-                            "source request registry changed during publication"
-                        )
-                    if record.publication_action != action:
-                        raise RuntimeError(
-                            "publication action changed during result completion"
-                        )
-                    # A reclaim-first lifecycle can now mint REQUEST_RETIRED.
-                    # Publish the Python mirror before that action can leave
-                    # the process-wide output projection seam.
-                    record.publication_action = None
-                    record.publication_terminal = True
-                    record.publication_failed = publication_failed
+                # A reclaim-first lifecycle can now mint REQUEST_RETIRED.
+                # Publish the Python mirror before that action can leave the
+                # process-wide output projection seam.
+                record.publication_action = None
+                record.publication_terminal = True
+                record.publication_failed = publication_failed
         except Exception as error:
             self._complete_failed_work(
                 action=action,

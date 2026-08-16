@@ -229,6 +229,7 @@ class _Runtime:
     fail_work_completion: bool
     fail_scheduler_completion: bool
     _projection_lock: threading.Lock
+    _contended_fence_attempt: threading.Event | None
 
     def __init__(
         self,
@@ -267,6 +268,7 @@ class _Runtime:
         self.fail_work_completion = False
         self.fail_scheduler_completion = False
         self._projection_lock = threading.Lock()
+        self._contended_fence_attempt = None
 
     def python_producer_id(
         self,
@@ -432,7 +434,13 @@ class _Runtime:
         :returns: Non-reentrant delivery fence sharing the process lock.
         """
 
-        return NativeTerminalSourceActionDeliveryFence(self._projection_lock)
+        contended_attempt = self._contended_fence_attempt
+        if contended_attempt is None:
+            return NativeTerminalSourceActionDeliveryFence(self._projection_lock)
+        return _ObservedSourceActionDeliveryFence(
+            self._projection_lock,
+            contended_attempt,
+        )
 
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Record one consumed terminal action.
@@ -441,6 +449,33 @@ class _Runtime:
         """
 
         self.operations.append(("ack", action))
+
+
+class _ObservedSourceActionDeliveryFence(NativeTerminalSourceActionDeliveryFence):
+    """Expose a contended fence acquisition to concurrency tests."""
+
+    _contended_attempt: threading.Event
+
+    def __init__(
+        self,
+        projection_lock: threading.Lock,
+        contended_attempt: threading.Event,
+    ) -> None:
+        """Construct one fence with an exact contention observation.
+
+        :param projection_lock: Process-lifetime projection lock.
+        :param contended_attempt: Event set immediately before a blocked acquire.
+        """
+
+        super().__init__(projection_lock)
+        self._contended_attempt = contended_attempt
+
+    def __enter__(self) -> None:
+        """Expose contention before acquiring the process projection lock."""
+
+        if self._projection_lock.locked():
+            self._contended_attempt.set()
+        super().__enter__()
 
 
 @dataclasses.dataclass(slots=True)
@@ -1155,6 +1190,8 @@ def test_publication_last_join_linearizes_before_native_retirement(
     )
     completion_submitted = threading.Event()
     release_completion = threading.Event()
+    retirement_contended = threading.Event()
+    harness.runtime._contended_fence_attempt = retirement_contended
     retired_submissions: list[PackedTerminalSourceSubmission] = []
     original_completion = harness.runtime.complete_work_action
 
@@ -1199,6 +1236,9 @@ def test_publication_last_join_linearizes_before_native_retirement(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         publication_future = executor.submit(harness.wiring.publisher_result, result)
         assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+        wiring_lock_available = harness.wiring._lock.acquire(blocking=False)
+        if wiring_lock_available:
+            harness.wiring._lock.release()
 
         def project_retirement() -> PackedTerminalSourceSubmission | None:
             """Model output projection followed by lifecycle consumption.
@@ -1215,12 +1255,12 @@ def test_publication_last_join_linearizes_before_native_retirement(
         retirement_future = executor.submit(
             project_retirement,
         )
-        _, pending = concurrent.futures.wait(
-            (retirement_future,),
-            timeout=0.05,
-        )
-        assert pending == {retirement_future}
-        release_completion.set()
+        try:
+            assert not wiring_lock_available
+            assert retirement_contended.wait(timeout=_WAIT_SECONDS)
+            assert not retirement_future.done()
+        finally:
+            release_completion.set()
         publication_future.result(timeout=_WAIT_SECONDS)
         assert retirement_future.result(timeout=_WAIT_SECONDS) == harness.submission
 
@@ -1259,6 +1299,8 @@ def test_reclaim_last_join_linearizes_before_native_retirement(
     )
     completion_submitted = threading.Event()
     release_completion = threading.Event()
+    retirement_contended = threading.Event()
+    harness.runtime._contended_fence_attempt = retirement_contended
     retired_submissions: list[PackedTerminalSourceSubmission] = []
     original_completion = harness.runtime.complete_scheduler_action
 
@@ -1302,6 +1344,9 @@ def test_reclaim_last_join_linearizes_before_native_retirement(
             lambda submission: None,
         )
         assert completion_submitted.wait(timeout=_WAIT_SECONDS)
+        wiring_lock_available = harness.wiring._lock.acquire(blocking=False)
+        if wiring_lock_available:
+            harness.wiring._lock.release()
 
         def project_retirement() -> PackedTerminalSourceSubmission | None:
             """Model output projection followed by lifecycle consumption.
@@ -1318,12 +1363,12 @@ def test_reclaim_last_join_linearizes_before_native_retirement(
         retirement_future = executor.submit(
             project_retirement,
         )
-        _, pending = concurrent.futures.wait(
-            (retirement_future,),
-            timeout=0.05,
-        )
-        assert pending == {retirement_future}
-        release_completion.set()
+        try:
+            assert not wiring_lock_available
+            assert retirement_contended.wait(timeout=_WAIT_SECONDS)
+            assert not retirement_future.done()
+        finally:
+            release_completion.set()
         reclaim_future.result(timeout=_WAIT_SECONDS)
         assert retirement_future.result(timeout=_WAIT_SECONDS) == harness.submission
 

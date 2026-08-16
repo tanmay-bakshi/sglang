@@ -786,6 +786,56 @@ def _finish_handoff_runtime(runtime: NativeTerminalRuntime) -> None:
     _finish_fail_closed(runtime)
 
 
+def _pause_after_runtime_submit(
+    runtime: NativeTerminalRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Pause one completion immediately after native event admission.
+
+    :param runtime: Real runtime whose completion transaction is exercised.
+    :param monkeypatch: Test-owned patch fixture.
+    :returns: Native-admission observation and release events.
+    """
+
+    native_submitted = threading.Event()
+    release_submit = threading.Event()
+    original_submit = runtime.submit
+
+    def submit(
+        producer_id: int,
+        binding_digest: bytes,
+        kind: NativeTerminalOwnerEventKind,
+        *,
+        receipt: NativeTerminalReceipt | None = None,
+        reason: str | None = None,
+        enqueued_ns: int | None = None,
+    ) -> None:
+        """Expose the post-native, pre-ledger-retirement interval.
+
+        :param producer_id: Exact Python producer identity.
+        :param binding_digest: Exact lifecycle digest.
+        :param kind: Accepted native event kind.
+        :param receipt: Optional native receipt authority.
+        :param reason: Optional failure evidence.
+        :param enqueued_ns: Optional exact producer timestamp.
+        """
+
+        original_submit(
+            producer_id,
+            binding_digest,
+            kind,
+            receipt=receipt,
+            reason=reason,
+            enqueued_ns=enqueued_ns,
+        )
+        native_submitted.set()
+        if not release_submit.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("runtime submit transaction release was not delivered")
+
+    monkeypatch.setattr(runtime, "submit", submit)
+    return native_submitted, release_submit
+
+
 def _complete_source(
     runtime: NativeTerminalRuntime,
     registration: NativeTerminalLifecycleRegistration,
@@ -916,6 +966,341 @@ def _emit_source_ready_actions(
     assert scheduler.kind is NativeTerminalOwnerActionKind.RECLAIM_AUTHORIZED
     assert publisher.kind is (NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY)
     return scheduler, publisher
+
+
+def test_work_completion_keeps_native_submit_and_authority_retirement_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort cannot enter between a work event and action retirement."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 58)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=58,
+        )
+        with monkeypatch.context() as completion_patch:
+            native_submitted, release_submit = _pause_after_runtime_submit(
+                runtime,
+                completion_patch,
+            )
+            abort_started = threading.Event()
+
+            def begin_abort() -> None:
+                """Attempt fail-closed reconciliation during completion."""
+
+                abort_started.set()
+                runtime.begin_abort("synthetic concurrent completion abort")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                completion = executor.submit(
+                    runtime.complete_work_action,
+                    _OWNER_RECEIPT_PRODUCER_ID,
+                    publisher,
+                    NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+                    receipt=_receipt(
+                        registration,
+                        owner,
+                        NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                        59,
+                    ),
+                )
+                try:
+                    assert native_submitted.wait(timeout=_WAIT_SECONDS)
+                    abort = executor.submit(begin_abort)
+                    assert abort_started.wait(timeout=_WAIT_SECONDS)
+                    condition_available = runtime._condition.acquire(blocking=False)
+                    if condition_available:
+                        runtime._condition.release()
+                    assert not abort.done()
+                finally:
+                    release_submit.set()
+                completion.result(timeout=_WAIT_SECONDS)
+                abort.result(timeout=_WAIT_SECONDS)
+                assert not condition_available
+
+        with runtime._condition:
+            assert publisher.action_id not in runtime._consumer_pending
+            assert scheduler.action_id in runtime._consumer_pending
+        assert (
+            runtime.snapshot().disposition
+            is NativeTerminalRuntimeDisposition.ABORT_DRAINING
+        )
+        assert not runtime.acknowledge_aborted_action_if_pending(publisher)
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_scheduler_completion_keeps_native_submit_and_authority_retirement_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort cannot enter between a scheduler event and action retirement."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 61)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=61,
+        )
+        with monkeypatch.context() as completion_patch:
+            native_submitted, release_submit = _pause_after_runtime_submit(
+                runtime,
+                completion_patch,
+            )
+            abort_started = threading.Event()
+
+            def begin_abort() -> None:
+                """Attempt fail-closed reconciliation during completion."""
+
+                abort_started.set()
+                runtime.begin_abort("synthetic concurrent completion abort")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                completion = executor.submit(
+                    runtime.complete_scheduler_action,
+                    _OWNER_RECEIPT_PRODUCER_ID,
+                    scheduler,
+                    NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+                    completion_receipt=_receipt(
+                        registration,
+                        owner,
+                        NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                        62,
+                    ),
+                )
+                try:
+                    assert native_submitted.wait(timeout=_WAIT_SECONDS)
+                    abort = executor.submit(begin_abort)
+                    assert abort_started.wait(timeout=_WAIT_SECONDS)
+                    condition_available = runtime._condition.acquire(blocking=False)
+                    if condition_available:
+                        runtime._condition.release()
+                    assert not abort.done()
+                finally:
+                    release_submit.set()
+                completion.result(timeout=_WAIT_SECONDS)
+                abort.result(timeout=_WAIT_SECONDS)
+                assert not condition_available
+
+        with runtime._condition:
+            assert scheduler.action_id not in runtime._consumer_pending
+            assert publisher.action_id in runtime._consumer_pending
+        assert (
+            runtime.snapshot().disposition
+            is NativeTerminalRuntimeDisposition.ABORT_DRAINING
+        )
+        assert not runtime.acknowledge_aborted_action_if_pending(scheduler)
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_work_completion_retains_exact_authority_after_native_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected work event leaves its one-shot action reusable for failure."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 64)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=64,
+        )
+        original_submit = runtime._owner.submit
+        native_submit_attempted = threading.Event()
+
+        def reject_publication(event: NativeTerminalOwnerEvent) -> None:
+            """Reject only the target publication before native acceptance.
+
+            :param event: Exact native event offered by the runtime.
+            """
+
+            if event.kind is NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED:
+                native_submit_attempted.set()
+                raise OSError("synthetic native publication rejection")
+            original_submit(event)
+
+        with monkeypatch.context() as rejection_patch:
+            rejection_patch.setattr(runtime._owner, "submit", reject_publication)
+            with pytest.raises(
+                OSError,
+                match="synthetic native publication rejection",
+            ):
+                runtime.complete_work_action(
+                    _OWNER_RECEIPT_PRODUCER_ID,
+                    publisher,
+                    NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+                    receipt=_receipt(
+                        registration,
+                        owner,
+                        NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                        65,
+                    ),
+                )
+        assert native_submit_attempted.is_set()
+        with runtime._condition:
+            assert runtime._consumer_pending.get(publisher.action_id) == publisher
+            assert publisher.action_id in runtime._inbox_claimed_action_ids
+        assert (
+            runtime.snapshot().disposition
+            is NativeTerminalRuntimeDisposition.RUNNING
+        )
+
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                65,
+            ),
+        )
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                66,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+        runtime.stop_admission()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _drain_observations(runtime)
+        runtime.close_clean()
+    finally:
+        _finish_fail_closed(runtime)
+
+
+def test_scheduler_completion_retains_exact_authority_after_native_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected scheduler event leaves all three ledgers unchanged."""
+
+    runtime, owner, remote = _runtime(
+        TerminalOwnerRole.SOURCE,
+        enable_forward_independent_handoff=True,
+    )
+    registration = _registration(owner, remote, 67)
+    runtime.start()
+    try:
+        runtime.register_lifecycle(registration)
+        scheduler, publisher = _emit_source_ready_actions(
+            runtime,
+            registration,
+            remote,
+            nonce_value=67,
+        )
+        original_submit = runtime._owner.submit
+        native_submit_attempted = threading.Event()
+
+        def reject_reclaim(event: NativeTerminalOwnerEvent) -> None:
+            """Reject only the target reclaim before native acceptance.
+
+            :param event: Exact native event offered by the runtime.
+            """
+
+            if event.kind is NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED:
+                native_submit_attempted.set()
+                raise OSError("synthetic native reclaim rejection")
+            original_submit(event)
+
+        with monkeypatch.context() as rejection_patch:
+            rejection_patch.setattr(runtime._owner, "submit", reject_reclaim)
+            with pytest.raises(
+                OSError,
+                match="synthetic native reclaim rejection",
+            ):
+                runtime.complete_scheduler_action(
+                    _OWNER_RECEIPT_PRODUCER_ID,
+                    scheduler,
+                    NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+                    completion_receipt=_receipt(
+                        registration,
+                        owner,
+                        NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                        68,
+                    ),
+                )
+        assert native_submit_attempted.is_set()
+        with runtime._condition:
+            assert runtime._scheduler_pending.get(registration.binding.digest) == (
+                scheduler
+            )
+            assert runtime._consumer_pending.get(scheduler.action_id) == scheduler
+            assert scheduler.action_id in runtime._inbox_claimed_action_ids
+        assert (
+            runtime.snapshot().disposition
+            is NativeTerminalRuntimeDisposition.RUNNING
+        )
+
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            scheduler,
+            NativeTerminalOwnerEventKind.SOURCE_RECLAIM_CONSUMED,
+            completion_receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.RECLAIM_CONSUMED,
+                68,
+            ),
+        )
+        runtime.complete_work_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            publisher,
+            NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+            receipt=_receipt(
+                registration,
+                owner,
+                NativeTerminalReceiptKind.GATEWAY_PUBLISHED,
+                69,
+            ),
+        )
+        retired = _drain_actions(runtime.lifecycle_actions)
+        assert tuple(action.kind for action in retired) == (
+            NativeTerminalOwnerActionKind.REQUEST_RETIRED,
+        )
+        runtime.acknowledge_consumed_action(retired[0])
+        runtime.stop_admission()
+        _retire_all_producers(runtime)
+        runtime.join_producers()
+        _drain_observations(runtime)
+        runtime.close_clean()
+    finally:
+        _finish_fail_closed(runtime)
 
 
 def test_source_handoff_requires_one_atomic_prestart_delivery_authority() -> None:

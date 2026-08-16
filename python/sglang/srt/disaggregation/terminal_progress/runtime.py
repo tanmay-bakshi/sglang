@@ -1455,22 +1455,23 @@ class NativeTerminalRuntime:
                 raise NativeTerminalRuntimeError(
                     "scheduler action was completed before inbox claim"
                 )
-        self.submit(
-            producer_id=producer_id,
-            binding_digest=binding_digest,
-            kind=followup_kind,
-            receipt=receipt,
-            enqueued_ns=enqueued_ns,
-        )
-        with self._condition:
-            current = self._scheduler_pending.get(binding_digest)
-            if current != action:
+            if self._consumer_pending.get(action.action_id) != action:
                 self._enter_runtime_fatal_locked(
-                    "scheduler action changed during exact consumption"
+                    "scheduler action differs from retained consumer authority"
                 )
                 raise NativeTerminalRuntimeError(
-                    "scheduler action changed during exact consumption"
+                    "scheduler action differs from retained consumer authority"
                 )
+            # Event admission and Python authority retirement are one delivery
+            # transaction. Once native accepts the event, no abort or competing
+            # consumer may observe the action as still available.
+            self.submit(
+                producer_id=producer_id,
+                binding_digest=binding_digest,
+                kind=followup_kind,
+                receipt=receipt,
+                enqueued_ns=enqueued_ns,
+            )
             del self._scheduler_pending[binding_digest]
             self._consumer_pending.pop(action.action_id)
             self._inbox_claimed_action_ids.remove(action.action_id)
@@ -2232,21 +2233,34 @@ class NativeTerminalRuntime:
             raise ValueError("followup kind was not earned by this work action")
         with self._condition:
             pending = self._consumer_pending.get(action.action_id)
-        if pending != action:
-            if pending is None:
-                self._reject_forward_independent_claim(action)
-            raise NativeTerminalRuntimeError(
-                "work action is absent, stale, or already completed"
-            )
-        self.submit(
-            producer_id=producer_id,
-            binding_digest=action.binding.digest,
-            kind=followup_kind,
-            receipt=receipt,
-            reason=reason,
-            enqueued_ns=enqueued_ns,
+            if pending == action:
+                if action.action_id not in self._inbox_claimed_action_ids:
+                    self._enter_runtime_fatal_locked(
+                        "work action was completed before inbox claim"
+                    )
+                    raise NativeTerminalRuntimeError(
+                        "work action was completed before inbox claim"
+                    )
+                # Keep the accepted native event and its Python consumer
+                # authority indivisible. A raised completion therefore means
+                # native admission did not happen and failure may consume it.
+                self.submit(
+                    producer_id=producer_id,
+                    binding_digest=action.binding.digest,
+                    kind=followup_kind,
+                    receipt=receipt,
+                    reason=reason,
+                    enqueued_ns=enqueued_ns,
+                )
+                del self._consumer_pending[action.action_id]
+                self._inbox_claimed_action_ids.remove(action.action_id)
+                self._condition.notify_all()
+                return
+        if pending is None:
+            self._reject_forward_independent_claim(action)
+        raise NativeTerminalRuntimeError(
+            "work action is absent, stale, or already completed"
         )
-        self.acknowledge_consumed_action(action)
 
     def stop_admission(self) -> None:
         """Close request and event admission before producer drain."""
