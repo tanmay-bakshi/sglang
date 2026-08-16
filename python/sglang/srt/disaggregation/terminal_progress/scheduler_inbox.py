@@ -452,8 +452,8 @@ class TerminalReceiptInbox:
 
         This boundary deliberately touches only the publication-intent
         condition. Source delivery establishes the complete request-intent
-        population before scheduling its native callback, independently of
-        receipt-state ownership.
+        population before atomically transferring its native action batch,
+        independently of receipt-state ownership.
 
         :param binding: Exact request generation protected by the intent.
         :returns: Take-once intent consumed after durable delivery.

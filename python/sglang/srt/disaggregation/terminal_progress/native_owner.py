@@ -144,7 +144,7 @@ class _NativeTerminalOwnerBridge(Protocol):
     def claim_source_forward_independent_handoffs(
         self, action_ids: tuple[int, ...]
     ) -> None:
-        """Claim one complete source batch through a restored callback.
+        """Atomically claim one complete source output-drain batch.
 
         :param action_ids: Exact source action identities with durable leases.
         """
@@ -564,14 +564,14 @@ class NativeTerminalOwner:
         )
 
     def enable_forward_independent_handoff(self) -> None:
-        """Enable the scheduler GIL handoff before native owner startup."""
+        """Enable forward-independent delivery before native owner startup."""
 
         self._native.enable_forward_independent_handoff()
 
     def forward_independent_handoff_action_kinds(
         self,
     ) -> frozenset[NativeTerminalOwnerActionKind]:
-        """Return the native reducer's complete scheduler-handoff partition.
+        """Return the native reducer's forward-independent action partition.
 
         :returns: Exact forward-independent action kinds.
         """
@@ -800,7 +800,7 @@ class NativeTerminalOwner:
     def claim_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Release one captured callback after Python delivery is durable.
+        """Transfer one action after its Python delivery is durable.
 
         :param action: Forward-independent action claimed by its sole owner.
         """
@@ -814,9 +814,10 @@ class NativeTerminalOwner:
     ) -> None:
         """Claim an exact source batch after its Python leases are durable.
 
-        The native boundary schedules one callback generation, claims the
-        complete batch while the scheduler callback is parked off-GIL, and
-        returns only after that callback records GIL restoration.
+        The native boundary verifies that ``actions`` is the complete eligible
+        subset of the current output drain and transfers the whole population
+        in one mutex-protected commit. No scheduler callback participates in
+        source delivery.
 
         :param actions: Complete non-empty source action batch.
         """

@@ -461,7 +461,7 @@ class TerminalSchedulerServing:
         Intent acquisition deliberately performs no live-request lookup or
         receipt-state access. Exact generation validation is owned by the
         source delivery registry, which constructs the complete lease batch
-        before native callback activation.
+        before native exact-batch claim.
 
         :param binding: Exact source request generation being delivered.
         :returns: Take-once launch exclusion for the generation.

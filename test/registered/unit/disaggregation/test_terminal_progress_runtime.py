@@ -551,21 +551,13 @@ def _claim_direct_source_batch(
     owner: NativeTerminalOwner,
     actions: tuple[NativeTerminalOwnerAction, ...],
 ) -> None:
-    """Drive one exact source callback from a non-main caller.
+    """Claim one exact source output-drain batch synchronously.
 
     :param owner: Running deterministic source owner.
     :param actions: Complete eligible population from the current output drain.
     """
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            owner.claim_source_forward_independent_handoffs,
-            actions,
-        )
-        expires_at = time.monotonic() + _WAIT_SECONDS
-        while not future.done() and time.monotonic() < expires_at:
-            pass
-        future.result(timeout=_WAIT_SECONDS)
+    owner.claim_source_forward_independent_handoffs(actions)
 
 
 def _receipt(
@@ -1056,8 +1048,8 @@ def test_abort_after_native_claim_rejects_functional_projection(
         _finish_handoff_runtime(runtime)
 
 
-def test_source_batch_callback_restores_before_downstream_lock() -> None:
-    """The callback restores before downstream action processing can block."""
+def test_source_batch_claim_does_not_borrow_downstream_lock() -> None:
+    """A source batch transfers before downstream processing can block."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.SOURCE,
@@ -1109,9 +1101,9 @@ def test_source_batch_callback_restores_before_downstream_lock() -> None:
             snapshot = runtime.snapshot()
             assert snapshot.owner.unclaimed_handoff_action_count == 0
             assert snapshot.owner.claimed_handoff_action_count == 1
-            assert snapshot.owner.handoff_callback_count == 1
+            assert snapshot.owner.handoff_callback_count == 0
             assert snapshot.owner.terminal_handoff_callback_state is (
-                NativeTerminalHandoffCallbackTerminalState.RESTORED
+                NativeTerminalHandoffCallbackTerminalState.NONE
             )
             assert snapshot.consumer_pending_count == 1
             scheduler_owned_lock.release()
@@ -1165,8 +1157,6 @@ def test_exact_source_batch_rejection_is_atomic(invalid_case: str) -> None:
         assert not inventory.handoff_callback_scheduled
         assert not inventory.handoff_callback_active
         assert not inventory.handoff_callback_restoring
-        assert inventory.scheduled_source_batch_action_count == 0
-        assert inventory.active_source_batch_action_count == 0
         assert inventory.terminal_handoff_callback_state is (
             NativeTerminalHandoffCallbackTerminalState.NONE
         )
@@ -1178,7 +1168,7 @@ def test_exact_source_batch_rejection_is_atomic(invalid_case: str) -> None:
 def test_exact_source_batch_claims_complete_multi_action_population(
     reverse_order: bool,
 ) -> None:
-    """One callback claims every eligible drained action independent of order."""
+    """One atomic commit claims every eligible action independent of order."""
 
     owner, registrations = _direct_handoff_owner_population((90, 91, 92))
     actions = _drain_direct_source_gathers(owner, registrations)
@@ -1192,53 +1182,17 @@ def test_exact_source_batch_claims_complete_multi_action_population(
         assert inventory.claimed_handoff_action_count == len(actions)
         assert inventory.source_batch_handoff_count == 1
         assert inventory.source_batch_handoff_action_count == len(actions)
-        assert inventory.handoff_callback_count == 1
+        assert inventory.handoff_callback_count == 0
         assert not inventory.handoff_callback_scheduled
         assert not inventory.handoff_callback_active
         assert not inventory.handoff_callback_restoring
-        assert inventory.scheduled_source_batch_action_count == 0
-        assert inventory.active_source_batch_action_count == 0
         assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.RESTORED
+            NativeTerminalHandoffCallbackTerminalState.NONE
         )
 
         for action in actions:
             owner.acknowledge_action(action)
         assert owner.inventory().pending_action_count == 0
-    finally:
-        owner.abort_and_close()
-
-
-def test_exact_source_batch_pending_call_rejection_rolls_back_activation() -> None:
-    """Pending-call rejection retains no activated exact-batch authority."""
-
-    owner, registrations = _direct_handoff_owner_population((82, 83))
-    try:
-        actions = _drain_direct_source_gathers(owner, registrations)
-        owner.reject_next_handoff_pending_call_for_testing()
-        with pytest.raises(
-            RuntimeError,
-            match="CPython rejected the source terminal handoff pending call",
-        ):
-            owner.claim_source_forward_independent_handoffs(actions)
-
-        inventory = owner.inventory()
-        assert inventory.fatal_code is (
-            NativeTerminalOwnerFatalCode.PENDING_CALL_QUEUE_FAILURE
-        )
-        assert inventory.unclaimed_handoff_action_count == len(actions)
-        assert inventory.claimed_handoff_action_count == 0
-        assert inventory.source_batch_handoff_count == 0
-        assert inventory.source_batch_handoff_action_count == 0
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
-        assert inventory.scheduled_source_batch_action_count == 0
-        assert inventory.active_source_batch_action_count == 0
-        assert inventory.terminal_handoff_callback_id > 0
-        assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.SCHEDULING_REJECTED
-        )
     finally:
         owner.abort_and_close()
 
@@ -1606,340 +1560,77 @@ def test_decode_handoff_schedules_next_generation_during_restoration() -> None:
         owner.abort_and_close()
 
 
-@pytest.mark.parametrize(
-    ("phase", "expected_claimed_count", "expected_callback_count"),
-    (
-        ("activation", 0, 0),
-        ("restoration", 1, 1),
-    ),
-)
-def test_exact_source_batch_callback_phase_timeout(
-    phase: str,
-    expected_claimed_count: int,
-    expected_callback_count: int,
-) -> None:
-    """Activation and restoration deadlines fail closed without live state."""
-
-    owner, registrations = _direct_handoff_owner_population((84,))
-    actions = _drain_direct_source_gathers(owner, registrations)
-    owner.set_handoff_callback_holds_for_testing(
-        hold_activation=phase == "activation",
-        hold_restoration=phase == "restoration",
-    )
-
-    def expire_callback_phase() -> None:
-        """Advance the deterministic clock only after the target phase begins."""
-
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: (
-                inventory.handoff_callback_scheduled
-                if phase == "activation"
-                else inventory.handoff_callback_restoring
-            ),
-        )
-        owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            expiry_future = executor.submit(expire_callback_phase)
-            claim_future = executor.submit(
-                owner.claim_source_forward_independent_handoffs,
-                actions,
-            )
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while not claim_future.done() and time.monotonic() < expires_at:
-                pass
-            expiry_future.result(timeout=_WAIT_SECONDS)
-            with pytest.raises(RuntimeError):
-                claim_future.result(timeout=_WAIT_SECONDS)
-
-        inventory = owner.inventory()
-        assert inventory.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_TIMEOUT
-        assert inventory.unclaimed_handoff_action_count == (
-            len(actions) - expected_claimed_count
-        )
-        assert inventory.claimed_handoff_action_count == expected_claimed_count
-        assert inventory.handoff_callback_count == expected_callback_count
-        assert inventory.source_batch_handoff_count == expected_callback_count
-        assert inventory.source_batch_handoff_action_count == expected_claimed_count
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
-        assert inventory.scheduled_source_batch_action_count == 0
-        assert inventory.active_source_batch_action_count == 0
-        assert inventory.terminal_handoff_callback_id > 0
-        assert inventory.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.TIMED_OUT
-        )
-    finally:
-        owner.abort_and_close()
-
-
-@pytest.mark.parametrize(
-    ("phase", "expected_claimed_count", "expected_callback_count"),
-    (
-        ("scheduled", 0, 0),
-        ("restoring", 1, 1),
-    ),
-)
-def test_exact_source_batch_abort_defers_close_through_callback_lifetime(
-    phase: str,
-    expected_claimed_count: int,
-    expected_callback_count: int,
-) -> None:
-    """Abort keeps the owner alive through scheduled and restoring callbacks."""
-
-    owner, registrations = _direct_handoff_owner_population((85,))
-    actions = _drain_direct_source_gathers(owner, registrations)
-    owner.set_handoff_callback_holds_for_testing(
-        hold_activation=phase == "scheduled",
-        hold_restoration=phase == "restoring",
-    )
-
-    def abort_during_callback() -> None:
-        """Abort only after the requested native callback phase is visible."""
-
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: (
-                inventory.handoff_callback_scheduled
-                if phase == "scheduled"
-                else inventory.handoff_callback_restoring
-            ),
-        )
-        owner.abort_and_close()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        abort_future = executor.submit(abort_during_callback)
-        claim_future = executor.submit(
-            owner.claim_source_forward_independent_handoffs,
-            actions,
-        )
-        expires_at = time.monotonic() + _WAIT_SECONDS
-        while not claim_future.done() and time.monotonic() < expires_at:
-            pass
-        abort_future.result(timeout=_WAIT_SECONDS)
-        with pytest.raises(RuntimeError):
-            claim_future.result(timeout=_WAIT_SECONDS)
-
-    inventory = _wait_for_owner_inventory(owner, lambda current: current.closed)
-    assert inventory.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-    assert inventory.pending_action_count == 0
-    assert inventory.unclaimed_handoff_action_count == 0
-    assert inventory.claimed_handoff_action_count == expected_claimed_count
-    assert inventory.handoff_callback_count == expected_callback_count
-    assert inventory.source_batch_handoff_count == expected_callback_count
-    assert inventory.source_batch_handoff_action_count == expected_claimed_count
-    assert not inventory.handoff_callback_scheduled
-    assert not inventory.handoff_callback_active
-    assert not inventory.handoff_callback_restoring
-    assert inventory.scheduled_source_batch_action_count == 0
-    assert inventory.active_source_batch_action_count == 0
-    assert inventory.terminal_handoff_callback_id > 0
-    assert inventory.terminal_handoff_callback_state is (
-        NativeTerminalHandoffCallbackTerminalState.CANCELLED
-    )
-    assert not inventory.input_eventfd_open
-    assert not inventory.output_eventfd_open
-    assert not inventory.observation_eventfd_open
-
-
-def test_exact_source_batch_linearizes_before_post_restored_abort() -> None:
-    """A committed native claim remains successful when abort follows it."""
+def test_exact_source_batch_claim_survives_later_abort() -> None:
+    """An abort cannot roll back a completed atomic source-batch transfer."""
 
     owner, registrations = _direct_handoff_owner_population((87,))
     actions = _drain_direct_source_gathers(owner, registrations)
-    previous_switch_interval = sys.getswitchinterval()
     try:
-        sys.setswitchinterval(0.5)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            claim_future = executor.submit(
-                owner.claim_source_forward_independent_handoffs,
-                actions,
-            )
-            restored = _wait_for_owner_inventory(
-                owner,
-                lambda inventory: inventory.terminal_handoff_callback_state
-                is NativeTerminalHandoffCallbackTerminalState.RESTORED,
-            )
-            assert restored.terminal_handoff_callback_id > 0
-            assert not claim_future.done()
+        owner.claim_source_forward_independent_handoffs(actions)
+        claimed = owner.inventory()
+        assert claimed.claimed_handoff_action_count == len(actions)
+        assert claimed.source_batch_handoff_count == 1
+        assert claimed.source_batch_handoff_action_count == len(actions)
+        assert claimed.handoff_callback_count == 0
 
-            owner.abort_and_close()
-            claim_future.result(timeout=_WAIT_SECONDS)
-
-        closed = _wait_for_owner_inventory(owner, lambda inventory: inventory.closed)
+        owner.abort_and_close()
+        closed = owner.inventory()
+        assert closed.closed
         assert closed.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-        assert closed.terminal_handoff_callback_state is (
-            NativeTerminalHandoffCallbackTerminalState.RESTORED
-        )
         assert closed.pending_action_count == 0
         assert closed.unclaimed_handoff_action_count == 0
         assert closed.claimed_handoff_action_count == len(actions)
-        assert not closed.input_eventfd_open
-        assert not closed.output_eventfd_open
-        assert not closed.observation_eventfd_open
+        assert closed.source_batch_handoff_count == 1
+        assert closed.source_batch_handoff_action_count == len(actions)
+        assert closed.handoff_callback_count == 0
+        assert closed.terminal_handoff_callback_state is (
+            NativeTerminalHandoffCallbackTerminalState.NONE
+        )
     finally:
-        sys.setswitchinterval(previous_switch_interval)
         owner.abort_and_close()
 
 
-def test_clean_close_returns_after_concurrent_deferred_abort() -> None:
-    """Clean close becomes idempotent when deferred abort wins restoration."""
+def test_abort_before_exact_source_batch_claim_transfers_no_authority() -> None:
+    """Abort discards an unclaimed source drain without a partial transfer."""
 
     owner, registrations = _direct_handoff_owner_population((89,))
     actions = _drain_direct_source_gathers(owner, registrations)
-    begin_close = threading.Event()
-    close_worker_ready = threading.Event()
-    abort_worker_ready = threading.Event()
-    owner.set_handoff_callback_holds_for_testing(
-        hold_activation=False,
-        hold_restoration=True,
-    )
+    owner.abort_and_close()
 
-    def close_after_claim() -> None:
-        """Enter clean close only after callback authority is consumed."""
+    with pytest.raises(RuntimeError, match="running enabled owner"):
+        owner.claim_source_forward_independent_handoffs(actions)
 
-        close_worker_ready.set()
-        if not begin_close.wait(_WAIT_SECONDS):
-            raise TimeoutError("clean-close race was not released")
-        owner.close()
-
-    def abort_after_close_waits() -> None:
-        """Let clean close park, then win closure through deferred abort."""
-
-        abort_worker_ready.set()
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: inventory.handoff_callback_restoring,
-        )
-        owner.acknowledge_action(actions[0])
-        begin_close.set()
-        _wait_for_owner_inventory(
-            owner,
-            lambda inventory: not inventory.admission_open,
-        )
-        owner.abort_and_close()
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            close_future = executor.submit(close_after_claim)
-            abort_future = executor.submit(abort_after_close_waits)
-            assert close_worker_ready.wait(_WAIT_SECONDS)
-            assert abort_worker_ready.wait(_WAIT_SECONDS)
-            claim_future = executor.submit(
-                owner.claim_source_forward_independent_handoffs,
-                actions,
-            )
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while not close_future.done() and time.monotonic() < expires_at:
-                pass
-
-            abort_future.result(timeout=_WAIT_SECONDS)
-            close_future.result(timeout=_WAIT_SECONDS)
-            with pytest.raises(RuntimeError):
-                claim_future.result(timeout=_WAIT_SECONDS)
-
-        inventory = _wait_for_owner_inventory(
-            owner,
-            lambda current: current.closed,
-        )
-        assert (
-            inventory.fatal_code is NativeTerminalOwnerFatalCode.DEPENDENCY_DEATH
-        )
-        assert inventory.pending_action_count == 0
-        assert inventory.unclaimed_handoff_action_count == 0
-        assert inventory.claimed_handoff_action_count == len(actions)
-        assert not inventory.handoff_callback_scheduled
-        assert not inventory.handoff_callback_active
-        assert not inventory.handoff_callback_restoring
-        assert not inventory.input_eventfd_open
-        assert not inventory.output_eventfd_open
-        assert not inventory.observation_eventfd_open
-    finally:
-        inventory = owner.inventory()
-        if not inventory.closed:
-            owner.set_handoff_callback_holds_for_testing(
-                hold_activation=False,
-                hold_restoration=False,
-            )
-        owner.abort_and_close()
+    inventory = owner.inventory()
+    assert inventory.closed
+    assert inventory.pending_action_count == 0
+    assert inventory.unclaimed_handoff_action_count == 0
+    assert inventory.claimed_handoff_action_count == 0
+    assert inventory.source_batch_handoff_count == 0
+    assert inventory.source_batch_handoff_action_count == 0
+    assert inventory.handoff_callback_count == 0
 
 
 def test_later_arrivals_form_a_distinct_exact_source_batch() -> None:
-    """Later outputs cannot join an exact batch already restoring its callback."""
+    """Later outputs cannot join the current swapped output-drain batch."""
 
     owner, registrations = _direct_handoff_owner_population((93, 94, 95))
     first_actions = _drain_direct_source_gathers(owner, registrations[:1])
-    owner.set_handoff_callback_holds_for_testing(
-        hold_activation=False,
-        hold_restoration=True,
-    )
     try:
-        def submit_later_arrivals() -> tuple[
-            NativeTerminalOwnerInventory,
-            NativeTerminalOwnerInventory,
-        ]:
-            """Queue later outputs while the first callback is restoring.
+        for registration in registrations[1:]:
+            _submit_direct_source_gather(owner, registration)
+        later_queued = _wait_for_owner_inventory(
+            owner,
+            lambda inventory: inventory.queued_output_count == 2,
+        )
+        assert later_queued.unclaimed_handoff_action_count == 3
 
-            :returns: Inventories before and after the later arrivals queue.
-            """
-
-            try:
-                restoring = _wait_for_owner_inventory(
-                    owner,
-                    lambda inventory: inventory.handoff_callback_restoring,
-                )
-                assert restoring.active_source_batch_action_count == 1
-                assert restoring.source_batch_handoff_count == 1
-                assert restoring.source_batch_handoff_action_count == 1
-
-                for registration in registrations[1:]:
-                    _submit_direct_source_gather(owner, registration)
-                later_queued = _wait_for_owner_inventory(
-                    owner,
-                    lambda inventory: inventory.queued_output_count == 2,
-                )
-                assert later_queued.handoff_callback_restoring
-                assert later_queued.active_source_batch_action_count == 1
-                assert later_queued.unclaimed_handoff_action_count == 2
-                assert later_queued.source_batch_handoff_count == 1
-                assert later_queued.source_batch_handoff_action_count == 1
-                return restoring, later_queued
-            finally:
-                owner.set_handoff_callback_holds_for_testing(
-                    hold_activation=False,
-                    hold_restoration=False,
-                )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            later_arrivals = executor.submit(submit_later_arrivals)
-            first_claim = executor.submit(
-                owner.claim_source_forward_independent_handoffs,
-                first_actions,
-            )
-            expires_at = time.monotonic() + _WAIT_SECONDS
-            while (
-                (not first_claim.done() or not later_arrivals.done())
-                and time.monotonic() < expires_at
-            ):
-                pass
-            if later_arrivals.done():
-                later_arrivals.result(timeout=0.0)
-            if not first_claim.done() or not later_arrivals.done():
-                owner.set_handoff_callback_holds_for_testing(
-                    hold_activation=False,
-                    hold_restoration=False,
-                )
-                raise TimeoutError("exact source-batch callback did not settle")
-
-            restoring, later_queued = later_arrivals.result(timeout=_WAIT_SECONDS)
-            first_claim.result(timeout=_WAIT_SECONDS)
-
-            assert restoring.active_source_batch_action_count == 1
-            assert later_queued.active_source_batch_action_count == 1
-            assert later_queued.unclaimed_handoff_action_count == 2
+        _claim_direct_source_batch(owner, first_actions)
+        first_claimed = owner.inventory()
+        assert first_claimed.unclaimed_handoff_action_count == 2
+        assert first_claimed.claimed_handoff_action_count == 1
+        assert first_claimed.source_batch_handoff_count == 1
+        assert first_claimed.source_batch_handoff_action_count == 1
+        assert first_claimed.handoff_callback_count == 0
 
         owner.acknowledge_action(first_actions[0])
         later_actions = tuple(
@@ -1956,16 +1647,11 @@ def test_later_arrivals_form_a_distinct_exact_source_batch() -> None:
         assert inventory.claimed_handoff_action_count == 3
         assert inventory.source_batch_handoff_count == 2
         assert inventory.source_batch_handoff_action_count == 3
-        assert inventory.handoff_callback_count == 2
+        assert inventory.handoff_callback_count == 0
         assert not inventory.handoff_callback_scheduled
         assert not inventory.handoff_callback_active
         assert not inventory.handoff_callback_restoring
     finally:
-        if not owner.inventory().closed:
-            owner.set_handoff_callback_holds_for_testing(
-                hold_activation=False,
-                hold_restoration=False,
-            )
         owner.abort_and_close()
 
 

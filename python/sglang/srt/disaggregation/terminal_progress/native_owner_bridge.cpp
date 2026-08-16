@@ -747,8 +747,6 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
   std::uint64_t handoff_discard_count{0};
   std::uint64_t source_batch_handoff_count{0};
   std::uint64_t source_batch_handoff_action_count{0};
-  std::vector<std::uint64_t> scheduled_source_batch_action_ids{};
-  std::vector<std::uint64_t> active_source_batch_action_ids{};
   bool started{false};
   bool admission_open{true};
   bool event_admission_open{true};
@@ -790,8 +788,6 @@ struct SharedOwner : std::enable_shared_from_this<SharedOwner> {
 struct PendingHandoffCall {
   std::shared_ptr<SharedOwner> owner{};
   std::uint64_t callback_id{0};
-  bool exact_source_batch{false};
-  std::vector<std::uint64_t> action_ids{};
 };
 
 int terminal_handoff_pending_call(void *opaque) noexcept;
@@ -1583,39 +1579,6 @@ bool schedule_handoff_pending_call_locked(SharedOwner &owner,
   }
 }
 
-bool schedule_source_batch_pending_call_locked(
-    SharedOwner &owner, const std::vector<std::uint64_t> &action_ids,
-    std::uint64_t &callback_id) {
-  if (owner.next_handoff_callback_id == 0 ||
-      owner.next_handoff_callback_id == UINT64_MAX) {
-    throw std::overflow_error("terminal handoff callback identity exhausted");
-  }
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-  if (owner.test_reject_next_handoff_pending_call) {
-    owner.test_reject_next_handoff_pending_call = false;
-    callback_id = owner.next_handoff_callback_id++;
-    return false;
-  }
-#endif
-  auto call = std::make_unique<PendingHandoffCall>();
-  call->owner = owner.shared_from_this();
-  call->callback_id = owner.next_handoff_callback_id++;
-  callback_id = call->callback_id;
-  call->exact_source_batch = true;
-  call->action_ids = action_ids;
-  owner.scheduled_source_batch_action_ids = action_ids;
-  if (Py_AddPendingCall(&terminal_handoff_pending_call, call.get()) != 0) {
-    owner.scheduled_source_batch_action_ids.clear();
-    return false;
-  }
-  owner.handoff_callback_scheduled = true;
-  owner.scheduled_handoff_callback_id = call->callback_id;
-  owner.scheduled_handoff_watermark =
-      *std::max_element(action_ids.begin(), action_ids.end());
-  call.release();
-  return true;
-}
-
 void register_forward_independent_handoffs_locked(
     SharedOwner &owner, const Output &output) noexcept {
   if (!owner.handoff_enabled) {
@@ -1647,14 +1610,7 @@ void discard_forward_independent_handoff_locked(
 }
 
 void clear_scheduled_handoff_activation_locked(
-    SharedOwner &owner, const PendingHandoffCall &call,
-    std::uint64_t watermark) noexcept {
-  if (call.exact_source_batch) {
-    for (const std::uint64_t action_id : call.action_ids) {
-      owner.activated_handoff_action_ids.erase(action_id);
-    }
-    return;
-  }
+    SharedOwner &owner, std::uint64_t watermark) noexcept {
   for (auto action = owner.activated_handoff_action_ids.begin();
        action != owner.activated_handoff_action_ids.end();) {
     if (*action <= watermark) {
@@ -1677,11 +1633,10 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
     if (owner.handoff_callback_scheduled &&
         owner.scheduled_handoff_callback_id == call->callback_id) {
       clear_scheduled_handoff_activation_locked(
-          owner, *call, owner.scheduled_handoff_watermark);
+          owner, owner.scheduled_handoff_watermark);
       owner.handoff_callback_scheduled = false;
       owner.scheduled_handoff_callback_id = 0;
       owner.scheduled_handoff_watermark = 0;
-      owner.scheduled_source_batch_action_ids.clear();
       owner.terminal_handoff_callback_id = call->callback_id;
       owner.terminal_handoff_callback_state =
           HandoffCallbackTerminalState::kCancelled;
@@ -1698,46 +1653,11 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
         "terminal handoff callback identity was stale or concurrent");
     if (owner.scheduled_handoff_callback_id == call->callback_id) {
       clear_scheduled_handoff_activation_locked(
-          owner, *call, owner.scheduled_handoff_watermark);
+          owner, owner.scheduled_handoff_watermark);
       owner.handoff_callback_scheduled = false;
       owner.scheduled_handoff_callback_id = 0;
       owner.scheduled_handoff_watermark = 0;
-      owner.scheduled_source_batch_action_ids.clear();
     }
-    owner.terminal_handoff_callback_id = call->callback_id;
-    owner.terminal_handoff_callback_state =
-        HandoffCallbackTerminalState::kCancelled;
-    finish_deferred_abort_close_locked(owner);
-    return 0;
-  }
-  if (call->exact_source_batch !=
-      !owner.scheduled_source_batch_action_ids.empty()) {
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffAuthority,
-        "terminal handoff callback batch classification disagreed");
-    clear_scheduled_handoff_activation_locked(
-        owner, *call, owner.scheduled_handoff_watermark);
-    owner.handoff_callback_scheduled = false;
-    owner.scheduled_handoff_callback_id = 0;
-    owner.scheduled_handoff_watermark = 0;
-    owner.scheduled_source_batch_action_ids.clear();
-    owner.terminal_handoff_callback_id = call->callback_id;
-    owner.terminal_handoff_callback_state =
-        HandoffCallbackTerminalState::kCancelled;
-    finish_deferred_abort_close_locked(owner);
-    return 0;
-  }
-  if (call->exact_source_batch &&
-      owner.scheduled_source_batch_action_ids != call->action_ids) {
-    enter_handoff_fatal_locked(
-        owner, FatalCode::kHandoffAuthority,
-        "terminal handoff callback batch identity disagreed");
-    clear_scheduled_handoff_activation_locked(
-        owner, *call, owner.scheduled_handoff_watermark);
-    owner.handoff_callback_scheduled = false;
-    owner.scheduled_handoff_callback_id = 0;
-    owner.scheduled_handoff_watermark = 0;
-    owner.scheduled_source_batch_action_ids.clear();
     owner.terminal_handoff_callback_id = call->callback_id;
     owner.terminal_handoff_callback_state =
         HandoffCallbackTerminalState::kCancelled;
@@ -1769,11 +1689,10 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
     if (activation_timed_out || owner.handoff_callback_cancel_requested ||
         owner.handoff_callback_timeout_requested || owner.closed) {
       clear_scheduled_handoff_activation_locked(
-          owner, *call, owner.scheduled_handoff_watermark);
+          owner, owner.scheduled_handoff_watermark);
       owner.handoff_callback_scheduled = false;
       owner.scheduled_handoff_callback_id = 0;
       owner.scheduled_handoff_watermark = 0;
-      owner.scheduled_source_batch_action_ids.clear();
       owner.handoff_callback_cancel_requested = false;
       owner.handoff_callback_timeout_requested = false;
       owner.terminal_handoff_callback_id = call->callback_id;
@@ -1799,8 +1718,6 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
   owner.handoff_callback_active = true;
   owner.active_handoff_callback_id = call->callback_id;
   owner.active_handoff_watermark = watermark;
-  owner.active_source_batch_action_ids =
-      std::move(owner.scheduled_source_batch_action_ids);
   ++owner.handoff_callback_count;
   owner.condition.notify_all();
 
@@ -1821,14 +1738,6 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
               owner.handoff_callback_timeout_requested) {
             return true;
           }
-          if (call->exact_source_batch) {
-            return std::none_of(
-                call->action_ids.begin(), call->action_ids.end(),
-                [&owner](std::uint64_t action_id) {
-                  return owner.activated_handoff_action_ids.count(action_id) ==
-                         1;
-                });
-          }
           if (!handoff_unclaimed_through_locked(owner, watermark)) {
             return true;
           }
@@ -1839,30 +1748,12 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
           return false;
 #endif
         });
-    const bool handoff_still_active = call->exact_source_batch
-                                          ? std::any_of(
-                                                call->action_ids.begin(),
-                                                call->action_ids.end(),
-                                                [&owner](std::uint64_t action_id) {
-                                                  return owner
-                                                             .activated_handoff_action_ids
-                                                             .count(action_id) ==
-                                                         1;
-                                                })
-                                          : handoff_unclaimed_through_locked(
-                                                owner, watermark);
+    const bool handoff_still_active =
+        handoff_unclaimed_through_locked(owner, watermark);
     deadline_expired = handoff_still_active && !owner.closed &&
                        owner_now_ns_locked(owner) >= deadline_ns;
   } catch (...) {
     wait_failed = true;
-  }
-  if (call->exact_source_batch &&
-      (wait_failed || !completed || deadline_expired || owner.closed ||
-       owner.handoff_callback_cancel_requested ||
-       owner.handoff_callback_timeout_requested)) {
-    for (const std::uint64_t action_id : call->action_ids) {
-      owner.activated_handoff_action_ids.erase(action_id);
-    }
   }
   if (wait_failed) {
     terminal_state = HandoffCallbackTerminalState::kCancelled;
@@ -1920,7 +1811,6 @@ int terminal_handoff_pending_call(void *opaque) noexcept {
   }
   owner.handoff_callback_restoring = false;
   owner.restoring_handoff_callback_id = 0;
-  owner.active_source_batch_action_ids.clear();
   owner.handoff_callback_cancel_requested = false;
   owner.handoff_callback_timeout_requested = false;
   owner.terminal_handoff_callback_id = call->callback_id;
@@ -3298,235 +3188,67 @@ public:
       action_ids.push_back(action_id);
     }
 
-    std::uint64_t callback_id = 0;
-    {
-      std::lock_guard<std::mutex> lock(owner_->mutex);
-      const auto reject_authority = [this](const std::string &reason) {
-        enter_handoff_fatal_locked(*owner_, FatalCode::kHandoffAuthority,
-                                   reason);
-        throw std::runtime_error(reason);
-      };
-      if (!owner_->started || owner_->closed || !owner_->handoff_enabled) {
-        reject_authority(
-            "source terminal handoff requires a running enabled owner");
-      }
-      if (owner_->owner_identity.role != OwnerRole::kSource) {
-        reject_authority(
-            "source terminal handoff requires a source-role owner");
-      }
-      if (owner_->fatal_code != FatalCode::kNone) {
-        throw std::runtime_error(
-            "source terminal handoff cannot enter after process fatality");
-      }
-      if (owner_->handoff_callback_scheduled ||
-          owner_->handoff_callback_active ||
-          owner_->handoff_callback_restoring ||
-          !owner_->activated_handoff_action_ids.empty() ||
-          !owner_->scheduled_source_batch_action_ids.empty() ||
-          !owner_->active_source_batch_action_ids.empty() ||
-          owner_->handoff_callback_cancel_requested ||
-          owner_->handoff_callback_timeout_requested) {
-        reject_authority(
-            "source terminal handoff encountered a stale callback generation");
-      }
-      std::unordered_set<std::uint64_t> eligible_action_ids;
-      eligible_action_ids.reserve(owner_->output_drain_action_ids.size());
-      for (const std::uint64_t action_id : owner_->output_drain_action_ids) {
-        const auto action = owner_->pending_actions.find(action_id);
-        if (action == owner_->pending_actions.end()) {
-          reject_authority(
-              "source terminal handoff drain contained unknown authority");
-        }
-        if (action->second.binding.owner.role == OwnerRole::kSource &&
-            action_requires_forward_independent_handoff(action->second.kind)) {
-          eligible_action_ids.insert(action_id);
-        }
-      }
-      if (unique_action_ids != eligible_action_ids) {
-        reject_authority(
-            "source terminal handoff batch differed from the complete eligible "
-            "output drain");
-      }
-      for (const std::uint64_t action_id : action_ids) {
-        const auto action = owner_->pending_actions.find(action_id);
-        if (action == owner_->pending_actions.end() ||
-            owner_->output_drain_action_ids.count(action_id) != 1 ||
-            action->second.binding.owner.role != OwnerRole::kSource ||
-            !action_requires_forward_independent_handoff(
-                action->second.kind) ||
-            owner_->unclaimed_handoff_action_ids.count(action_id) != 1) {
-          reject_authority(
-              "source terminal handoff batch contained ineligible authority");
-        }
-      }
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    const auto reject_authority = [this](const std::string &reason) {
+      enter_handoff_fatal_locked(*owner_, FatalCode::kHandoffAuthority,
+                                 reason);
+      throw std::runtime_error(reason);
+    };
+    if (!owner_->started || owner_->closed || !owner_->handoff_enabled) {
+      reject_authority(
+          "source terminal handoff requires a running enabled owner");
+    }
+    if (owner_->owner_identity.role != OwnerRole::kSource) {
+      reject_authority(
+          "source terminal handoff requires a source-role owner");
+    }
+    if (owner_->fatal_code != FatalCode::kNone) {
+      throw std::runtime_error(
+          "source terminal handoff cannot enter after process fatality");
+    }
+    if (!owner_->output_drain_active) {
+      reject_authority(
+          "source terminal handoff requires the current output drain");
+    }
 
-      std::vector<std::uint64_t> activated_action_ids;
-      activated_action_ids.reserve(action_ids.size());
-      try {
-        for (const std::uint64_t action_id : action_ids) {
-          if (!owner_->activated_handoff_action_ids.insert(action_id).second) {
-            reject_authority(
-                "source terminal handoff batch activation was replayed");
-          }
-          activated_action_ids.push_back(action_id);
-        }
-        if (!schedule_source_batch_pending_call_locked(
-                *owner_, action_ids, callback_id)) {
-          for (const std::uint64_t action_id : activated_action_ids) {
-            owner_->activated_handoff_action_ids.erase(action_id);
-          }
-          owner_->terminal_handoff_callback_id = callback_id;
-          owner_->terminal_handoff_callback_state =
-              HandoffCallbackTerminalState::kSchedulingRejected;
-          enter_handoff_fatal_locked(
-              *owner_, FatalCode::kPendingCallQueueFailure,
-              "CPython rejected the source terminal handoff pending call");
-          throw std::runtime_error(
-              "CPython rejected the source terminal handoff pending call");
-        }
-      } catch (...) {
-        if (!owner_->handoff_callback_scheduled) {
-          for (const std::uint64_t action_id : activated_action_ids) {
-            owner_->activated_handoff_action_ids.erase(action_id);
-          }
-          owner_->scheduled_source_batch_action_ids.clear();
-          if (owner_->fatal_code == FatalCode::kNone) {
-            if (callback_id != 0) {
-              owner_->terminal_handoff_callback_id = callback_id;
-              owner_->terminal_handoff_callback_state =
-                  HandoffCallbackTerminalState::kSchedulingRejected;
-            }
-            enter_handoff_fatal_locked(
-                *owner_, FatalCode::kPendingCallQueueFailure,
-                "source terminal handoff scheduling failed");
-          }
-        }
-        throw;
+    std::unordered_set<std::uint64_t> eligible_action_ids;
+    eligible_action_ids.reserve(owner_->output_drain_action_ids.size());
+    for (const std::uint64_t action_id : owner_->output_drain_action_ids) {
+      const auto action = owner_->pending_actions.find(action_id);
+      if (action == owner_->pending_actions.end()) {
+        reject_authority(
+            "source terminal handoff drain contained unknown authority");
+      }
+      if (action->second.binding.owner.role == OwnerRole::kSource &&
+          action_requires_forward_independent_handoff(action->second.kind)) {
+        eligible_action_ids.insert(action_id);
+      }
+    }
+    if (unique_action_ids != eligible_action_ids) {
+      reject_authority(
+          "source terminal handoff batch differed from the complete eligible "
+          "output drain");
+    }
+    for (const std::uint64_t action_id : action_ids) {
+      const auto action = owner_->pending_actions.find(action_id);
+      if (action == owner_->pending_actions.end() ||
+          owner_->output_drain_action_ids.count(action_id) != 1 ||
+          action->second.binding.owner.role != OwnerRole::kSource ||
+          !action_requires_forward_independent_handoff(action->second.kind) ||
+          owner_->unclaimed_handoff_action_ids.count(action_id) != 1 ||
+          owner_->activated_handoff_action_ids.count(action_id) != 0) {
+        reject_authority(
+            "source terminal handoff batch contained ineligible authority");
       }
     }
 
-    bool restored = false;
-    std::string failure_reason;
-    {
-      py::gil_scoped_release release;
-      std::unique_lock<std::mutex> lock(owner_->mutex);
-      const DeadlineSpec &shutdown = owner_->deadline_specs[
-          static_cast<std::uint8_t>(DeadlineKind::kOwnerShutdownDrain)];
-      const std::uint64_t native_deadline_ns =
-          owner_now_ns_locked(*owner_) + shutdown.duration_ns;
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::nanoseconds(shutdown.duration_ns);
-      const auto native_deadline_expired = [&]() {
-#ifdef SGLANG_TERMINAL_OWNER_TESTING
-        return owner_->test_clock_enabled &&
-               owner_now_ns_locked(*owner_) >= native_deadline_ns;
-#else
-        return false;
-#endif
-      };
-      const bool activation_resolved = owner_->condition.wait_until(
-          lock, deadline, [&]() {
-            return (owner_->handoff_callback_active &&
-                    owner_->active_handoff_callback_id == callback_id) ||
-                   owner_->terminal_handoff_callback_id == callback_id ||
-                   owner_->fatal_code != FatalCode::kNone || owner_->closed ||
-                   native_deadline_expired();
-          });
-      const bool callback_active = owner_->handoff_callback_active &&
-                                   owner_->active_handoff_callback_id ==
-                                       callback_id;
-      if ((!activation_resolved || native_deadline_expired()) &&
-          !callback_active) {
-        for (const std::uint64_t action_id : action_ids) {
-          owner_->activated_handoff_action_ids.erase(action_id);
-        }
-        owner_->handoff_callback_timeout_requested = true;
-        enter_handoff_fatal_locked(
-            *owner_, FatalCode::kHandoffTimeout,
-            "source terminal handoff callback activation timed out");
-        owner_->condition.notify_all();
-        failure_reason =
-            "source terminal handoff callback activation timed out";
-      } else if (owner_->fatal_code != FatalCode::kNone || owner_->closed) {
-        for (const std::uint64_t action_id : action_ids) {
-          owner_->activated_handoff_action_ids.erase(action_id);
-        }
-        owner_->handoff_callback_cancel_requested = true;
-        owner_->condition.notify_all();
-        failure_reason =
-            "source terminal handoff was cancelled by process fatality";
-      } else if (!owner_->handoff_callback_active ||
-                 owner_->active_handoff_callback_id != callback_id ||
-                 owner_->active_source_batch_action_ids != action_ids) {
-        for (const std::uint64_t action_id : action_ids) {
-          owner_->activated_handoff_action_ids.erase(action_id);
-        }
-        owner_->handoff_callback_cancel_requested = true;
-        enter_handoff_fatal_locked(
-            *owner_, FatalCode::kHandoffAuthority,
-            "source terminal handoff callback activated with stale identity");
-        owner_->condition.notify_all();
-        failure_reason =
-            "source terminal handoff callback activated with stale identity";
-      } else {
-        bool authority_complete = true;
-        for (const std::uint64_t action_id : action_ids) {
-          authority_complete =
-              authority_complete &&
-              owner_->unclaimed_handoff_action_ids.count(action_id) == 1 &&
-              owner_->activated_handoff_action_ids.count(action_id) == 1;
-        }
-        if (!authority_complete) {
-          for (const std::uint64_t action_id : action_ids) {
-            owner_->activated_handoff_action_ids.erase(action_id);
-          }
-          owner_->handoff_callback_cancel_requested = true;
-          enter_handoff_fatal_locked(
-              *owner_, FatalCode::kHandoffAuthority,
-              "source terminal handoff batch lost native authority");
-          owner_->condition.notify_all();
-          failure_reason =
-              "source terminal handoff batch lost native authority";
-        } else {
-          for (const std::uint64_t action_id : action_ids) {
-            owner_->activated_handoff_action_ids.erase(action_id);
-            owner_->unclaimed_handoff_action_ids.erase(action_id);
-          }
-          owner_->handoff_claim_count += action_ids.size();
-          ++owner_->source_batch_handoff_count;
-          owner_->source_batch_handoff_action_count += action_ids.size();
-          owner_->condition.notify_all();
-
-          const bool callback_terminal = owner_->condition.wait_until(
-              lock, deadline, [&]() {
-                return owner_->terminal_handoff_callback_id == callback_id ||
-                       native_deadline_expired();
-              });
-          if (!callback_terminal ||
-              (native_deadline_expired() &&
-               owner_->terminal_handoff_callback_id != callback_id)) {
-            owner_->handoff_callback_timeout_requested = true;
-            enter_handoff_fatal_locked(
-                *owner_, FatalCode::kHandoffTimeout,
-                "source terminal handoff callback restoration timed out");
-            owner_->condition.notify_all();
-            failure_reason =
-                "source terminal handoff callback restoration timed out";
-          } else if (owner_->terminal_handoff_callback_state !=
-                         HandoffCallbackTerminalState::kRestored ||
-                     owner_->fatal_code != FatalCode::kNone || owner_->closed ||
-                     owner_->abort_started) {
-            failure_reason =
-                "source terminal handoff callback restored outside an open owner";
-          } else {
-            restored = true;
-          }
-        }
-      }
+    for (const std::uint64_t action_id : action_ids) {
+      owner_->unclaimed_handoff_action_ids.erase(action_id);
     }
-    if (!restored) {
-      throw std::runtime_error(failure_reason);
-    }
+    owner_->handoff_claim_count += action_ids.size();
+    ++owner_->source_batch_handoff_count;
+    owner_->source_batch_handoff_action_count += action_ids.size();
+    owner_->condition.notify_all();
   }
 
   bool activate_forward_independent_handoff(std::uint64_t action_id) {
@@ -3545,14 +3267,6 @@ public:
         owner_->fatal_code != FatalCode::kNone) {
       throw std::runtime_error(
           "decode terminal handoff requires a running non-fatal owner");
-    }
-    if (!owner_->scheduled_source_batch_action_ids.empty() ||
-        !owner_->active_source_batch_action_ids.empty()) {
-      enter_handoff_fatal_locked(
-          *owner_, FatalCode::kHandoffAuthority,
-          "single-action handoff overlapped a source batch generation");
-      throw std::runtime_error(
-          "single-action handoff overlapped a source batch generation");
     }
     const auto action = owner_->pending_actions.find(action_id);
     if (action == owner_->pending_actions.end()) {
@@ -4089,8 +3803,6 @@ public:
                       owner_->handoff_callback_scheduled ||
                       owner_->handoff_callback_active ||
                       owner_->handoff_callback_restoring ||
-                      !owner_->scheduled_source_batch_action_ids.empty() ||
-                      !owner_->active_source_batch_action_ids.empty() ||
                       !owner_->producers_joined;
       for (const auto &entry : owner_->lifecycles) {
         retained = retained || entry.second.live_resources != 0;
@@ -4188,9 +3900,7 @@ public:
         !owner_->activated_handoff_action_ids.empty() ||
         owner_->handoff_callback_scheduled ||
         owner_->handoff_callback_active ||
-        owner_->handoff_callback_restoring ||
-        !owner_->scheduled_source_batch_action_ids.empty() ||
-        !owner_->active_source_batch_action_ids.empty()) {
+        owner_->handoff_callback_restoring) {
       throw std::runtime_error(
           "aborted close retained unrouted terminal authority");
     }
@@ -4386,10 +4096,6 @@ private:
         owner_->terminal_handoff_callback_id;
     result["terminal_handoff_callback_state"] =
         static_cast<int>(owner_->terminal_handoff_callback_state);
-    result["scheduled_source_batch_action_count"] =
-        owner_->scheduled_source_batch_action_ids.size();
-    result["active_source_batch_action_count"] =
-        owner_->active_source_batch_action_ids.size();
     result["output_drain_active"] = owner_->output_drain_active;
     result["producer_count"] = owner_->producers.size();
     py::list producers;

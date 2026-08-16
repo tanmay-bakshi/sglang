@@ -876,7 +876,7 @@ class NativeTerminalRuntime:
         :param publisher_capacity: Gateway publication inbox capacity.
         :param observation_capacity: Non-gating metrics queue capacity.
         :param enable_forward_independent_handoff: Whether forward-independent
-            actions park the scheduler until their dedicated inbox claims them.
+            actions use their role-specific delivery handoff.
         :param testing: Whether the native owner exposes deterministic test
             controls. Production runtimes leave this disabled.
         """
@@ -1896,9 +1896,9 @@ class NativeTerminalRuntime:
     ) -> tuple[NativeTerminalOwnerAction, ...]:
         """Transfer projected actions at the isolated inbox-dequeue boundary.
 
-        Source actions transfer an already-restored batch preclaim. Decode
-        actions claim their visible native handoff here. In both cases, the
-        action remains in ``_consumer_pending`` until downstream
+        Source actions consume an atomically transferred batch preclaim.
+        Decode actions claim their visible native handoff here. In both cases,
+        the action remains in ``_consumer_pending`` until downstream
         acknowledgement, preserving resource and lifecycle authority across
         consumer work and recursive native submissions.
 
@@ -2723,9 +2723,8 @@ class NativeTerminalRuntime:
                     and self._forward_independent_handoff_enabled
                     and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
                 )
-                # A pending callback can run when inbox signalling first yields
-                # the GIL. Fatal admission and durable publication must remain
-                # one ownership transition until that point.
+                # Fatal admission and durable publication remain one ownership
+                # transition until the bounded consumer inbox owns the action.
                 with self._condition:
                     fail_closed = self._disposition in (
                         NativeTerminalRuntimeDisposition.PROCESS_FATAL,
@@ -2912,10 +2911,11 @@ class NativeTerminalRuntime:
         A readable native batch is one authority boundary for every role. No
         functional sibling may become visible when that batch already contains
         process-fatal authority. For a healthy source batch, delivery leases
-        become durable before the native callback can suspend the scheduler.
-        The native rendezvous then proves that the callback interrupted and
-        restored that scheduler before any action is projected. Decode instead
-        activates and durably projects each action under one runtime lock.
+        become durable before one synchronous exact-batch native claim. That
+        claim has no scheduler-thread or interpreter-main-thread dependency;
+        the existing leases exclude another host launch until the projected
+        work reaches its causal completion milestones. Decode retains its
+        activate-before-publication handoff.
 
         :param outputs: Complete native population drained by one readable wake.
         """

@@ -618,9 +618,8 @@ def _pump(
 def _wait_for_phase(predicate: Callable[[], bool], description: str) -> None:
     """Keep the main interpreter runnable until a reactor-owned phase lands.
 
-    Native pending calls execute on the main interpreter. A condition wait here
-    would park the only thread that can accept a handoff even though the serving
-    reactor correctly owns the downstream drain.
+    Yielding between observations lets the serving reactor and its workers own
+    downstream progress without coupling the assertion to their conditions.
 
     :param predicate: Exact phase condition to observe.
     :param description: Stable assertion context when the phase misses its bound.
@@ -1539,16 +1538,16 @@ def test_delivery_batch_allocation_retains_launch_exclusion_until_owner_death(
         serving.abort_and_close()
 
 
-@pytest.mark.parametrize("hold_intent_condition", (True, False))
-def test_native_batch_handoff_restores_while_scheduler_lock_is_held(
+def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
     monkeypatch: pytest.MonkeyPatch,
-    hold_intent_condition: bool,
 ) -> None:
-    """An acquired batch restores without borrowing scheduler-owned locks."""
+    """Source delivery breaks the attempt-29 scheduler-wait cycle."""
 
     identity = _identity()
     leases_acquired = threading.Event()
     release_acquisition = threading.Event()
+    scheduler_waiting = threading.Event()
+    launch_submitted = threading.Event()
     gather_entered = threading.Event()
     release_gather = threading.Event()
 
@@ -1600,12 +1599,24 @@ def test_native_batch_handoff_restores_while_scheduler_lock_is_held(
         reactor_failures.append,
     )
     scheduler_inbox = serving._scheduler_serving._inbox
-    scheduler_lock = (
-        scheduler_inbox._intent_condition
-        if hold_intent_condition
-        else scheduler_inbox._state_lock
+    original_wait = scheduler_inbox._wait_for_publication_intents
+
+    def observe_scheduler_wait(intents: frozenset[int]) -> None:
+        """Expose the real launch wait which deadlocked attempt 29.
+
+        :param intents: Exact causal delivery intents blocking host launch.
+        """
+
+        scheduler_waiting.set()
+        original_wait(intents)
+
+    monkeypatch.setattr(
+        scheduler_inbox,
+        "_wait_for_publication_intents",
+        observe_scheduler_wait,
     )
-    scheduler_lock_owned = False
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    launch: concurrent.futures.Future[str] | None = None
     reactor_started = False
     serving.start()
     try:
@@ -1616,42 +1627,53 @@ def test_native_batch_handoff_restores_while_scheduler_lock_is_held(
         serving.attach_producer_completion(submission)
         assert serving.packed_ready(identity.local_binding.digest)
         assert leases_acquired.wait(timeout=_WAIT_SECONDS)
-        scheduler_lock.acquire()
-        scheduler_lock_owned = True
+        launch = executor.submit(
+            serving._scheduler_serving.launch_handoff,
+            lambda: launch_submitted.set() or "submitted",
+        )
+        assert scheduler_waiting.wait(timeout=_WAIT_SECONDS)
+        assert not launch_submitted.is_set()
+
         release_acquisition.set()
         _wait_for_phase(
             lambda: runtime.snapshot().owner.source_batch_handoff_action_count == 1,
-            "native source batch did not claim while scheduler lock was held",
+            "native source batch did not claim while the scheduler waited",
         )
-        _wait_for_phase(gather_entered.is_set, "gather worker did not claim delivery")
+        _wait_for_phase(
+            gather_entered.is_set,
+            "source gather remained coupled to the blocked scheduler",
+        )
         owner = runtime.snapshot().owner
         assert owner.unclaimed_handoff_action_count == 0
         assert owner.claimed_handoff_action_count == 1
         assert owner.source_batch_handoff_count == 1
         assert owner.source_batch_handoff_action_count == 1
+        assert owner.handoff_callback_count == 0
         assert not owner.handoff_callback_scheduled
         assert not owner.handoff_callback_active
         assert not owner.handoff_callback_restoring
-        assert (
-            owner.terminal_handoff_callback_state
-            is NativeTerminalHandoffCallbackTerminalState.RESTORED
-        )
         assert serving._delivery_leases.inventory().active_binding_digests == (
             identity.local_binding.digest,
         )
-        scheduler_lock.release()
-        scheduler_lock_owned = False
+        assert not launch_submitted.is_set()
+
         release_gather.set()
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+        serving._delivery_leases.mark_outcomes_sent(identity.local_binding)
+        serving._delivery_leases.mark_publication_owned(identity.local_binding)
+        assert launch.result(timeout=_WAIT_SECONDS) == "submitted"
+
+        assert launch_submitted.is_set()
         assert reactor_failures == []
     finally:
         release_acquisition.set()
-        if scheduler_lock_owned:
-            scheduler_lock.release()
         release_gather.set()
+        if launch is not None and not launch.done():
+            serving._delivery_leases.release_process_fatal()
         if reactor_started:
             reactor.close(_WAIT_SECONDS)
         serving.abort_and_close()
+        executor.shutdown(wait=True)
 
 
 def test_gather_worker_owns_direct_inbox_and_binds_device_once(
@@ -2771,15 +2793,13 @@ def test_full_source_composition_retires_exactly_once(
         owner = final_inventory.runtime.owner
         assert owner.source_batch_handoff_count == 5
         assert owner.source_batch_handoff_action_count == 5
-        assert owner.handoff_callback_count == 5
+        assert owner.handoff_callback_count == 0
         assert not owner.handoff_callback_scheduled
         assert not owner.handoff_callback_active
         assert not owner.handoff_callback_restoring
-        assert owner.scheduled_source_batch_action_count == 0
-        assert owner.active_source_batch_action_count == 0
         assert (
             owner.terminal_handoff_callback_state
-            is NativeTerminalHandoffCallbackTerminalState.RESTORED
+            is NativeTerminalHandoffCallbackTerminalState.NONE
         )
         assert final_inventory.runtime.source_preclaimed_count == 0
         assert final_inventory.runtime.source_preclaimed_consumer_count == 0

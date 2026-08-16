@@ -1318,10 +1318,10 @@ class PackedTerminalSourceServing:
     ) -> _PackedTerminalSourceRuntimeActionBatch:
         """Claim every process-reactor action before invoking a consumer.
 
-        Native source-batch handoff is restored before output projection.
-        Claiming the complete cross-inbox population while the projection
-        fence is held preserves one ordered consumer snapshot before any
-        scheduler-affine publication can wait on scheduler state.
+        Native source-batch authority transfers synchronously before output
+        projection. Claiming the complete cross-inbox population while the
+        projection fence is held preserves one ordered consumer snapshot
+        before any scheduler-affine publication can wait on scheduler state.
 
         :returns: Immutable, already-claimed action populations.
         """
