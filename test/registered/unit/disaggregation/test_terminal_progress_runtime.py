@@ -740,24 +740,38 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
     previous_switch_interval = sys.getswitchinterval()
     try:
 
-        def expire_active_handoff() -> None:
+        def expire_active_handoff() -> tuple[NativeTerminalOwnerAction, ...]:
             assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
+            assert owner.wait_for_process_fatal(_WAIT_SECONDS)
+            actions = tuple(
+                action for output in owner.drain_outputs() for action in output.actions
+            )
+            for action in actions:
+                owner.acknowledge_action(action)
+                owner.complete_forward_independent_handoff(action)
+            return actions
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             expiry_future = executor.submit(expire_active_handoff)
-            sys.setswitchinterval(1.0)
+            sys.setswitchinterval(0.005)
             _submit_direct_source_gather(owner, registration)
             expires_at = time.monotonic() + 0.5
             while not expiry_future.done() and time.monotonic() < expires_at:
                 pass
-            expiry_future.result(timeout=_WAIT_SECONDS)
+            actions = expiry_future.result(timeout=_WAIT_SECONDS)
             sys.setswitchinterval(previous_switch_interval)
 
         inventory = owner.inventory()
+        assert len(actions) == 2
+        assert any(
+            action.kind is NativeTerminalOwnerActionKind.PROCESS_FATAL
+            for action in actions
+        )
         assert inventory.fatal_code is NativeTerminalOwnerFatalCode.HANDOFF_TIMEOUT
-        assert inventory.pending_handoff_action_count >= 1
-        assert inventory.handoff_callback_count >= 1
+        assert inventory.pending_handoff_action_count == 0
+        assert inventory.completed_handoff_action_count == 2
+        assert inventory.handoff_callback_count == 2
     finally:
         sys.setswitchinterval(previous_switch_interval)
         owner.abort_and_close()
@@ -782,7 +796,7 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             close_future = executor.submit(reject_close_and_resolve_actions)
-            sys.setswitchinterval(1.0)
+            sys.setswitchinterval(0.005)
             _submit_direct_source_gather(owner, registration)
             expires_at = time.monotonic() + 0.5
             while not close_future.done() and time.monotonic() < expires_at:

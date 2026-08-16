@@ -3015,6 +3015,17 @@ public:
   }
 
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+  bool wait_for_process_fatal(double timeout_seconds) {
+    if (timeout_seconds <= 0.0) {
+      throw std::invalid_argument("process-fatal wait must be positive");
+    }
+    std::unique_lock<std::mutex> lock(owner_->mutex);
+    return owner_->condition.wait_for(
+        lock, std::chrono::duration<double>(timeout_seconds), [&]() {
+          return owner_->fatal_code != FatalCode::kNone || owner_->closed;
+        }) && owner_->fatal_code != FatalCode::kNone;
+  }
+
   py::dict lifecycle_snapshot(const py::bytes &binding_digest) const {
     const Digest digest =
         exact_bytes<kDigestBytes>(binding_digest, "binding digest");
@@ -3782,6 +3793,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("timeout_seconds"),
            py::call_guard<py::gil_scoped_release>())
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+      .def("wait_for_process_fatal",
+           &NativeTerminalOwnerBridge::wait_for_process_fatal,
+           py::arg("timeout_seconds"),
+           py::call_guard<py::gil_scoped_release>())
       .def("lifecycle_snapshot",
            &NativeTerminalOwnerBridge::lifecycle_snapshot,
            py::arg("binding_digest"))

@@ -164,6 +164,13 @@ class _NativeTerminalOwnerBridge(Protocol):
         :returns: Whether a forward-independent handoff became active.
         """
 
+    def wait_for_process_fatal(self, timeout_seconds: float) -> bool:
+        """Wait until a test owner enters process-fatal authority.
+
+        :param timeout_seconds: Positive wall-clock bound.
+        :returns: Whether process-fatal authority became active.
+        """
+
     def enable_test_clock(self, now_ns: int) -> None:
         """Enable the deterministic clock before reactor startup.
 
@@ -792,6 +799,20 @@ class NativeTerminalOwner:
         return bool(
             self._native.wait_for_forward_independent_handoff(timeout_seconds)
         )
+
+    def wait_for_process_fatal(self, timeout_seconds: float) -> bool:
+        """Wait until a deterministic test owner enters process-fatal authority.
+
+        :param timeout_seconds: Positive wall-clock wait bound.
+        :returns: Whether process-fatal authority became active.
+        :raises RuntimeError: If this owner was not built for testing.
+        """
+
+        if not self._testing:
+            raise RuntimeError("process-fatal waits require a native test build")
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native.wait_for_process_fatal(timeout_seconds))
 
     def producer_api(self) -> object:
         """Return the versioned producer ABI capsule.
