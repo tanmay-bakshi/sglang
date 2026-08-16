@@ -569,11 +569,15 @@ def _actor(
 def _runtime(
     local_identity: TerminalProcessIdentity,
     source_identity: TerminalProcessIdentity,
+    *,
+    enable_forward_independent_handoff: bool,
 ) -> NativeTerminalRuntime:
     """Construct one decode runtime with a complete frozen producer directory.
 
     :param local_identity: Decode process owned by the runtime.
     :param source_identity: Authenticated source control peer.
+    :param enable_forward_independent_handoff: Whether native delivery authority
+        gates scheduler launches.
     :returns: Dormant process-lifetime runtime.
     """
 
@@ -648,7 +652,7 @@ def _runtime(
         decode_work_capacity=8,
         publisher_capacity=8,
         observation_capacity=64,
-        enable_forward_independent_handoff=True,
+        enable_forward_independent_handoff=enable_forward_independent_handoff,
     )
 
 
@@ -665,6 +669,7 @@ def _standalone_scatter_runtime() -> tuple[
     runtime = _runtime(
         bindings[0].owner,
         source_plan.writers[0].process_identity,
+        enable_forward_independent_handoff=False,
     )
     runtime.start()
     return runtime, bindings[0]
@@ -869,7 +874,11 @@ def _serving(
 
     bindings, source_plan, manifest = _identity_graph(decode_tp_size)
     local_identity = bindings[0].owner
-    runtime = _runtime(local_identity, source_plan.writers[0].process_identity)
+    runtime = _runtime(
+        local_identity,
+        source_plan.writers[0].process_identity,
+        enable_forward_independent_handoff=True,
+    )
     actor, actor_state = _actor(source_plan)
     completion = _CudaCompletion(runtime)
     deliveries: list[PackedTerminalDecodeWireDelivery] = []
