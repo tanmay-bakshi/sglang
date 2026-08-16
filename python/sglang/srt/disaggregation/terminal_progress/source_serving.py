@@ -325,6 +325,7 @@ class PackedTerminalSourceServingInventory:
                 len(self.wiring.active_binding_digests),
                 len(self.wiring.active_result_slot_binding_digests),
                 self.wiring.pending_publication_action_count,
+                self.wiring.pending_publication_receipt_count,
                 len(self.scheduler_consumer.active_binding_digests),
                 self.scheduler_serving.inbox.live_count,
                 len(self.scheduler_serving.retained_action_ids),

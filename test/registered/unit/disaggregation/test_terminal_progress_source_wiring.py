@@ -1246,6 +1246,65 @@ def test_noncanonical_rank_consumes_its_exact_publication_receipt() -> None:
     )
 
 
+def test_noncanonical_publication_receipt_joins_late_native_action() -> None:
+    """An authenticated remote outcome may outrun the local action inbox."""
+
+    harness = _harness(local_rank=1)
+    _ready(harness)
+    canonical = _identities(local_rank=0)
+    canonical_ready = TerminalWireReceiptIssuer(
+        harness.identity.request_ready_issuer
+    ).issue(
+        binding=canonical.local_binding,
+        kind=TerminalReceiptKind.REQUEST_READY,
+        outcome=TerminalReceiptOutcome.SUCCESS,
+        terminal_timestamp_ns=harness.clock.now_ns(),
+    )
+    publication = FrozenTerminalGatewayPublication(
+        identity=harness.identity.publication_identity,
+        canonical_binding=harness.identity.source_bindings[0],
+        source_bindings=harness.identity.source_bindings,
+        request_ready_receipt=canonical_ready.local_receipt,
+        output_projection=_Projection(payload=b"output"),
+        enqueued_ns=harness.clock.now_ns(),
+    )
+    result = _publication_result(harness, publication, success=True)
+    local_receipt = next(
+        receipt
+        for receipt in result.source_receipts
+        if receipt.wire_receipt.binding == harness.identity.local_binding
+    )
+    operation_count = len(harness.runtime.operations)
+
+    harness.wiring.publication_receipt(
+        wire_receipt=local_receipt.wire_receipt,
+        local_receipt=local_receipt.local_receipt,
+        authenticated_issuer=harness.identity.publisher_issuer,
+    )
+
+    inventory = harness.wiring.inventory()
+    assert len(harness.runtime.operations) == operation_count
+    assert inventory.pending_publication_action_count == 0
+    assert inventory.pending_publication_receipt_count == 1
+
+    action = _action(
+        harness,
+        NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
+        41,
+    )
+    assert harness.wiring.consume_gateway_publication_ready(action) is None
+    completion = harness.runtime.operations[-1]
+    assert completion[0:4] == (
+        "work",
+        _PUBLISHER_RECEIPT_PRODUCER_ID,
+        action,
+        NativeTerminalOwnerEventKind.SOURCE_GATEWAY_PUBLISHED,
+    )
+    inventory = harness.wiring.inventory()
+    assert inventory.pending_publication_action_count == 0
+    assert inventory.pending_publication_receipt_count == 0
+
+
 def test_publication_failure_quarantines_identity_after_safe_reclaim() -> None:
     """Retain failed publication identity while storage is already reusable."""
 
