@@ -1814,6 +1814,23 @@ def test_scatter_submission_isolated_and_drains_before_cuda_retirement() -> None
         assert actor_state.retirement_worker_inventories == []
 
         actor_state.scatter_release.set()
+        _pump_until(
+            serving,
+            lambda inventory: "teardown" in actor_state.events,
+        )
+        assert not shutdown_finished.is_set()
+        assert actor_state.retirement_worker_inventories == []
+
+        serving.control_received(writer_id, object())
+        serving.control_received(writer_id, object())
+        expires_at = time.monotonic() + _WAIT_SECONDS
+        while (
+            runtime.scheduler_actions.snapshot().queued_count != 1
+            and time.monotonic() < expires_at
+        ):
+            pass
+        assert runtime.scheduler_actions.snapshot().queued_count == 1
+
         shutdown_thread.join(timeout=_WAIT_SECONDS)
         assert not shutdown_thread.is_alive()
         assert shutdown_error == []

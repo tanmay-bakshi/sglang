@@ -3370,14 +3370,15 @@ def test_gateway_result_lifetime_does_not_extend_launch_exclusion() -> None:
         _finish_handoff_runtime(runtime)
 
 
-def test_decode_scatter_lifetime_does_not_extend_launch_exclusion() -> None:
-    """Delivered scatter work retains decode authority without gating launch."""
+def test_decode_scatter_claim_does_not_settle_writer_reservation() -> None:
+    """Scatter delivery leaves launch excluded until adoption publication."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.DECODE,
         enable_forward_independent_handoff=True,
     )
     registration = _registration(owner, remote, 103)
+    binding_digest = registration.binding.digest
     runtime.start()
     try:
         runtime.register_lifecycle(registration)
@@ -3398,18 +3399,54 @@ def test_decode_scatter_lifetime_does_not_extend_launch_exclusion() -> None:
             )
             assert not launch.done()
             scatter = _drain_actions(runtime.decode_scatter_actions)[0]
+            claimed = runtime.snapshot()
+            assert claimed.owner.active_handoff_action_count == 0
+            assert claimed.owner.decode_delivery_reservation_count == 1
+            assert claimed.consumer_pending_count == 1
+            assert not launch.done()
+
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                scatter,
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+            )
+            runtime.submit(
+                _LOCAL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_SCATTER_TERMINAL,
+            )
+            teardown = _drain_actions(runtime.decode_work_actions)[0]
+            runtime.complete_work_action(
+                _LOCAL_PRODUCER_ID,
+                teardown,
+                NativeTerminalOwnerEventKind.DECODE_TEARDOWN_SENT,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_AGGREGATION_STARTED,
+            )
+            runtime.submit(
+                _REMOTE_CONTROL_PRODUCER_ID,
+                binding_digest,
+                NativeTerminalOwnerEventKind.DECODE_ACK_MANIFEST_COMPLETED,
+            )
+            adoption = _drain_actions(runtime.scheduler_actions)[0]
+            transferred = runtime.snapshot()
+            assert transferred.owner.decode_delivery_reservation_count == 0
+            assert transferred.owner.transferred_decode_delivery_reservation_count == 1
+            assert transferred.owner.decode_reservation_backed_handoff_action_count == 1
+            assert transferred.owner.active_handoff_action_count == 1
+            assert not launch.done()
+
+            runtime.settle_decode_scheduler_publication_handoff(adoption)
             token = launch.result(timeout=_WAIT_SECONDS)
 
-        delivered = runtime.snapshot()
-        assert delivered.owner.active_handoff_action_count == 0
-        assert delivered.owner.pending_action_count == 0
-        assert delivered.consumer_pending_count == 1
-        assert delivered.scheduler_live_count == 1
         runtime.end_scheduler_launch_handoff(token)
-        runtime.complete_work_action(
-            _LOCAL_PRODUCER_ID,
-            scatter,
-            NativeTerminalOwnerEventKind.DECODE_SCATTER_STARTED,
+        runtime.complete_scheduler_action(
+            _OWNER_RECEIPT_PRODUCER_ID,
+            adoption,
+            NativeTerminalOwnerEventKind.DECODE_ADOPTION_CONSUMED,
         )
     finally:
         _finish_handoff_runtime(runtime)
@@ -3991,8 +4028,8 @@ def test_native_quiescence_waits_for_complete_output_projection() -> None:
             _finish_fail_closed(runtime)
 
 
-def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> None:
-    """Four decode actions preclaim at publication; adoption stays scheduler-owned."""
+def test_decode_publication_preclaims_all_actions() -> None:
+    """All five decode actions preclaim at their destination publication."""
 
     runtime, owner, remote = _runtime(
         TerminalOwnerRole.DECODE,
@@ -4082,10 +4119,12 @@ def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> Non
             ):
                 pass
             adoption_snapshot = runtime.snapshot()
-            assert adoption_snapshot.decode_publication_preclaimed_count == 0
-            assert adoption_snapshot.owner.claimed_handoff_action_count == 2
+            assert adoption_snapshot.decode_publication_preclaimed_count == 1
+            assert adoption_snapshot.owner.claimed_handoff_action_count == 3
             adoption = _drain_actions(runtime.scheduler_actions)
             assert adoption[0].kind is NativeTerminalOwnerActionKind.ADOPTION_READY
+            assert runtime.snapshot().decode_publication_preclaimed_count == 0
+            runtime.settle_decode_scheduler_publication_handoff(adoption[0])
             runtime.complete_scheduler_action(
                 _OWNER_RECEIPT_PRODUCER_ID,
                 adoption[0],
@@ -4101,7 +4140,7 @@ def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> Non
                 binding_digest,
                 NativeTerminalOwnerEventKind.DECODE_LOCAL_READY_ISSUED,
             )
-            local_ready = drain_preclaimed(runtime.coordinator_actions, 3)
+            local_ready = drain_preclaimed(runtime.coordinator_actions, 4)
             assert (
                 local_ready[0].kind is NativeTerminalOwnerActionKind.LOCAL_DECODE_READY
             )
@@ -4116,7 +4155,7 @@ def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> Non
                 NativeTerminalOwnerEventKind.DECODE_REQUEST_READY,
             )
             runtime.acknowledge_consumed_action(local_ready[0])
-            lifecycle = drain_preclaimed(runtime.lifecycle_actions, 4)
+            lifecycle = drain_preclaimed(runtime.lifecycle_actions, 5)
             assert lifecycle[0].kind is NativeTerminalOwnerActionKind.REQUEST_RETIRED
             runtime.acknowledge_consumed_action(lifecycle[0])
             return runtime.snapshot().owner
@@ -4129,7 +4168,7 @@ def test_decode_publication_preclaims_all_actions_and_excludes_adoption() -> Non
             owner_inventory = future.result(timeout=_WAIT_SECONDS)
 
         assert owner_inventory.unclaimed_handoff_action_count == 0
-        assert owner_inventory.claimed_handoff_action_count == 4
+        assert owner_inventory.claimed_handoff_action_count == 5
         snapshot = runtime.snapshot()
         assert snapshot.scheduler_live_count == 0
         assert snapshot.scheduler_pending_count == 0
