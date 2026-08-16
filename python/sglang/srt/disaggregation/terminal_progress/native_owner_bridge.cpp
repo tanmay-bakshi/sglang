@@ -2997,6 +2997,7 @@ public:
     if (timeout_seconds <= 0.0) {
       throw std::invalid_argument("handoff wait must be positive");
     }
+    py::gil_scoped_release release;
     std::unique_lock<std::mutex> lock(owner_->mutex);
     const bool reached = owner_->condition.wait_for(
         lock, std::chrono::duration<double>(timeout_seconds), [&]() {
@@ -3011,6 +3012,7 @@ public:
     if (timeout_seconds <= 0.0) {
       throw std::invalid_argument("process-fatal wait must be positive");
     }
+    py::gil_scoped_release release;
     std::unique_lock<std::mutex> lock(owner_->mutex);
     return owner_->condition.wait_for(
         lock, std::chrono::duration<double>(timeout_seconds), [&]() {
@@ -3783,13 +3785,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("binding_digest"), py::arg("timeout_seconds"))
       .def("wait_for_forward_independent_handoff",
            &NativeTerminalOwnerBridge::wait_for_forward_independent_handoff,
-           py::arg("timeout_seconds"),
-           py::call_guard<py::gil_scoped_release>())
+           py::arg("timeout_seconds"))
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
       .def("wait_for_process_fatal",
            &NativeTerminalOwnerBridge::wait_for_process_fatal,
-           py::arg("timeout_seconds"),
-           py::call_guard<py::gil_scoped_release>())
+           py::arg("timeout_seconds"))
       .def("lifecycle_snapshot",
            &NativeTerminalOwnerBridge::lifecycle_snapshot,
            py::arg("binding_digest"))

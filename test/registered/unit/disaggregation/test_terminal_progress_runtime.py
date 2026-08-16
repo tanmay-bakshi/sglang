@@ -744,7 +744,7 @@ def test_handoff_timeout_uses_the_hash_bound_owner_shutdown_deadline() -> None:
     try:
 
         def expire_active_handoff() -> tuple[NativeTerminalOwnerAction, ...]:
-            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS * 2.0)
+            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             owner.set_test_clock(_TEST_CLOCK_NS + 120_000_000_000)
             assert owner.wait_for_process_fatal(_WAIT_SECONDS)
             actions = tuple(
@@ -788,7 +788,7 @@ def test_close_with_a_pending_handoff_fails_closed_before_release() -> None:
     try:
 
         def reject_close_and_resolve_actions() -> str:
-            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS * 2.0)
+            assert owner.wait_for_forward_independent_handoff(_WAIT_SECONDS)
             with pytest.raises(RuntimeError) as error:
                 owner.close()
             for output in owner.drain_outputs():
