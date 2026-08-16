@@ -48,6 +48,7 @@ class _FakeRuntime:
     producer_specs: tuple[NativeTerminalRuntimeProducerSpec, ...]
     fatal_producer_id: int
     capacities: tuple[int, ...]
+    forward_independent_handoff_enabled: bool
     disposition: NativeTerminalRuntimeDisposition
     start_calls: int
     begin_abort_calls: int
@@ -69,6 +70,7 @@ class _FakeRuntime:
         decode_work_capacity: int,
         publisher_capacity: int,
         observation_capacity: int,
+        enable_forward_independent_handoff: bool,
     ) -> None:
         """Capture the complete runtime construction.
 
@@ -87,11 +89,16 @@ class _FakeRuntime:
         :param decode_work_capacity: Decode work inbox capacity.
         :param publisher_capacity: Publisher inbox capacity.
         :param observation_capacity: Observation inbox capacity.
+        :param enable_forward_independent_handoff: Whether native actions wake
+            their forward-independent Python owners.
         """
 
         self.owner_identity = owner_identity
         self.producer_specs = producer_specs
         self.fatal_producer_id = fatal_producer_id
+        self.forward_independent_handoff_enabled = (
+            enable_forward_independent_handoff
+        )
         self.capacities = (
             input_capacity,
             output_capacity,
@@ -467,6 +474,7 @@ def test_factory_constructs_one_dormant_role_exact_runtime(
         == expected_native_ids
     )
     assert runtime.capacities == tuple(range(101, 113))
+    assert runtime.forward_independent_handoff_enabled is True
     assert runtime.disposition is NativeTerminalRuntimeDisposition.CREATED
     assert runtime.start_calls == 0
     has_source_cuda = binding.advertisement.role is TerminalOwnerRole.SOURCE
