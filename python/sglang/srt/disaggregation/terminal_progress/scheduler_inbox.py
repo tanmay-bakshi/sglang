@@ -451,9 +451,9 @@ class TerminalReceiptInbox:
         """Exclude a host launch while an external delivery remains causal.
 
         This boundary deliberately touches only the publication-intent
-        condition. A delivery owner may call it while a native pending call
-        has interrupted the scheduler inside the receipt state lock; taking
-        that lock here would recreate the handoff deadlock this intent avoids.
+        condition. Source delivery establishes the complete request-intent
+        population before scheduling its native callback, independently of
+        receipt-state ownership.
 
         :param binding: Exact request generation protected by the intent.
         :returns: Take-once intent consumed after durable delivery.

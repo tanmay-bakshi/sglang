@@ -404,7 +404,7 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
         """Establish every request intent before native claims are released.
 
         :param actions: Exact action population about to cross inbox delivery.
-        :returns: Whether normal lease authority or scheduler-fatal drain owns
+        :returns: Whether normal lease authority or fail-closed drain owns
             the population.
         """
 
@@ -416,13 +416,9 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
             return self._acquire_for_actions(actions)
         except Exception as error:
             formatted_traceback = traceback.format_exc()
-            try:
-                self._retain_failure_barrier(actions)
-            except Exception:  # noqa: BLE001
-                logger.critical(
-                    "Source delivery failure could not retain its launch barrier:\n%s",
-                    traceback.format_exc(),
-                )
+            with self._lock:
+                self._functional_admission_closed = True
+                self._process_fatal = True
             raise RuntimeError(
                 f"source delivery lease acquisition failed:\n{formatted_traceback}"
             ) from error
@@ -434,7 +430,7 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
         """Allocate one prevalidated request batch under the registry lock.
 
         :param actions: Exact action population about to cross inbox delivery.
-        :returns: Whether normal lease authority or scheduler-fatal drain owns
+        :returns: Whether normal lease authority or fail-closed drain owns
             the population.
         """
 
@@ -455,9 +451,11 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
             action_kinds.setdefault(request_key, set()).add(action.kind)
         with self._lock:
             if self._scheduler_fatal:
-                return NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
+                return NativeTerminalDeliveryLeaseDisposition.FAIL_CLOSED_DRAIN
             if self._process_fatal:
                 raise RuntimeError("source delivery lease owner is process-fatal")
+            if self._functional_admission_closed:
+                return NativeTerminalDeliveryLeaseDisposition.FAIL_CLOSED_DRAIN
             if len(bindings) == 0:
                 return NativeTerminalDeliveryLeaseDisposition.ACQUIRED
             for request_key, binding in bindings.items():
@@ -484,7 +482,10 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
                     )
             except Exception as error:
                 formatted_traceback = traceback.format_exc()
-                self._records.update(new_records)
+                for request_key, record in new_records.items():
+                    self._records[request_key] = record
+                self._functional_admission_closed = True
+                self._process_fatal = True
                 raise RuntimeError(
                     "source delivery lease batch allocation failed:\n"
                     f"{formatted_traceback}"
@@ -497,42 +498,6 @@ class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority)
                     raise RuntimeError("delivery lease changed during allocation")
                 self._records[request_key] = record
             return NativeTerminalDeliveryLeaseDisposition.ACQUIRED
-
-    def _retain_failure_barrier(
-        self,
-        actions: tuple[NativeTerminalOwnerAction, ...],
-    ) -> None:
-        """Keep launch exclusion active until outer owner-death is durable.
-
-        This boundary must not take scheduler state. It may run while the
-        pending-call handoff has interrupted that exact lock; the outer source
-        failure path marks scheduler death only after the native claim releases
-        the interrupted thread.
-
-        :param actions: Exact failed delivery population.
-        """
-
-        causal = tuple(
-            action
-            for action in actions
-            if action.kind in _SOURCE_CAUSAL_DELIVERY_ACTIONS
-        )
-        with self._lock:
-            if self._scheduler_fatal:
-                return
-            self._functional_admission_closed = True
-            self._process_fatal = True
-            if len(self._records) > 0:
-                return
-            if len(causal) == 0:
-                raise RuntimeError("delivery failure lacks a causal source action")
-            binding = causal[0].binding.to_binding()
-            self._records[binding.request_key] = (
-                _PackedTerminalSourceDeliveryLeaseRecord(
-                    binding=binding,
-                    lease=self._scheduler_serving.begin_delivery_lease(binding),
-                )
-            )
 
     def mark_outcomes_sent(self, binding: TerminalRequestBinding) -> None:
         """Commit the source-outcome milestone and release a complete join.
@@ -951,6 +916,8 @@ class PackedTerminalSourceServingInventory:
                 runtime.scheduler_live_count,
                 runtime.scheduler_pending_count,
                 runtime.consumer_pending_count,
+                runtime.source_preclaimed_count,
+                runtime.source_preclaimed_consumer_count,
                 len(runtime.quarantined_binding_digests),
                 int(runtime.fatal_reason is not None),
                 sum(inbox.queued_count for inbox in runtime_inboxes),
@@ -1351,10 +1318,10 @@ class PackedTerminalSourceServing:
     ) -> _PackedTerminalSourceRuntimeActionBatch:
         """Claim every process-reactor action before invoking a consumer.
 
-        A CPython pending call may interrupt the scheduler while its receipt
-        inbox lock is held. Claiming the complete cross-inbox population first
-        lets every forward-independent sibling release that handoff before a
-        scheduler-affine publication can wait on the interrupted lock.
+        Native source-batch handoff is restored before output projection.
+        Claiming the complete cross-inbox population while the projection
+        fence is held preserves one ordered consumer snapshot before any
+        scheduler-affine publication can wait on scheduler state.
 
         :returns: Immutable, already-claimed action populations.
         """

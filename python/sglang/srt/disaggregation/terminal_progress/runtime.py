@@ -53,7 +53,7 @@ class NativeTerminalDeliveryLeaseDisposition(enum.StrEnum):
     """Result of establishing source delivery authority before native claim."""
 
     ACQUIRED = "acquired"
-    SCHEDULER_FATAL_DRAIN = "scheduler_fatal_drain"
+    FAIL_CLOSED_DRAIN = "fail_closed_drain"
 
 
 class NativeTerminalSourceDeliveryAuthority(abc.ABC):
@@ -76,7 +76,7 @@ class NativeTerminalSourceDeliveryAuthority(abc.ABC):
         """Establish source delivery authority before native claim.
 
         :param actions: Exact action population about to cross inbox delivery.
-        :returns: Whether normal lease authority or scheduler-fatal drain owns
+        :returns: Whether normal lease authority or fail-closed drain owns
             the population.
         """
 
@@ -342,7 +342,15 @@ class _BoundedFdInbox[ValueT]:
                     f"runtime inbox {self._name} exceeded capacity {self._capacity}"
                 )
             self._pending.append(value)
-            self._signal_locked()
+            try:
+                self._signal_locked()
+            except (NativeTerminalRuntimeOverflowError, OSError):
+                removed = self._pending.pop()
+                if removed is not value:
+                    raise NativeTerminalRuntimeError(
+                        f"runtime inbox {self._name} enqueue rollback lost FIFO tail"
+                    )
+                raise
 
     def _mark_fatal(self, reason: str) -> None:
         """Wake consumers with one sticky process-fatal reason.
@@ -557,6 +565,10 @@ class NativeTerminalRuntimeSnapshot:
         not explicitly completed.
     :ivar consumer_pending_count: All functional actions awaiting explicit
         downstream acceptance or completion.
+    :ivar source_preclaimed_count: Source actions whose native handoff was
+        claimed before output projection and which do not yet have an inbox.
+    :ivar source_preclaimed_consumer_count: Projected source actions whose
+        inbox consumer has not yet accepted the preclaimed handoff.
     :ivar quarantined_binding_digests: Fail-closed identities accepted by
         lifecycle consumers.
     :ivar output_reactor_alive: Whether the sole output consumer is alive.
@@ -580,6 +592,8 @@ class NativeTerminalRuntimeSnapshot:
     scheduler_live_count: int
     scheduler_pending_count: int
     consumer_pending_count: int
+    source_preclaimed_count: int
+    source_preclaimed_consumer_count: int
     quarantined_binding_digests: tuple[bytes, ...]
     output_reactor_alive: bool
     producers_joined: bool
@@ -612,12 +626,26 @@ class NativeTerminalRuntimeSnapshot:
             self.scheduler_live_count,
             self.scheduler_pending_count,
             self.consumer_pending_count,
+            self.source_preclaimed_count,
+            self.source_preclaimed_consumer_count,
             self.dropped_observation_count,
         )
         if any(type(value) is not int or value < 0 for value in counts):
             raise ValueError("runtime counts must be non-negative integers")
         if self.scheduler_pending_count > self.scheduler_live_count:
             raise ValueError("scheduler pending actions exceed live requests")
+        if self.source_preclaimed_consumer_count > self.consumer_pending_count:
+            raise ValueError("source preclaims exceed retained consumer authority")
+        if not self.owner.handoff_enabled and (
+            self.source_preclaimed_count != 0
+            or self.source_preclaimed_consumer_count != 0
+        ):
+            raise ValueError("disabled native handoff retains source preclaims")
+        if self.disposition is NativeTerminalRuntimeDisposition.STOPPED and (
+            self.source_preclaimed_count != 0
+            or self.source_preclaimed_consumer_count != 0
+        ):
+            raise ValueError("stopped runtime retains source preclaims")
         if type(self.quarantined_binding_digests) is not tuple or any(
             type(digest) is not bytes or len(digest) != 32
             for digest in self.quarantined_binding_digests
@@ -787,6 +815,8 @@ class NativeTerminalRuntime:
     _scheduler_pending: dict[bytes, NativeTerminalOwnerAction]
     _consumer_pending: dict[int, NativeTerminalOwnerAction]
     _inbox_claimed_action_ids: set[int]
+    _source_preclaimed_actions: dict[int, NativeTerminalOwnerAction]
+    _source_preclaimed_consumer_action_ids: set[int]
     _known_bindings: dict[bytes, NativeTerminalLifecycleRegistration]
     _quarantined_bindings: set[bytes]
     _condition: threading.Condition
@@ -824,6 +854,7 @@ class NativeTerminalRuntime:
         publisher_capacity: int,
         observation_capacity: int,
         enable_forward_independent_handoff: bool,
+        testing: bool = False,
     ) -> None:
         """Construct a dormant runtime and every process-lifetime queue.
 
@@ -846,6 +877,8 @@ class NativeTerminalRuntime:
         :param observation_capacity: Non-gating metrics queue capacity.
         :param enable_forward_independent_handoff: Whether forward-independent
             actions park the scheduler until their dedicated inbox claims them.
+        :param testing: Whether the native owner exposes deterministic test
+            controls. Production runtimes leave this disabled.
         """
 
         if type(owner_identity) is not NativeTerminalProcessIdentity:
@@ -877,6 +910,8 @@ class NativeTerminalRuntime:
             raise ValueError("runtime capacities must be positive integers")
         if type(enable_forward_independent_handoff) is not bool:
             raise TypeError("enable_forward_independent_handoff must be bool")
+        if type(testing) is not bool:
+            raise TypeError("testing must be bool")
         producers: dict[int, _RuntimeProducer] = {}
         producer_ids_by_name: dict[str, int] = {}
         python_producer_ids_by_authority: dict[
@@ -919,6 +954,7 @@ class NativeTerminalRuntime:
             observation_capacity=observation_capacity,
             owner_identity=owner_identity,
             maximum_live_lifecycles=maximum_live_lifecycles,
+            testing=testing,
         )
         native_handoff_actions = owner.forward_independent_handoff_action_kinds()
         if native_handoff_actions != _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
@@ -989,6 +1025,8 @@ class NativeTerminalRuntime:
         self._scheduler_pending = {}
         self._consumer_pending = {}
         self._inbox_claimed_action_ids = set()
+        self._source_preclaimed_actions = {}
+        self._source_preclaimed_consumer_action_ids = set()
         self._known_bindings = {}
         self._quarantined_bindings = set()
         self._condition = threading.Condition()
@@ -1111,10 +1149,10 @@ class NativeTerminalRuntime:
     ) -> NativeTerminalSourceActionDeliveryFence:
         """Create a one-turn source claim and scheduler-delivery fence.
 
-        The source process reactor must claim every action sibling before it
-        can wait on scheduler-owned state. Keeping output projection excluded
-        through that scheduler publication also prevents a later native output
-        from activating a handoff which the blocked reactor cannot yet claim.
+        The source process reactor claims every action sibling before it can
+        wait on scheduler-owned state. Keeping output projection excluded
+        through scheduler publication preserves batch order while the output
+        reactor prepares later request leases outside this fence.
 
         :returns: Single-use fence over native output projection.
         """
@@ -1515,10 +1553,10 @@ class NativeTerminalRuntime:
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Retire one non-scheduler action after downstream acceptance.
 
-        The dedicated consumer claims the scheduler handoff while dequeuing
-        the action. This method releases the runtime's consumer-side generation
-        accounting only after the receiving component accepted the immutable
-        action.
+        The dedicated consumer accepts its source preclaim or claims its decode
+        handoff while dequeuing the action. This method releases the runtime's
+        consumer-side generation accounting only after the receiving component
+        accepted the immutable action.
 
         :param action: Action previously drained from a runtime inbox.
         """
@@ -1856,12 +1894,13 @@ class NativeTerminalRuntime:
     def _claim_consumer_actions(
         self, actions: tuple[NativeTerminalOwnerAction, ...]
     ) -> tuple[NativeTerminalOwnerAction, ...]:
-        """End scheduler handoffs at the isolated inbox-dequeue boundary.
+        """Transfer projected actions at the isolated inbox-dequeue boundary.
 
-        Claiming proves only that the dedicated consumer owns the immutable
-        action. The action remains in ``_consumer_pending`` until its existing
-        downstream acknowledgement, which preserves resource and lifecycle
-        authority across consumer work and recursive native submissions.
+        Source actions transfer an already-restored batch preclaim. Decode
+        actions claim their visible native handoff here. In both cases, the
+        action remains in ``_consumer_pending`` until downstream
+        acknowledgement, preserving resource and lifecycle authority across
+        consumer work and recursive native submissions.
 
         :param actions: Exact FIFO prefix removed from one runtime-owned inbox.
         :returns: Exact population newly claimed by this drain.
@@ -1890,52 +1929,38 @@ class NativeTerminalRuntime:
                         "consumer action changed during exact inbox claim"
                     )
                     continue
+                source_preclaimed = (
+                    self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+                    and self._forward_independent_handoff_enabled
+                    and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+                )
+                if (
+                    source_preclaimed
+                    and action.action_id
+                    not in self._source_preclaimed_consumer_action_ids
+                ):
+                    if claim_failure is None:
+                        claim_failure = (
+                            "source inbox action lacks preclaimed handoff authority"
+                        )
+                    self._enter_runtime_fatal_locked(
+                        "source inbox action lacks preclaimed handoff authority"
+                    )
+                    continue
                 claimable_actions.append(action)
         claim_error: Exception | None = None
         claim_traceback: str | None = None
-        lease_actions = tuple(
-            action
-            for action in claimable_actions
-            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
-        )
-        if (
-            len(lease_actions) > 0
-            and self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
-            and self._forward_independent_handoff_enabled
-        ):
-            authority = self._source_delivery_authority
-            if authority is None:
-                claim_error = NativeTerminalRuntimeError(
-                    "source delivery authority disappeared after startup"
-                )
-                claim_traceback = str(claim_error)
-                with self._condition:
-                    self._enter_runtime_fatal_locked(claim_traceback)
-            else:
-                try:
-                    lease_disposition = authority.acquire_for_actions(lease_actions)
-                    if type(lease_disposition) is not (
-                        NativeTerminalDeliveryLeaseDisposition
-                    ):
-                        raise TypeError(
-                            "source delivery lease owner returned an invalid "
-                            "disposition"
-                        )
-                    if lease_disposition is (
-                        NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
-                    ):
-                        with self._condition:
-                            self._enter_runtime_fatal_locked(
-                                "source delivery entered scheduler-fatal drain"
-                            )
-                except Exception as error:  # noqa: BLE001
-                    claim_error = error
-                    claim_traceback = traceback.format_exc()
-                    with self._condition:
-                        self._enter_runtime_fatal_locked(claim_traceback)
         locally_claimed_actions: list[NativeTerminalOwnerAction] = []
         for action in claimable_actions:
-            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS:
+            source_preclaimed = (
+                self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+                and self._forward_independent_handoff_enabled
+                and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+            )
+            if (
+                action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+                and not source_preclaimed
+            ):
                 try:
                     self._claim_forward_independent_handoff(action)
                 except Exception as error:  # noqa: BLE001
@@ -1956,6 +1981,20 @@ class NativeTerminalRuntime:
                         "consumer action changed while inbox claim completed"
                     )
                     continue
+                if source_preclaimed:
+                    if (
+                        action.action_id
+                        not in self._source_preclaimed_consumer_action_ids
+                    ):
+                        if claim_failure is None:
+                            claim_failure = (
+                                "source handoff preclaim changed during inbox claim"
+                            )
+                        self._enter_runtime_fatal_locked(
+                            "source handoff preclaim changed during inbox claim"
+                        )
+                        continue
+                    self._source_preclaimed_consumer_action_ids.remove(action.action_id)
                 self._inbox_claimed_action_ids.add(action.action_id)
                 locally_claimed_actions.append(action)
                 self._condition.notify_all()
@@ -2023,9 +2062,14 @@ class NativeTerminalRuntime:
     def _activate_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Activate a scheduler wake only after unlocked inbox publication.
+        """Activate a decode scheduler wake before consumer publication.
 
-        :param action: Exact action already visible to its dedicated consumer.
+        The output reactor is not the main interpreter thread. A queued CPython
+        callback therefore cannot run until the output reactor yields the GIL.
+        The runtime condition remains held from activation through durable inbox
+        insertion, so fatality cannot split those two ownership transitions.
+
+        :param action: Exact decode action about to enter its dedicated inbox.
         """
 
         if (
@@ -2034,7 +2078,11 @@ class NativeTerminalRuntime:
         ):
             return
         try:
-            self._owner.activate_forward_independent_handoff(action)
+            activated = self._owner.activate_forward_independent_handoff(action)
+            if not activated:
+                raise NativeTerminalRuntimeError(
+                    "decode handoff was claimed before consumer publication"
+                )
         except Exception:
             formatted_traceback = traceback.format_exc()
             with self._condition:
@@ -2209,6 +2257,10 @@ class NativeTerminalRuntime:
                 scheduler_live_count=len(self._scheduler_live),
                 scheduler_pending_count=len(self._scheduler_pending),
                 consumer_pending_count=len(self._consumer_pending),
+                source_preclaimed_count=len(self._source_preclaimed_actions),
+                source_preclaimed_consumer_count=len(
+                    self._source_preclaimed_consumer_action_ids
+                ),
                 quarantined_binding_digests=tuple(sorted(self._quarantined_bindings)),
                 output_reactor_alive=self._output_reactor_alive,
                 producers_joined=self._producers_joined,
@@ -2327,6 +2379,8 @@ class NativeTerminalRuntime:
                     or len(self._scheduler_pending) != 0
                     or len(self._consumer_pending) != 0
                     or len(self._inbox_claimed_action_ids) != 0
+                    or len(self._source_preclaimed_actions) != 0
+                    or len(self._source_preclaimed_consumer_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "clean close acquired new consumer authority during drain"
@@ -2418,6 +2472,8 @@ class NativeTerminalRuntime:
                     or len(self._scheduler_pending) != 0
                     or len(self._consumer_pending) != 0
                     or len(self._inbox_claimed_action_ids) != 0
+                    or len(self._source_preclaimed_actions) != 0
+                    or len(self._source_preclaimed_consumer_action_ids) != 0
                 ):
                     raise NativeTerminalRuntimeError(
                         "abort finish retains unaccepted consumer authority"
@@ -2544,8 +2600,16 @@ class NativeTerminalRuntime:
                 ready = selector.select()
                 ready_kinds = frozenset(int(key.data) for key, _ in ready)
                 if 1 in ready_kinds:
+                    outputs = self._owner.drain_outputs()
+                    try:
+                        self._prepare_output_batch(outputs)
+                    except Exception:  # noqa: BLE001
+                        self._reject_output_batch(
+                            outputs,
+                            traceback.format_exc(),
+                        )
+                        continue
                     with self._output_projection_lock:
-                        outputs = self._owner.drain_outputs()
                         for output in outputs:
                             current_binding = output.binding.digest
                             self._route_output(output)
@@ -2621,7 +2685,7 @@ class NativeTerminalRuntime:
                 self._condition.notify_all()
 
     def _route_output(self, output: NativeTerminalOwnerOutput) -> None:
-        """Publish and activate every action before native acknowledgement.
+        """Project every action before native acknowledgement.
 
         :param output: One action-bearing native commit.
         """
@@ -2629,34 +2693,63 @@ class NativeTerminalRuntime:
         if type(output) is not NativeTerminalOwnerOutput:
             raise TypeError("output must be NativeTerminalOwnerOutput")
         if output.process_fatal:
-            owner_inventory = self._owner.inventory()
-            native_reason = owner_inventory.fatal_reason
-            if native_reason is None:
-                native_reason = "native owner did not expose a failure reason"
-            reason = (
-                f"native terminal owner entered {output.fatal_code.name}: "
-                f"{native_reason}; event={output.event_kind.name}; "
-                f"previous_phase={output.previous_phase}; "
-                f"producer_id={output.producer_id}; "
-                f"producer_sequence={output.producer_sequence}; "
-                f"binding={output.binding.digest.hex()}"
-            )
+            reason = self._native_fatal_reason(output)
             logger.error("%s", reason)
             with self._condition:
                 self._enter_runtime_fatal_locked(reason)
         delivered_actions: list[NativeTerminalOwnerAction] = []
+        routing_failure: str | None = None
+        secondary_failures: list[str] = []
         for action in output.actions:
+            if routing_failure is not None:
+                if action.kind in _LIFECYCLE_ACTIONS:
+                    try:
+                        self._route_fail_closed_lifecycle_action(action)
+                    except Exception:  # noqa: BLE001
+                        secondary_failures.append(traceback.format_exc())
+                    else:
+                        delivered_actions.append(action)
+                        continue
+                secondary = self._reject_unprojected_action_delivery(
+                    action,
+                    "runtime rejected an action after a sibling routing failure",
+                )
+                if secondary is not None:
+                    secondary_failures.append(secondary)
+                continue
             try:
-                self._route_action(action)
-                self._activate_forward_independent_handoff(action)
+                decode_handoff_required = (
+                    self._owner_identity.role is NativeTerminalOwnerRole.DECODE
+                    and self._forward_independent_handoff_enabled
+                    and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+                )
+                # A pending callback can run when inbox signalling first yields
+                # the GIL. Fatal admission and durable publication must remain
+                # one ownership transition until that point.
+                with self._condition:
+                    fail_closed = self._disposition in (
+                        NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                        NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+                    )
+                    if fail_closed and action.kind not in _LIFECYCLE_ACTIONS:
+                        raise NativeTerminalRuntimeClosedError(
+                            "functional action delivery lost the race to "
+                            "fail-closed drain"
+                        )
+                    if decode_handoff_required:
+                        self._activate_forward_independent_handoff(action)
+                    self._project_action(action)
             except Exception:  # noqa: BLE001
                 formatted_traceback = traceback.format_exc()
-                self._owner.fail_action_delivery(
+                with self._condition:
+                    self._enter_runtime_fatal_locked(formatted_traceback)
+                routing_failure = formatted_traceback
+                secondary = self._reject_unprojected_action_delivery(
                     action,
                     "runtime consumer rejected a native terminal action",
                 )
-                with self._condition:
-                    self._enter_runtime_fatal_locked(formatted_traceback)
+                if secondary is not None:
+                    secondary_failures.append(secondary)
                 continue
             delivered_actions.append(action)
         try:
@@ -2665,8 +2758,347 @@ class NativeTerminalRuntime:
             with self._condition:
                 self._dropped_observation_count += 1
                 self._condition.notify_all()
+        except Exception:  # noqa: BLE001
+            observation_failure = traceback.format_exc()
+            secondary_failures.append(observation_failure)
+            with self._condition:
+                self._dropped_observation_count += 1
+                self._condition.notify_all()
+            if routing_failure is None:
+                logger.error(
+                    "Native output observation routing failed without gating "
+                    "lifecycle:\n%s",
+                    observation_failure,
+                )
         for action in delivered_actions:
-            self._owner.acknowledge_action(action)
+            try:
+                self._owner.acknowledge_action(action)
+            except Exception:  # noqa: BLE001
+                acknowledgement_failure = traceback.format_exc()
+                with self._condition:
+                    self._enter_runtime_fatal_locked(acknowledgement_failure)
+                if routing_failure is None:
+                    routing_failure = acknowledgement_failure
+                else:
+                    secondary_failures.append(acknowledgement_failure)
+        if routing_failure is not None:
+            reason = routing_failure
+            if len(secondary_failures) > 0:
+                reason = f"{reason}\nOutput rejection failures:\n" + "\n".join(
+                    secondary_failures
+                )
+            logger.error("Native output routing failed closed:\n%s", reason)
+
+    def _native_fatal_reason(self, output: NativeTerminalOwnerOutput) -> str:
+        """Format one process-fatal output with authoritative native evidence.
+
+        :param output: Native output carrying process-fatal authority.
+        :returns: Stable process-fatal reason with its triggering identity.
+        """
+
+        if type(output) is not NativeTerminalOwnerOutput:
+            raise TypeError("output must be NativeTerminalOwnerOutput")
+        if not output.process_fatal:
+            raise ValueError("output must carry process-fatal authority")
+        owner_inventory = self._owner.inventory()
+        native_reason = owner_inventory.fatal_reason
+        if native_reason is None:
+            native_reason = "native owner did not expose a failure reason"
+        return (
+            f"native terminal owner entered {output.fatal_code.name}: "
+            f"{native_reason}; event={output.event_kind.name}; "
+            f"previous_phase={output.previous_phase}; "
+            f"producer_id={output.producer_id}; "
+            f"producer_sequence={output.producer_sequence}; "
+            f"binding={output.binding.digest.hex()}"
+        )
+
+    def _project_action(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Project one action and transfer source preclaim authority atomically.
+
+        :param action: Exact action being projected into its bounded inbox.
+        """
+
+        source_preclaimed = (
+            self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+            and self._forward_independent_handoff_enabled
+            and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        )
+        with self._condition:
+            fail_closed = self._disposition in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+            )
+            if fail_closed and action.kind not in _LIFECYCLE_ACTIONS:
+                raise NativeTerminalRuntimeClosedError(
+                    "functional action projection lost the race to fail-closed drain"
+                )
+            if not source_preclaimed:
+                self._route_action(action)
+                return
+            if self._source_preclaimed_actions.get(action.action_id) != action:
+                self._enter_runtime_fatal_locked(
+                    "source action lacks exact unprojected preclaim authority"
+                )
+                raise NativeTerminalRuntimeError(
+                    "source action lacks exact unprojected preclaim authority"
+                )
+            if action.action_id in self._source_preclaimed_consumer_action_ids:
+                self._enter_runtime_fatal_locked(
+                    "source action preclaim was projected more than once"
+                )
+                raise NativeTerminalRuntimeError(
+                    "source action preclaim was projected more than once"
+                )
+            del self._source_preclaimed_actions[action.action_id]
+            self._source_preclaimed_consumer_action_ids.add(action.action_id)
+            try:
+                self._route_action(action)
+            except Exception as error:  # noqa: BLE001
+                formatted_traceback = traceback.format_exc()
+                self._source_preclaimed_consumer_action_ids.remove(action.action_id)
+                self._source_preclaimed_actions[action.action_id] = action
+                self._condition.notify_all()
+                raise NativeTerminalRuntimeError(
+                    "source action projection failed after preclaim transfer:\n"
+                    f"{formatted_traceback}"
+                ) from error
+            self._condition.notify_all()
+
+    def _route_fail_closed_lifecycle_action(
+        self,
+        action: NativeTerminalOwnerAction,
+    ) -> None:
+        """Preserve one terminal lifecycle action after functional routing fails.
+
+        A source ``REQUEST_RETIRED`` action still carries native handoff
+        authority. It is claimed directly after fatality, without scheduling a
+        callback, before entering the same Python preclaim path as a normal
+        source batch. Quarantine and process-fatal actions need no handoff.
+
+        :param action: Exact lifecycle authority which must remain observable.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if action.kind not in _LIFECYCLE_ACTIONS:
+            raise ValueError("fail-closed preservation requires a lifecycle action")
+        source_preclaimed = (
+            self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+            and self._forward_independent_handoff_enabled
+            and action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        )
+        if source_preclaimed:
+            with self._condition:
+                existing = self._source_preclaimed_actions.get(action.action_id)
+                if existing is not None and existing != action:
+                    raise NativeTerminalRuntimeError(
+                        "fail-closed lifecycle preclaim aliases another action"
+                    )
+            if existing is None:
+                self._owner.claim_forward_independent_handoff(action)
+                self._record_source_preclaims((action,))
+        self._project_action(action)
+
+    def _prepare_output_batch(
+        self,
+        outputs: tuple[NativeTerminalOwnerOutput, ...],
+    ) -> None:
+        """Reject mixed-fatal work, then preclaim a complete source population.
+
+        A readable native batch is one authority boundary for every role. No
+        functional sibling may become visible when that batch already contains
+        process-fatal authority. For a healthy source batch, delivery leases
+        become durable before the native callback can suspend the scheduler.
+        The native rendezvous then proves that the callback interrupted and
+        restored that scheduler before any action is projected. Decode instead
+        activates and durably projects each action under one runtime lock.
+
+        :param outputs: Complete native population drained by one readable wake.
+        """
+
+        if type(outputs) is not tuple or any(
+            type(output) is not NativeTerminalOwnerOutput for output in outputs
+        ):
+            raise TypeError("outputs must contain NativeTerminalOwnerOutput values")
+        fatal_output = next(
+            (output for output in outputs if output.process_fatal),
+            None,
+        )
+        if fatal_output is not None:
+            raise NativeTerminalRuntimeError(self._native_fatal_reason(fatal_output))
+        if (
+            self._owner_identity.role is not NativeTerminalOwnerRole.SOURCE
+            or not self._forward_independent_handoff_enabled
+        ):
+            return
+        actions = tuple(
+            action
+            for output in outputs
+            for action in output.actions
+            if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+        )
+        if len(actions) == 0:
+            return
+        action_ids = tuple(action.action_id for action in actions)
+        if len(set(action_ids)) != len(action_ids):
+            raise NativeTerminalRuntimeError(
+                "source output batch aliases a native action identity"
+            )
+        with self._condition:
+            fail_closed = self._disposition in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+            )
+        if fail_closed:
+            for action in actions:
+                self._owner.claim_forward_independent_handoff(action)
+            self._record_source_preclaims(actions)
+            return
+        authority = self._source_delivery_authority
+        if authority is None:
+            raise NativeTerminalRuntimeError(
+                "source delivery authority disappeared after startup"
+            )
+        disposition = authority.acquire_for_actions(actions)
+        if type(disposition) is not NativeTerminalDeliveryLeaseDisposition:
+            raise TypeError("source delivery authority returned an invalid disposition")
+        if disposition is NativeTerminalDeliveryLeaseDisposition.FAIL_CLOSED_DRAIN:
+            with self._condition:
+                self._enter_runtime_fatal_locked(
+                    "source delivery entered fail-closed drain"
+                )
+            for action in actions:
+                self._owner.claim_forward_independent_handoff(action)
+            self._record_source_preclaims(actions)
+            return
+        self._owner.claim_source_forward_independent_handoffs(actions)
+        self._record_source_preclaims(actions)
+        with self._condition:
+            if self._disposition in (
+                NativeTerminalRuntimeDisposition.PROCESS_FATAL,
+                NativeTerminalRuntimeDisposition.ABORT_DRAINING,
+            ):
+                raise NativeTerminalRuntimeClosedError(
+                    "source delivery entered fail-closed drain after native handoff"
+                )
+
+    def _record_source_preclaims(
+        self,
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> None:
+        """Record native source claims before any consumer can observe them.
+
+        :param actions: Exact source action population claimed in native state.
+        """
+
+        action_ids = tuple(action.action_id for action in actions)
+        with self._condition:
+            if len(set(action_ids) & self._source_preclaimed_actions.keys()) != 0:
+                self._enter_runtime_fatal_locked(
+                    "source output batch reuses unprojected preclaim authority"
+                )
+                raise NativeTerminalRuntimeError(
+                    "source output batch reuses unprojected preclaim authority"
+                )
+            if len(set(action_ids) & self._source_preclaimed_consumer_action_ids) != 0:
+                self._enter_runtime_fatal_locked(
+                    "source output batch reuses projected preclaim authority"
+                )
+                raise NativeTerminalRuntimeError(
+                    "source output batch reuses projected preclaim authority"
+                )
+            self._source_preclaimed_actions.update(
+                (action.action_id, action) for action in actions
+            )
+            self._condition.notify_all()
+
+    def _reject_output_batch(
+        self,
+        outputs: tuple[NativeTerminalOwnerOutput, ...],
+        formatted_traceback: str,
+    ) -> None:
+        """Resolve every swapped action after batch preparation fails.
+
+        :param outputs: Complete native batch already removed from its queue.
+        :param formatted_traceback: Original preparation failure evidence.
+        """
+
+        if type(formatted_traceback) is not str or len(formatted_traceback) == 0:
+            raise ValueError("formatted_traceback must be a non-empty string")
+        with self._condition:
+            self._enter_runtime_fatal_locked(formatted_traceback)
+        secondary_failures: list[str] = []
+        delivered_actions: list[NativeTerminalOwnerAction] = []
+        for output in outputs:
+            for action in output.actions:
+                if action.kind in _LIFECYCLE_ACTIONS:
+                    try:
+                        self._route_fail_closed_lifecycle_action(action)
+                    except Exception:  # noqa: BLE001
+                        secondary_failures.append(traceback.format_exc())
+                    else:
+                        delivered_actions.append(action)
+                        continue
+                secondary = self._reject_unprojected_action_delivery(
+                    action,
+                    "runtime could not prepare source output delivery",
+                )
+                if secondary is not None:
+                    secondary_failures.append(secondary)
+            try:
+                self._observations._enqueue(output)
+            except Exception:  # noqa: BLE001
+                secondary_failures.append(traceback.format_exc())
+                with self._condition:
+                    self._dropped_observation_count += 1
+                    self._condition.notify_all()
+        for action in delivered_actions:
+            try:
+                self._owner.acknowledge_action(action)
+            except Exception:  # noqa: BLE001
+                secondary_failures.append(traceback.format_exc())
+        reason = formatted_traceback
+        if len(secondary_failures) > 0:
+            reason = f"{reason}\nBatch rejection failures:\n" + "\n".join(
+                secondary_failures
+            )
+        logger.error("Native output batch preparation failed:\n%s", reason)
+
+    def _reject_unprojected_action_delivery(
+        self,
+        action: NativeTerminalOwnerAction,
+        reason: str,
+    ) -> str | None:
+        """Reject one action only while no Python consumer owns it.
+
+        :param action: Exact native action whose projection did not complete.
+        :param reason: Non-empty native failure classification.
+        :returns: Secondary failure evidence, or ``None`` after exact cleanup.
+        """
+
+        if type(action) is not NativeTerminalOwnerAction:
+            raise TypeError("action must be NativeTerminalOwnerAction")
+        if type(reason) is not str or len(reason) == 0:
+            raise ValueError("reason must be a non-empty string")
+        with self._condition:
+            if self._consumer_pending.get(action.action_id) == action:
+                return (
+                    "native rejection skipped because exact consumer projection "
+                    f"already owns action {action.action_id}"
+                )
+        try:
+            self._owner.fail_action_delivery(action, reason)
+        except Exception:  # noqa: BLE001
+            return traceback.format_exc()
+        with self._condition:
+            if self._source_preclaimed_actions.get(action.action_id) == action:
+                del self._source_preclaimed_actions[action.action_id]
+            self._condition.notify_all()
+        return None
 
     def _route_observation(self, observation: NativeTerminalOwnerObservation) -> None:
         """Project actionless native evidence without changing authority.
@@ -2792,6 +3224,92 @@ class NativeTerminalRuntime:
     def _require_consumer_claim_conservation_locked(self) -> None:
         """Require every inbox claim to retain downstream consumer authority."""
 
+        preclaimed_ids = set(self._source_preclaimed_actions)
+        source_batch_handoff = (
+            self._owner_identity.role is NativeTerminalOwnerRole.SOURCE
+            and self._forward_independent_handoff_enabled
+        )
+        if not source_batch_handoff and (
+            len(preclaimed_ids) != 0
+            or len(self._source_preclaimed_consumer_action_ids) != 0
+        ):
+            self._enter_runtime_fatal_locked(
+                "source preclaims exist outside source batch handoff mode"
+            )
+            raise NativeTerminalRuntimeError(
+                "source preclaims exist outside source batch handoff mode"
+            )
+        if any(
+            action_id != action.action_id
+            or action.kind not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+            or action.binding.owner != self._owner_identity
+            for action_id, action in self._source_preclaimed_actions.items()
+        ):
+            self._enter_runtime_fatal_locked(
+                "unprojected source preclaim has an invalid action domain"
+            )
+            raise NativeTerminalRuntimeError(
+                "unprojected source preclaim has an invalid action domain"
+            )
+        if len(preclaimed_ids & self._consumer_pending.keys()) != 0:
+            self._enter_runtime_fatal_locked(
+                "unprojected source preclaims alias consumer authority"
+            )
+            raise NativeTerminalRuntimeError(
+                "unprojected source preclaims alias consumer authority"
+            )
+        if not self._source_preclaimed_consumer_action_ids.issubset(
+            self._consumer_pending
+        ):
+            self._enter_runtime_fatal_locked(
+                "projected source preclaims exceed consumer authority"
+            )
+            raise NativeTerminalRuntimeError(
+                "projected source preclaims exceed consumer authority"
+            )
+        if any(
+            self._consumer_pending[action_id].kind
+            not in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+            or self._consumer_pending[action_id].binding.owner != self._owner_identity
+            for action_id in self._source_preclaimed_consumer_action_ids
+        ):
+            self._enter_runtime_fatal_locked(
+                "projected source preclaim has an invalid action domain"
+            )
+            raise NativeTerminalRuntimeError(
+                "projected source preclaim has an invalid action domain"
+            )
+        if (
+            len(
+                self._source_preclaimed_consumer_action_ids
+                & self._inbox_claimed_action_ids
+            )
+            != 0
+        ):
+            self._enter_runtime_fatal_locked(
+                "source preclaims alias accepted inbox authority"
+            )
+            raise NativeTerminalRuntimeError(
+                "source preclaims alias accepted inbox authority"
+            )
+        if source_batch_handoff:
+            source_handoff_consumer_ids = {
+                action_id
+                for action_id, action in self._consumer_pending.items()
+                if action.kind in _FORWARD_INDEPENDENT_HANDOFF_ACTIONS
+            }
+            claimed_source_handoff_ids = (
+                self._inbox_claimed_action_ids & source_handoff_consumer_ids
+            )
+            if source_handoff_consumer_ids != (
+                self._source_preclaimed_consumer_action_ids | claimed_source_handoff_ids
+            ):
+                self._enter_runtime_fatal_locked(
+                    "source consumer handoff authority is not exactly partitioned"
+                )
+                raise NativeTerminalRuntimeError(
+                    "source consumer handoff authority is not exactly partitioned"
+                )
         if self._inbox_claimed_action_ids.issubset(self._consumer_pending):
             return
         self._enter_runtime_fatal_locked(

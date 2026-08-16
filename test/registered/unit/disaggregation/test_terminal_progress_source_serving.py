@@ -25,10 +25,15 @@ from sglang.srt.disaggregation.terminal_progress.identity import (
     TerminalRequestBinding,
 )
 from sglang.srt.disaggregation.terminal_progress.native_state import (
+    NATIVE_SOURCE_RESOURCE_MASK,
+    NativeSourceLifecyclePhase,
+    NativeTerminalHandoffCallbackTerminalState,
     NativeTerminalOwnerAction,
     NativeTerminalOwnerActionKind,
     NativeTerminalOwnerEvent,
     NativeTerminalOwnerEventKind,
+    NativeTerminalOwnerFatalCode,
+    NativeTerminalOwnerOutput,
     NativeTerminalOwnerRole,
     NativeTerminalProcessIdentity,
     NativeTerminalProducerClass,
@@ -685,6 +690,39 @@ def _action(
     )
 
 
+def _output(
+    action: NativeTerminalOwnerAction,
+    *,
+    owner_sequence: int,
+) -> NativeTerminalOwnerOutput:
+    """Wrap one synthetic source action in an immutable native output.
+
+    :param action: Exact action carried by the output.
+    :param owner_sequence: Positive process-local output sequence.
+    :returns: Structurally valid source output for projection-boundary tests.
+    """
+
+    return NativeTerminalOwnerOutput(
+        binding=action.binding,
+        owner_sequence=owner_sequence,
+        producer_id=_NATIVE_PRODUCER_ID,
+        producer_sequence=owner_sequence,
+        event_kind=NativeTerminalOwnerEventKind.SOURCE_PRODUCER_COMPLETED,
+        enqueued_ns=action.commit_timestamp_ns,
+        completed_ns=action.commit_timestamp_ns,
+        role=NativeTerminalOwnerRole.SOURCE,
+        previous_phase=int(NativeSourceLifecyclePhase.WAITING_FOR_PRODUCER),
+        phase=int(NativeSourceLifecyclePhase.GATHERING),
+        live_resources=NATIVE_SOURCE_RESOURCE_MASK,
+        retired_resources=0,
+        quarantined_resources=0,
+        actions=(action,),
+        armed_deadline_mask=0,
+        process_fatal=False,
+        fatal_code=NativeTerminalOwnerFatalCode.NONE,
+    )
+
+
 def _advance_source_to_request_ready_join(
     serving: PackedTerminalSourceServing,
     runtime: NativeTerminalRuntime,
@@ -806,10 +844,12 @@ def test_delivery_batch_rejects_generation_alias_before_allocating_intent() -> N
         with pytest.raises(RuntimeError, match="aliases a request generation"):
             serving._delivery_leases.acquire_for_actions((first, conflicting))
 
-        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents != ()
+        inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == ()
+        assert inventory.scheduler_serving.inbox.active_delivery_intents == ()
         with pytest.raises(RuntimeError, match="process-fatal"):
             serving._delivery_leases.acquire_for_actions((first,))
-        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents != ()
+        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents == ()
         serving.begin_fail_closed_abort()
         inventory = serving.inventory()
         assert inventory.delivery_leases.active_binding_digests == ()
@@ -847,7 +887,7 @@ def test_scheduler_fatal_delivery_state_admits_only_lease_free_abort_drain() -> 
         ):
             action = _action(identity, action_id=action_id, kind=kind)
             assert serving._delivery_leases.acquire_for_actions((action,)) is (
-                NativeTerminalDeliveryLeaseDisposition.SCHEDULER_FATAL_DRAIN
+                NativeTerminalDeliveryLeaseDisposition.FAIL_CLOSED_DRAIN
             )
         inventory = serving.inventory()
         assert inventory.delivery_leases.active_binding_digests == ()
@@ -883,24 +923,14 @@ def test_composed_source_fatal_is_valid_after_binding_before_start() -> None:
         serving.start()
 
 
-def test_scheduler_fatal_reactor_drains_causal_actions_without_side_effects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_scheduler_fatal_reactor_drains_causal_actions_without_side_effects() -> None:
     """Outcome and publication actions reconcile after scheduler death."""
 
     identity = _identity()
-    serving, runtime, publisher, _, work_labels, _ = _serving(
-        identity,
-        enable_forward_independent_handoff=True,
-    )
+    serving, runtime, publisher, _, work_labels, _ = _serving(identity)
     serving.start()
     try:
         serving.begin_fail_closed_abort()
-        monkeypatch.setattr(
-            runtime,
-            "_claim_forward_independent_handoff",
-            lambda action: None,
-        )
         actions = (
             _action(
                 identity,
@@ -928,24 +958,14 @@ def test_scheduler_fatal_reactor_drains_causal_actions_without_side_effects(
         serving.abort_and_close()
 
 
-def test_scheduler_fatal_gather_drain_never_executes_functional_work(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_scheduler_fatal_gather_drain_never_executes_functional_work() -> None:
     """A worker observes runtime fatality before consuming a claimed gather."""
 
     identity = _identity()
-    serving, runtime, _, _, work_labels, _ = _serving(
-        identity,
-        enable_forward_independent_handoff=True,
-    )
+    serving, runtime, _, _, work_labels, _ = _serving(identity)
     serving.start()
     try:
         serving.begin_fail_closed_abort()
-        monkeypatch.setattr(
-            runtime,
-            "_claim_forward_independent_handoff",
-            lambda action: None,
-        )
         actions = tuple(
             _action(
                 identity,
@@ -1003,11 +1023,6 @@ def test_acquired_delivery_racing_source_fatal_cannot_execute_functional_work(
         "acquire_for_actions",
         pause_acquired_delivery,
     )
-    monkeypatch.setattr(
-        runtime,
-        "_claim_forward_independent_handoff",
-        lambda action: None,
-    )
     reactor_failures: list[PackedTerminalProcessReactorFailure] = []
     reactor = PackedTerminalProcessReactor.for_source(
         serving,
@@ -1020,13 +1035,8 @@ def test_acquired_delivery_racing_source_fatal_cannot_execute_functional_work(
         reactor_started = True
         submission = _submission(identity)
         serving.bind_submission(submission, lambda value: None)
-        runtime._route_action(
-            _action(
-                identity,
-                action_id=94,
-                kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-            )
-        )
+        serving.attach_producer_completion(submission)
+        assert serving.packed_ready(identity.local_binding.digest)
         assert acquisition_returning.wait(timeout=_WAIT_SECONDS)
 
         serving.begin_fail_closed_abort()
@@ -1051,6 +1061,95 @@ def test_acquired_delivery_racing_source_fatal_cannot_execute_functional_work(
         if reactor_started:
             reactor.close(_WAIT_SECONDS)
         serving.abort_and_close()
+
+
+def test_source_fatal_before_delivery_acquisition_allocates_no_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime fatality closes delivery admission before lease allocation."""
+
+    identity = _identity()
+    serving, runtime, _, _, work_labels, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
+    acquisition_entered = threading.Event()
+    release_acquisition = threading.Event()
+    begin_delivery_bindings: list[TerminalRequestBinding] = []
+    original_acquirer = serving._delivery_leases.acquire_for_actions
+    original_begin_delivery = serving._scheduler_serving.begin_delivery_lease
+
+    def pause_before_acquisition(
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalDeliveryLeaseDisposition:
+        """Expose the runtime-fatal to authority-acquisition ordering.
+
+        :param actions: Exact action population crossing native handoff.
+        :returns: Delivery disposition established after the race release.
+        """
+
+        acquisition_entered.set()
+        if not release_acquisition.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("source delivery acquisition was not released")
+        return original_acquirer(actions)
+
+    def record_begin_delivery(
+        binding: TerminalRequestBinding,
+    ) -> TerminalSchedulerDeliveryLease:
+        """Record any forbidden scheduler lease allocation.
+
+        :param binding: Request generation requesting a delivery lease.
+        :returns: Newly allocated delivery lease.
+        """
+
+        begin_delivery_bindings.append(binding)
+        return original_begin_delivery(binding)
+
+    monkeypatch.setattr(
+        serving._delivery_leases,
+        "acquire_for_actions",
+        pause_before_acquisition,
+    )
+    monkeypatch.setattr(
+        serving._scheduler_serving,
+        "begin_delivery_lease",
+        record_begin_delivery,
+    )
+    serving.start()
+    closed = False
+    try:
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        serving.attach_producer_completion(submission)
+        assert serving.packed_ready(identity.local_binding.digest)
+        assert acquisition_entered.wait(timeout=_WAIT_SECONDS)
+
+        with runtime._condition:
+            assert runtime._disposition is NativeTerminalRuntimeDisposition.RUNNING
+            runtime._enter_runtime_fatal_locked(
+                "synthetic runtime fatal before source delivery acquisition"
+            )
+        assert serving.inventory().scheduler_serving.inbox.fatal_cause is None
+
+        release_acquisition.set()
+        assert runtime.wait_for_output_projection(_WAIT_SECONDS)
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+
+        final_inventory = serving.abort_and_close()
+        closed = True
+        assert begin_delivery_bindings == []
+        assert work_labels == ["quarantine"]
+        assert final_inventory.runtime.owner.source_batch_handoff_count == 0
+        assert final_inventory.runtime.owner.handoff_callback_count == 0
+        assert final_inventory.runtime.consumer_pending_count == 0
+        assert final_inventory.runtime.source_preclaimed_count == 0
+        assert final_inventory.runtime.source_preclaimed_consumer_count == 0
+        assert final_inventory.delivery_leases.active_binding_digests == ()
+        assert final_inventory.scheduler_serving.inbox.active_delivery_intents == ()
+    finally:
+        release_acquisition.set()
+        if not closed:
+            serving.abort_and_close()
 
 
 def test_functional_start_before_fatal_retains_delivery_until_callback_return() -> None:
@@ -1102,20 +1201,13 @@ def test_gather_fatal_winning_final_start_gate_aborts_without_side_effect(
         enable_forward_independent_handoff=True,
     )
     entered, release = _pause_functional_start(monkeypatch, serving)
-    monkeypatch.setattr(
-        runtime,
-        "_claim_forward_independent_handoff",
-        lambda action: None,
-    )
-    action = _action(
-        identity,
-        action_id=96,
-        kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-    )
     serving.start()
     try:
-        runtime._route_action(action)
-        assert entered.wait(timeout=_WAIT_SECONDS)
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        serving.attach_producer_completion(submission)
+        assert serving.packed_ready(identity.local_binding.digest)
+        _wait_for_phase(entered.is_set, "gather did not reach functional admission")
 
         serving.begin_fail_closed_abort()
         assert serving.inventory().delivery_leases.active_binding_digests == ()
@@ -1151,35 +1243,53 @@ def test_source_work_fatal_winning_final_start_gate_aborts_without_side_effect(
         identity,
         enable_forward_independent_handoff=True,
     )
-    entered, release = _pause_functional_start(monkeypatch, serving)
-    monkeypatch.setattr(
-        runtime,
-        "_claim_forward_independent_handoff",
-        lambda action: None,
-    )
-    monkeypatch.setattr(
-        serving._wiring,
-        "consume_outcome_ready",
-        lambda action, callback: work_labels.append("outcome"),
-    )
-    monkeypatch.setattr(
-        serving._wiring,
-        "consume_ack_ready",
-        lambda action, callback: work_labels.append("ack"),
-    )
-    if kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
-        gather = _action(
-            identity,
-            action_id=97,
-            kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-        )
-        assert serving._delivery_leases.acquire_for_actions((gather,)) is (
-            NativeTerminalDeliveryLeaseDisposition.ACQUIRED
-        )
-    action = _action(identity, action_id=98, kind=kind)
+    release = threading.Event()
     serving.start()
     try:
-        runtime._route_action(action)
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        serving.attach_producer_completion(submission)
+        digest = identity.local_binding.digest
+        assert serving.packed_ready(digest)
+        _wait_for_phase(
+            lambda: work_labels == ["gather"],
+            "initial gather did not complete",
+        )
+        assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
+        assert work_labels == ["gather"]
+
+        if kind is NativeTerminalOwnerActionKind.SOURCE_ACK_READY:
+            runtime._owner.submit(
+                NativeTerminalOwnerEvent(
+                    producer_id=_NATIVE_PRODUCER_ID,
+                    binding_digest=digest,
+                    kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+                    enqueued_ns=2_000,
+                )
+            )
+            _wait_for_phase(
+                lambda: runtime.source_work_actions.snapshot().queued_count == 1,
+                "outcome action did not reach its inbox",
+            )
+            serving.drain_runtime_actions()
+            assert work_labels == ["gather", "outcome"]
+
+        entered, release = _pause_functional_start(monkeypatch, serving)
+        if kind is NativeTerminalOwnerActionKind.SOURCE_OUTCOME_READY:
+            runtime._owner.submit(
+                NativeTerminalOwnerEvent(
+                    producer_id=_NATIVE_PRODUCER_ID,
+                    binding_digest=digest,
+                    kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+                    enqueued_ns=2_000,
+                )
+            )
+        else:
+            serving.wiring.teardown_received(digest, identity.request_ready_issuer)
+        _wait_for_phase(
+            lambda: runtime.source_work_actions.snapshot().queued_count == 1,
+            "target source-work action did not reach its inbox",
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             drain = executor.submit(serving.drain_runtime_actions)
             assert entered.wait(timeout=_WAIT_SECONDS)
@@ -1187,7 +1297,7 @@ def test_source_work_fatal_winning_final_start_gate_aborts_without_side_effect(
             serving.begin_fail_closed_abort()
             release.set()
 
-            assert drain.result(timeout=_WAIT_SECONDS) == 1
+            assert drain.result(timeout=_WAIT_SECONDS) >= 1
         inventory = serving.inventory()
         assert expected_label not in work_labels
         assert inventory.delivery_leases.active_binding_digests == ()
@@ -1203,38 +1313,60 @@ def test_publisher_fatal_winning_final_start_gate_aborts_without_side_effect(
     """Publisher submission cannot begin after scheduler fatal wins."""
 
     identity = _identity()
-    serving, runtime, publisher, _, _, _ = _serving(
+    serving, runtime, publisher, _, work_labels, _ = _serving(
         identity,
         enable_forward_independent_handoff=True,
     )
-    entered, release = _pause_functional_start(monkeypatch, serving)
-    monkeypatch.setattr(
-        runtime,
-        "_claim_forward_independent_handoff",
-        lambda action: None,
-    )
+    release = threading.Event()
     publication_calls: list[NativeTerminalOwnerAction] = []
-    monkeypatch.setattr(
-        serving._wiring,
-        "consume_gateway_publication_ready",
-        publication_calls.append,
-    )
-    gather = _action(
-        identity,
-        action_id=99,
-        kind=NativeTerminalOwnerActionKind.SOURCE_GATHER_READY,
-    )
-    assert serving._delivery_leases.acquire_for_actions((gather,)) is (
-        NativeTerminalDeliveryLeaseDisposition.ACQUIRED
-    )
-    action = _action(
-        identity,
-        action_id=100,
-        kind=NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
-    )
     serving.start()
     try:
-        runtime._route_action(action)
+        submission = _submission(identity)
+        serving.bind_submission(submission, lambda value: None)
+        serving.attach_producer_completion(submission)
+        digest = identity.local_binding.digest
+        assert serving.packed_ready(digest)
+        _wait_for_phase(
+            lambda: work_labels == ["gather"],
+            "publisher setup gather did not complete",
+        )
+        runtime._owner.submit(
+            NativeTerminalOwnerEvent(
+                producer_id=_NATIVE_PRODUCER_ID,
+                binding_digest=digest,
+                kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+                enqueued_ns=2_000,
+            )
+        )
+        _wait_for_phase(
+            lambda: runtime.source_work_actions.snapshot().queued_count == 1,
+            "publisher setup outcome did not reach its inbox",
+        )
+        serving.drain_runtime_actions()
+        serving.wiring.teardown_received(digest, identity.request_ready_issuer)
+        _wait_for_phase(
+            lambda: runtime.source_work_actions.snapshot().queued_count == 1,
+            "publisher setup acknowledgement did not reach its inbox",
+        )
+        serving.drain_runtime_actions()
+        assert work_labels == ["gather", "outcome", "ack"]
+        entered, release = _pause_functional_start(monkeypatch, serving)
+        monkeypatch.setattr(
+            serving._wiring,
+            "consume_gateway_publication_ready",
+            publication_calls.append,
+        )
+        ready = _request_ready_receipt(identity)
+        serving.request_ready(
+            binding_digest=identity.local_binding.digest,
+            wire_receipt=ready.wire_receipt,
+            local_receipt=ready.local_receipt,
+            authenticated_issuer=identity.request_ready_issuer,
+        )
+        _wait_for_phase(
+            lambda: runtime.publisher_actions.snapshot().queued_count == 1,
+            "gateway publication did not reach its inbox",
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             drain = executor.submit(serving.drain_runtime_actions)
             assert entered.wait(timeout=_WAIT_SECONDS)
@@ -1242,7 +1374,7 @@ def test_publisher_fatal_winning_final_start_gate_aborts_without_side_effect(
             serving.begin_fail_closed_abort()
             release.set()
 
-            assert drain.result(timeout=_WAIT_SECONDS) == 1
+            assert drain.result(timeout=_WAIT_SECONDS) >= 1
         inventory = serving.inventory()
         assert publication_calls == []
         assert publisher.values == []
@@ -1253,13 +1385,13 @@ def test_publisher_fatal_winning_final_start_gate_aborts_without_side_effect(
         serving.abort_and_close()
 
 
-def test_delivery_batch_allocation_rolls_back_every_earlier_intent(
+def test_delivery_batch_allocation_retains_launch_exclusion_until_owner_death(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A later allocation failure cannot leave a partial launch exclusion."""
+    """A partial batch failure blocks another launch through owner death."""
 
     identity = _identity()
-    serving, _, _, _, _, _ = _serving(
+    serving, runtime, _, _, _, _ = _serving(
         identity,
         enable_forward_independent_handoff=True,
     )
@@ -1285,8 +1417,14 @@ def test_delivery_batch_allocation_rolls_back_every_earlier_intent(
             action_id=85,
             binding=NativeTerminalRequestBinding.from_binding(second_binding),
         )
+        outputs = (
+            _output(first, owner_sequence=1),
+            _output(second, owner_sequence=2),
+        )
         original_begin = serving._scheduler_serving.begin_delivery_lease
         allocation_count = 0
+        native_claims: list[tuple[NativeTerminalOwnerAction, ...]] = []
+        rejected_actions: list[NativeTerminalOwnerAction] = []
 
         def fail_second(
             binding: TerminalRequestBinding,
@@ -1308,22 +1446,109 @@ def test_delivery_batch_allocation_rolls_back_every_earlier_intent(
             "begin_delivery_lease",
             fail_second,
         )
-        with pytest.raises(RuntimeError, match="batch allocation failed"):
-            serving._delivery_leases.acquire_for_actions((first, second))
+        monkeypatch.setattr(
+            runtime._owner,
+            "claim_source_forward_independent_handoffs",
+            native_claims.append,
+        )
+        monkeypatch.setattr(
+            runtime._owner,
+            "fail_action_delivery",
+            lambda action, reason: rejected_actions.append(action),
+        )
+        with pytest.raises(RuntimeError, match="batch allocation failed") as raised:
+            runtime._prepare_output_batch(outputs)
 
-        assert serving.inventory().scheduler_serving.inbox.active_delivery_intents != ()
-        serving.begin_fail_closed_abort()
+        assert allocation_count == 2
+        assert native_claims == []
         inventory = serving.inventory()
+        assert inventory.delivery_leases.active_binding_digests == (
+            identity.local_binding.digest,
+        )
+        assert len(inventory.scheduler_serving.inbox.active_delivery_intents) == 1
+        assert tuple(serving._delivery_leases._records) == (
+            identity.local_binding.request_key,
+        )
+
+        launch_submitted = threading.Event()
+
+        def submit() -> str:
+            """Record any host launch which crosses the retained intent.
+
+            :returns: Synthetic launch result.
+            """
+
+            launch_submitted.set()
+            return "submitted"
+
+        handoff_waiting = threading.Event()
+        original_wait = serving._scheduler_serving._inbox._wait_for_publication_intents
+
+        def signal_handoff_wait(intents: frozenset[int]) -> None:
+            """Expose the scheduler's wait on the retained delivery intent.
+
+            :param intents: Exact intent population blocking host submission.
+            """
+
+            handoff_waiting.set()
+            original_wait(intents)
+
+        monkeypatch.setattr(
+            serving._scheduler_serving._inbox,
+            "_wait_for_publication_intents",
+            signal_handoff_wait,
+        )
+
+        launch_blocked_before_rejection = False
+        launch_blocked_after_rejection = False
+
+        def enter_owner_death() -> None:
+            """Reject the batch and make scheduler owner death durable."""
+
+            nonlocal launch_blocked_before_rejection
+            nonlocal launch_blocked_after_rejection
+            if not handoff_waiting.wait(timeout=_WAIT_SECONDS):
+                serving.begin_fail_closed_abort()
+                raise TimeoutError("scheduler did not wait on the delivery intent")
+            launch_blocked_before_rejection = not launch_submitted.is_set()
+            runtime._reject_output_batch(
+                outputs,
+                str(raised.value),
+            )
+            launch_blocked_after_rejection = not launch_submitted.is_set()
+            serving.drain_runtime_actions()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            owner_death = executor.submit(enter_owner_death)
+            with pytest.raises(RuntimeError, match="process-fatal"):
+                serving._scheduler_serving.launch_handoff(submit)
+            owner_death.result(timeout=_WAIT_SECONDS)
+
+        assert rejected_actions == [first, second]
+        assert launch_blocked_before_rejection
+        assert launch_blocked_after_rejection
+        assert not launch_submitted.is_set()
+        inventory = serving.inventory()
+        assert inventory.owner_dead_marked
         assert inventory.delivery_leases.active_binding_digests == ()
         assert inventory.scheduler_serving.inbox.active_delivery_intents == ()
+        snapshot = runtime.snapshot()
+        assert snapshot.source_preclaimed_count == 0
+        assert snapshot.source_preclaimed_consumer_count == 0
     finally:
         serving.abort_and_close()
 
 
-def test_native_delivery_claims_while_scheduler_state_lock_is_held() -> None:
-    """The pending-call handoff never borrows the interrupted scheduler lock."""
+@pytest.mark.parametrize("hold_intent_condition", (True, False))
+def test_native_batch_handoff_restores_while_scheduler_lock_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+    hold_intent_condition: bool,
+) -> None:
+    """An acquired batch restores without borrowing scheduler-owned locks."""
 
     identity = _identity()
+    leases_acquired = threading.Event()
+    release_acquisition = threading.Event()
     gather_entered = threading.Event()
     release_gather = threading.Event()
 
@@ -1346,13 +1571,41 @@ def test_native_delivery_claims_while_scheduler_state_lock_is_held() -> None:
         post_gather=post_gather,
         enable_forward_independent_handoff=True,
     )
+    original_acquire = serving._delivery_leases.acquire_for_actions
+
+    def acquire_then_pause(
+        actions: tuple[NativeTerminalOwnerAction, ...],
+    ) -> NativeTerminalDeliveryLeaseDisposition:
+        """Expose the exact post-lease, pre-native-handoff boundary.
+
+        :param actions: Complete source batch selected by the output reactor.
+        :returns: Real delivery disposition after the test releases the batch.
+        """
+
+        disposition = original_acquire(actions)
+        assert disposition is NativeTerminalDeliveryLeaseDisposition.ACQUIRED
+        leases_acquired.set()
+        if not release_acquisition.wait(timeout=_WAIT_SECONDS):
+            raise TimeoutError("source batch acquisition release was not delivered")
+        return disposition
+
+    monkeypatch.setattr(
+        serving._delivery_leases,
+        "acquire_for_actions",
+        acquire_then_pause,
+    )
     reactor_failures: list[PackedTerminalProcessReactorFailure] = []
     reactor = PackedTerminalProcessReactor.for_source(
         serving,
         reactor_failures.append,
     )
-    scheduler_state_lock = serving._scheduler_serving._inbox._state_lock
-    state_lock_owned = False
+    scheduler_inbox = serving._scheduler_serving._inbox
+    scheduler_lock = (
+        scheduler_inbox._intent_condition
+        if hold_intent_condition
+        else scheduler_inbox._state_lock
+    )
+    scheduler_lock_owned = False
     reactor_started = False
     serving.start()
     try:
@@ -1361,30 +1614,40 @@ def test_native_delivery_claims_while_scheduler_state_lock_is_held() -> None:
         submission = _submission(identity)
         serving.bind_submission(submission, lambda value: None)
         serving.attach_producer_completion(submission)
-        scheduler_state_lock.acquire()
-        state_lock_owned = True
         assert serving.packed_ready(identity.local_binding.digest)
-        deadline = time.monotonic() + _WAIT_SECONDS
-        while (
-            runtime.snapshot().owner.claimed_handoff_action_count == 0
-            and time.monotonic() < deadline
-        ):
-            pass
+        assert leases_acquired.wait(timeout=_WAIT_SECONDS)
+        scheduler_lock.acquire()
+        scheduler_lock_owned = True
+        release_acquisition.set()
+        _wait_for_phase(
+            lambda: runtime.snapshot().owner.source_batch_handoff_action_count == 1,
+            "native source batch did not claim while scheduler lock was held",
+        )
         _wait_for_phase(gather_entered.is_set, "gather worker did not claim delivery")
         owner = runtime.snapshot().owner
         assert owner.unclaimed_handoff_action_count == 0
         assert owner.claimed_handoff_action_count == 1
+        assert owner.source_batch_handoff_count == 1
+        assert owner.source_batch_handoff_action_count == 1
+        assert not owner.handoff_callback_scheduled
+        assert not owner.handoff_callback_active
+        assert not owner.handoff_callback_restoring
+        assert (
+            owner.terminal_handoff_callback_state
+            is NativeTerminalHandoffCallbackTerminalState.RESTORED
+        )
         assert serving._delivery_leases.inventory().active_binding_digests == (
             identity.local_binding.digest,
         )
-        scheduler_state_lock.release()
-        state_lock_owned = False
+        scheduler_lock.release()
+        scheduler_lock_owned = False
         release_gather.set()
         assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
         assert reactor_failures == []
     finally:
-        if state_lock_owned:
-            scheduler_state_lock.release()
+        release_acquisition.set()
+        if scheduler_lock_owned:
+            scheduler_lock.release()
         release_gather.set()
         if reactor_started:
             reactor.close(_WAIT_SECONDS)
@@ -2074,13 +2337,16 @@ def test_later_inbox_claim_failure_reconciles_earlier_population(
         serving.abort_and_close()
 
 
-def test_mid_claim_failure_retains_and_reconciles_complete_population(
+def test_preclaimed_batch_failure_reconciles_without_native_dequeue_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed member claim cannot strand its later dequeued siblings."""
+    """A failed consumer reconciles a batch without repeating native claim."""
 
     identity = _identity()
-    serving, runtime, _, _, _, _ = _serving(identity)
+    serving, runtime, publisher, _, _, _ = _serving(
+        identity,
+        enable_forward_independent_handoff=True,
+    )
     actions = (
         _action(
             identity,
@@ -2093,40 +2359,60 @@ def test_mid_claim_failure_retains_and_reconciles_complete_population(
             kind=NativeTerminalOwnerActionKind.GATEWAY_PUBLICATION_READY,
         ),
     )
-    claim_count = 0
 
-    def fail_first_native_claim(action: NativeTerminalOwnerAction) -> None:
-        """Fail one member while allowing the later member to be retained.
+    def fail_publisher_population(
+        claimed: tuple[NativeTerminalOwnerAction, ...],
+        execution: object,
+    ) -> None:
+        """Reject the exact already-claimed publisher population.
 
-        :param action: Exact forward-independent action being claimed.
+        :param claimed: Complete preclaimed publisher population.
+        :param execution: Source reactor's local ownership ledger.
         """
 
-        nonlocal claim_count
-        claim_count += 1
-        if claim_count == 1:
-            raise RuntimeError("synthetic mid-population claim failure")
+        assert claimed == actions
+        raise RuntimeError("synthetic preclaimed population failure")
+
+    def reject_dequeue_reclaim(action: NativeTerminalOwnerAction) -> None:
+        """Fail if the obsolete per-action native claim seam is reached.
+
+        :param action: Unexpected action offered for a second native claim.
+        """
+
+        raise AssertionError(f"action {action.action_id} was claimed twice")
 
     serving.start()
     try:
+        runtime._record_source_preclaims(actions)
         for action in actions:
-            runtime._route_action(action)
-        monkeypatch.setattr(
-            runtime,
-            "_claim_forward_independent_handoff",
-            fail_first_native_claim,
-        )
-        with pytest.raises(
-            RuntimeError,
-            match="source runtime action batch claim failed",
-        ):
-            serving.drain_runtime_actions()
+            runtime._project_action(action)
+        with monkeypatch.context() as scoped_patch:
+            scoped_patch.setattr(
+                runtime._owner,
+                "claim_forward_independent_handoff",
+                reject_dequeue_reclaim,
+            )
+            scoped_patch.setattr(
+                serving,
+                "_consume_publisher_actions",
+                fail_publisher_population,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="synthetic preclaimed population failure",
+            ):
+                serving.drain_runtime_actions()
 
-        assert claim_count == 2
         action_ids = frozenset(action.action_id for action in actions)
         with runtime._condition:
             assert action_ids.isdisjoint(runtime._consumer_pending)
             assert action_ids.isdisjoint(runtime._inbox_claimed_action_ids)
-        runtime.snapshot()
+            assert action_ids.isdisjoint(runtime._source_preclaimed_actions)
+            assert action_ids.isdisjoint(runtime._source_preclaimed_consumer_action_ids)
+        snapshot = runtime.snapshot()
+        assert snapshot.source_preclaimed_count == 0
+        assert snapshot.source_preclaimed_consumer_count == 0
+        assert publisher.values == []
     finally:
         serving.abort_and_close()
 
@@ -2481,6 +2767,22 @@ def test_full_source_composition_retires_exactly_once(
         reactor.close(_WAIT_SECONDS)
         reactor_closed = True
         assert reactor_failures == []
+        final_inventory = serving.inventory()
+        owner = final_inventory.runtime.owner
+        assert owner.source_batch_handoff_count == 5
+        assert owner.source_batch_handoff_action_count == 5
+        assert owner.handoff_callback_count == 5
+        assert not owner.handoff_callback_scheduled
+        assert not owner.handoff_callback_active
+        assert not owner.handoff_callback_restoring
+        assert owner.scheduled_source_batch_action_count == 0
+        assert owner.active_source_batch_action_count == 0
+        assert (
+            owner.terminal_handoff_callback_state
+            is NativeTerminalHandoffCallbackTerminalState.RESTORED
+        )
+        assert final_inventory.runtime.source_preclaimed_count == 0
+        assert final_inventory.runtime.source_preclaimed_consumer_count == 0
         serving.close_clean(_WAIT_SECONDS)
         serving_closed = True
     finally:

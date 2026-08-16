@@ -458,11 +458,10 @@ class TerminalSchedulerServing:
     ) -> TerminalSchedulerDeliveryLease:
         """Exclude another host launch until causal source delivery completes.
 
-        Intent acquisition deliberately performs no live-request lookup. It
-        must remain independent of the receipt state lock because a native
-        pending call may have interrupted the scheduler while that lock is
-        held. Exact generation validation is owned by the source delivery
-        registry which calls this boundary.
+        Intent acquisition deliberately performs no live-request lookup or
+        receipt-state access. Exact generation validation is owned by the
+        source delivery registry, which constructs the complete lease batch
+        before native callback activation.
 
         :param binding: Exact source request generation being delivered.
         :returns: Take-once launch exclusion for the generation.
