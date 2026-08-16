@@ -3612,7 +3612,6 @@ public:
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
                  owner_->active_handoff_actions.empty() &&
-                 owner_->abort_settled_handoff_delivery_ids.empty() &&
                  !owner_->scheduler_launch_handoff_begin_active &&
                  owner_->active_scheduler_launch_handoff_token == 0 &&
                  !owner_->output_drain_active &&
