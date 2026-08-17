@@ -144,7 +144,7 @@ class _NativeTerminalOwnerBridge(Protocol):
         """
 
     def settle_forward_independent_handoff(self, action_id: int) -> None:
-        """Retire one launch exclusion after typed-inbox delivery.
+        """Retire one action-level launch exclusion after typed-inbox delivery.
 
         :param action_id: Exact forward-independent native action identity.
         """
@@ -213,6 +213,12 @@ class _NativeTerminalOwnerBridge(Protocol):
 
     def expire_deadlines_for_test(self) -> None:
         """Evaluate all armed deadlines at deterministic test time."""
+
+    def hold_source_acceptance_dispatch_for_test(self) -> None:
+        """Hold one accepted source event after reservation admission."""
+
+    def release_source_acceptance_dispatch_for_test(self) -> None:
+        """Release the exact accepted source event captured by the test hold."""
 
     def hold_decode_delivery_dispatch_for_test(self) -> None:
         """Hold one local-ready event after reservation admission."""
@@ -692,6 +698,28 @@ class NativeTerminalOwner:
             raise RuntimeError("deterministic clocks require a native test build")
         self._native.expire_deadlines_for_test()
 
+    def hold_source_acceptance_dispatch_for_testing(self) -> None:
+        """Hold one accepted source event after its reservation commits.
+
+        :raises RuntimeError: If this owner was not built for testing or is not
+            a quiescent source owner.
+        """
+
+        if not self._testing:
+            raise RuntimeError("source acceptance holds require a native test build")
+        self._native.hold_source_acceptance_dispatch_for_test()
+
+    def release_source_acceptance_dispatch_for_testing(self) -> None:
+        """Release the exact accepted source event captured by the test hold.
+
+        :raises RuntimeError: If this owner was not built for testing or no
+            event is held.
+        """
+
+        if not self._testing:
+            raise RuntimeError("source acceptance holds require a native test build")
+        self._native.release_source_acceptance_dispatch_for_test()
+
     def hold_decode_delivery_dispatch_for_testing(self) -> None:
         """Hold one local-ready event after its native reservation commits.
 
@@ -863,7 +891,7 @@ class NativeTerminalOwner:
     def settle_forward_independent_handoff(
         self, action: NativeTerminalOwnerAction
     ) -> None:
-        """Retire one launch exclusion after typed-inbox delivery.
+        """Retire one action-level launch exclusion after typed-inbox delivery.
 
         :param action: Forward-independent action owned by its dedicated consumer.
         """
@@ -876,7 +904,8 @@ class NativeTerminalOwner:
         """Wait for prior delivery work and acquire one scheduler launch lease.
 
         The native boundary captures an action watermark, releases the GIL
-        while waiting for those actions to settle, and returns one exact token.
+        while waiting for captured actions and request reservations to settle,
+        and returns one exact token.
 
         :param timeout_seconds: Positive finite settlement wait.
         :returns: One-shot native scheduler launch token.

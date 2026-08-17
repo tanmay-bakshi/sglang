@@ -1615,7 +1615,7 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
         if not release_gather.wait(timeout=_WAIT_SECONDS):
             raise TimeoutError("test gather release was not delivered")
 
-    serving, runtime, _, _, _, _ = _serving(
+    serving, runtime, _, _, work_labels, _ = _serving(
         identity,
         post_gather=post_gather,
         enable_forward_independent_handoff=True,
@@ -1709,11 +1709,38 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
 
                 release_gather.set()
                 assert serving._gather_worker.wait_until_idle(_WAIT_SECONDS)
-                serving._delivery_leases.mark_outcomes_sent(identity.local_binding)
+                runtime._owner.submit(
+                    NativeTerminalOwnerEvent(
+                        producer_id=_NATIVE_PRODUCER_ID,
+                        binding_digest=identity.local_binding.digest,
+                        kind=NativeTerminalOwnerEventKind.SOURCE_NATIVE_TERMINAL,
+                        enqueued_ns=2_000,
+                    )
+                )
+                _wait_for_phase(
+                    lambda: "outcome" in work_labels,
+                    "source outcome remained coupled to the blocked scheduler",
+                )
                 assert (
                     serving._delivery_leases.inventory().active_binding_digests
                     == (identity.local_binding.digest,)
                 )
+                assert not launch_submitted.is_set()
+
+                serving.wiring.teardown_received(
+                    identity.local_binding.digest,
+                    identity.request_ready_issuer,
+                )
+                _wait_for_phase(
+                    lambda: (
+                        "ack" in work_labels
+                        and runtime.snapshot().owner.source_delivery_reservation_count
+                        == 0
+                    ),
+                    "source ACK did not settle its native delivery reservation",
+                )
+                owner = runtime.snapshot().owner
+                assert owner.terminal_source_delivery_reservation_count == 1
                 assert not launch_submitted.is_set()
                 serving._delivery_leases.mark_publication_owned(identity.local_binding)
                 return owner
@@ -1732,7 +1759,8 @@ def test_native_batch_handoff_progresses_while_scheduler_waits_on_delivery(
             owner = delivery.result(timeout=_WAIT_SECONDS)
 
         assert launch_result == "submitted"
-        assert owner.source_batch_handoff_action_count == 1
+        assert owner.source_batch_handoff_count == 3
+        assert owner.source_batch_handoff_action_count == 3
 
         assert launch_submitted.is_set()
         assert reactor_failures == []

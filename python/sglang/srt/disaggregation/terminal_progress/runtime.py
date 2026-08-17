@@ -1658,9 +1658,11 @@ class NativeTerminalRuntime:
     def acknowledge_consumed_action(self, action: NativeTerminalOwnerAction) -> None:
         """Retire one non-scheduler action after downstream completion.
 
-        The dedicated consumer settles launch exclusion while dequeuing the
-        action. This method releases only the longer-lived functional and
-        lifecycle authority after the receiving component finishes its work.
+        The dedicated consumer settles the action-level launch exclusion while
+        dequeuing the action. A source request reservation remains independent
+        and live through its ACK-sent boundary. This method releases only the
+        longer-lived functional and lifecycle authority after the receiving
+        component finishes its work.
 
         :param action: Action previously drained from a runtime inbox.
         """

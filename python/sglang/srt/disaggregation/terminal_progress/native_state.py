@@ -1486,16 +1486,12 @@ class NativeTerminalOwnerInventory:
         inbox delivery, failed delivery, or abort.
     :ivar abort_settled_handoff_delivery_count: Aborted native handoffs whose
         Python delivery owner has not yet consumed the exact abort replay entry.
-    :ivar source_delivery_reservation_count: Accepted source submissions not
-        yet transferred into their gather-action handoff.
-    :ivar source_reservation_backed_handoff_action_count: Active source gather
-        actions retaining the reservation identity captured at acceptance.
+    :ivar source_delivery_reservation_count: Accepted source submissions whose
+        ACK-sent terminal event has not yet committed.
     :ivar registered_source_delivery_reservation_count: Source delivery
         reservations established synchronously at accepted-event submission.
-    :ivar transferred_source_delivery_reservation_count: Reservations moved
-        atomically into source gather actions.
     :ivar terminal_source_delivery_reservation_count: Reservations consumed by
-        request-local or process-terminal ownership before gather creation.
+        ACK success, request failure, timeout, or process-terminal ownership.
     :ivar decode_delivery_reservation_count: Accepted decode delivery
         generations not yet transferred into their corresponding handoff. Each
         request has a writer-to-adoption generation and a local-ready-ingress-to-
@@ -1583,9 +1579,7 @@ class NativeTerminalOwnerInventory:
     settled_handoff_action_count: int
     abort_settled_handoff_delivery_count: int
     source_delivery_reservation_count: int
-    source_reservation_backed_handoff_action_count: int
     registered_source_delivery_reservation_count: int
-    transferred_source_delivery_reservation_count: int
     terminal_source_delivery_reservation_count: int
     decode_delivery_reservation_count: int
     decode_reservation_backed_handoff_action_count: int
@@ -1656,9 +1650,7 @@ class NativeTerminalOwnerInventory:
             self.settled_handoff_action_count,
             self.abort_settled_handoff_delivery_count,
             self.source_delivery_reservation_count,
-            self.source_reservation_backed_handoff_action_count,
             self.registered_source_delivery_reservation_count,
-            self.transferred_source_delivery_reservation_count,
             self.terminal_source_delivery_reservation_count,
             self.decode_delivery_reservation_count,
             self.decode_reservation_backed_handoff_action_count,
@@ -1732,20 +1724,10 @@ class NativeTerminalOwnerInventory:
             )
         if self.registered_source_delivery_reservation_count != (
             self.source_delivery_reservation_count
-            + self.transferred_source_delivery_reservation_count
             + self.terminal_source_delivery_reservation_count
         ):
             raise ValueError(
                 "native source delivery reservation accounting violates conservation"
-            )
-        if (
-            self.source_reservation_backed_handoff_action_count
-            > self.active_handoff_action_count
-            or self.source_reservation_backed_handoff_action_count
-            > self.transferred_source_delivery_reservation_count
-        ):
-            raise ValueError(
-                "native reservation-backed handoff accounting is inconsistent"
             )
         if self.registered_decode_delivery_reservation_count != (
             self.decode_delivery_reservation_count
@@ -1850,9 +1832,7 @@ class NativeTerminalOwnerInventory:
             or self.registered_handoff_action_count != 0
             or self.abort_settled_handoff_delivery_count != 0
             or self.source_delivery_reservation_count != 0
-            or self.source_reservation_backed_handoff_action_count != 0
             or self.registered_source_delivery_reservation_count != 0
-            or self.transferred_source_delivery_reservation_count != 0
             or self.terminal_source_delivery_reservation_count != 0
             or self.decode_delivery_reservation_count != 0
             or self.decode_reservation_backed_handoff_action_count != 0
@@ -1922,7 +1902,6 @@ class NativeTerminalOwnerInventory:
                 or self.active_handoff_action_count != 0
                 or self.abort_settled_handoff_delivery_count != 0
                 or self.source_delivery_reservation_count != 0
-                or self.source_reservation_backed_handoff_action_count != 0
                 or self.decode_delivery_reservation_count != 0
                 or self.decode_reservation_backed_handoff_action_count != 0
                 or self.active_source_count != 0
@@ -1987,14 +1966,8 @@ class NativeTerminalOwnerInventory:
             source_delivery_reservation_count=int(
                 value["source_delivery_reservation_count"]
             ),
-            source_reservation_backed_handoff_action_count=int(
-                value["source_reservation_backed_handoff_action_count"]
-            ),
             registered_source_delivery_reservation_count=int(
                 value["registered_source_delivery_reservation_count"]
-            ),
-            transferred_source_delivery_reservation_count=int(
-                value["transferred_source_delivery_reservation_count"]
             ),
             terminal_source_delivery_reservation_count=int(
                 value["terminal_source_delivery_reservation_count"]

@@ -370,7 +370,7 @@ class _PackedTerminalSourceDeliveryLeaseRecord:
 
 
 class _PackedTerminalSourceDeliveryLeases(NativeTerminalSourceDeliveryAuthority):
-    """Transfer native handoff authority into request-scoped launch intents."""
+    """Pair native request reservations with Python scheduler launch intents."""
 
     _scheduler_serving: TerminalSchedulerServing
     _records: dict[PackedRequestKey, _PackedTerminalSourceDeliveryLeaseRecord]

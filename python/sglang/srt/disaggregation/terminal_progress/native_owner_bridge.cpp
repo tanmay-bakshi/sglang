@@ -696,7 +696,6 @@ struct DecodeDeliveryReservation {
 
 struct ActiveHandoffAuthority {
   ActionKind kind;
-  std::optional<std::uint64_t> source_reservation_id;
   std::optional<std::uint64_t> decode_reservation_id;
 };
 
@@ -753,7 +752,6 @@ struct SharedOwner {
   std::uint64_t handoff_registration_count{0};
   std::uint64_t next_source_delivery_reservation_id{1};
   std::uint64_t source_delivery_reservation_registration_count{0};
-  std::uint64_t source_delivery_reservation_transfer_count{0};
   std::uint64_t source_delivery_reservation_terminal_count{0};
   std::uint64_t next_decode_delivery_reservation_id{1};
   std::uint64_t decode_delivery_reservation_registration_count{0};
@@ -786,6 +784,8 @@ struct SharedOwner {
   bool scheduler_launch_handoff_begin_active{false};
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
   bool test_clock_enabled{false};
+  bool test_source_acceptance_dispatch_held{false};
+  bool test_source_acceptance_dispatch_captured{false};
   bool test_decode_delivery_dispatch_held{false};
   bool test_decode_delivery_dispatch_captured{false};
   std::uint64_t test_now_ns{0};
@@ -811,6 +811,11 @@ bool terminalize_source_delivery_reservation_locked(
 
 void terminalize_all_source_delivery_reservations_locked(
     SharedOwner &owner) noexcept;
+
+bool source_phase_retains_delivery_reservation(
+    std::uint8_t phase_value) noexcept;
+
+bool source_input_projection_complete_locked(const SharedOwner &owner) noexcept;
 
 bool terminalize_decode_delivery_reservation_locked(
     SharedOwner &owner, const Digest &binding_digest) noexcept;
@@ -1555,6 +1560,44 @@ bool action_requires_forward_independent_handoff(ActionKind kind) noexcept {
   return false;
 }
 
+struct QueuedSourceAdmission {
+  std::size_t registration_count{0};
+  std::size_t acceptance_count{0};
+  std::size_t first_registration_index{0};
+  std::size_t first_acceptance_index{0};
+
+  bool is_exact_ordered_pair() const noexcept {
+    return registration_count == 1 && acceptance_count == 1 &&
+           first_registration_index < first_acceptance_index;
+  }
+};
+
+QueuedSourceAdmission queued_source_admission_locked(
+    const SharedOwner &owner, const Digest &binding_digest) noexcept {
+  QueuedSourceAdmission result{};
+  std::size_t index = 0;
+  for (const InputCommand &command : owner.input_queue) {
+    if (command.kind == InputKind::kRegisterLifecycle &&
+        command.lifecycle.role == OwnerRole::kSource &&
+        command.lifecycle.binding.digest == binding_digest) {
+      if (result.registration_count == 0) {
+        result.first_registration_index = index;
+      }
+      ++result.registration_count;
+    }
+    if (command.kind == InputKind::kEvent &&
+        command.event.kind == EventKind::kSourceSubmissionAccepted &&
+        command.event.binding_digest == binding_digest) {
+      if (result.acceptance_count == 0) {
+        result.first_acceptance_index = index;
+      }
+      ++result.acceptance_count;
+    }
+    ++index;
+  }
+  return result;
+}
+
 bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
   const bool unclaimed_is_authorized = std::all_of(
       owner.unclaimed_handoff_action_ids.begin(),
@@ -1574,14 +1617,10 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
         if (!action_requires_forward_independent_handoff(authority.kind)) {
           return false;
         }
-        const bool source_backed = authority.source_reservation_id.has_value();
         const bool decode_backed = authority.decode_reservation_id.has_value();
-        return source_backed ==
-                   (authority.kind == ActionKind::kSourceGatherReady) &&
-               decode_backed ==
-                   (authority.kind == ActionKind::kAdoptionReady ||
-                    authority.kind == ActionKind::kLocalDecodeReady) &&
-               !(source_backed && decode_backed);
+        return decode_backed ==
+               (authority.kind == ActionKind::kAdoptionReady ||
+                authority.kind == ActionKind::kLocalDecodeReady);
       });
   const bool action_conservation =
       owner.handoff_registration_count ==
@@ -1590,7 +1629,6 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
   const bool reservation_conservation =
       owner.source_delivery_reservation_registration_count ==
       owner.source_delivery_reservations.size() +
-          owner.source_delivery_reservation_transfer_count +
           owner.source_delivery_reservation_terminal_count;
   const bool decode_reservation_conservation =
       owner.decode_delivery_reservation_registration_count ==
@@ -1601,8 +1639,28 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
       owner.source_delivery_reservations.begin(),
       owner.source_delivery_reservations.end(), [&owner](const auto &entry) {
         const std::uint64_t reservation_id = entry.second.reservation_id;
+        const auto lifecycle = owner.lifecycles.find(entry.first);
+        const QueuedSourceAdmission queued =
+            queued_source_admission_locked(owner, entry.first);
+        const bool queued_before_registration =
+            lifecycle == owner.lifecycles.end() &&
+            queued.is_exact_ordered_pair();
+        const bool queued_after_registration =
+            lifecycle != owner.lifecycles.end() &&
+            lifecycle->second.role == OwnerRole::kSource &&
+            lifecycle->second.phase ==
+                static_cast<std::uint8_t>(SourcePhase::kFrozen) &&
+            queued.registration_count == 0 && queued.acceptance_count == 1;
+        const bool active_lifecycle =
+            lifecycle != owner.lifecycles.end() &&
+            lifecycle->second.role == OwnerRole::kSource &&
+            source_phase_retains_delivery_reservation(
+                lifecycle->second.phase) &&
+            queued.registration_count == 0 && queued.acceptance_count == 0;
         if (reservation_id == 0 ||
-            reservation_id >= owner.next_source_delivery_reservation_id) {
+            reservation_id >= owner.next_source_delivery_reservation_id ||
+            (!queued_before_registration && !queued_after_registration &&
+             !active_lifecycle)) {
           return false;
         }
         return std::count_if(
@@ -1612,36 +1670,49 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
                      return candidate.second.reservation_id == reservation_id;
                    }) == 1;
       });
-  const bool transferred_reservations_are_valid = std::all_of(
-      owner.active_handoff_actions.begin(),
-      owner.active_handoff_actions.end(), [&owner](const auto &entry) {
-        const std::optional<std::uint64_t> reservation_id =
-            entry.second.source_reservation_id;
-        if (!reservation_id.has_value()) {
-          return entry.second.kind != ActionKind::kSourceGatherReady;
-        }
-        if (entry.second.kind != ActionKind::kSourceGatherReady ||
-            reservation_id.value() == 0 ||
-            reservation_id.value() >=
-                owner.next_source_delivery_reservation_id) {
-          return false;
-        }
-        if (std::any_of(owner.source_delivery_reservations.begin(),
-                        owner.source_delivery_reservations.end(),
-                        [reservation_id](const auto &reservation) {
-                          return reservation.second.reservation_id ==
-                                 reservation_id.value();
-                        })) {
-          return false;
-        }
-        return std::count_if(
-                   owner.active_handoff_actions.begin(),
-                   owner.active_handoff_actions.end(),
-                   [reservation_id](const auto &candidate) {
-                     return candidate.second.source_reservation_id ==
-                            reservation_id;
-                   }) == 1;
-      });
+  const bool source_lifecycle_reservations_are_complete =
+      !owner.handoff_enabled || owner.fatal_code != FatalCode::kNone ||
+      owner.abort_started ||
+      std::all_of(owner.lifecycles.begin(), owner.lifecycles.end(),
+                  [&owner](const auto &entry) {
+                    const Lifecycle &lifecycle = entry.second;
+                    if (lifecycle.role != OwnerRole::kSource) {
+                      return true;
+                    }
+                    const bool has_reservation =
+                        owner.source_delivery_reservations.count(entry.first) ==
+                        1;
+                    const QueuedSourceAdmission queued =
+                        queued_source_admission_locked(owner, entry.first);
+                    const SourcePhase phase =
+                        static_cast<SourcePhase>(lifecycle.phase);
+                    if (phase == SourcePhase::kFrozen) {
+                      return queued.registration_count == 0 &&
+                             queued.acceptance_count <= 1 &&
+                             has_reservation ==
+                                 (queued.acceptance_count == 1);
+                    }
+                    if (source_phase_retains_delivery_reservation(
+                            lifecycle.phase)) {
+                      return has_reservation &&
+                             queued.registration_count == 0 &&
+                             queued.acceptance_count == 0;
+                    }
+                    return !has_reservation;
+                  });
+  const bool queued_source_acceptances_are_reserved =
+      !owner.handoff_enabled || owner.fatal_code != FatalCode::kNone ||
+      owner.abort_started ||
+      std::all_of(owner.input_queue.begin(), owner.input_queue.end(),
+                  [&owner](const InputCommand &command) {
+                    if (command.kind != InputKind::kEvent ||
+                        command.event.kind !=
+                            EventKind::kSourceSubmissionAccepted) {
+                      return true;
+                    }
+                    return owner.source_delivery_reservations.count(
+                               command.event.binding_digest) == 1;
+                  });
   const bool live_decode_reservations_are_valid = std::all_of(
       owner.decode_delivery_reservations.begin(),
       owner.decode_delivery_reservations.end(), [&owner](const auto &entry) {
@@ -1720,7 +1791,8 @@ bool handoff_authority_is_consistent_locked(const SharedOwner &owner) noexcept {
   return unclaimed_is_authorized && active_is_authorized &&
          action_conservation && reservation_conservation &&
          decode_reservation_conservation && live_reservations_are_valid &&
-         transferred_reservations_are_valid &&
+         source_lifecycle_reservations_are_complete &&
+         queued_source_acceptances_are_reserved &&
          live_decode_reservations_are_valid &&
          transferred_decode_reservations_are_valid &&
          abort_settlement_is_authorized && token_conservation &&
@@ -1804,6 +1876,32 @@ void terminalize_all_source_delivery_reservations_locked(
   owner.condition.notify_all();
 }
 
+bool source_phase_retains_delivery_reservation(
+    std::uint8_t phase_value) noexcept {
+  const SourcePhase phase = static_cast<SourcePhase>(phase_value);
+  return phase >= SourcePhase::kWaitingForProducer &&
+         phase <= SourcePhase::kTeardownReceived;
+}
+
+bool source_input_projection_complete_locked(const SharedOwner &owner) noexcept {
+  if (!owner.handoff_enabled) {
+    return true;
+  }
+  return std::all_of(
+      owner.source_delivery_reservations.begin(),
+      owner.source_delivery_reservations.end(), [&owner](const auto &entry) {
+        const auto lifecycle = owner.lifecycles.find(entry.first);
+        if (lifecycle == owner.lifecycles.end() ||
+            lifecycle->second.role != OwnerRole::kSource) {
+          return false;
+        }
+        const SourcePhase phase =
+            static_cast<SourcePhase>(lifecycle->second.phase);
+        return phase >= SourcePhase::kGathering &&
+               phase <= SourcePhase::kTeardownReceived;
+      });
+}
+
 bool reserve_decode_delivery_locked(SharedOwner &owner,
                                     const Event &event) noexcept {
   if (!owner.handoff_enabled ||
@@ -1884,7 +1982,7 @@ bool register_forward_independent_handoffs_locked(
   if (!owner.handoff_enabled) {
     return true;
   }
-  const bool transfers_source_reservation =
+  const bool retains_source_reservation =
       !output.process_fatal && output.role == OwnerRole::kSource &&
       output.event_kind == EventKind::kSourceProducerCompleted;
   const bool transfers_decode_reservation =
@@ -1895,7 +1993,7 @@ bool register_forward_independent_handoffs_locked(
       output.event_kind == EventKind::kDecodeAckManifestCompleted
           ? ActionKind::kAdoptionReady
           : ActionKind::kLocalDecodeReady;
-  if (transfers_source_reservation &&
+  if (retains_source_reservation &&
       (output.actions.size() != 1 ||
        output.actions.front().kind != ActionKind::kSourceGatherReady)) {
     enter_handoff_fatal_locked(
@@ -1911,8 +2009,7 @@ bool register_forward_independent_handoffs_locked(
         "decode delivery completion did not yield its exact handoff");
     return false;
   }
-  std::optional<std::uint64_t> source_reservation_id{};
-  if (transfers_source_reservation) {
+  if (retains_source_reservation) {
     const auto reservation =
         owner.source_delivery_reservations.find(output.binding.digest);
     if (reservation == owner.source_delivery_reservations.end()) {
@@ -1921,7 +2018,6 @@ bool register_forward_independent_handoffs_locked(
           "source gather handoff lacked its accepted-delivery reservation");
       return false;
     }
-    source_reservation_id = reservation->second.reservation_id;
   }
   std::optional<std::uint64_t> decode_reservation_id{};
   if (transfers_decode_reservation) {
@@ -1946,7 +2042,7 @@ bool register_forward_independent_handoffs_locked(
     const bool decode_backed =
         action.kind == ActionKind::kAdoptionReady ||
         action.kind == ActionKind::kLocalDecodeReady;
-    if (source_gather != transfers_source_reservation ||
+    if (source_gather != retains_source_reservation ||
         decode_backed != transfers_decode_reservation ||
         (transfers_decode_reservation &&
          action.kind != decode_reservation_action_kind) ||
@@ -1975,11 +2071,7 @@ bool register_forward_independent_handoffs_locked(
       if (!action_requires_forward_independent_handoff(action.kind)) {
         continue;
       }
-      ActiveHandoffAuthority authority{action.kind, std::nullopt,
-                                       std::nullopt};
-      if (action.kind == ActionKind::kSourceGatherReady) {
-        authority.source_reservation_id = source_reservation_id;
-      }
+      ActiveHandoffAuthority authority{action.kind, std::nullopt};
       if (action.kind == ActionKind::kAdoptionReady ||
           action.kind == ActionKind::kLocalDecodeReady) {
         authority.decode_reservation_id = decode_reservation_id;
@@ -2006,10 +2098,6 @@ bool register_forward_independent_handoffs_locked(
     return false;
   }
 
-  if (transfers_source_reservation) {
-    owner.source_delivery_reservations.erase(output.binding.digest);
-    ++owner.source_delivery_reservation_transfer_count;
-  }
   if (transfers_decode_reservation) {
     owner.decode_delivery_reservations.erase(output.binding.digest);
     ++owner.decode_delivery_reservation_transfer_count;
@@ -2134,20 +2222,15 @@ bool active_handoff_at_or_below_locked(const SharedOwner &owner,
   return std::any_of(
       owner.active_handoff_actions.begin(),
       owner.active_handoff_actions.end(),
-      [action_watermark, reservation_watermark,
-       decode_reservation_watermark](const auto &entry) {
+      [action_watermark, decode_reservation_watermark](const auto &entry) {
         if (entry.first <= action_watermark) {
           return true;
         }
-        const bool captured_source_reservation =
-            entry.second.source_reservation_id.has_value() &&
-            entry.second.source_reservation_id.value() <=
-                reservation_watermark;
         const bool captured_decode_reservation =
             entry.second.decode_reservation_id.has_value() &&
             entry.second.decode_reservation_id.value() <=
                 decode_reservation_watermark;
-        return captured_source_reservation || captured_decode_reservation;
+        return captured_decode_reservation;
       });
 }
 
@@ -2302,15 +2385,13 @@ void expire_deadlines_locked(SharedOwner &owner) {
         return;
       }
       const std::uint8_t previous_phase = lifecycle.phase;
-      if (owner.handoff_enabled &&
-          lifecycle.role == OwnerRole::kSource &&
-          previous_phase ==
-              static_cast<std::uint8_t>(SourcePhase::kWaitingForProducer) &&
+      if (owner.handoff_enabled && lifecycle.role == OwnerRole::kSource &&
+          source_phase_retains_delivery_reservation(previous_phase) &&
           !terminalize_source_delivery_reservation_locked(
               owner, lifecycle.binding.digest)) {
         quarantine_all_locked(
             owner, FatalCode::kHandoffAuthority, nullptr,
-            "source deadline lost its accepted-delivery reservation");
+            "source deadline lost its live delivery reservation");
         return;
       }
       if (owner.handoff_enabled &&
@@ -2791,14 +2872,14 @@ void dispatch_event_locked(SharedOwner &owner, const Event &event) {
     output.previous_phase = previous_phase;
     if (lifecycle.role == OwnerRole::kSource) {
       if (owner.handoff_enabled &&
-          previous_phase ==
-              static_cast<std::uint8_t>(SourcePhase::kWaitingForProducer) &&
-          canonical_event.kind == EventKind::kSourceRequestFailed &&
+          (canonical_event.kind == EventKind::kSourceAckSent ||
+           canonical_event.kind == EventKind::kSourceRequestFailed) &&
+          source_phase_retains_delivery_reservation(previous_phase) &&
           !terminalize_source_delivery_reservation_locked(
               owner, lifecycle.binding.digest)) {
         enter_handoff_fatal_locked(
             owner, FatalCode::kHandoffAuthority,
-            "source failure lost its accepted-delivery reservation");
+            "source terminal event lost its live delivery reservation");
         return;
       }
       reduce_source_locked(owner, lifecycle, canonical_event, output,
@@ -2958,14 +3039,20 @@ void reactor_main(std::shared_ptr<SharedOwner> owner) noexcept {
         }
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
         const InputCommand &next_command = owner->input_queue.front();
+        const bool holds_source_acceptance =
+            owner->test_source_acceptance_dispatch_held &&
+            owner->test_source_acceptance_dispatch_captured &&
+            next_command.kind == InputKind::kEvent &&
+            next_command.event.kind == EventKind::kSourceSubmissionAccepted;
         const bool holds_decode_delivery =
             owner->test_decode_delivery_dispatch_held &&
             owner->test_decode_delivery_dispatch_captured &&
             next_command.kind == InputKind::kEvent &&
             next_command.event.kind == EventKind::kDecodeLocalReadyIssued;
-        if (holds_decode_delivery) {
+        if (holds_source_acceptance || holds_decode_delivery) {
           owner->condition.wait(lock, [&]() {
-            return !owner->test_decode_delivery_dispatch_held ||
+            return (!owner->test_source_acceptance_dispatch_held &&
+                    !owner->test_decode_delivery_dispatch_held) ||
                    owner->fatal_code != FatalCode::kNone || owner->closed;
           });
           if (owner->input_queue.empty()) {
@@ -3020,6 +3107,9 @@ int submit_event_locked(SharedOwner &owner, Event event) noexcept {
     return EIO;
   }
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+  const bool captures_test_source_acceptance_dispatch =
+      owner.test_source_acceptance_dispatch_held &&
+      event.kind == EventKind::kSourceSubmissionAccepted;
   const bool captures_test_decode_delivery_dispatch =
       owner.test_decode_delivery_dispatch_held &&
       event.kind == EventKind::kDecodeLocalReadyIssued;
@@ -3030,6 +3120,9 @@ int submit_event_locked(SharedOwner &owner, Event event) noexcept {
   owner.input_queue.push_back(std::move(command));
   ++producer.next_submission_sequence;
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+  if (captures_test_source_acceptance_dispatch) {
+    owner.test_source_acceptance_dispatch_captured = true;
+  }
   if (captures_test_decode_delivery_dispatch) {
     owner.test_decode_delivery_dispatch_captured = true;
   }
@@ -3907,6 +4000,38 @@ public:
     expire_deadlines_locked(*owner_);
   }
 
+  void hold_source_acceptance_dispatch_for_test() {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->started || owner_->closed || !owner_->handoff_enabled ||
+        owner_->owner_identity.role != OwnerRole::kSource ||
+        owner_->fatal_code != FatalCode::kNone ||
+        !owner_->input_queue.empty() ||
+        !owner_->output_queue.empty() ||
+        !owner_->fatal_output_queue.empty() ||
+        !owner_->pending_actions.empty() ||
+        owner_->scheduler_launch_handoff_begin_active ||
+        owner_->active_scheduler_launch_handoff_token != 0 ||
+        owner_->test_source_acceptance_dispatch_held) {
+      throw std::runtime_error(
+          "source acceptance dispatch hold requires a quiescent source owner");
+    }
+    owner_->test_source_acceptance_dispatch_held = true;
+    owner_->test_source_acceptance_dispatch_captured = false;
+  }
+
+  void release_source_acceptance_dispatch_for_test() {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (!owner_->started || owner_->closed ||
+        !owner_->test_source_acceptance_dispatch_held ||
+        !owner_->test_source_acceptance_dispatch_captured) {
+      throw std::runtime_error(
+          "source acceptance dispatch release lacks a captured event");
+    }
+    owner_->test_source_acceptance_dispatch_held = false;
+    owner_->test_source_acceptance_dispatch_captured = false;
+    owner_->condition.notify_all();
+  }
+
   void hold_decode_delivery_dispatch_for_test() {
     std::lock_guard<std::mutex> lock(owner_->mutex);
     if (!owner_->started || owner_->closed || !owner_->handoff_enabled ||
@@ -4219,7 +4344,7 @@ public:
                  owner_->output_queue.empty() &&
                  owner_->fatal_output_queue.empty() &&
                  owner_->pending_actions.empty() &&
-                 owner_->source_delivery_reservations.empty() &&
+                 source_input_projection_complete_locked(*owner_) &&
                  owner_->decode_delivery_reservations.empty() &&
                  !owner_->output_drain_active &&
                  !owner_->qualification.running;
@@ -4338,6 +4463,8 @@ public:
       }
       owner_->input_queue.clear();
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+      owner_->test_source_acceptance_dispatch_held = false;
+      owner_->test_source_acceptance_dispatch_captured = false;
       owner_->test_decode_delivery_dispatch_held = false;
       owner_->test_decode_delivery_dispatch_captured = false;
 #endif
@@ -4449,6 +4576,8 @@ private:
     owner_->decode_delivery_reservations.clear();
     owner_->unclaimed_handoff_action_ids.clear();
 #ifdef SGLANG_TERMINAL_OWNER_TESTING
+    owner_->test_source_acceptance_dispatch_held = false;
+    owner_->test_source_acceptance_dispatch_captured = false;
     owner_->test_decode_delivery_dispatch_held = false;
     owner_->test_decode_delivery_dispatch_captured = false;
 #endif
@@ -4603,16 +4732,8 @@ private:
         owner_->abort_settled_handoff_delivery_ids.size();
     result["source_delivery_reservation_count"] =
         owner_->source_delivery_reservations.size();
-    result["source_reservation_backed_handoff_action_count"] =
-        std::count_if(owner_->active_handoff_actions.begin(),
-                      owner_->active_handoff_actions.end(),
-                      [](const auto &entry) {
-                        return entry.second.source_reservation_id.has_value();
-                      });
     result["registered_source_delivery_reservation_count"] =
         owner_->source_delivery_reservation_registration_count;
-    result["transferred_source_delivery_reservation_count"] =
-        owner_->source_delivery_reservation_transfer_count;
     result["terminal_source_delivery_reservation_count"] =
         owner_->source_delivery_reservation_terminal_count;
     result["decode_delivery_reservation_count"] =
@@ -4838,6 +4959,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
            py::arg("now_ns"))
       .def("expire_deadlines_for_test",
            &NativeTerminalOwnerBridge::expire_deadlines_for_test)
+      .def("hold_source_acceptance_dispatch_for_test",
+           &NativeTerminalOwnerBridge::hold_source_acceptance_dispatch_for_test)
+      .def(
+          "release_source_acceptance_dispatch_for_test",
+          &NativeTerminalOwnerBridge::release_source_acceptance_dispatch_for_test)
       .def("hold_decode_delivery_dispatch_for_test",
            &NativeTerminalOwnerBridge::hold_decode_delivery_dispatch_for_test)
       .def(
