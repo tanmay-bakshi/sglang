@@ -17,6 +17,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import jinja2
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -26,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
+    parse_chat_template_json,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -118,6 +120,90 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_terminal_assistant_message_remains_a_historical_turn(self) -> None:
+        """Keep a terminal assistant turn when continuation is disabled."""
+        messages = [
+            {"role": "user", "content": "Count to three."},
+            {"role": "assistant", "content": "One, two, three."},
+        ]
+        request = ChatCompletionRequest(model="x", messages=messages)
+
+        processed_messages, assistant_prefix = self.chat._handle_last_assistant_message(
+            messages, request
+        )
+
+        self.assertEqual(processed_messages, messages)
+        self.assertEqual(processed_messages[-1]["role"], "assistant")
+        self.assertIsNone(assistant_prefix)
+
+    def test_continue_final_message_extracts_terminal_assistant_text(self) -> None:
+        """Extract terminal assistant text only for explicit continuation."""
+        messages = [
+            {"role": "user", "content": "Count to three."},
+            {"role": "assistant", "content": "One, two"},
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=messages,
+            continue_final_message=True,
+        )
+
+        processed_messages, assistant_prefix = self.chat._handle_last_assistant_message(
+            messages, request
+        )
+
+        self.assertEqual(processed_messages, messages[:-1])
+        self.assertEqual(assistant_prefix, "One, two")
+
+    def test_message_reasoning_field_is_preserved(self) -> None:
+        """Preserve vLLM-compatible historical reasoning input."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Inspect the weather."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "The weather tool is required.",
+                },
+            ],
+        )
+
+        self.assertEqual(
+            request.messages[-1].model_dump()["reasoning"],
+            "The weather tool is required.",
+        )
+
+    def test_gemma4_jinja_receives_json_parser_and_preserves_assistant_role(
+        self,
+    ) -> None:
+        """Provide Gemma 4 templates with immutable JSON parsing semantics."""
+        self.tm.model_config.hf_config.model_type = "gemma4"
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        chat.chat_encoding_spec = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Count to three."},
+                {"role": "assistant", "content": "One, two, three."},
+            ],
+        )
+
+        with patch.object(chat, "_encode_messages", return_value=None):
+            chat._process_messages(request, False)
+
+        rendered_messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        template_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(rendered_messages[-1]["role"], "assistant")
+        self.assertEqual(template_kwargs["fromjson"]('{"b":2,"a":1}'), {"b": 2, "a": 1})
+
+    def test_chat_template_json_parser_rejects_invalid_json(self) -> None:
+        """Convert malformed template JSON into a client-visible template error."""
+        with self.assertRaises(jinja2.TemplateError):
+            parse_chat_template_json("not-json")
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):

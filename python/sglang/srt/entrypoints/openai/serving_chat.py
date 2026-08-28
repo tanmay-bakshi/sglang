@@ -78,6 +78,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def parse_chat_template_json(value: str) -> Any:
+    """Parse a JSON value supplied to a chat template.
+
+    :param value: Serialized JSON value.
+    :returns: Parsed JSON value.
+    :raises jinja2.TemplateError: If the value is not valid JSON.
+    """
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise jinja2.TemplateError("Chat template input must be valid JSON.") from exc
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -250,38 +263,24 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Extract a terminal assistant prefix when continuation is requested.
+
+        :param messages: Message dictionaries to render.
+        :param request: Chat completion request controlling continuation behavior.
+        :returns: Renderable messages and an optional assistant prefix.
         """
-        Handle continue_final_message feature: separate final assistant message.
+        if not request.continue_final_message or len(messages) == 0:
+            return messages, None
 
-        If continue_final_message is enabled and the last message is from assistant,
-        extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
+        last_message = messages[-1]
+        if last_message.get("role") != "assistant":
+            return messages, None
 
-        Only processes text-based content (strings), ignoring multimodal content (lists).
+        last_content = last_message.get("content")
+        if not isinstance(last_content, str):
+            return messages, None
 
-        Args:
-            messages: List of message dictionaries
-            request: ChatCompletionRequest with continue_final_message flag
-
-        Returns:
-            Tuple of (processed_messages, assistant_prefix)
-            - processed_messages: Messages with last assistant message handled appropriately
-            - assistant_prefix: Content of the last assistant message (string only), or None
-        """
-        assistant_prefix = None
-        if messages and messages[-1].get("role") == "assistant":
-            last_content = messages[-1].get("content")
-            # Only process string content, ignore multimodal content (lists)
-            if isinstance(last_content, str):
-                if request.continue_final_message:
-                    # Extract content and remove the assistant message
-                    assistant_prefix = last_content
-                    messages = messages[:-1]
-                else:
-                    # Convert the last assistant message to user message
-                    messages[-1] = {"role": "user", "content": last_content}
-        return messages, assistant_prefix
+        return messages[:-1], last_content
 
     def _append_assistant_prefix_to_prompt_ids(
         self, prompt_ids: List[int], assistant_prefix: str
@@ -1005,9 +1004,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
+                if not self.is_gemma4:
+                    processed_msg["content"] = normalize_tool_content(
+                        processed_msg["role"], processed_msg.get("content")
+                    )
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -1021,6 +1021,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            if self.is_gemma4:
+                extra_template_kwargs["fromjson"] = parse_chat_template_json
 
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:

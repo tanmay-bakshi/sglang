@@ -610,6 +610,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    reasoning: str | None = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
