@@ -120,6 +120,127 @@ class Gemma4ChatTemplateTest(unittest.TestCase):
         )
         self.assertNotIn("{value:", rendered)
 
+    def test_boltzmann_tool_rounds_retain_every_reasoning_span(self) -> None:
+        """Retain reasoning across an assistant/tool-only Boltzmann history."""
+        messages: list[dict[str, object]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Perform a Boltzmann-style sequence using each observation "
+                    "before choosing the next action."
+                ),
+            },
+            {
+                "role": "assistant",
+                "reasoning": (
+                    "BOLTZMANN_REASONING_ONE: collect the first observation."
+                ),
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_observe_001",
+                        "type": "function",
+                        "function": {
+                            "name": "observe",
+                            "arguments": '{"step":1}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_observe_001",
+                "content": '{"observed":1}',
+            },
+            {
+                "role": "assistant",
+                "reasoning": (
+                    "BOLTZMANN_REASONING_TWO: incorporate observation one and "
+                    "collect observation two."
+                ),
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_observe_002",
+                        "type": "function",
+                        "function": {
+                            "name": "observe",
+                            "arguments": '{"step":2}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_observe_002",
+                "content": '{"observed":2}',
+            },
+            {
+                "role": "assistant",
+                "reasoning": (
+                    "BOLTZMANN_REASONING_THREE: incorporate both observations "
+                    "and collect the final observation."
+                ),
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_observe_003",
+                        "type": "function",
+                        "function": {
+                            "name": "observe",
+                            "arguments": '{"step":3}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_observe_003",
+                "content": '{"observed":3}',
+            },
+        ]
+        tools: list[dict[str, object]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "observe",
+                    "description": "Record one numbered observation.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"step": {"type": "integer", "minimum": 1}},
+                        "required": ["step"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+        rendered: str = self._render(messages, tools)
+
+        self.assertEqual(rendered.count("<|channel>thought\n"), 3)
+        for reasoning in (
+            "BOLTZMANN_REASONING_ONE: collect the first observation.",
+            (
+                "BOLTZMANN_REASONING_TWO: incorporate observation one and "
+                "collect observation two."
+            ),
+            (
+                "BOLTZMANN_REASONING_THREE: incorporate both observations and "
+                "collect the final observation."
+            ),
+        ):
+            with self.subTest(reasoning=reasoning):
+                self.assertEqual(rendered.count(reasoning), 1)
+
+        self.assertLess(
+            rendered.index("BOLTZMANN_REASONING_ONE"),
+            rendered.index("BOLTZMANN_REASONING_TWO"),
+        )
+        self.assertLess(
+            rendered.index("BOLTZMANN_REASONING_TWO"),
+            rendered.index("BOLTZMANN_REASONING_THREE"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
