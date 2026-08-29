@@ -320,14 +320,33 @@ class StreamingSession(BasePrefixCache):
         is_first = slot is None
 
         # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here. A first request has
-        # no successful boundary to preserve, so it still releases its
-        # transient resources. Later requests roll the owning slot back to
-        # its last successful boundary and keep it hot.
+        # (set in find_active_slot) and never reach here. Preserve any fully
+        # materialized admitted boundary, including a first request or a
+        # truncate that retired the previous slot.
         if isinstance(req.finished_reason, FINISH_ABORT):
             if slot is None:
-                # First-request mid-processing abort: create ephemeral
-                # slot from req state so release_session handles cleanup.
+                rollback_len = len(req.origin_input_ids)
+                can_preserve_preburst = (
+                    req.streaming_session_preburst_mutation
+                    and req.kv_committed_len >= rollback_len
+                    and req.kv.kv_allocated_len >= rollback_len
+                )
+                if can_preserve_preburst:
+                    slot = SessionSlot(
+                        req_pool_idx=req.req_pool_idx,
+                        kv_committed_len=req.kv_committed_len,
+                        kv=copy.copy(req.kv),
+                    )
+                    self.slots[session_id] = slot
+                    self._free_tail(slot, req, rollback_len)
+                    slot.save_from_req(req, is_first=True)
+                    slot.kv_committed_len = rollback_len
+                    req.session.abort_req()
+                    req.time_stats.increment_streaming_session_abort_with_slot_preserved()
+                    return True
+
+                # No complete pre-burst KV boundary exists. Create an
+                # ephemeral slot so release_session handles cleanup.
                 # Include last_node/cache_protected_len from the req so
                 # release_session calls dec_lock_ref on the tree lock.
                 # Also carry the mamba refs over so _free_slot_mamba can
@@ -357,9 +376,11 @@ class StreamingSession(BasePrefixCache):
                 return True
 
             rollback_len = slot.kv_committed_len
-            durable_commit = req.streaming_session_commit_to is not None
-            if durable_commit:
+            durable_mutation = req.streaming_session_preburst_mutation
+            if durable_mutation:
                 rollback_len = len(req.origin_input_ids)
+
+            if durable_mutation:
                 if (
                     req.kv_committed_len < rollback_len
                     or req.kv.kv_allocated_len < rollback_len

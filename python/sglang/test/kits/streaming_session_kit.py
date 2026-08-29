@@ -15,6 +15,7 @@ import time
 import uuid
 
 import requests
+
 from sglang.test.server_fixtures.streaming_session_fixture import (
     _abort_repro_run_all,
     _concurrent_logprob_run,
@@ -197,8 +198,7 @@ class StreamingSessionKitMixin:
         )
 
     def test_nth_mid_abort_recovery(self) -> None:
-        """Abort an Nth-turn request mid-decode; session rolls back to last
-        successful turn."""
+        """Abort an Nth-turn burst and preserve its admitted raw delta."""
         requests.post(self.base_url + "/flush_cache")
 
         resp = requests.post(
@@ -268,7 +268,8 @@ class StreamingSessionKitMixin:
                 "Turn 2 should be aborted, not finished normally",
             )
 
-            # Turn 3: recovery. Rolls back to turn 1.
+            # Turn 3: recovery. The admitted raw delta from turn 2 persists;
+            # only its sampled tokens roll back.
             ids_3 = self.tokenizer.encode(" What happens next?")
             for attempt in range(20):
                 resp_3 = requests.post(
@@ -285,18 +286,17 @@ class StreamingSessionKitMixin:
                 time.sleep(0.5)
             self.assertEqual(resp_3.status_code, 200, resp_3.text)
             data_3 = resp_3.json()
+            turn_2_boundary = turn_1_total + len(ids_2)
             self.assertEqual(
                 data_3["meta_info"]["cached_tokens"],
-                turn_1_total,
+                turn_2_boundary,
                 "Abort must preserve the pre-burst KV slot",
             )
-            # prompt_tokens = turn_1_total + append (BOS stripped).
-            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
-            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            expected_prompt_3 = turn_2_boundary + len(ids_3)
             self.assertEqual(
                 data_3["meta_info"]["prompt_tokens"],
                 expected_prompt_3,
-                "prompt_tokens must equal turn_1_total + append (no stale abort context)",
+                "prompt_tokens must contain both admitted raw deltas and no sampled abort tail",
             )
         finally:
             requests.post(
@@ -308,8 +308,7 @@ class StreamingSessionKitMixin:
         self.assertEqual(health.status_code, 200)
 
     def test_first_mid_abort_recovery(self) -> None:
-        """Abort the very first request mid-decode (no slot yet; ephemeral
-        slot is created and nuked). Session must still be usable."""
+        """Abort the first burst and rebuild its admitted raw context."""
         requests.post(self.base_url + "/flush_cache")
 
         resp = requests.post(
@@ -360,7 +359,8 @@ class StreamingSessionKitMixin:
                 "Turn 1 should be aborted, not finished normally",
             )
 
-            # Turn 2: recovery. No inherited context (req_nodes empty).
+            # The admitted raw context is the first request's pre-burst
+            # boundary, so both its logical tokens and hot slot survive.
             ids_2 = self.tokenizer.encode("Tell me a short joke.")
             for attempt in range(20):
                 resp_2 = requests.post(
@@ -378,9 +378,14 @@ class StreamingSessionKitMixin:
             self.assertEqual(resp_2.status_code, 200, resp_2.text)
             data_2 = resp_2.json()
             self.assertEqual(
+                data_2["meta_info"]["cached_tokens"],
+                len(ids_1),
+                "first-request abort must preserve its complete pre-burst KV slot",
+            )
+            self.assertEqual(
                 data_2["meta_info"]["prompt_tokens"],
-                len(ids_2),
-                "prompt_tokens must equal turn 2 input only (no inherited context)",
+                len(ids_1) + len(ids_2),
+                "prompt_tokens must contain both admitted raw contexts",
             )
         finally:
             requests.post(
@@ -437,7 +442,7 @@ class StreamingSessionKitMixin:
                 },
                 timeout=30,
             )
-            self.assertIn(resp_2.status_code, (200, 400), resp_2.text)
+            self.assertEqual(resp_2.status_code, 400, resp_2.text)
 
             # Turn 3: normal append. Slot should be intact from turn 1.
             ids_3 = self.tokenizer.encode(" What happens next?")
@@ -452,8 +457,7 @@ class StreamingSessionKitMixin:
             )
             self.assertEqual(resp_3.status_code, 200, resp_3.text)
             data_3 = resp_3.json()
-            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
-            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            expected_prompt_3 = turn_1_total + len(ids_3)
             self.assertEqual(
                 data_3["meta_info"]["prompt_tokens"],
                 expected_prompt_3,

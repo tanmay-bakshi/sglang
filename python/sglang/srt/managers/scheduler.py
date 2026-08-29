@@ -2406,11 +2406,16 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.session is not None and req.session.streaming:
-            req.session.commit_prepared_req(req, self.tree_cache)
-            if len(req.origin_input_ids) == 0:
-                self._finish_empty_streaming_session_mutation(req)
+        if (
+            req.session is not None
+            and req.session.streaming
+            and len(req.origin_input_ids) == 0
+        ):
+            if not self._set_or_validate_priority(req):
                 return
+            req.session.commit_prepared_req(req, self.tree_cache)
+            self._finish_empty_streaming_session_mutation(req)
+            return
 
         self._enqueue_prepared_generate_request(req)
 
@@ -2671,6 +2676,8 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            if req.session is not None and req.session.streaming:
+                return
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
@@ -2695,6 +2702,8 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if req.finished():
+            self._release_unadmitted_streaming_session(req)
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2740,11 +2749,43 @@ class Scheduler(
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self._release_unadmitted_streaming_session(req)
             return False
         return True
 
+    @staticmethod
+    def _release_unadmitted_streaming_session(req: Req) -> None:
+        """Release a session request rejected before scheduler admission.
+
+        :param req: Request that never acquired model execution ownership.
+        """
+        if (
+            req.session is not None
+            and req.session.streaming
+            and req.streaming_session_admitted is False
+        ):
+            req.session.abort_req()
+
+    def _admit_streaming_session_request(self, req: Req) -> None:
+        """Commit a streaming-session transaction at model admission.
+
+        :param req: Request selected for an executable prefill attempt.
+        """
+        if (
+            req.session is not None
+            and req.session.streaming
+            and req.streaming_session_admitted is False
+        ):
+            req.session.commit_prepared_req(req, self.tree_cache)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        if (
+            recv_req.session is not None
+            and recv_req.session.streaming
+            and recv_req.streaming_session_admitted
+        ):
+            return False
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
@@ -2764,10 +2805,22 @@ class Scheduler(
                 direction * item[1].priority,
                 item[1].time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
-            abort_existing_req = (
-                direction * recv_req.priority < direction * candidate_req.priority
-            )
+            candidates = [
+                (index, candidate)
+                for index, candidate in enumerate(self.waiting_queue)
+                if not (
+                    candidate.session is not None
+                    and candidate.session.streaming
+                    and candidate.streaming_session_admitted
+                )
+            ]
+            if len(candidates) > 0:
+                idx, candidate_req = max(candidates, key=key_fn)
+                abort_existing_req = (
+                    direction * recv_req.priority < direction * candidate_req.priority
+                )
+            else:
+                abort_existing_req = False
             if abort_existing_req:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
@@ -2790,6 +2843,7 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        self._release_unadmitted_streaming_session(req_to_abort)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2799,6 +2853,12 @@ class Scheduler(
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
+            if (
+                req.session is not None
+                and req.session.streaming
+                and req.streaming_session_admitted
+            ):
+                continue
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
@@ -2815,6 +2875,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                self._release_unadmitted_streaming_session(req)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -3278,7 +3339,9 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage and not (
+                req.session is not None and req.session.streaming
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -3288,6 +3351,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
+            self._admit_streaming_session_request(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -4402,6 +4466,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if req.session is not None and req.session.streaming:
+                req.session.abort_req()
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

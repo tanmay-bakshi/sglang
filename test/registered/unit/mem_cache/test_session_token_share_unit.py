@@ -19,8 +19,8 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import CloseSessionReqInput, OpenSessionReqInput
 from sglang.srt.mem_cache.base_prefix_cache import StreamingSessionCacheSnapshot
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
     StreamingSessionConflictError,
@@ -39,15 +39,18 @@ def _recv(
     truncate_to=None,
     commit_to=None,
     expected_tip=None,
+    offset=None,
+    input_text=None,
 ):
     return SimpleNamespace(
         rid=rid,
+        input_text=input_text,
         input_ids=array("q", input_ids),
         mm_inputs=None,
         session_params=SimpleNamespace(
             id="s",
             rid=None,
-            offset=None,
+            offset=offset,
             replace=False,
             drop_previous_output=False,
             truncate_to=truncate_to,
@@ -163,29 +166,108 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
+    def test_raw_delta_preserves_intentional_leading_bos(self):
+        first = self._create("r1", [10, 11])
+        self._decode_and_finish(first, [12])
+
+        second = self.session.create_req(
+            _recv("r2", [2, 13], input_text=None),
+            tokenizer=SimpleNamespace(bos_token_id=2),
+            vocab_size=VOCAB,
+        )
+
+        self.assertEqual(list(second.origin_input_ids), [10, 11, 12, 2, 13])
+
+    def test_tokenized_text_delta_strips_synthetic_leading_bos(self):
+        first = self._create("r1", [10, 11])
+        self._decode_and_finish(first, [12])
+
+        second = self.session.create_req(
+            _recv("r2", [2, 13], input_text="next turn"),
+            tokenizer=SimpleNamespace(bos_token_id=2),
+            vocab_size=VOCAB,
+        )
+
+        self.assertEqual(list(second.origin_input_ids), [10, 11, 12, 13])
+
+    def test_streaming_session_rejects_offset_zero_non_destructively(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4])
+
+        with get_parallel().override(tp_rank=0):
+            rejected = self.session.create_req(
+                _recv("offset", [9], offset=0),
+                tokenizer=None,
+                vocab_size=VOCAB,
+            )
+
+        self.assertIsNotNone(rejected.to_finish)
+        self.assertIn("do not support offset", rejected.to_finish.message)
+        self.assertEqual(self.session.current_tip(), 4)
+        self.assertFalse(self.session._inflight)
+
+    def test_streaming_session_rejects_string_stop_conditions(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4])
+
+        for field in ("stop_strs", "stop_regex_strs"):
+            with self.subTest(field=field), get_parallel().override(tp_rank=0):
+                recv = _recv(field, [9])
+                setattr(recv.sampling_params, field, ["stop"])
+                rejected = self.session.create_req(
+                    recv,
+                    tokenizer=None,
+                    vocab_size=VOCAB,
+                )
+
+                self.assertIsNotNone(rejected.to_finish)
+                self.assertIn("stop_token_ids only", rejected.to_finish.message)
+                self.assertEqual(self.session.current_tip(), 4)
+                self.assertFalse(self.session._inflight)
+
+    def test_streaming_session_accepts_token_id_stop_conditions(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4])
+        recv = _recv("token-stop", [9])
+        recv.sampling_params.stop_token_ids = {10}
+
+        accepted = self.session.create_req(
+            recv,
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+
+        self.assertIsNone(accepted.to_finish)
+        self.assertTrue(self.session._inflight)
+        self.session.abort_req()
+
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
         r1 = self._create("r1", in1)
         self._decode_and_finish(r1, out1)
 
-        # Turn 2 extends the shared arrays, decodes a bit, then aborts:
-        # finish_req never runs, req_nodes still points at r1.
+        # Turn 2 is admitted, so its raw delta becomes the pre-burst
+        # boundary. Sampled tokens remain provisional until finish_req.
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
+        self.session.commit_prepared_req(r2, SimpleNamespace())
         r2.output_ids.extend([6, 7])
         r2._refresh_fill_ids()
         self.session.abort_req()
-        self.assertEqual(self.session.committed_origin_len, len(in1))
+        self.assertEqual(
+            self.session.committed_origin_len,
+            len(in1) + len(out1) + 2,
+        )
 
-        # Turn 3 must see exactly r1's history — no [50, 51], no doubled out1.
+        # Turn 3 sees the admitted delta, but not sampled [6, 7].
         r3 = self._create("r3", [60])
-        self.assertEqual(list(r3.origin_input_ids), in1 + out1 + [60])
+        self.assertEqual(list(r3.origin_input_ids), in1 + out1 + [50, 51, 60])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
-        # Two aborted attempts in a row heal idempotently.
+        # A request rejected before admission does not mutate the boundary.
         self.session.abort_req()
         r4 = self._create("r4", [70])
-        self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [70])
+        self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [50, 51, 70])
         self.assertEqual(list(r4.full_untruncated_fill_ids), list(r4.origin_input_ids))
 
     def test_first_turn_abort(self):
@@ -243,7 +325,10 @@ class TestSessionTokenShare(CustomTestCase):
 
         self.session.abort_req()
         r3 = self._create("r3", [40])
-        self.assertEqual(list(r3.origin_input_ids), [10, 11, 12, 13, 20, 40])
+        self.assertEqual(
+            list(r3.origin_input_ids),
+            [10, 11, 12, 13, 20, 30, 31, 40],
+        )
 
     def test_invalid_truncate_is_non_destructive(self):
         r1 = self._create("r1", [1, 2, 3])

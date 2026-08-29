@@ -93,6 +93,9 @@ class _FakeReq:
         self.output_ids = []
         self.streaming_session_floor = 0
         self.streaming_session_commit_to = None
+        self.streaming_session_truncate_to = None
+        self.streaming_session_admitted = True
+        self.streaming_session_preburst_mutation = False
         self.extra_key = None
         self.last_node = None
         self.cache_protected_len = 0
@@ -207,6 +210,33 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert allocator.freed[0].tolist() == list(range(20))
 
 
+def test_first_mid_abort_preserves_complete_preburst_slot():
+    page_size = 1
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=45)
+    req.origin_input_ids = list(range(40))
+    req.origin_input_ids_unpadded = req.origin_input_ids
+    req.streaming_session_preburst_mutation = True
+    req.finished_reason = FINISH_ABORT("client disconnected")
+
+    tree_cache.cache_finished_req(req)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 40
+    assert slot.kv.kv_allocated_len == 40
+    assert allocator.freed[0].tolist() == list(range(40, 45))
+    assert req.req_pool_idx is None
+    assert req.kv is None
+    assert req_to_token_pool.free_slots == []
+
+
 def test_nth_mid_abort_preserves_session_slot():
     """Nth-request abort rolls KV back to the last successful boundary."""
     page_size = 1
@@ -261,6 +291,7 @@ def test_committed_append_becomes_abort_rollback_boundary():
 
     req = _FakeReq("session-a", req_pool_idx=0, committed=70, allocated=75)
     req.streaming_session_commit_to = 60
+    req.streaming_session_preburst_mutation = True
     req.streaming_session_floor = 60
     req.finished_reason = FINISH_ABORT("client disconnected")
 
@@ -271,6 +302,65 @@ def test_committed_append_becomes_abort_rollback_boundary():
     assert slot.kv.kv_allocated_len == 70
     assert slot.streaming_session_floor == 60
     assert allocator.freed[0].tolist() == list(range(70, 75))
+
+
+def test_raw_append_becomes_abort_rollback_boundary():
+    page_size = 1
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=70, allocated=75)
+    req.origin_input_ids = list(range(70))
+    req.origin_input_ids_unpadded = req.origin_input_ids
+    req.streaming_session_preburst_mutation = True
+    req.finished_reason = FINISH_ABORT("client disconnected")
+
+    tree_cache.cache_finished_req(req)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 70
+    assert slot.kv.kv_allocated_len == 70
+    assert allocator.freed[0].tolist() == list(range(70, 75))
+
+
+def test_truncate_rebuild_becomes_abort_rollback_boundary():
+    page_size = 16
+    req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=64,
+        kv=SimpleNamespace(kv_allocated_len=64, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=144, allocated=160)
+    req.origin_input_ids = list(range(144))
+    req.origin_input_ids_unpadded = req.origin_input_ids
+    req.streaming_session_truncate_to = 128
+    req.streaming_session_preburst_mutation = True
+    req.finished_reason = FINISH_ABORT("client disconnected")
+
+    tree_cache.cache_finished_req(req)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 144
+    assert slot.kv.kv_allocated_len == 144
+    assert slot.cache_protected_len == 64
+    assert allocator.freed[0].tolist() == list(range(144, 160))
 
 
 def test_incomplete_committed_append_retires_physical_slot():
@@ -291,6 +381,7 @@ def test_incomplete_committed_append_retires_physical_slot():
     req.origin_input_ids = list(range(70))
     req.origin_input_ids_unpadded = req.origin_input_ids
     req.streaming_session_commit_to = 60
+    req.streaming_session_preburst_mutation = True
     req.streaming_session_floor = 60
     req.finished_reason = FINISH_ABORT("prefill interrupted")
 

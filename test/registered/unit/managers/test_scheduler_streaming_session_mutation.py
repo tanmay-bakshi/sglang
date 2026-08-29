@@ -60,6 +60,74 @@ class TestEmptyStreamingSessionMutation(CustomTestCase):
         time_stats.set_completion_time.assert_called_once_with(timestamp)
 
 
+class TestStreamingSessionAdmission(CustomTestCase):
+    """Exercise the scheduler-owned transaction boundary."""
+
+    @staticmethod
+    def _request(*, admitted: bool = False) -> SimpleNamespace:
+        session = SimpleNamespace(
+            streaming=True,
+            abort_req=MagicMock(),
+            commit_prepared_req=MagicMock(),
+        )
+        req = SimpleNamespace(
+            rid="session-request",
+            session=session,
+            streaming_session_admitted=admitted,
+            priority=None,
+            finished=lambda: False,
+            time_stats=SimpleNamespace(
+                trace_ctx=MagicMock(),
+                wait_queue_entry_time=0.0,
+            ),
+        )
+        session.commit_prepared_req.side_effect = lambda request, tree_cache: setattr(
+            request, "streaming_session_admitted", True
+        )
+        return req
+
+    def test_admission_commits_once_at_model_selection(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = MagicMock()
+        req = self._request()
+
+        Scheduler._admit_streaming_session_request(scheduler, req)
+        Scheduler._admit_streaming_session_request(scheduler, req)
+
+        req.session.commit_prepared_req.assert_called_once_with(
+            req, scheduler.tree_cache
+        )
+        self.assertTrue(req.streaming_session_admitted)
+        req.session.abort_req.assert_not_called()
+
+    def test_pre_admission_rejection_releases_session_owner(self):
+        req = self._request()
+
+        Scheduler._release_unadmitted_streaming_session(req)
+
+        req.session.abort_req.assert_called_once_with()
+        req.session.commit_prepared_req.assert_not_called()
+
+    def test_post_admission_cleanup_does_not_roll_back_transaction(self):
+        req = self._request(admitted=True)
+
+        Scheduler._release_unadmitted_streaming_session(req)
+
+        req.session.abort_req.assert_not_called()
+
+    def test_hicache_prefetch_never_touches_unadmitted_session_state(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hicache_storage = True
+        scheduler.tree_cache = MagicMock()
+        req = self._request()
+        req.init_next_round_input = MagicMock()
+
+        Scheduler._prefetch_kvcache(scheduler, req)
+
+        req.init_next_round_input.assert_not_called()
+        scheduler.tree_cache.prefetch_from_storage.assert_not_called()
+
+
 class TestStreamingSessionTopologyAndMetrics(CustomTestCase):
     """Exercise topology fail-closed and exactly-once conflict accounting."""
 

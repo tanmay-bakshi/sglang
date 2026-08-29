@@ -487,13 +487,35 @@ class SessionClient:
         return self.parse_generate(self.post_generate(payload))
 
 
+def _context_with_divergent_suffix(context: list[int], target: int) -> list[int]:
+    """Build an equal-length history that differs only after ``target``.
+
+    :param context: Source token history.
+    :param target: First token position allowed to differ.
+    :returns: Equal-length history with a deliberately different suffix.
+    """
+    assert 0 < target < len(context)
+    distinct_tokens = list(dict.fromkeys(context))
+    assert len(distinct_tokens) >= 2
+    divergent = list(context)
+    for index in range(target, len(divergent)):
+        divergent[index] = (
+            distinct_tokens[1]
+            if divergent[index] == distinct_tokens[0]
+            else distinct_tokens[0]
+        )
+    assert divergent[:target] == context[:target]
+    assert divergent[target:] != context[target:]
+    return divergent
+
+
 def _qualify_truncate_case(
     client: SessionClient,
     base_context: list[int],
     target: int,
     delta: list[int],
 ) -> None:
-    """Compare a hot truncation with a fresh greedy oracle.
+    """Compare two schedule-matched histories after suffix erasure.
 
     :param client: Live session client.
     :param base_context: Token context before truncation.
@@ -501,17 +523,23 @@ def _qualify_truncate_case(
     :param delta: Tokens appended after truncation.
     """
     hot_session = client.open(manual_commit=True)
-    fresh_session = client.open()
+    peer_session = client.open(manual_commit=True)
     hot_key = "truncate-hot-" + uuid.uuid4().hex
-    fresh_key = "truncate-fresh-" + uuid.uuid4().hex
+    peer_key = "truncate-peer-" + uuid.uuid4().hex
+    peer_context = _context_with_divergent_suffix(base_context, target)
     try:
-        seed = client.generate(
+        client.generate(
             hot_session,
             base_context,
             max_new_tokens=8,
             extra_key=hot_key,
         )
-        exact_context = base_context + seed.output_ids
+        client.generate(
+            peer_session,
+            peer_context,
+            max_new_tokens=8,
+            extra_key=peer_key,
+        )
         hot = client.generate(
             hot_session,
             delta,
@@ -520,24 +548,23 @@ def _qualify_truncate_case(
             extra_key=hot_key,
             ignore_eos=False,
         )
-        fresh = client.generate(
-            fresh_session,
-            exact_context[:target] + delta,
+        peer = client.generate(
+            peer_session,
+            delta,
             max_new_tokens=16,
-            extra_key=fresh_key,
+            truncate_to=target,
+            extra_key=peer_key,
             ignore_eos=False,
         )
-        assert (
-            fresh.cached_tokens == 0
-        ), f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
-        assert hot.output_ids == fresh.output_ids, (
+        assert hot.cached_tokens == peer.cached_tokens == target
+        assert hot.output_ids == peer.output_ids, (
             f"greedy mismatch at target={target}: "
-            f"hot={hot.output_ids}, fresh={fresh.output_ids}"
+            f"hot={hot.output_ids}, peer={peer.output_ids}"
         )
-        assert hot.prompt_tokens == target + len(delta)
+        assert hot.prompt_tokens == peer.prompt_tokens == target + len(delta)
     finally:
         client.close(hot_session)
-        client.close(fresh_session)
+        client.close(peer_session)
 
 
 def _qualify_protected_boundary_case(
@@ -552,20 +579,23 @@ def _qualify_protected_boundary_case(
     :param base_context: Token context extending beyond the shared prefix.
     """
     shared_key = "protected-boundary-shared-" + uuid.uuid4().hex
-    fresh_key = "protected-boundary-fresh-" + uuid.uuid4().hex
-    prime = requests.post(
-        base_url.rstrip("/") + "/generate",
-        json={
-            "input_ids": base_context[:1_024],
-            "extra_key": shared_key,
-            "sampling_params": {"temperature": 0, "max_new_tokens": 0},
-        },
-        timeout=300,
-    )
-    assert prime.status_code == 200, prime.text
+    peer_key = "protected-boundary-peer-" + uuid.uuid4().hex
+    for cache_key in (shared_key, peer_key):
+        prime = requests.post(
+            base_url.rstrip("/") + "/generate",
+            json={
+                "input_ids": base_context[:1_024],
+                "extra_key": cache_key,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+            },
+            timeout=300,
+        )
+        assert prime.status_code == 200, prime.text
 
     hot_session = client.open(manual_commit=True)
-    fresh_session = client.open()
+    peer_session = client.open(manual_commit=True)
+    target = 1_024
+    peer_context = _context_with_divergent_suffix(base_context, target)
     try:
         seeded = client.generate(
             hot_session,
@@ -573,10 +603,19 @@ def _qualify_protected_boundary_case(
             max_new_tokens=0,
             extra_key=shared_key,
         )
+        peer_seeded = client.generate(
+            peer_session,
+            peer_context,
+            max_new_tokens=0,
+            extra_key=peer_key,
+        )
         before = client.session_info(hot_session)
-        target = before.protected
+        peer_before = client.session_info(peer_session)
         assert 0 < target < seeded.tip
         assert target % 64 == 0
+        assert seeded.cached_tokens == peer_seeded.cached_tokens == target
+        assert before.protected == peer_before.protected == target
+        assert peer_seeded.tip == seeded.tip
 
         truncated = client.generate(
             hot_session,
@@ -586,10 +625,34 @@ def _qualify_protected_boundary_case(
             expected_tip=seeded.tip,
             extra_key=shared_key,
         )
+        peer_truncated = client.generate(
+            peer_session,
+            [],
+            max_new_tokens=0,
+            truncate_to=target,
+            expected_tip=peer_seeded.tip,
+            extra_key=peer_key,
+        )
         after_truncate = client.session_info(hot_session)
+        peer_after_truncate = client.session_info(peer_session)
         expected_protected = ((target - 1) // 64) * 64
-        assert truncated.tip == after_truncate.tip == target
-        assert after_truncate.protected == expected_protected
+        assert (
+            truncated.tip
+            == peer_truncated.tip
+            == after_truncate.tip
+            == peer_after_truncate.tip
+            == target
+        )
+        assert (
+            after_truncate.protected
+            == peer_after_truncate.protected
+            == expected_protected
+        )
+        assert (
+            truncated.cached_tokens
+            == peer_truncated.cached_tokens
+            == expected_protected
+        )
 
         hot = client.generate(
             hot_session,
@@ -599,23 +662,23 @@ def _qualify_protected_boundary_case(
             extra_key=shared_key,
             ignore_eos=False,
         )
-        fresh = client.generate(
-            fresh_session,
-            base_context[:target],
+        peer = client.generate(
+            peer_session,
+            [],
             max_new_tokens=16,
-            extra_key=fresh_key,
+            expected_tip=target,
+            extra_key=peer_key,
             ignore_eos=False,
         )
-        assert fresh.cached_tokens == 0
-        assert hot.cached_tokens in {target - 1, target}
-        assert hot.prompt_tokens == fresh.prompt_tokens == target
-        assert hot.output_ids == fresh.output_ids, (
+        assert hot.cached_tokens == peer.cached_tokens == target - 1
+        assert hot.prompt_tokens == peer.prompt_tokens == target
+        assert hot.output_ids == peer.output_ids, (
             "protected-boundary greedy mismatch: "
-            f"target={target}, hot={hot.output_ids}, fresh={fresh.output_ids}"
+            f"target={target}, hot={hot.output_ids}, peer={peer.output_ids}"
         )
     finally:
         client.close(hot_session)
-        client.close(fresh_session)
+        client.close(peer_session)
 
 
 def run_truncate_qualification(base_url: str) -> None:
@@ -684,7 +747,7 @@ def _qualify_commit_case(
     tokenizer: PreTrainedTokenizerBase,
     expected_sentinel: str,
 ) -> None:
-    """Compare a floor-pinned rewind with an exact fresh-session oracle.
+    """Compare a floor-pinned rewind with an equal-shape reference.
 
     :param client: Live session client.
     :param base_context: Context extending more than one SWA window past floor.
@@ -694,57 +757,85 @@ def _qualify_commit_case(
     :param tokenizer: Tokenizer used to inspect the sampled answer.
     :param expected_sentinel: Context-dependent answer expected at the target.
     """
-    hot_session = client.open(manual_commit=True)
-    fresh_session = client.open()
-    hot_key = "commit-hot-" + uuid.uuid4().hex
-    fresh_key = "commit-fresh-" + uuid.uuid4().hex
+    candidate_session = client.open(manual_commit=True)
+    reference_session = client.open(manual_commit=True)
+    candidate_key = "commit-candidate-" + uuid.uuid4().hex
+    reference_key = "commit-reference-" + uuid.uuid4().hex
     try:
-        client.generate(
-            hot_session,
+        candidate_floor = client.generate(
+            candidate_session,
             base_context[:floor],
             max_new_tokens=0,
             commit_to=floor,
-            extra_key=hot_key,
+            extra_key=candidate_key,
         )
-        extended = client.generate(
-            hot_session,
-            base_context[floor:],
+        reference_floor = client.generate(
+            reference_session,
+            base_context[:floor],
             max_new_tokens=0,
-            extra_key=hot_key,
+            commit_to=floor,
+            extra_key=reference_key,
         )
-        assert extended.tip == len(base_context)
+        assert candidate_floor.tip == reference_floor.tip == floor
 
-        hot = client.generate(
-            hot_session,
+        if target > floor:
+            candidate_target = client.generate(
+                candidate_session,
+                base_context[floor:target],
+                max_new_tokens=0,
+                extra_key=candidate_key,
+            )
+            reference_target = client.generate(
+                reference_session,
+                base_context[floor:target],
+                max_new_tokens=0,
+                extra_key=reference_key,
+            )
+            assert candidate_target.tip == reference_target.tip == target
+
+        candidate_at_target = client.session_info(candidate_session)
+        reference_at_target = client.session_info(reference_session)
+        assert candidate_at_target.floor == reference_at_target.floor == floor
+        assert candidate_at_target.tip == reference_at_target.tip == target
+
+        candidate_extended = client.generate(
+            candidate_session,
+            base_context[target:],
+            max_new_tokens=0,
+            extra_key=candidate_key,
+        )
+        assert candidate_extended.tip == len(base_context)
+        assert client.session_info(candidate_session).floor == floor
+
+        candidate = client.generate(
+            candidate_session,
             delta,
             max_new_tokens=16,
             truncate_to=target,
-            extra_key=hot_key,
+            extra_key=candidate_key,
             ignore_eos=False,
         )
-        fresh = client.generate(
-            fresh_session,
-            base_context[:target] + delta,
+        reference = client.generate(
+            reference_session,
+            delta,
             max_new_tokens=16,
-            extra_key=fresh_key,
+            extra_key=reference_key,
             ignore_eos=False,
         )
-        assert hot.cached_tokens == target
-        assert (
-            fresh.cached_tokens == 0
-        ), f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
-        assert hot.output_ids == fresh.output_ids, (
+        assert candidate.cached_tokens == reference.cached_tokens == target
+        assert candidate.prompt_tokens == reference.prompt_tokens == target + len(delta)
+        assert candidate.output_ids == reference.output_ids, (
             f"floor-pinned greedy mismatch at floor={floor}, target={target}: "
-            f"hot={hot.output_ids}, fresh={fresh.output_ids}"
+            f"candidate={candidate.output_ids}, reference={reference.output_ids}"
         )
-        decoded = tokenizer.decode(hot.output_ids, skip_special_tokens=False)
+        decoded = tokenizer.decode(candidate.output_ids, skip_special_tokens=False)
         assert expected_sentinel in decoded, (
             f"wrong sentinel at target={target}: expected={expected_sentinel}, "
             f"decoded={decoded!r}"
         )
     finally:
-        client.close(hot_session)
-        client.close(fresh_session)
+        client.close(candidate_session)
+        client.close(reference_session)
 
 
 def run_commit_qualification(base_url: str) -> None:
@@ -988,9 +1079,20 @@ def _abort_request_and_assert_recovery(
             if stream_response is not None:
                 stream_response.close()
 
-    assert any(
-        _is_terminal_abort(body) for body in streamed_bodies
-    ), f"aborted stream omitted its terminal reason: {streamed_bodies!r}"
+    terminal_aborts = [body for body in streamed_bodies if _is_terminal_abort(body)]
+    assert len(terminal_aborts) == 1, (
+        f"aborted stream omitted or duplicated its terminal reason: "
+        f"{streamed_bodies!r}"
+    )
+    sampled_counts = [
+        body["meta_info"]["completion_tokens"]
+        for body in streamed_bodies
+        if isinstance(body.get("meta_info"), dict)
+        and isinstance(body["meta_info"].get("completion_tokens"), int)
+    ]
+    terminal_sampled_count = terminal_aborts[0]["meta_info"]["completion_tokens"]
+    assert terminal_sampled_count > 0
+    assert terminal_sampled_count == max(sampled_counts)
     _wait_for_inflight(client, session_id, False, timeout=30)
     healed = client.session_info(session_id)
     assert healed.exists
@@ -1049,16 +1151,29 @@ def _qualify_timeout_reads(client: SessionClient) -> None:
 
 def _qualify_prepared_mutation_abort_recovery(
     client: SessionClient,
+    base_url: str,
     context: list[int],
 ) -> None:
     """Exercise truncate and commit durability through live abort completion.
 
     :param client: Live session client.
+    :param base_url: Live inference server URL.
     :param context: Natural Gemma-4 token context.
     """
     truncate_session_id = client.open(manual_commit=True)
     truncate_key = "stage4-truncate-abort-" + uuid.uuid4().hex
     try:
+        prime = requests.post(
+            base_url.rstrip("/") + "/generate",
+            json={
+                "input_ids": context[:128],
+                "extra_key": truncate_key,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+            },
+            timeout=300,
+        )
+        assert prime.status_code == 200, prime.text
+
         seeded = client.generate(
             truncate_session_id,
             context[:256],
@@ -1069,11 +1184,13 @@ def _qualify_prepared_mutation_abort_recovery(
         assert seeded_info.tip == seeded.tip
         assert seeded_info.floor == 0
 
-        truncate_target = 128
+        truncate_target = 35
+        assert seeded_info.protected > truncate_target
+        truncate_delta = context[256:260]
         truncate_rid = "stage4-truncate-abort-" + uuid.uuid4().hex
         truncate_payload = client.generate_payload(
             truncate_session_id,
-            [],
+            truncate_delta,
             max_new_tokens=100_000,
             truncate_to=truncate_target,
             expected_tip=seeded.tip,
@@ -1085,23 +1202,23 @@ def _qualify_prepared_mutation_abort_recovery(
             client,
             truncate_session_id,
             truncate_payload,
-            expected_tip=truncate_target,
+            expected_tip=truncate_target + len(truncate_delta),
             expected_floor=0,
             expected_last_rid=truncate_rid,
         )
-        assert truncated.tip == truncate_target
+        assert truncated.tip == truncate_target + len(truncate_delta)
         assert truncated.last_rid == truncate_rid
 
         truncate_resume = client.generate(
             truncate_session_id,
-            context[256:260],
+            context[260:264],
             max_new_tokens=1,
-            expected_tip=truncate_target,
+            expected_tip=truncate_target + len(truncate_delta),
             extra_key=truncate_key,
         )
         assert truncate_resume.cached_tokens in {
-            truncate_target - 1,
-            truncate_target,
+            truncate_target + len(truncate_delta) - 1,
+            truncate_target + len(truncate_delta),
         }
     finally:
         client.close(truncate_session_id)
@@ -1328,20 +1445,20 @@ def run_recovery_qualification(base_url: str) -> None:
             client,
             session_id,
             abort_payload,
-            expected_tip=accepted_info.tip,
+            expected_tip=accepted_info.tip + len(context[128:144]),
             expected_floor=accepted_info.floor,
-            expected_last_rid=accepted_info.last_rid,
+            expected_last_rid=abort_rid,
         )
-        assert (
-            healed == accepted_info
-        ), f"aborted request did not heal to its pre-burst state: {healed}"
+        assert healed.tip == accepted_info.tip + len(context[128:144])
+        assert healed.floor == accepted_info.floor
+        assert healed.last_rid == abort_rid
 
         recovery_rid = "stage4-recovery-" + uuid.uuid4().hex
         recovery = client.generate(
             session_id,
             context[144:160],
             max_new_tokens=4,
-            expected_tip=accepted_info.tip,
+            expected_tip=healed.tip,
             extra_key=hot_extra_key,
             request_rid=recovery_rid,
         )
@@ -1362,7 +1479,7 @@ def run_recovery_qualification(base_url: str) -> None:
         held_tokens=0,
         last_rid=None,
     )
-    _qualify_prepared_mutation_abort_recovery(client, context)
+    _qualify_prepared_mutation_abort_recovery(client, base_url, context)
     _qualify_timeout_reads(client)
 
 
@@ -1822,7 +1939,7 @@ def _run_edge_cases(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    context, delta, _ = _build_gemma4_context()
+    context, delta, tokenizer = _build_gemma4_context()
     cache_key = "edge-protected-" + uuid.uuid4().hex
 
     prime = requests.post(
@@ -1924,6 +2041,60 @@ def _run_edge_cases(base_url: str) -> None:
         low_truncate_response = client.post_generate(low_truncate_payload)
         assert low_truncate_response.status_code == 400, low_truncate_response.text
         assert client.session_info(session_id) == committed_info
+
+        offset_payload = client.generate_payload(
+            session_id,
+            [tokenizer.bos_token_id],
+            max_new_tokens=0,
+            expected_tip=committed_info.tip,
+            extra_key=cache_key,
+        )
+        offset_payload["session_params"]["offset"] = 0
+        offset_response = client.post_generate(offset_payload)
+        assert offset_response.status_code == 400, offset_response.text
+        assert "do not support offset" in offset_response.text
+        assert client.session_info(session_id) == committed_info
+
+        for stop_field, stop_value in (
+            ("stop", "application-owned-stop"),
+            ("stop_regex", "application-owned-.*"),
+        ):
+            stop_payload = client.generate_payload(
+                session_id,
+                [],
+                max_new_tokens=1,
+                expected_tip=committed_info.tip,
+                extra_key=cache_key,
+            )
+            stop_payload["sampling_params"][stop_field] = stop_value
+            stop_response = client.post_generate(stop_payload)
+            assert stop_response.status_code == 400, stop_response.text
+            assert "stop_token_ids only" in stop_response.text
+            assert client.session_info(session_id) == committed_info
+
+        bos_append = client.generate(
+            session_id,
+            [tokenizer.bos_token_id],
+            max_new_tokens=0,
+            expected_tip=committed_info.tip,
+            extra_key=cache_key,
+        )
+        assert bos_append.prompt_tokens == committed_info.tip + 1
+        after_bos = client.session_info(session_id)
+        assert after_bos.tip == committed_info.tip + 1
+
+        token_stop_payload = client.generate_payload(
+            session_id,
+            [],
+            max_new_tokens=1,
+            expected_tip=after_bos.tip,
+            extra_key=cache_key,
+        )
+        token_stop_payload["sampling_params"]["stop_token_ids"] = [
+            tokenizer.eos_token_id
+        ]
+        token_stop_response = client.post_generate(token_stop_payload)
+        assert token_stop_response.status_code == 200, token_stop_response.text
     finally:
         client.close(session_id)
 
@@ -1994,7 +2165,7 @@ class Gemma4StreamingSessionOracleKitMixin:
     base_url: str
 
     def test_10_truncate_greedy_equivalence(self) -> None:
-        """Match hot floor-pinned truncation to an isolated fresh session."""
+        """Match floor-pinned truncations across isolated equal-shape histories."""
         _flush_to_quiescent_metrics(self.base_url)
         truncations_before = _read_required_metric(
             self.base_url,
@@ -2004,6 +2175,7 @@ class Gemma4StreamingSessionOracleKitMixin:
             self.base_url,
             COMMIT_METRIC_NAME,
         )
+        run_truncate_qualification(self.base_url)
         run_commit_qualification(self.base_url)
         context, _, _ = _build_gemma4_context()
         _qualify_protected_boundary_case(
@@ -2012,12 +2184,12 @@ class Gemma4StreamingSessionOracleKitMixin:
         _wait_for_metric(
             self.base_url,
             TRUNCATION_METRIC_NAME,
-            truncations_before + 4,
+            truncations_before + 11,
         )
         _wait_for_metric(
             self.base_url,
             COMMIT_METRIC_NAME,
-            commits_before + 5,
+            commits_before + 8,
         )
         _flush_to_quiescent_metrics(self.base_url)
 

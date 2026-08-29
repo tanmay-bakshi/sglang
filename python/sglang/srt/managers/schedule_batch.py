@@ -782,6 +782,8 @@ class Req(ReqDllmMixin):
         self.session_id = session_id
         self.streaming_session_truncate_to: int | None = None
         self.streaming_session_commit_to: int | None = None
+        self.streaming_session_admitted: bool = False
+        self.streaming_session_preburst_mutation: bool = False
         # None distinguishes ordinary requests from a streaming session whose
         # valid rollback floor is token zero.
         self.streaming_session_floor: int | None = None

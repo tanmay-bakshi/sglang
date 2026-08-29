@@ -148,8 +148,12 @@ class Session:
         return self.committed_origin_len + self.committed_output_len
 
     @staticmethod
-    def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
-        """Trim a leading BOS on an appended turn; shift mm offsets to match."""
+    def _strip_tokenized_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
+        """Trim a tokenizer-added BOS on an appended text turn.
+
+        :param req: Tokenized text request whose leading BOS is synthetic.
+        :param tokenizer: Tokenizer that may have added the BOS token.
+        """
         if not (
             tokenizer is not None
             and req.input_ids
@@ -268,7 +272,7 @@ class Session:
         input_ids = last_req.origin_input_ids + out_tail
         if session_params.drop_previous_output:
             input_ids = last_req.origin_input_ids[:]
-        if session_params.offset and session_params.offset != 0:
+        if session_params.offset is not None:
             input_ids = input_ids[: session_params.offset] + req.input_ids
         else:
             input_ids += req.input_ids
@@ -276,7 +280,7 @@ class Session:
         input_ids_unpadded = last_req.origin_input_ids_unpadded + out_tail
         if session_params.drop_previous_output:
             input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-        if session_params.offset and session_params.offset != 0:
+        if session_params.offset is not None:
             input_ids_unpadded = (
                 input_ids_unpadded[: session_params.offset] + req.input_ids
             )
@@ -325,9 +329,22 @@ class Session:
                 abort_message = (
                     "Streaming sessions do not support drop_previous_output."
                 )
-            elif session_params.offset and session_params.offset != 0:
+            elif session_params.offset is not None:
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
+            elif (
+                req.sampling_params.stop_strs is not None
+                and len(req.sampling_params.stop_strs) > 0
+            ) or (
+                req.sampling_params.stop_regex_strs is not None
+                and len(req.sampling_params.stop_regex_strs) > 0
+            ):
+                abort = True
+                abort_message = (
+                    "Streaming sessions support stop_token_ids only; string and "
+                    "regular-expression stop conditions require application-side "
+                    "token handling."
+                )
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
                 # Peek (don't pop) the single req_node. req_nodes is updated
@@ -335,8 +352,8 @@ class Session:
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
 
-            if last_req is not None:
-                self._strip_bos_token(req, tokenizer)
+            if last_req is not None and req.input_text is not None:
+                self._strip_tokenized_bos_token(req, tokenizer)
 
             if not abort:
                 tip = self.current_tip()
@@ -426,7 +443,7 @@ class Session:
                 and not abort
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
-                and not (session_params.offset and session_params.offset != 0)
+                and session_params.offset is None
                 and session_params.truncate_to is None
                 and session_params.commit_to is None
             )
@@ -493,6 +510,11 @@ class Session:
         if not abort:
             new_req.streaming_session_truncate_to = session_params.truncate_to
             new_req.streaming_session_commit_to = session_params.commit_to
+            new_req.streaming_session_preburst_mutation = (
+                len(req.input_ids) > 0
+                or session_params.truncate_to is not None
+                or session_params.commit_to is not None
+            )
             new_req.streaming_session_floor = (
                 session_params.commit_to
                 if session_params.commit_to is not None
@@ -518,25 +540,27 @@ class Session:
 
     def commit_prepared_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
         """Commit irreversible session mutations after scheduler validation."""
+        assert req.streaming_session_admitted is False
+        req.streaming_session_admitted = True
+
         truncate_target = req.streaming_session_truncate_to
         if truncate_target is not None:
             tree_cache.truncate_session(self.session_id, truncate_target)
             self._truncate_token_arrays(truncate_target)
-            self.last_rid = req.rid
             req.time_stats.increment_streaming_session_truncation()
 
         commit_target = req.streaming_session_commit_to
-        if commit_target is None:
-            return
+        if commit_target is not None:
+            self.floor = commit_target
+            req.streaming_session_floor = commit_target
+            tree_cache.commit_session(self.session_id, commit_target)
+            req.time_stats.increment_streaming_session_commit()
 
-        self.floor = commit_target
-        req.streaming_session_floor = commit_target
-        self._adopt_preburst_context(req)
-        tree_cache.commit_session(self.session_id, commit_target)
-        req.time_stats.increment_streaming_session_commit()
+        if req.streaming_session_preburst_mutation:
+            self._adopt_preburst_context(req)
 
     def _adopt_preburst_context(self, req: Req) -> None:
-        """Make an explicitly committed append the durable abort boundary."""
+        """Make an admitted context mutation the durable abort boundary."""
         if len(self.req_nodes) > 0:
             [prev_node] = self.req_nodes.values()
             if prev_node.req is not req:
@@ -544,7 +568,8 @@ class Session:
             self.req_nodes.clear()
         self.req_nodes[req.rid] = SessionReqNode(req)
 
-        req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+        if len(req.full_untruncated_fill_ids) != len(req.origin_input_ids):
+            req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
         self.committed_origin_len = len(req.origin_input_ids)
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
