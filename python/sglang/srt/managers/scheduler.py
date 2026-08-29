@@ -342,19 +342,25 @@ def _validate_streaming_session_topology(
     server_args: ServerArgs,
     ps: ParallelState,
 ) -> None:
-    """Reject streaming sessions when built-in DP cannot preserve ownership.
+    """Reject topologies that cannot preserve one durable session owner.
 
     :param server_args: Resolved server configuration.
     :param ps: Distributed topology for this scheduler process.
-    :raises ValueError: If streaming sessions are enabled with built-in DP.
+    :raises ValueError: If streaming sessions lack one local scheduler owner.
     """
-    if not server_args.enable_streaming_session or ps.dp_size == 1:
+    if not server_args.enable_streaming_session:
         return
-    raise ValueError(
-        "Streaming sessions require dp_size == 1 because built-in data-parallel "
-        "dispatch does not preserve a single session owner. Run independent DP1 "
-        "servers behind sticky routing instead."
-    )
+    if ps.dp_size != 1:
+        raise ValueError(
+            "Streaming sessions require dp_size == 1 because built-in data-parallel "
+            "dispatch does not preserve a single session owner. Run independent DP1 "
+            "servers behind sticky routing instead."
+        )
+    if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
+        raise ValueError(
+            "Streaming sessions do not support disaggregation because remote queue "
+            "admission cannot yet preserve an atomic session transaction."
+        )
 
 
 def _is_streaming_session_output_rank(ps: ParallelState) -> bool:
@@ -2374,7 +2380,7 @@ class Scheduler(
                 and req.to_finish.err_type == STREAMING_SESSION_CONFLICT_ERROR_TYPE
             ):
                 self._record_streaming_session_idempotency_conflict(req)
-            finish_reason = req.finished_reason
+            finish_reason = req.to_finish
             if isinstance(finish_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2702,7 +2708,7 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-        if req.finished():
+        if req.finished() or req.to_finish is not None:
             self._release_unadmitted_streaming_session(req)
         if not self._set_or_validate_priority(req):
             return
@@ -2719,7 +2725,7 @@ class Scheduler(
         ):
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-        if not req.finished():
+        if not req.finished() and req.to_finish is None:
             self._admit_streaming_session_request(req)
 
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2771,12 +2777,35 @@ class Scheduler(
 
         :param req: Request that never acquired model execution ownership.
         """
-        if (
-            req.session is not None
-            and req.session.streaming
-            and req.streaming_session_admitted is False
-        ):
-            req.session.abort_req()
+        session = req.session
+        if session is None or not session.streaming or req.streaming_session_admitted:
+            return
+        if req.streaming_session_owns_inflight:
+            session.abort_req(req)
+        req.session = None
+
+    @staticmethod
+    def _abort_queued_streaming_session(
+        req: Req,
+        message: str,
+        status_code: HTTPStatus | int | None = None,
+    ) -> None:
+        """Terminalize a queued session request without rewriting its token arrays.
+
+        :param req: Queued request being removed before model execution.
+        :param message: Terminal abort reason.
+        :param status_code: Optional public response status.
+        """
+        session = req.session
+        if session is None or not session.streaming:
+            return
+        if not req.streaming_session_admitted:
+            Scheduler._release_unadmitted_streaming_session(req)
+            return
+
+        prepare_abort(req, message, status_code=status_code)
+        req.to_finish = None
+        session.abort_req(req)
 
     def _admit_streaming_session_request(self, req: Req) -> None:
         """Commit a streaming-session transaction at scheduler admission.
@@ -2817,15 +2846,7 @@ class Scheduler(
                 direction * item[1].priority,
                 item[1].time_stats.wait_queue_entry_time,
             )
-            candidates = [
-                (index, candidate)
-                for index, candidate in enumerate(self.waiting_queue)
-                if not (
-                    candidate.session is not None
-                    and candidate.session.streaming
-                    and candidate.streaming_session_admitted
-                )
-            ]
+            candidates = list(enumerate(self.waiting_queue))
             if len(candidates) > 0:
                 idx, candidate_req = max(candidates, key=key_fn)
                 abort_existing_req = (
@@ -2855,7 +2876,11 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        self._release_unadmitted_streaming_session(req_to_abort)
+        self._abort_queued_streaming_session(
+            req_to_abort,
+            message,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2865,12 +2890,6 @@ class Scheduler(
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
-            if (
-                req.session is not None
-                and req.session.streaming
-                and req.streaming_session_admitted
-            ):
-                continue
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
@@ -2887,7 +2906,11 @@ class Scheduler(
                     ),
                     req,
                 )
-                self._release_unadmitted_streaming_session(req)
+                self._abort_queued_streaming_session(
+                    req,
+                    "Request waiting timeout reached.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -4477,8 +4500,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if req.session is not None and req.session.streaming:
-                req.session.abort_req()
+            self._abort_queued_streaming_session(req, "Aborted")
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

@@ -236,7 +236,8 @@ class StreamingSession(BasePrefixCache):
         if slot is None or slot.kv is None:
             return None
         if req.to_finish is not None:
-            req.session.abort_req()
+            if req.streaming_session_owns_inflight:
+                req.session.abort_req(req)
             req.session = None
             return None
         return slot
@@ -341,7 +342,7 @@ class StreamingSession(BasePrefixCache):
                     self._free_tail(slot, req, rollback_len)
                     slot.save_from_req(req, is_first=True)
                     slot.kv_committed_len = rollback_len
-                    req.session.abort_req()
+                    req.session.abort_req(req)
                     req.time_stats.increment_streaming_session_abort_with_slot_preserved()
                     return True
 
@@ -372,7 +373,7 @@ class StreamingSession(BasePrefixCache):
                 self.release_session(session_id)
                 req.req_pool_idx = None
                 req.kv = None
-                req.session.abort_req()
+                req.session.abort_req(req)
                 return True
 
             rollback_len = slot.kv_committed_len
@@ -393,7 +394,7 @@ class StreamingSession(BasePrefixCache):
                     req.kv = None
                     req.mamba_pool_idx = None
                     req.mamba_ping_pong_track_buffer = None
-                    req.session.abort_req()
+                    req.session.abort_req(req)
                     return True
 
             slot.kv.kv_allocated_len = max(
@@ -402,7 +403,7 @@ class StreamingSession(BasePrefixCache):
             self._free_tail(slot, req, rollback_len)
             slot.save_from_req(req, is_first=False)
             slot.kv_committed_len = rollback_len
-            req.session.abort_req()
+            req.session.abort_req(req)
             req.time_stats.increment_streaming_session_abort_with_slot_preserved()
             return True
 

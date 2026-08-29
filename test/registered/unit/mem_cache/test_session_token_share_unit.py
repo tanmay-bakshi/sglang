@@ -239,7 +239,7 @@ class TestSessionTokenShare(CustomTestCase):
 
         self.assertIsNone(accepted.to_finish)
         self.assertTrue(self.session._inflight)
-        self.session.abort_req()
+        self.session.abort_req(accepted)
 
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
@@ -253,7 +253,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.session.commit_prepared_req(r2, SimpleNamespace())
         r2.output_ids.extend([6, 7])
         r2._refresh_fill_ids()
-        self.session.abort_req()
+        self.session.abort_req(r2)
         self.assertEqual(
             self.session.committed_origin_len,
             len(in1) + len(out1) + 2,
@@ -265,15 +265,15 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
         # A request rejected before admission does not mutate the boundary.
-        self.session.abort_req()
+        self.session.abort_req(r3)
         r4 = self._create("r4", [70])
         self.assertEqual(list(r4.origin_input_ids), in1 + out1 + [50, 51, 70])
         self.assertEqual(list(r4.full_untruncated_fill_ids), list(r4.origin_input_ids))
 
     def test_first_turn_abort(self):
-        self._create("r1", [1, 2, 3])
+        r1 = self._create("r1", [1, 2, 3])
         self.assertTrue(self.session._inflight)
-        self.session.abort_req()
+        self.session.abort_req(r1)
         self.assertFalse(self.session._inflight)
         # No finish_req ran: nothing committed, next turn starts from scratch.
         self.assertIsNone(self.session.committed_origin_len)
@@ -323,7 +323,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r1.origin_input_ids), [10, 11, 12, 13, 20])
         self.assertEqual(list(r1.output_ids), [])
 
-        self.session.abort_req()
+        self.session.abort_req(r2)
         r3 = self._create("r3", [40])
         self.assertEqual(
             list(r3.origin_input_ids),
@@ -386,7 +386,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertIsNone(second.finished_reason)
         self.assertEqual(self.session.current_tip(), 4)
         self.assertEqual(self.session.last_rid, "r1")
-        self.session.abort_req()
+        self.session.abort_req(second)
         self.assertEqual(self.session.current_tip(), 4)
         self.assertEqual(self.session.last_rid, "r1")
 
@@ -402,7 +402,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(rejected.to_finish.status_code, HTTPStatus.BAD_REQUEST)
         self.assertEqual(rejected.to_finish.err_type, "BadRequestError")
         self.assertIn("already has an active request", rejected.to_finish.message)
-        self.session.abort_req()
+        self.session.abort_req(active)
 
     def test_durable_tip_and_last_rid_follow_prepared_mutations(self):
         first = self._create("r1", [1, 2, 3, 4])
@@ -422,7 +422,7 @@ class TestSessionTokenShare(CustomTestCase):
             (self.session.current_tip(), self.session.last_rid),
             (4, "truncate"),
         )
-        self.session.abort_req()
+        self.session.abort_req(truncate)
         self.assertEqual(
             (self.session.current_tip(), self.session.last_rid),
             (4, "truncate"),
@@ -434,7 +434,7 @@ class TestSessionTokenShare(CustomTestCase):
             (self.session.current_tip(), self.session.last_rid),
             (6, "commit"),
         )
-        self.session.abort_req()
+        self.session.abort_req(commit)
 
     def test_default_mode_auto_commits_successful_tip(self):
         session = Session(
@@ -473,7 +473,7 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(self.session.floor, 7)
         second.output_ids.extend([8, 9])
         second._refresh_fill_ids()
-        self.session.abort_req()
+        self.session.abort_req(second)
 
         third = self._create("r3", [10])
         self.assertEqual(list(third.origin_input_ids), list(range(1, 8)) + [10])

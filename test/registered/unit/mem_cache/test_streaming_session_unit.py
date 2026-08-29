@@ -75,13 +75,26 @@ class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
-        self.session = SimpleNamespace(
+        session = SimpleNamespace(
             session_id=session_id,
             streaming=True,
-            finish_req=lambda req: None,
-            abort_req=lambda: None,
-            _inflight=False,
+            _inflight=True,
         )
+
+        def finish_req(req: _FakeReq) -> None:
+            assert req is self
+            req.streaming_session_owns_inflight = False
+            session._inflight = False
+
+        def abort_req(req: _FakeReq) -> None:
+            assert req is self
+            req.streaming_session_owns_inflight = False
+            session._inflight = False
+
+        session.finish_req = finish_req
+        session.abort_req = abort_req
+        self.session = session
+        self.streaming_session_owns_inflight = True
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
         self.kv = SimpleNamespace(

@@ -530,6 +530,7 @@ class Session:
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
             self.last_active_time = time.monotonic()
+            new_req.streaming_session_owns_inflight = True
             self._inflight = True
         else:
             self.last_active_time = time.monotonic()
@@ -540,6 +541,7 @@ class Session:
 
     def commit_prepared_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
         """Commit irreversible session mutations after scheduler validation."""
+        assert req.streaming_session_owns_inflight
         assert req.streaming_session_admitted is False
         req.streaming_session_admitted = True
 
@@ -578,6 +580,8 @@ class Session:
 
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
+        assert req.streaming_session_owns_inflight
+        req.streaming_session_owns_inflight = False
         self._inflight = False
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
@@ -601,8 +605,14 @@ class Session:
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
         self.committed_output_len = finished_len
 
-    def abort_req(self):
-        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+    def abort_req(self, req: Req) -> None:
+        """Release the exact request that owns the in-flight session turn.
+
+        :param req: Request whose prepared or admitted turn is being aborted.
+        """
+        assert req.session is self
+        assert req.streaming_session_owns_inflight
+        req.streaming_session_owns_inflight = False
         self._inflight = False
 
 

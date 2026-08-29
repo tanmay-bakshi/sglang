@@ -29,6 +29,7 @@ CONFLICT_METRIC_NAME = "sglang:streaming_session_idempotency_conflicts_total"
 SESSION_TIMEOUT_SECONDS = 1.25
 SESSION_REAP_INTERVAL_SECONDS = 1.0
 SESSION_INFO_POLL_SECONDS = 0.1
+PRODUCTION_PAGE_SIZE = 64
 
 
 def _build_gemma4_context() -> tuple[list[int], list[int], PreTrainedTokenizerBase]:
@@ -556,7 +557,14 @@ def _qualify_truncate_case(
             extra_key=peer_key,
             ignore_eos=False,
         )
-        assert hot.cached_tokens == peer.cached_tokens == target
+        expected_cached_tokens = (
+            (target - 1) // PRODUCTION_PAGE_SIZE
+        ) * PRODUCTION_PAGE_SIZE
+        assert hot.cached_tokens == peer.cached_tokens == expected_cached_tokens, (
+            f"truncate cache boundary mismatch at target={target}: "
+            f"expected={expected_cached_tokens}, hot={hot.cached_tokens}, "
+            f"peer={peer.cached_tokens}"
+        )
         assert hot.output_ids == peer.output_ids, (
             f"greedy mismatch at target={target}: "
             f"hot={hot.output_ids}, peer={peer.output_ids}"
@@ -612,7 +620,7 @@ def _qualify_protected_boundary_case(
         before = client.session_info(hot_session)
         peer_before = client.session_info(peer_session)
         assert 0 < target < seeded.tip
-        assert target % 64 == 0
+        assert target % PRODUCTION_PAGE_SIZE == 0
         assert seeded.cached_tokens == peer_seeded.cached_tokens == target
         assert before.protected == peer_before.protected == target
         assert peer_seeded.tip == seeded.tip
@@ -635,7 +643,9 @@ def _qualify_protected_boundary_case(
         )
         after_truncate = client.session_info(hot_session)
         peer_after_truncate = client.session_info(peer_session)
-        expected_protected = ((target - 1) // 64) * 64
+        expected_protected = (
+            (target - 1) // PRODUCTION_PAGE_SIZE
+        ) * PRODUCTION_PAGE_SIZE
         assert (
             truncated.tip
             == peer_truncated.tip
@@ -1379,6 +1389,24 @@ def run_recovery_qualification(base_url: str) -> None:
             session_id,
             stable,
             high_stream_payload,
+        )
+        conflict_count += 1
+
+        stale_truncate_rid = "stage4-stale-truncate-" + uuid.uuid4().hex
+        stale_truncate_payload = client.generate_payload(
+            session_id,
+            context[96:112],
+            max_new_tokens=4,
+            truncate_to=0,
+            expected_tip=stable.tip - 1,
+            extra_key=hot_extra_key,
+            request_rid=stale_truncate_rid,
+        )
+        _assert_conflict_preserves_state(
+            client,
+            session_id,
+            stable,
+            stale_truncate_payload,
         )
         conflict_count += 1
 
