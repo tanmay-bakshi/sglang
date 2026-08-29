@@ -18,7 +18,7 @@ import uuid
 from array import array
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional
 
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -35,6 +35,9 @@ from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+StreamingSessionReapCause = Literal["close", "timeout"]
+StreamingSessionReapObserver = Callable[[StreamingSessionReapCause], None]
+
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +121,7 @@ class Session:
         self.last_rid: str | None = None
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
-        self.close_on_finish: bool = False
+        self.close_on_finish_cause: StreamingSessionReapCause | None = None
         self._inflight: bool = False
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
@@ -579,10 +582,15 @@ class Session:
 
 
 class SessionController:
-    def __init__(self, tree_cache: BasePrefixCache):
+    def __init__(
+        self,
+        tree_cache: BasePrefixCache,
+        reap_observer: StreamingSessionReapObserver | None = None,
+    ):
         self.sessions: Dict[str, Session] = {}
         self._last_reap_time: float = 0.0
         self.tree_cache = tree_cache
+        self.reap_observer = reap_observer
 
     def __contains__(self, session_id: str) -> bool:
         return session_id in self.sessions
@@ -650,9 +658,9 @@ class SessionController:
         if session_id not in self.sessions:
             logger.warning(f"session id {session_id} does not exist, cannot delete.")
         else:
-            self._close(session_id)
+            self._close(session_id, cause="close")
 
-    def _close(self, session_id: str):
+    def _close(self, session_id: str, cause: StreamingSessionReapCause):
         session = self.sessions[session_id]
         req = None
         has_unfinished_request = False
@@ -671,7 +679,8 @@ class SessionController:
             # session for deferred cleanup: the request keeps its session
             # reference so cache_finished_req takes the streaming path,
             # and we schedule release_session for after it completes.
-            session.close_on_finish = True
+            if session.close_on_finish_cause is None:
+                session.close_on_finish_cause = cause
             logger.info(
                 "Deferring session close for %s (unfinished request)",
                 session_id,
@@ -696,6 +705,8 @@ class SessionController:
 
         self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
+        if session.streaming and self.reap_observer is not None:
+            self.reap_observer(cause)
         log_info_on_rank0(
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
         )
@@ -709,22 +720,24 @@ class SessionController:
             pending = [
                 sid
                 for sid, session in self.sessions.items()
-                if session.close_on_finish and self._all_requests_finished(session)
+                if session.close_on_finish_cause is not None
+                and self._all_requests_finished(session)
             ]
             for sid in pending:
                 log_info_on_rank0(
                     logger, f"Deferred close ready for session {sid}, releasing."
                 )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
-                self._close(sid)
+                cause = self.sessions[sid].close_on_finish_cause
+                assert cause is not None
+                self.sessions[sid].close_on_finish_cause = None
+                self._close(sid, cause=cause)
 
             timed_out = [
                 sid for sid, session in self.sessions.items() if session.is_timed_out()
             ]
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
-                self._close(sid)
+                self._close(sid, cause="timeout")
 
     @staticmethod
     def _all_requests_finished(session: Session) -> bool:

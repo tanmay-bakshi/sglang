@@ -1108,7 +1108,14 @@ class Scheduler(
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
-        self.session_controller = SessionController(self.tree_cache)
+        reap_observer = (
+            self.metrics_collector.increment_streaming_session_reap
+            if _is_streaming_session_output_rank(self.ps)
+            and self.server_args.enable_streaming_session
+            and self.metrics_collector is not None
+            else None
+        )
+        self.session_controller = SessionController(self.tree_cache, reap_observer)
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -2349,7 +2356,7 @@ class Scheduler(
 
         elif (
             session_id in self.session_controller
-            and not self.session_controller.get(session_id).close_on_finish
+            and self.session_controller.get(session_id).close_on_finish_cause is None
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)

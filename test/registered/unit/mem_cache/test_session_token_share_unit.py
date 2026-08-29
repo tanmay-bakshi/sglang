@@ -17,7 +17,7 @@ from array import array
 from http import HTTPStatus
 from types import SimpleNamespace
 
-from sglang.srt.managers.io_struct import OpenSessionReqInput
+from sglang.srt.managers.io_struct import CloseSessionReqInput, OpenSessionReqInput
 from sglang.srt.mem_cache.base_prefix_cache import StreamingSessionCacheSnapshot
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.runtime_context import get_parallel
@@ -613,6 +613,89 @@ class TestSessionTokenShare(CustomTestCase):
             "Session ordinary-session is not a streaming session",
         ):
             controller.get_info("ordinary-session")
+
+    def test_controller_records_close_only_after_deferred_release(self):
+        """Record explicit close when the in-flight owner has released storage."""
+        causes: list[str] = []
+        released: list[str] = []
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False,
+            release_session=released.append,
+        )
+        controller = SessionController(tree_cache, causes.append)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="deferred-close",
+                streaming=True,
+            )
+        )
+        session = controller.get("deferred-close")
+        self.assertIsNotNone(session)
+        session._inflight = True
+
+        controller.close(CloseSessionReqInput(session_id="deferred-close"))
+
+        self.assertEqual(causes, [])
+        self.assertEqual(released, [])
+        self.assertEqual(session.close_on_finish_cause, "close")
+
+        session._inflight = False
+        controller.maybe_reap(now=1.0, interval=0.0)
+
+        self.assertEqual(causes, ["close"])
+        self.assertEqual(released, ["deferred-close"])
+        self.assertNotIn("deferred-close", controller)
+
+    def test_controller_records_timeout_reap(self):
+        """Record timeout when lease expiry retires an idle session."""
+        causes: list[str] = []
+        released: list[str] = []
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False,
+            release_session=released.append,
+        )
+        controller = SessionController(tree_cache, causes.append)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="timed-out",
+                streaming=True,
+                timeout=1.0,
+            )
+        )
+        session = controller.get("timed-out")
+        self.assertIsNotNone(session)
+        session.last_active_time = 0.0
+
+        controller.maybe_reap(now=1.0, interval=0.0)
+
+        self.assertEqual(causes, ["timeout"])
+        self.assertEqual(released, ["timed-out"])
+        self.assertNotIn("timed-out", controller)
+
+    def test_controller_does_not_record_ordinary_session_close(self):
+        """Exclude non-streaming sessions from streaming reap counters."""
+        causes: list[str] = []
+        released: list[str] = []
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False,
+            release_session=released.append,
+        )
+        controller = SessionController(tree_cache, causes.append)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="ordinary",
+                streaming=False,
+            )
+        )
+
+        controller.close(CloseSessionReqInput(session_id="ordinary"))
+
+        self.assertEqual(causes, [])
+        self.assertEqual(released, ["ordinary"])
+        self.assertNotIn("ordinary", controller)
 
 
 if __name__ == "__main__":

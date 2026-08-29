@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.session.session_controller import StreamingSessionReapCause
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -685,6 +686,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 documentation="Number of streaming-session requests rejected by expected_tip.",
                 labelnames=labels.keys(),
             )
+            self.streaming_session_reaps_total = Counter(
+                name="sglang:streaming_session_reaps_total",
+                documentation="Number of streaming sessions retired by lifecycle cause.",
+                labelnames=[*labels.keys(), "cause"],
+            )
             for counter in (
                 self.streaming_session_truncations_total,
                 self.streaming_session_commits_total,
@@ -693,6 +699,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ):
                 counter.labels(**labels).inc(0)
 
+            for cause in ("close", "timeout"):
+                self.streaming_session_reaps_total.labels(**labels, cause=cause).inc(0)
         # =================================================================
         # Routing key metrics
         # =================================================================
@@ -1166,6 +1174,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_streaming_session_idempotency_conflict(self) -> None:
         self.streaming_session_idempotency_conflicts_total.labels(**self.labels).inc(1)
+
+    def increment_streaming_session_reap(
+        self, cause: StreamingSessionReapCause
+    ) -> None:
+        self.streaming_session_reaps_total.labels(**self.labels, cause=cause).inc(1)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)

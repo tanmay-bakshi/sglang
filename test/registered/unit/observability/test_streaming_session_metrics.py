@@ -56,11 +56,10 @@ class TestStreamingSessionMetrics(unittest.TestCase):
                 ),
             )
 
-        samples = {
-            sample.name: sample
-            for metric in registry.collect()
-            for sample in metric.samples
-        }
+        all_samples = [
+            sample for metric in registry.collect() for sample in metric.samples
+        ]
+        samples = {sample.name: sample for sample in all_samples}
         expected_names = {
             "sglang:streaming_session_truncations_total",
             "sglang:streaming_session_commits_total",
@@ -72,6 +71,22 @@ class TestStreamingSessionMetrics(unittest.TestCase):
             self.assertEqual(sample.value, 0)
             self.assertEqual(
                 sample.labels,
+                {key: str(value) for key, value in labels.items()},
+            )
+        reap_samples = [
+            sample
+            for sample in all_samples
+            if sample.name == "sglang:streaming_session_reaps_total"
+        ]
+        self.assertEqual(len(reap_samples), 2)
+        self.assertEqual(
+            {sample.labels["cause"] for sample in reap_samples},
+            {"close", "timeout"},
+        )
+        for sample in reap_samples:
+            self.assertEqual(sample.value, 0)
+            self.assertEqual(
+                {key: sample.labels[key] for key in labels},
                 {key: str(value) for key, value in labels.items()},
             )
 
