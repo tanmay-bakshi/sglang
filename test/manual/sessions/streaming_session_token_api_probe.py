@@ -1040,14 +1040,14 @@ def run_recovery_qualification(base_url: str) -> None:
     client = SessionClient(base_url)
     context, _, _ = _build_gemma4_context()
     session_id = client.open()
-    hot_extra_key = "stage4-recovery-hot-" + uuid.uuid4().hex
-    conflict_count = 0
-    conflict_metric_before = _read_counter(base_url, CONFLICT_METRIC_NAME)
-    assert (
-        conflict_metric_before is not None
-    ), f"required metric is not exposed: {CONFLICT_METRIC_NAME}"
-
     try:
+        hot_extra_key = "stage4-recovery-hot-" + uuid.uuid4().hex
+        conflict_count = 0
+        conflict_metric_before = _read_counter(base_url, CONFLICT_METRIC_NAME)
+        assert (
+            conflict_metric_before is not None
+        ), f"required metric is not exposed: {CONFLICT_METRIC_NAME}"
+
         empty = client.session_info(session_id)
         assert empty == SessionInfo(
             exists=True,

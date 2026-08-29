@@ -685,6 +685,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 documentation="Number of streaming-session requests rejected by expected_tip.",
                 labelnames=labels.keys(),
             )
+            for counter in (
+                self.streaming_session_truncations_total,
+                self.streaming_session_commits_total,
+                self.streaming_session_aborts_with_slot_preserved_total,
+                self.streaming_session_idempotency_conflicts_total,
+            ):
+                counter.labels(**labels).inc(0)
 
         # =================================================================
         # Routing key metrics
