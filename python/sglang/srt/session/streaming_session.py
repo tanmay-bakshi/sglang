@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import streaming_session_swa_eviction_threshold
+from sglang.srt.mem_cache.common import streaming_session_swa_eviction_plan
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -506,7 +506,11 @@ class StreamingSession(BasePrefixCache):
         old_protected_len = slot.cache_protected_len
         if self.supports_swa() and target >= old_protected_len:
             retention = max(self.sliding_window_size, self.page_size)
-            latest_safe_watermark = max(old_protected_len, target - retention)
+            latest_safe_watermark = max(0, target - retention)
+            if self.page_size > 1:
+                latest_safe_watermark = (
+                    latest_safe_watermark // self.page_size
+                ) * self.page_size
             assert slot.kv.swa_evicted_seqlen <= latest_safe_watermark, (
                 "streaming-session SWA pin invariant violated: required rollback "
                 f"KV was already evicted ({slot.kv.swa_evicted_seqlen=} > "
@@ -552,26 +556,22 @@ class StreamingSession(BasePrefixCache):
         if not slot.is_holding_kv or not self.supports_swa():
             return
 
-        threshold = streaming_session_swa_eviction_threshold(
+        new_watermark, physical_free_start = streaming_session_swa_eviction_plan(
+            slot.kv.swa_evicted_seqlen,
             slot.kv_committed_len,
+            cache_protected_len=slot.cache_protected_len,
             sliding_window_size=self.sliding_window_size,
             page_size=self.page_size,
             streaming_session_floor=slot.streaming_session_floor,
         )
-        new_watermark = max(
-            slot.kv.swa_evicted_seqlen,
-            slot.cache_protected_len,
-            threshold,
-        )
-        if self.page_size > 1:
-            new_watermark = (new_watermark // self.page_size) * self.page_size
         if new_watermark <= slot.kv.swa_evicted_seqlen:
             return
 
-        free_slots = self.req_to_token_pool.req_to_token[
-            slot.req_pool_idx, slot.kv.swa_evicted_seqlen : new_watermark
-        ]
-        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        if new_watermark > physical_free_start:
+            free_slots = self.req_to_token_pool.req_to_token[
+                slot.req_pool_idx, physical_free_start:new_watermark
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             self.token_to_kv_pool_allocator,
             self.req_to_token_pool,

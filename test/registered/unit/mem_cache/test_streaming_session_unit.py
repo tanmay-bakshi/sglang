@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -437,6 +438,112 @@ def test_active_swa_eviction_is_clamped_by_streaming_floor():
     assert allocator.freed_swa[0].tolist() == list(range(48))
 
 
+def test_streaming_floor_preserves_radix_owned_rollback_window():
+    req_to_token = torch.arange(9_216, dtype=torch.int32).reshape(2, 4_608)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        cache_protected_len=2_048,
+        swa_evict_floor=0,
+        streaming_session_floor=2_048,
+        kv=SimpleNamespace(swa_evicted_seqlen=0),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        4_608,
+        sliding_window_size=1_024,
+        page_size=64,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.swa_evicted_seqlen == 1_024
+    assert allocator.freed_swa == []
+
+
+def test_streaming_floor_preserves_forced_evict_prefix():
+    req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        cache_protected_len=64,
+        swa_evict_floor=96,
+        streaming_session_floor=256,
+        kv=SimpleNamespace(swa_evicted_seqlen=32),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        256,
+        sliding_window_size=64,
+        page_size=16,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.swa_evicted_seqlen == 192
+    assert len(allocator.freed_swa) == 1
+    assert allocator.freed_swa[0].tolist() == list(range(96, 192))
+
+
+def test_detached_floor_frees_only_session_owned_swa():
+    req_to_token = torch.arange(9_216, dtype=torch.int32).reshape(2, 4_608)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            req_to_token_pool,
+            allocator,
+            page_size=64,
+            sliding_window_size=1_024,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=4_608,
+        kv=SimpleNamespace(kv_allocated_len=4_608, swa_evicted_seqlen=0),
+        streaming_session_floor=2_048,
+        cache_protected_len=2_048,
+    )
+
+    tree_cache.commit_session("session-a", 2_048)
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv.swa_evicted_seqlen == 1_024
+    assert allocator.freed_swa == []
+
+    tree_cache.commit_session("session-a", 4_096)
+    assert slot.kv.swa_evicted_seqlen == 3_072
+    assert len(allocator.freed_swa) == 1
+    assert allocator.freed_swa[0].tolist() == list(range(2_048, 3_072))
+
+
+def test_truncate_rejects_logically_evicted_rollback_window():
+    req_to_token = torch.arange(9_216, dtype=torch.int32).reshape(2, 4_608)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            req_to_token_pool,
+            allocator,
+            page_size=64,
+            sliding_window_size=1_024,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=4_608,
+        kv=SimpleNamespace(kv_allocated_len=4_608, swa_evicted_seqlen=2_048),
+        streaming_session_floor=2_048,
+        cache_protected_len=2_048,
+    )
+
+    with pytest.raises(AssertionError, match="SWA pin invariant"):
+        tree_cache.truncate_session("session-a", 2_048)
+
+
 def test_non_session_swa_eviction_keeps_existing_frontier():
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
@@ -499,7 +606,5 @@ def test_subpage_truncate_retires_slot_and_reallocates_fresh_owner():
 
 if __name__ == "__main__":
     import sys
-
-    import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))

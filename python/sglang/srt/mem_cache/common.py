@@ -65,6 +65,64 @@ def streaming_session_swa_eviction_threshold(
     return threshold
 
 
+def streaming_session_swa_eviction_plan(
+    current_watermark: int,
+    pre_len: int,
+    *,
+    cache_protected_len: int,
+    sliding_window_size: int,
+    page_size: int,
+    streaming_session_floor: int,
+    forced_evict_floor: int = 0,
+    is_chunk_cache: bool = False,
+) -> tuple[int, int]:
+    """Plan logical SWA eviction without freeing radix-owned mappings.
+
+    :param current_watermark: Current logical SWA eviction watermark.
+    :param pre_len: Request length used by ordinary SWA eviction.
+    :param cache_protected_len: Prefix whose physical KV is radix-owned.
+    :param sliding_window_size: Model sliding-attention window.
+    :param page_size: KV cache page size.
+    :param streaming_session_floor: Durable rollback floor for the session.
+    :param forced_evict_floor: Additional request-specific eviction floor.
+    :param is_chunk_cache: Whether the request uses a chunk cache.
+    :returns: New logical watermark and first physically freeable token.
+    """
+    assert current_watermark >= 0
+    assert pre_len >= 0
+    assert cache_protected_len >= 0
+    assert streaming_session_floor >= 0
+    assert forced_evict_floor >= 0
+    if page_size > 1:
+        assert current_watermark % page_size == 0
+        assert cache_protected_len % page_size == 0
+
+    if page_size > 1 and forced_evict_floor > 0:
+        forced_evict_floor = -(-forced_evict_floor // page_size) * page_size
+
+    threshold = streaming_session_swa_eviction_threshold(
+        pre_len,
+        sliding_window_size=sliding_window_size,
+        page_size=page_size,
+        streaming_session_floor=streaming_session_floor,
+        is_chunk_cache=is_chunk_cache,
+    )
+    logical_watermark = max(
+        current_watermark,
+        forced_evict_floor,
+        threshold,
+    )
+    physical_free_start = max(
+        current_watermark,
+        cache_protected_len,
+        forced_evict_floor,
+    )
+    if page_size > 1:
+        assert logical_watermark % page_size == 0
+        assert physical_free_start % page_size == 0
+    return logical_watermark, physical_free_start
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,
@@ -76,6 +134,36 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     if req.kv is None:
+        return
+
+    streaming_session_floor = getattr(req, "streaming_session_floor", None)
+    if streaming_session_floor is not None:
+        new_swa_evicted_seqlen, physical_free_start = (
+            streaming_session_swa_eviction_plan(
+                req.kv.swa_evicted_seqlen,
+                pre_len,
+                cache_protected_len=req.cache_protected_len,
+                sliding_window_size=sliding_window_size,
+                page_size=page_size,
+                streaming_session_floor=streaming_session_floor,
+                forced_evict_floor=getattr(req, "swa_evict_floor", 0),
+                is_chunk_cache=is_chunk_cache,
+            )
+        )
+        if new_swa_evicted_seqlen > physical_free_start:
+            free_slots = req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                physical_free_start:new_swa_evicted_seqlen,
+            ]
+            token_to_kv_pool_allocator.free_swa(free_slots)
+        if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+            maybe_evict_dsv4_state_on_swa(
+                token_to_kv_pool_allocator,
+                req_to_token_pool,
+                req,
+                new_swa_evicted_seqlen,
+            )
+        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
         return
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
@@ -91,7 +179,7 @@ def free_swa_out_of_window_slots(
         pre_len,
         sliding_window_size=sliding_window_size,
         page_size=page_size,
-        streaming_session_floor=getattr(req, "streaming_session_floor", None),
+        streaming_session_floor=None,
         is_chunk_cache=is_chunk_cache,
     )
     new_swa_evicted_seqlen = max(
