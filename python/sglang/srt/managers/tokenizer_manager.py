@@ -87,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetSessionInfoReqOutput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -537,6 +538,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.session_info_futures: dict[
+            str, asyncio.Future[GetSessionInfoReqOutput]
+        ] = {}
         self.decode_control_futures: dict[
             str,
             tuple[str, asyncio.Future[dict[str, object]]],
@@ -725,6 +729,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (GetSessionInfoReqOutput, self._handle_get_session_info_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -3684,6 +3689,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_get_session_info_req_output(
+        self, recv_obj: GetSessionInfoReqOutput
+    ) -> None:
+        """Complete the exact waiter for a concurrent session-info read.
+
+        :param recv_obj: Atomic scheduler-owned session snapshot.
+        """
+        future = self.session_info_futures.get(recv_obj.correlation_id)
+        if future is None:
+            logger.warning(
+                "Session info response arrived after waiter cleanup: %s",
+                recv_obj.correlation_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.model_update_expected_workers == 1:

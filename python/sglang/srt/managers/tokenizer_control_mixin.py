@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetSessionInfoReqInput,
+    GetSessionInfoReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -884,6 +886,32 @@ class TokenizerControlMixin:
             return await future
         finally:
             self.session_futures.pop(obj.session_id, None)
+
+    async def get_session_info(
+        self: TokenizerManager,
+        session_id: str,
+    ) -> GetSessionInfoReqOutput:
+        """Read one streaming session's durable recovery state.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Atomic scheduler-owned session snapshot.
+        """
+        self.auto_create_handle_loop()
+        correlation_id = uuid.uuid4().hex
+        future: asyncio.Future[GetSessionInfoReqOutput] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self.session_info_futures[correlation_id] = future
+        self._dispatch_to_scheduler(
+            GetSessionInfoReqInput(
+                correlation_id=correlation_id,
+                session_id=session_id,
+            )
+        )
+        try:
+            return await future
+        finally:
+            self.session_info_futures.pop(correlation_id, None)
 
     async def close_session(
         self: TokenizerManager,

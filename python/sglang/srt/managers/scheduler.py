@@ -131,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetSessionInfoReqInput,
+    GetSessionInfoReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1499,6 +1501,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (GetSessionInfoReqInput, self.get_session_info),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -4735,6 +4738,32 @@ class Scheduler(
             self.server_args.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def get_session_info(
+        self, recv_req: GetSessionInfoReqInput
+    ) -> GetSessionInfoReqOutput | None:
+        """Read session state atomically on the scheduler that owns it.
+
+        :param recv_req: Session-info query with a unique waiter identity.
+        :returns: Snapshot from the scheduler's designated response rank.
+        """
+        info = self.session_controller.get_info(recv_req.session_id)
+        if not (
+            self.ps.pp_rank == 0
+            and self.ps.tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        ):
+            return None
+        return GetSessionInfoReqOutput(
+            correlation_id=recv_req.correlation_id,
+            exists=info.exists,
+            tip=info.tip,
+            floor=info.floor,
+            protected=info.protected,
+            inflight=info.inflight,
+            held_tokens=info.held_tokens,
+            last_rid=info.last_rid,
+        )
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

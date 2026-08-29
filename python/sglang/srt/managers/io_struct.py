@@ -2086,6 +2086,22 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class GetSessionInfoReqInput(BaseReq, kw_only=True):
+    correlation_id: str
+    session_id: str
+
+
+class GetSessionInfoReqOutput(BaseReq, kw_only=True):
+    correlation_id: str
+    exists: bool
+    tip: int
+    floor: int
+    protected: int
+    inflight: bool
+    held_tokens: int
+    last_rid: str | None
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

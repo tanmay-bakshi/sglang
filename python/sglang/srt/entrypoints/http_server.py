@@ -1588,6 +1588,23 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
         return _create_error_response(e)
 
 
+@app.get("/session_info")
+async def session_info(session_id: Annotated[str, Query(min_length=1)]):
+    """Return one streaming session's atomic recovery snapshot."""
+    result = await _global_state.tokenizer_manager.get_session_info(session_id)
+    return ORJSONResponse(
+        {
+            "exists": result.exists,
+            "tip": result.tip,
+            "floor": result.floor,
+            "protected": result.protected,
+            "inflight": result.inflight,
+            "held_tokens": result.held_tokens,
+            "last_rid": result.last_rid,
+        }
+    )
+
+
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(
