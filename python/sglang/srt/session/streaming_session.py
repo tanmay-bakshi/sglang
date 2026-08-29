@@ -325,6 +325,9 @@ class StreamingSession(BasePrefixCache):
                 return True
 
             rollback_len = slot.kv_committed_len
+            slot.kv.kv_allocated_len = max(
+                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
+            )
             self._free_tail(slot, req, rollback_len)
             slot.save_from_req(req, is_first=False)
             req.session.abort_req()

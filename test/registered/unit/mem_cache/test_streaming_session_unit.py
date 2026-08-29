@@ -18,6 +18,15 @@ class _FakeAllocator:
         self.freed.append(free_index.clone())
 
 
+class _FakeReqToTokenPool:
+    def __init__(self, req_to_token: torch.Tensor):
+        self.req_to_token = req_to_token
+        self.free_slots = []
+
+    def release_detached_request_slot(self, pool_idx: int) -> None:
+        self.free_slots.append(pool_idx)
+
+
 class _FakeInnerCache:
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
@@ -81,7 +90,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(
         req_to_token_pool,
@@ -129,7 +138,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     slot is created from req state and nuked via release_session."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -153,7 +162,7 @@ def test_nth_mid_abort_preserves_session_slot():
     """Nth-request abort rolls KV back to the last successful boundary."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -202,7 +211,7 @@ def test_trim_overshoot_postcondition():
     """
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
