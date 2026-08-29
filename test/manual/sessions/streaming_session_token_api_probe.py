@@ -6,16 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from transformers import AutoTokenizer
-
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 MODEL_PATH = "/models/gemma-4-31B-it-NVFP4"
 
 
-def _build_gemma4_context() -> tuple[list[int], list[int]]:
+def _build_gemma4_context() -> tuple[list[int], list[int], PreTrainedTokenizerBase]:
     """Build a natural-token context with rollback-sensitive sentinels.
 
-    :returns: A 4,608-token context and a raw-token question delta.
+    :returns: A 4,608-token context, a raw-token question delta, and its tokenizer.
     """
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     context = [tokenizer.bos_token_id]
@@ -62,7 +61,7 @@ def _build_gemma4_context() -> tuple[list[int], list[int]]:
         "<end_of_turn>\n<start_of_turn>model\n",
         add_special_tokens=False,
     )
-    return context, delta
+    return context, delta, tokenizer
 
 
 @dataclass(frozen=True)
@@ -145,6 +144,7 @@ class SessionClient:
         commit_to: int | None = None,
         expected_tip: int | None = None,
         extra_key: str | None = None,
+        ignore_eos: bool = True,
     ) -> GenerateResult:
         """Run one deterministic raw-token session request.
 
@@ -155,6 +155,7 @@ class SessionClient:
         :param commit_to: Optional commit-floor target.
         :param expected_tip: Optional idempotency precondition.
         :param extra_key: Cache namespace isolating an oracle arm.
+        :param ignore_eos: Whether generation continues after an end-of-sequence token.
         :returns: Normalized generation result.
         """
         session_params: dict[str, Any] = {"id": session_id, "rid": None}
@@ -174,7 +175,7 @@ class SessionClient:
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
+                    "ignore_eos": ignore_eos,
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
@@ -231,9 +232,9 @@ def _qualify_truncate_case(
             max_new_tokens=16,
             extra_key=fresh_key,
         )
-        assert fresh.cached_tokens == 0, (
-            f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
-        )
+        assert (
+            fresh.cached_tokens == 0
+        ), f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
         assert hot.output_ids == fresh.output_ids, (
             f"greedy mismatch at target={target}: "
             f"hot={hot.output_ids}, fresh={fresh.output_ids}"
@@ -250,7 +251,7 @@ def run_truncate_qualification(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    full_context, delta = _build_gemma4_context()
+    full_context, delta, _ = _build_gemma4_context()
     base_context = full_context[:2_048]
 
     _qualify_truncate_case(client, base_context, 1_900, delta)
@@ -307,6 +308,8 @@ def _qualify_commit_case(
     floor: int,
     target: int,
     delta: list[int],
+    tokenizer: PreTrainedTokenizerBase,
+    expected_sentinel: str,
 ) -> None:
     """Compare a floor-pinned rewind with an exact fresh-session oracle.
 
@@ -315,6 +318,8 @@ def _qualify_commit_case(
     :param floor: Explicit rollback floor.
     :param target: Truncation target at or above floor.
     :param delta: Tokens appended after truncation.
+    :param tokenizer: Tokenizer used to inspect the sampled answer.
+    :param expected_sentinel: Context-dependent answer expected at the target.
     """
     hot_session = client.open(manual_commit=True)
     fresh_session = client.open()
@@ -342,20 +347,27 @@ def _qualify_commit_case(
             max_new_tokens=16,
             truncate_to=target,
             extra_key=hot_key,
+            ignore_eos=False,
         )
         fresh = client.generate(
             fresh_session,
             base_context[:target] + delta,
             max_new_tokens=16,
             extra_key=fresh_key,
+            ignore_eos=False,
         )
         assert hot.cached_tokens == target
-        assert fresh.cached_tokens == 0, (
-            f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
-        )
+        assert (
+            fresh.cached_tokens == 0
+        ), f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
         assert hot.output_ids == fresh.output_ids, (
             f"floor-pinned greedy mismatch at floor={floor}, target={target}: "
             f"hot={hot.output_ids}, fresh={fresh.output_ids}"
+        )
+        decoded = tokenizer.decode(hot.output_ids, skip_special_tokens=False)
+        assert expected_sentinel in decoded, (
+            f"wrong sentinel at target={target}: expected={expected_sentinel}, "
+            f"decoded={decoded!r}"
         )
     finally:
         client.close(hot_session)
@@ -368,12 +380,25 @@ def run_commit_qualification(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    base_context, delta = _build_gemma4_context()
+    base_context, delta, tokenizer = _build_gemma4_context()
     floor = 2_048
     assert len(base_context) - floor > 1_024
 
-    for target in (floor, floor + 257, len(base_context) - 1):
-        _qualify_commit_case(client, base_context, floor, target, delta)
+    expected_sentinels = {
+        floor: "ORCHID",
+        floor + 257: "MAPLE",
+        len(base_context) - 1: "CEDAR",
+    }
+    for target, expected_sentinel in expected_sentinels.items():
+        _qualify_commit_case(
+            client,
+            base_context,
+            floor,
+            target,
+            delta,
+            tokenizer,
+            expected_sentinel,
+        )
 
     session_id = client.open(manual_commit=True)
     try:
