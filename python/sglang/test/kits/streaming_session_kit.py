@@ -229,6 +229,11 @@ class StreamingSessionKitMixin:
                 time.sleep(0.5)
             self.assertEqual(resp_3.status_code, 200, resp_3.text)
             data_3 = resp_3.json()
+            self.assertEqual(
+                data_3["meta_info"]["cached_tokens"],
+                turn_1_total,
+                "Abort must preserve the pre-burst KV slot",
+            )
             # prompt_tokens = turn_1_total + append (BOS stripped).
             bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
             expected_prompt_3 = turn_1_total + len(ids_3) - bos

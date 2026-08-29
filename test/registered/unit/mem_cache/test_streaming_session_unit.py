@@ -149,10 +149,8 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert allocator.freed[0].tolist() == list(range(20))
 
 
-def test_nth_mid_abort_nukes_session_slot():
-    """Nth-request mid-processing abort: slot exists, restore_to_req ran.
-    ALL KV is wiped (release_session). Slot is deleted. Token IDs stay
-    in req_nodes for next turn's re-prefill."""
+def test_nth_mid_abort_preserves_session_slot():
+    """Nth-request abort rolls KV back to the last successful boundary."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
@@ -175,14 +173,18 @@ def test_nth_mid_abort_nukes_session_slot():
 
     tree_cache.cache_finished_req(req)
 
-    # Slot wiped — deleted from slots dict.
-    assert "session-a" not in tree_cache.slots
-    # All KV freed: [0, 65) from release_session (slot extended to req's allocated).
+    # Only the aborted request's tail is freed; the committed slot survives.
+    slot = tree_cache.slots["session-a"]
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 50
+    assert slot.kv.kv_allocated_len == 50
     assert len(allocator.freed) == 1
-    assert allocator.freed[0].tolist() == list(range(65))
-    # Pool slot returned.
-    assert req_to_token_pool.free_slots == [0]
+    assert allocator.freed[0].tolist() == list(range(50, 65))
+    assert req_to_token_pool.free_slots == []
+
+    # Ownership moved back to the slot.
     assert req.req_pool_idx is None
+    assert req.kv is None
 
 
 # Shrink tests removed: streaming sessions are append-only after the

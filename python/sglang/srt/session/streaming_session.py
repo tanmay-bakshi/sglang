@@ -276,7 +276,7 @@ class StreamingSession(BasePrefixCache):
     def try_cache_finished_req(
         self, req: Req, is_insert: bool = True, **kwargs
     ) -> bool:
-        """Handles a streaming-session finish (save slot / mid-abort nuke).
+        """Handles a streaming-session finish (save slot / abort rollback).
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
             return False
@@ -288,10 +288,10 @@ class StreamingSession(BasePrefixCache):
         is_first = slot is None
 
         # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in find_active_slot) and never reach here.
-        # Nuke all KV via release_session, delete slot. Token IDs stay
-        # in req_nodes (finish_req was never called -> last successful
-        # req). Next request re-prefills from scratch.
+        # (set in find_active_slot) and never reach here. A first request has
+        # no successful boundary to preserve, so it still releases its
+        # transient resources. Later requests roll the owning slot back to
+        # its last successful boundary and keep it hot.
         if isinstance(req.finished_reason, FINISH_ABORT):
             if slot is None:
                 # First-request mid-processing abort: create ephemeral
@@ -315,12 +315,18 @@ class StreamingSession(BasePrefixCache):
                 # the abort fall-through doesn't double-free.
                 req.mamba_pool_idx = None
                 req.mamba_ping_pong_track_buffer = None
-            slot.kv.kv_allocated_len = max(
-                slot.kv.kv_allocated_len, req.kv.kv_allocated_len
-            )
-            self.release_session(session_id)
-            req.req_pool_idx = None
-            req.kv = None
+                slot.kv.kv_allocated_len = max(
+                    slot.kv.kv_allocated_len, req.kv.kv_allocated_len
+                )
+                self.release_session(session_id)
+                req.req_pool_idx = None
+                req.kv = None
+                req.session.abort_req()
+                return True
+
+            rollback_len = slot.kv_committed_len
+            self._free_tail(slot, req, rollback_len)
+            slot.save_from_req(req, is_first=False)
             req.session.abort_req()
             return True
 
