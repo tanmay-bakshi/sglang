@@ -17,6 +17,7 @@ from array import array
 from types import SimpleNamespace
 
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
 
@@ -197,7 +198,8 @@ class TestSessionTokenShare(CustomTestCase):
         origin_before = list(r1.origin_input_ids)
         output_before = list(r1.output_ids)
 
-        invalid = self._create("bad", [9], truncate_to=99)
+        with get_parallel().override(tp_rank=0):
+            invalid = self._create("bad", [9], truncate_to=99)
         self.assertIsNotNone(invalid.to_finish)
         self.assertFalse(self.session._inflight)
         self.assertEqual(list(r1.origin_input_ids), origin_before)
