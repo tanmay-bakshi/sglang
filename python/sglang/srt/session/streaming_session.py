@@ -271,13 +271,19 @@ class StreamingSession(BasePrefixCache):
             len(params.key),
         )
 
-        # A legal truncate can move the logical tip below the radix-owned
-        # prefix. The one-token logit reserve can move the match one position
-        # below the logical tip as well.
-        protected_match_len = min(slot.cache_protected_len, prefix_len)
-        assert prefix_len >= protected_match_len, (
+        assert (
+            0
+            <= slot.cache_protected_len
+            <= slot.kv_committed_len
+            <= slot.kv.kv_allocated_len
+        ), (
+            "streaming session slot cursors are inconsistent: "
+            f"{slot.cache_protected_len=}, {slot.kv_committed_len=}, "
+            f"kv_allocated_len={slot.kv.kv_allocated_len}"
+        )
+        assert prefix_len >= slot.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
-            f"{protected_match_len=}"
+            f"cache_protected_len={slot.cache_protected_len}"
         )
 
         # Free orphaned tail: alloc_for_extend will overwrite
@@ -518,12 +524,13 @@ class StreamingSession(BasePrefixCache):
                 f"{latest_safe_watermark=})"
             )
         retained_len = target
-        if target < old_protected_len:
-            # A partial shared page cannot be overwritten in place. Retain
-            # only complete tree-owned pages and re-prefill the final partial
-            # page from token IDs on the next turn.
+        if target <= old_protected_len:
+            # Prefix matching reserves the final logical token for the next
+            # forward. Retain only complete tree-owned pages strictly before
+            # that token so alloc_for_extend never overwrites shared KV.
+            retained_len = max(0, target - 1)
             if self.page_size > 1:
-                retained_len = (target // self.page_size) * self.page_size
+                retained_len = (retained_len // self.page_size) * self.page_size
 
         # With no complete page to inherit, the cache slot has no reusable
         # ownership. Retire it through the ordinary lifecycle so its request

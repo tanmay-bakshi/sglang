@@ -395,6 +395,117 @@ def test_truncate_below_protected_reprefills_partial_shared_page():
     assert allocator.freed[0].tolist() == list(range(64, 80))
 
 
+@pytest.mark.parametrize(("target", "expected_retained"), [(48, 32), (64, 48)])
+def test_truncate_at_protected_page_reprefills_logit_reserve_page(
+    target: int, expected_retained: int
+) -> None:
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=80,
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", target)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == expected_retained
+    assert slot.kv.kv_allocated_len == expected_retained
+    assert slot.cache_protected_len == expected_retained
+    assert slot.tree_protected_len == 64
+    assert allocator.freed[0].tolist() == list(range(64, 80))
+
+    req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
+    match = tree_cache.try_match_prefix(
+        SimpleNamespace(req=req, key=list(range(target - 1)))
+    )
+
+    assert match is not None
+    assert len(match.device_indices) == expected_retained
+    assert match.cache_protected_len == expected_retained
+
+
+def test_page_one_truncate_reprefills_logit_reserve_token() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=80,
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", 64)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 63
+    assert slot.kv.kv_allocated_len == 63
+    assert slot.cache_protected_len == 63
+    assert allocator.freed[0].tolist() == list(range(64, 80))
+
+
+def test_streaming_match_rejects_prefix_below_protected_boundary() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=16)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=64,
+        kv=SimpleNamespace(kv_allocated_len=64, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+    req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
+
+    with pytest.raises(AssertionError, match="streaming session prefix shrank"):
+        tree_cache.try_match_prefix(SimpleNamespace(req=req, key=list(range(63))))
+
+    assert allocator.freed == []
+
+
+def test_streaming_match_can_replay_session_owned_logit_reserve() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size=16)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=96,
+        kv=SimpleNamespace(kv_allocated_len=96, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", 80)
+    req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
+    match = tree_cache.try_match_prefix(SimpleNamespace(req=req, key=list(range(79))))
+
+    assert match is not None
+    assert len(match.device_indices) == 79
+    assert match.cache_protected_len == 64
+    assert tree_cache.slots["session-a"].kv_committed_len == 79
+    assert tree_cache.slots["session-a"].kv.kv_allocated_len == 79
+    assert allocator.freed[0].tolist() == list(range(80, 96))
+
+
 def test_floor_round_trip_and_detached_swa_reconciliation():
     page_size = 16
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
@@ -614,10 +725,10 @@ def test_below_protected_truncate_keeps_page_aligned_rollback_window():
     tree_cache.truncate_session("session-a", 48)
 
     slot = tree_cache.slots["session-a"]
-    assert slot.kv_committed_len == 48
-    assert slot.kv.kv_allocated_len == 48
+    assert slot.kv_committed_len == 32
+    assert slot.kv.kv_allocated_len == 32
     assert slot.kv.swa_evicted_seqlen == 16
-    assert slot.cache_protected_len == 48
+    assert slot.cache_protected_len == 32
     assert allocator.freed[0].tolist() == list(range(64, 128))
 
 

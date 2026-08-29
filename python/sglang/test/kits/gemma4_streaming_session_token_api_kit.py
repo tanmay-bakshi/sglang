@@ -540,6 +540,84 @@ def _qualify_truncate_case(
         client.close(fresh_session)
 
 
+def _qualify_protected_boundary_case(
+    client: SessionClient,
+    base_url: str,
+    base_context: list[int],
+) -> None:
+    """Rewind exactly to a shared-page boundary and regenerate greedily.
+
+    :param client: Live session client.
+    :param base_url: Live inference server URL.
+    :param base_context: Token context extending beyond the shared prefix.
+    """
+    shared_key = "protected-boundary-shared-" + uuid.uuid4().hex
+    fresh_key = "protected-boundary-fresh-" + uuid.uuid4().hex
+    prime = requests.post(
+        base_url.rstrip("/") + "/generate",
+        json={
+            "input_ids": base_context[:1_024],
+            "extra_key": shared_key,
+            "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+        },
+        timeout=300,
+    )
+    assert prime.status_code == 200, prime.text
+
+    hot_session = client.open(manual_commit=True)
+    fresh_session = client.open()
+    try:
+        seeded = client.generate(
+            hot_session,
+            base_context,
+            max_new_tokens=0,
+            extra_key=shared_key,
+        )
+        before = client.session_info(hot_session)
+        target = before.protected
+        assert 0 < target < seeded.tip
+        assert target % 64 == 0
+
+        truncated = client.generate(
+            hot_session,
+            [],
+            max_new_tokens=0,
+            truncate_to=target,
+            expected_tip=seeded.tip,
+            extra_key=shared_key,
+        )
+        after_truncate = client.session_info(hot_session)
+        expected_protected = ((target - 1) // 64) * 64
+        assert truncated.tip == after_truncate.tip == target
+        assert after_truncate.protected == expected_protected
+
+        hot = client.generate(
+            hot_session,
+            [],
+            max_new_tokens=16,
+            expected_tip=target,
+            extra_key=shared_key,
+            ignore_eos=False,
+        )
+        fresh = client.generate(
+            fresh_session,
+            base_context[:target],
+            max_new_tokens=16,
+            extra_key=fresh_key,
+            ignore_eos=False,
+        )
+        assert fresh.cached_tokens == 0
+        assert hot.cached_tokens in {target - 1, target}
+        assert hot.prompt_tokens == fresh.prompt_tokens == target
+        assert hot.output_ids == fresh.output_ids, (
+            "protected-boundary greedy mismatch: "
+            f"target={target}, hot={hot.output_ids}, fresh={fresh.output_ids}"
+        )
+    finally:
+        client.close(hot_session)
+        client.close(fresh_session)
+
+
 def run_truncate_qualification(base_url: str) -> None:
     """Run Stage 2 truncation acceptance cases.
 
@@ -1927,10 +2005,14 @@ class Gemma4StreamingSessionOracleKitMixin:
             COMMIT_METRIC_NAME,
         )
         run_commit_qualification(self.base_url)
+        context, _, _ = _build_gemma4_context()
+        _qualify_protected_boundary_case(
+            SessionClient(self.base_url), self.base_url, context
+        )
         _wait_for_metric(
             self.base_url,
             TRUNCATION_METRIC_NAME,
-            truncations_before + 3,
+            truncations_before + 4,
         )
         _wait_for_metric(
             self.base_url,
