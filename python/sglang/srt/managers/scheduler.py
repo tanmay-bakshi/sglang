@@ -2353,8 +2353,30 @@ class Scheduler(
 
         if req.session is not None and req.session.streaming:
             req.session.commit_prepared_req(req, self.tree_cache)
+            if len(req.origin_input_ids) == 0:
+                self._finish_empty_streaming_session_mutation(req)
+                return
 
         self._enqueue_prepared_generate_request(req)
+
+    def _finish_empty_streaming_session_mutation(self, req: Req) -> None:
+        """Finish a mutation whose post-operation context has no model input.
+
+        :param req: Prepared streaming-session request with an empty context.
+        """
+        assert req.session is not None and req.session.streaming
+        assert req.sampling_params.max_new_tokens == 0
+        assert req.req_pool_idx is None and req.kv is None
+
+        now = time.perf_counter()
+        req.time_stats.set_wait_queue_entry_time(now)
+        req.time_stats.set_forward_entry_time(now)
+        req.time_stats.set_prefill_finished_time(now)
+        req.update_finish_state()
+        assert req.finished()
+        req.session.finish_req(req)
+        req.time_stats.set_completion_time(now)
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _prepare_generate_request(
         self,

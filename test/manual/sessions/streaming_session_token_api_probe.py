@@ -215,6 +215,19 @@ def run_truncate_qualification(base_url: str) -> None:
 
         recovery = client.generate(session_id, delta, max_new_tokens=4)
         assert recovery.cached_tokens in {seed.tip - 1, seed.tip}
+
+        empty = client.generate(
+            session_id,
+            [],
+            max_new_tokens=0,
+            truncate_to=0,
+        )
+        assert empty.prompt_tokens == 0
+        assert empty.completion_tokens == 0
+
+        rebuilt = client.generate(session_id, delta, max_new_tokens=4)
+        assert rebuilt.prompt_tokens == len(delta)
+        assert rebuilt.cached_tokens == 0
     finally:
         client.close(session_id)
 

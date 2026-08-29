@@ -290,6 +290,32 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertIsNotNone(rejected.to_finish)
         self.assertFalse(session._inflight)
 
+    def test_empty_first_turn_is_prepared_only_for_mutation_completion(self):
+        empty = self._create("empty", [], max_new_tokens=0, truncate_to=0)
+
+        self.assertIsNone(empty.to_finish)
+        self.assertTrue(self.session._inflight)
+        self.assertEqual(list(empty.origin_input_ids), [])
+
+        cache = SimpleNamespace(calls=[])
+        cache.truncate_session = lambda session_id, target: cache.calls.append(
+            (session_id, target)
+        )
+        self.session.commit_prepared_req(empty, cache)
+        empty.update_finish_state()
+        self.session.finish_req(empty)
+
+        self.assertEqual(cache.calls, [("s", 0)])
+        self.assertTrue(empty.finished())
+        self.assertFalse(self.session._inflight)
+
+    def test_empty_context_cannot_start_decode_burst(self):
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("empty-decode", [], max_new_tokens=1)
+
+        self.assertIsNotNone(rejected.to_finish)
+        self.assertFalse(self.session._inflight)
+
 
 if __name__ == "__main__":
     unittest.main()

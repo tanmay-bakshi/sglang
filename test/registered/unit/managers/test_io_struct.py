@@ -616,9 +616,37 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         self.assertTrue(req.is_single)
         self.assertEqual(req.batch_size, 1)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 0)
 
     def test_ordinary_request_rejects_empty_token_input(self):
         req = GenerateReqInput(input_ids=[])
+
+        with self.assertRaisesRegex(ValueError, "input_ids cannot be empty"):
+            req.normalize_batch_and_arguments()
+
+    def test_empty_token_delta_requires_scalar_session_identifier(self):
+        invalid_session_metadata = (
+            {},
+            {"truncate_to": 0},
+            {"id": ""},
+            [],
+        )
+        for session_params in invalid_session_metadata:
+            with self.subTest(session_params=session_params):
+                req = GenerateReqInput(
+                    input_ids=[],
+                    session_params=session_params,
+                    sampling_params={"max_new_tokens": 0},
+                )
+                with self.assertRaisesRegex(ValueError, "input_ids cannot be empty"):
+                    req.normalize_batch_and_arguments()
+
+    def test_radix_native_session_does_not_admit_empty_token_input(self):
+        req = GenerateReqInput(
+            input_ids=[],
+            session_id="radix-native",
+            sampling_params={"max_new_tokens": 0},
+        )
 
         with self.assertRaisesRegex(ValueError, "input_ids cannot be empty"):
             req.normalize_batch_and_arguments()

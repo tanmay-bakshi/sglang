@@ -402,7 +402,12 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                if self.session_params is None:
+                session_id = (
+                    self.session_params.get("id")
+                    if isinstance(self.session_params, dict)
+                    else None
+                )
+                if not isinstance(session_id, str) or len(session_id) == 0:
                     raise ValueError("input_ids cannot be empty.")
                 self.is_single = True
                 self.batch_size = 1

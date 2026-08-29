@@ -359,6 +359,17 @@ class Session:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
+        if (
+            not abort
+            and self.streaming
+            and len(input_ids) == 0
+            and req.sampling_params.max_new_tokens != 0
+        ):
+            abort = True
+            abort_message = (
+                "Streaming sessions cannot decode from an empty token context."
+            )
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
