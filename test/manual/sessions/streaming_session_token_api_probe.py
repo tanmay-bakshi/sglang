@@ -484,12 +484,14 @@ def _qualify_truncate_case(
             max_new_tokens=16,
             truncate_to=target,
             extra_key=hot_key,
+            ignore_eos=False,
         )
         fresh = client.generate(
             fresh_session,
             exact_context[:target] + delta,
             max_new_tokens=16,
             extra_key=fresh_key,
+            ignore_eos=False,
         )
         assert (
             fresh.cached_tokens == 0
