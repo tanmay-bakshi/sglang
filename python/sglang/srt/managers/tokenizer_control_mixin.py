@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     GetSessionInfoReqOutput,
     GetWeightsByNameReqInput,
@@ -77,6 +78,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
+from sglang.srt.session.errors import StreamingSessionInfoUnavailableError
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
@@ -898,7 +900,9 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         correlation_id = uuid.uuid4().hex
-        future: asyncio.Future[GetSessionInfoReqOutput] = (
+        future: asyncio.Future[
+            GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput
+        ] = (
             asyncio.get_running_loop().create_future()
         )
         self.session_info_futures[correlation_id] = future
@@ -909,7 +913,10 @@ class TokenizerControlMixin:
             )
         )
         try:
-            return await future
+            result = await future
+            if isinstance(result, GetSessionInfoReqErrorOutput):
+                raise StreamingSessionInfoUnavailableError(result.message)
+            return result
         finally:
             self.session_info_futures.pop(correlation_id, None)
 

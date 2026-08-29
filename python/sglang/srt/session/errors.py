@@ -14,3 +14,7 @@ class StreamingSessionConflictError(Exception):
 
 
 STREAMING_SESSION_CONFLICT_ERROR_TYPE = StreamingSessionConflictError.__name__
+
+
+class StreamingSessionInfoUnavailableError(ValueError):
+    """Reports introspection of an existing non-streaming session."""

@@ -5,12 +5,14 @@ import unittest
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import (
+    GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     GetSessionInfoReqOutput,
     msgpack_decode,
     msgpack_encode,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.session.errors import StreamingSessionInfoUnavailableError
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -63,6 +65,21 @@ class _SessionInfoTokenizerManager:
         return self.response
 
 
+class _UnavailableSessionInfoTokenizerManager:
+    """Minimal tokenizer manager that rejects a non-streaming session."""
+
+    async def get_session_info(self, session_id: str) -> GetSessionInfoReqOutput:
+        """Reject introspection for an ordinary session.
+
+        :param session_id: Public session identifier.
+        :raises StreamingSessionInfoUnavailableError: Always.
+        :returns: Never returns.
+        """
+        raise StreamingSessionInfoUnavailableError(
+            f"Session {session_id} is not a streaming session."
+        )
+
+
 class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
     """Recovery endpoint and correlated IPC behavior."""
 
@@ -89,6 +106,26 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
                 "inflight": False,
                 "held_tokens": 128,
                 "last_rid": "rid-128",
+            },
+        )
+
+    async def test_non_streaming_session_returns_public_http_400(self) -> None:
+        """Reject an ordinary session instead of fabricating zero cursors."""
+        manager = _UnavailableSessionInfoTokenizerManager()
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(types.SimpleNamespace(tokenizer_manager=manager))
+        try:
+            response = await http_server.session_info("ordinary-session")
+        finally:
+            http_server.set_global_state(prior_state)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "error": {
+                    "message": ("Session ordinary-session is not a streaming session.")
+                }
             },
         )
 
@@ -147,6 +184,31 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(manager.session_info_futures, {})
 
+    async def test_typed_scheduler_error_reconstructs_at_tokenizer(self) -> None:
+        """Carry the non-streaming rejection across IPC as a typed response."""
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.session_info_futures = {}
+        manager.auto_create_handle_loop = lambda: None
+        dispatched: list[GetSessionInfoReqInput] = []
+        manager._dispatch_to_scheduler = dispatched.append
+
+        task = asyncio.create_task(manager.get_session_info("ordinary-session"))
+        await asyncio.sleep(0)
+        self.assertEqual(len(dispatched), 1)
+        manager._handle_get_session_info_req_output(
+            GetSessionInfoReqErrorOutput(
+                correlation_id=dispatched[0].correlation_id,
+                message="Session ordinary-session is not a streaming session.",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            StreamingSessionInfoUnavailableError,
+            "Session ordinary-session is not a streaming session",
+        ):
+            await task
+        self.assertEqual(manager.session_info_futures, {})
+
     async def test_session_info_ipc_round_trips_exact_value_domains(self) -> None:
         """Preserve correlation and public value domains over msgpack IPC."""
         request = GetSessionInfoReqInput(
@@ -163,9 +225,14 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
             held_tokens=0,
             last_rid=None,
         )
+        error = GetSessionInfoReqErrorOutput(
+            correlation_id="correlation-a",
+            message="not a streaming session",
+        )
 
         decoded_request = msgpack_decode(msgpack_encode(request))
         decoded_output = msgpack_decode(msgpack_encode(output))
+        decoded_error = msgpack_decode(msgpack_encode(error))
 
         self.assertIs(type(decoded_request), GetSessionInfoReqInput)
         self.assertEqual(decoded_request, request)
@@ -179,6 +246,10 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(type(decoded_output.inflight), bool)
         self.assertIs(type(decoded_output.held_tokens), int)
         self.assertIsNone(decoded_output.last_rid)
+        self.assertIs(type(decoded_error), GetSessionInfoReqErrorOutput)
+        self.assertEqual(decoded_error, error)
+        self.assertIs(type(decoded_error.correlation_id), str)
+        self.assertIs(type(decoded_error.message), str)
 
 
 if __name__ == "__main__":

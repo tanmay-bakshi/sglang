@@ -27,7 +27,10 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.session.errors import STREAMING_SESSION_CONFLICT_ERROR_TYPE
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionInfoUnavailableError,
+)
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -603,6 +606,10 @@ class SessionController:
                 inflight=False,
                 held_tokens=0,
                 last_rid=None,
+            )
+        if not session.streaming:
+            raise StreamingSessionInfoUnavailableError(
+                f"Session {session_id} is not a streaming session."
             )
 
         cache = self.tree_cache.streaming_session_cache_snapshot(session_id)

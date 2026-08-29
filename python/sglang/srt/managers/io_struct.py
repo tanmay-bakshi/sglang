@@ -2091,6 +2091,11 @@ class GetSessionInfoReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class GetSessionInfoReqErrorOutput(BaseReq, kw_only=True):
+    correlation_id: str
+    message: str
+
+
 class GetSessionInfoReqOutput(BaseReq, kw_only=True):
     correlation_id: str
     exists: bool

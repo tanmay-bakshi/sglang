@@ -87,6 +87,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetSessionInfoReqErrorOutput,
     GetSessionInfoReqOutput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
@@ -539,7 +540,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Session
         self.session_futures = {}  # session_id -> asyncio event
         self.session_info_futures: dict[
-            str, asyncio.Future[GetSessionInfoReqOutput]
+            str, asyncio.Future[GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput]
         ] = {}
         self.decode_control_futures: dict[
             str,
@@ -729,6 +730,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    GetSessionInfoReqErrorOutput,
+                    self._handle_get_session_info_req_output,
+                ),
                 (GetSessionInfoReqOutput, self._handle_get_session_info_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -3691,7 +3696,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_get_session_info_req_output(
-        self, recv_obj: GetSessionInfoReqOutput
+        self, recv_obj: GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput
     ) -> None:
         """Complete the exact waiter for a concurrent session-info read.
 

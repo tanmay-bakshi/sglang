@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
     StreamingSessionConflictError,
+    StreamingSessionInfoUnavailableError,
 )
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.test_utils import CustomTestCase
@@ -594,6 +595,24 @@ class TestSessionTokenShare(CustomTestCase):
                 last_rid=None,
             ),
         )
+
+    def test_controller_info_rejects_existing_non_streaming_session(self):
+        """Do not describe ordinary sessions with fabricated streaming cursors."""
+        tree_cache = SimpleNamespace(supports_mamba=lambda: False)
+        controller = SessionController(tree_cache)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="ordinary-session",
+                streaming=False,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            StreamingSessionInfoUnavailableError,
+            "Session ordinary-session is not a streaming session",
+        ):
+            controller.get_info("ordinary-session")
 
 
 if __name__ == "__main__":

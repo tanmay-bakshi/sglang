@@ -131,6 +131,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     GetSessionInfoReqOutput,
     GetWeightsByNameReqInput,
@@ -271,7 +272,10 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.session.errors import STREAMING_SESSION_CONFLICT_ERROR_TYPE
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionInfoUnavailableError,
+)
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -332,6 +336,39 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 DECODE_STEP_MAX_US = 2_000_000
+
+
+def _validate_streaming_session_topology(
+    server_args: ServerArgs,
+    ps: ParallelState,
+) -> None:
+    """Reject streaming sessions when built-in DP cannot preserve ownership.
+
+    :param server_args: Resolved server configuration.
+    :param ps: Distributed topology for this scheduler process.
+    :raises ValueError: If streaming sessions are enabled with built-in DP.
+    """
+    if not server_args.enable_streaming_session or ps.dp_size == 1:
+        return
+    raise ValueError(
+        "Streaming sessions require dp_size == 1 because built-in data-parallel "
+        "dispatch does not preserve a single session owner. Run independent DP1 "
+        "servers behind sticky routing instead."
+    )
+
+
+def _is_streaming_session_output_rank(ps: ParallelState) -> bool:
+    """Return whether one scheduler owns session control output and counters.
+
+    :param ps: Distributed topology for this scheduler process.
+    :returns: Whether this is the unique session control output rank.
+    """
+    return (
+        ps.pp_rank == 0
+        and ps.tp_rank == 0
+        and ps.attn_tp_rank == 0
+        and ps.attn_cp_rank == 0
+    )
 
 
 def _accumulate_decode_moment(
@@ -453,6 +490,7 @@ class Scheduler(
             dcp_size=server_args.dcp_size,
             gpu_id=gpu_id,
         )
+        _validate_streaming_session_topology(server_args, self.ps)
 
         # Init model configs
         self.init_model_config()
@@ -2328,7 +2366,7 @@ class Scheduler(
                 isinstance(req.to_finish, FINISH_ABORT)
                 and req.to_finish.err_type == STREAMING_SESSION_CONFLICT_ERROR_TYPE
             ):
-                req.time_stats.increment_streaming_session_idempotency_conflict()
+                self._record_streaming_session_idempotency_conflict(req)
             finish_reason = req.finished_reason
             if isinstance(finish_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
@@ -4727,7 +4765,7 @@ class Scheduler(
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)
-        if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        if _is_streaming_session_output_rank(self.ps):
             return output
         return None
 
@@ -4741,19 +4779,21 @@ class Scheduler(
 
     def get_session_info(
         self, recv_req: GetSessionInfoReqInput
-    ) -> GetSessionInfoReqOutput | None:
+    ) -> GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput | None:
         """Read session state atomically on the scheduler that owns it.
 
         :param recv_req: Session-info query with a unique waiter identity.
         :returns: Snapshot from the scheduler's designated response rank.
         """
-        info = self.session_controller.get_info(recv_req.session_id)
-        if not (
-            self.ps.pp_rank == 0
-            and self.ps.tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        ):
+        if not _is_streaming_session_output_rank(self.ps):
             return None
+        try:
+            info = self.session_controller.get_info(recv_req.session_id)
+        except StreamingSessionInfoUnavailableError as error:
+            return GetSessionInfoReqErrorOutput(
+                correlation_id=recv_req.correlation_id,
+                message=str(error),
+            )
         return GetSessionInfoReqOutput(
             correlation_id=recv_req.correlation_id,
             exists=info.exists,
@@ -4764,6 +4804,14 @@ class Scheduler(
             held_tokens=info.held_tokens,
             last_rid=info.last_rid,
         )
+
+    def _record_streaming_session_idempotency_conflict(self, req: Req) -> None:
+        """Increment the conflict counter on the single output/stats rank.
+
+        :param req: Rejected streaming-session request.
+        """
+        if _is_streaming_session_output_rank(self.ps):
+            req.time_stats.increment_streaming_session_idempotency_conflict()
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
