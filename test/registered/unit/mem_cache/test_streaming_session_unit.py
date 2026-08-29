@@ -237,6 +237,56 @@ def test_trim_overshoot_postcondition():
     assert allocator.freed[0].tolist() == list(range(38, 44))
 
 
+def test_truncate_session_frees_tail_and_clamps_cursors():
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=91,
+        kv=SimpleNamespace(kv_allocated_len=96, swa_evicted_seqlen=70),
+        cache_protected_len=32,
+    )
+
+    tree_cache.truncate_session("session-a", 53)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 53
+    assert slot.kv.kv_allocated_len == 53
+    assert slot.kv.swa_evicted_seqlen == 53
+    assert allocator.freed[0].tolist() == list(range(64, 96))
+
+
+def test_truncate_below_protected_reprefills_partial_shared_page():
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=80,
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=0),
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", 35)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 35
+    assert slot.kv.kv_allocated_len == 32
+    assert slot.cache_protected_len == 32
+    assert slot.tree_protected_len == 64
+    assert allocator.freed[0].tolist() == list(range(64, 80))
+
+
 if __name__ == "__main__":
     import sys
 

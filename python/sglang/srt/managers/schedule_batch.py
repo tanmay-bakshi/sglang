@@ -780,6 +780,7 @@ class Req(ReqDllmMixin):
 
         self.session = session
         self.session_id = session_id
+        self.streaming_session_truncate_to: int | None = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

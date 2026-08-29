@@ -1990,6 +1990,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
+    def truncate_session(self, session_id: str, target: int) -> None:
+        self.session.truncate_session(session_id, target)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_tokens(active_pool_idxs)
 

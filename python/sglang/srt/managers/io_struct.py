@@ -132,6 +132,9 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
+    # Absolute token position to retain before appending this request's input.
+    # Streaming sessions apply the truncation only after request validation.
+    truncate_to: int | None = None
 
 
 # Type definitions for multimodal input data

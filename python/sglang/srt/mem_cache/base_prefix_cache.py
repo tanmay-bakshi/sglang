@@ -426,6 +426,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_session(self, session_id: str) -> None:
         pass
 
+    def truncate_session(self, session_id: str, target: int) -> None:
+        pass
+
     def release_radix_session(self, session_id: str) -> None:
         pass
 

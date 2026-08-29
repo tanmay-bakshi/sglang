@@ -23,13 +23,18 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, truncate_to=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
         mm_inputs=None,
         session_params=SimpleNamespace(
-            id="s", rid=None, offset=None, replace=False, drop_previous_output=False
+            id="s",
+            rid=None,
+            offset=None,
+            replace=False,
+            drop_previous_output=False,
+            truncate_to=truncate_to,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
@@ -56,9 +61,14 @@ class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
 
-    def _create(self, rid, input_ids, max_new_tokens=8):
+    def _create(self, rid, input_ids, max_new_tokens=8, truncate_to=None):
         return self.session.create_req(
-            _recv(rid, input_ids, max_new_tokens=max_new_tokens),
+            _recv(
+                rid,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                truncate_to=truncate_to,
+            ),
             tokenizer=None,
             vocab_size=VOCAB,
         )
@@ -158,6 +168,40 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
         r2._refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
+
+    def test_truncate_is_prepared_then_committed(self):
+        r1 = self._create("r1", [10, 11, 12, 13])
+        self._decode_and_finish(r1, [20, 21, 22])
+        original = list(r1.origin_input_ids)
+
+        r2 = self._create("r2", [30, 31], truncate_to=5)
+        self.assertEqual(list(r2.origin_input_ids), [10, 11, 12, 13, 20, 30, 31])
+        self.assertEqual(list(r1.origin_input_ids), original)
+
+        cache = SimpleNamespace(calls=[])
+        cache.truncate_session = lambda session_id, target: cache.calls.append(
+            (session_id, target)
+        )
+        self.session.commit_prepared_req(r2, cache)
+        self.assertEqual(cache.calls, [("s", 5)])
+        self.assertEqual(list(r1.origin_input_ids), [10, 11, 12, 13, 20])
+        self.assertEqual(list(r1.output_ids), [])
+
+        self.session.abort_req()
+        r3 = self._create("r3", [40])
+        self.assertEqual(list(r3.origin_input_ids), [10, 11, 12, 13, 20, 40])
+
+    def test_invalid_truncate_is_non_destructive(self):
+        r1 = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(r1, [4, 5])
+        origin_before = list(r1.origin_input_ids)
+        output_before = list(r1.output_ids)
+
+        invalid = self._create("bad", [9], truncate_to=99)
+        self.assertIsNotNone(invalid.to_finish)
+        self.assertFalse(self.session._inflight)
+        self.assertEqual(list(r1.origin_input_ids), origin_before)
+        self.assertEqual(list(r1.output_ids), output_before)
 
 
 if __name__ == "__main__":

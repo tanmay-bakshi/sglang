@@ -2351,6 +2351,9 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if req.session is not None and req.session.streaming:
+            req.session.commit_prepared_req(req, self.tree_cache)
+
         self._enqueue_prepared_generate_request(req)
 
     def _prepare_generate_request(

@@ -174,6 +174,46 @@ class Session:
             input_ids_unpadded.extend(new_input_ids)
         return input_ids, input_ids_unpadded, carry_fill
 
+    def _committed_token_arrays(self, last_req: Req) -> tuple[array, array]:
+        """Materialize the last successful context from its split arrays."""
+        assert self.committed_origin_len is not None
+        assert self.committed_unpadded_len is not None
+
+        output_ids = last_req.output_ids[
+            : last_req.sampling_params.max_new_tokens
+        ]
+        input_ids = array(
+            "q", last_req.origin_input_ids[: self.committed_origin_len]
+        )
+        input_ids.extend(output_ids)
+
+        input_ids_unpadded = array(
+            "q",
+            last_req.origin_input_ids_unpadded[: self.committed_unpadded_len],
+        )
+        input_ids_unpadded.extend(output_ids)
+        return input_ids, input_ids_unpadded
+
+    def _truncate_token_arrays(self, target: int) -> None:
+        """Move the last successful logical context to ``target``."""
+        if len(self.req_nodes) == 0:
+            assert target == 0
+            return
+
+        [last_req_node] = self.req_nodes.values()
+        last_req = last_req_node.req
+        input_ids, input_ids_unpadded = self._committed_token_arrays(last_req)
+        del input_ids[target:]
+        del input_ids_unpadded[target:]
+
+        last_req.origin_input_ids = input_ids
+        last_req.origin_input_ids_unpadded = input_ids_unpadded
+        last_req.output_ids = array("q")
+        last_req.full_untruncated_fill_ids = array("q", input_ids)
+        self.committed_origin_len = len(input_ids)
+        self.committed_unpadded_len = len(input_ids_unpadded)
+        self.committed_fill_len = len(input_ids)
+
     @staticmethod
     def _concat_token_arrays(
         last_req: Req, req: TokenizedGenerateReqInput, session_params
@@ -208,7 +248,6 @@ class Session:
         eos_token_ids=None,
     ):
         assert req.session_params is not None
-        self.last_active_time = time.monotonic()
         session_params = req.session_params
 
         last_req_node = None
@@ -237,6 +276,19 @@ class Session:
                 # only in finish_req after the request completes successfully.
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
+
+            if not abort and session_params.truncate_to is not None:
+                if last_req is None:
+                    tip = 0
+                else:
+                    input_ids, _ = self._committed_token_arrays(last_req)
+                    tip = len(input_ids)
+                if not 0 <= session_params.truncate_to <= tip:
+                    abort = True
+                    abort_message = (
+                        "Streaming session truncate_to must be between 0 and "
+                        f"the current tip ({tip}), got {session_params.truncate_to}."
+                    )
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
@@ -276,8 +328,15 @@ class Session:
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
                 and not (session_params.offset and session_params.offset != 0)
+                and session_params.truncate_to is None
             )
-            if can_share_token_arrays:
+            if self.streaming and session_params.truncate_to is not None and not abort:
+                input_ids, input_ids_unpadded = self._committed_token_arrays(last_req)
+                del input_ids[session_params.truncate_to :]
+                del input_ids_unpadded[session_params.truncate_to :]
+                input_ids.extend(req.input_ids)
+                input_ids_unpadded.extend(req.input_ids)
+            elif can_share_token_arrays:
                 input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
                     last_req, req.input_ids
                 )
@@ -320,17 +379,30 @@ class Session:
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
+        if not abort:
+            new_req.streaming_session_truncate_to = session_params.truncate_to
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
+            self.last_active_time = time.monotonic()
             self._inflight = True
         else:
+            self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
         return new_req
+
+    def commit_prepared_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
+        """Commit irreversible session mutations after scheduler validation."""
+        target = req.streaming_session_truncate_to
+        if target is None:
+            return
+
+        tree_cache.truncate_session(self.session_id, target)
+        self._truncate_token_arrays(target)
 
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""

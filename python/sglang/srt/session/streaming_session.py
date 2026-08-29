@@ -52,6 +52,7 @@ class SessionSlot:
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
     cache_protected_len: int = 0
+    tree_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
 
     # Mamba states
@@ -75,6 +76,7 @@ class SessionSlot:
         if is_first:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
+            self.tree_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
 
         self.mamba_pool_idx = req.mamba_pool_idx
@@ -245,13 +247,19 @@ class StreamingSession(BasePrefixCache):
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key))
+        prefix_len = min(
+            req.kv_committed_len,
+            req.kv.kv_allocated_len,
+            len(params.key),
+        )
 
-        # Streaming sessions are append-only (session_controller rollback
-        # ensures req_nodes always points to the last successful req).
-        assert prefix_len >= slot.cache_protected_len, (
+        # A legal truncate can move the logical tip below the radix-owned
+        # prefix. The one-token logit reserve can move the match one position
+        # below the logical tip as well.
+        protected_match_len = min(slot.cache_protected_len, prefix_len)
+        assert prefix_len >= protected_match_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
-            f"{slot.cache_protected_len=}"
+            f"{protected_match_len=}"
         )
 
         # Free orphaned tail: alloc_for_extend will overwrite
@@ -448,6 +456,36 @@ class StreamingSession(BasePrefixCache):
 
         self._free_slot_mamba(slot)
 
+    def truncate_session(self, session_id: str, target: int) -> None:
+        """Trim a session slot to an already-validated logical token index."""
+        slot = self.slots.get(session_id)
+        if slot is None or not slot.is_holding_kv:
+            assert target == 0
+            return
+
+        assert target >= 0
+        if target >= slot.kv_committed_len:
+            return
+
+        old_protected_len = slot.cache_protected_len
+        free_start = max(target, old_protected_len)
+        self._free_kv_aligned(
+            slot.req_pool_idx, free_start, slot.kv.kv_allocated_len
+        )
+
+        retained_len = target
+        if target < old_protected_len:
+            # A partial shared page cannot be overwritten in place. Retain
+            # only complete tree-owned pages and re-prefill the final partial
+            # page from token IDs on the next turn.
+            if self.page_size > 1:
+                retained_len = (target // self.page_size) * self.page_size
+            slot.cache_protected_len = retained_len
+
+        slot.kv.kv_allocated_len = min(slot.kv.kv_allocated_len, retained_len)
+        slot.kv_committed_len = target
+        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, target)
+
     def release_radix_session(self, session_id: str) -> None:
         self.inner.release_radix_session(session_id)
 
@@ -465,7 +503,7 @@ class StreamingSession(BasePrefixCache):
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
-                total += allocated - slot.cache_protected_len
+                total += max(0, allocated - slot.cache_protected_len)
         return total
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
@@ -481,8 +519,10 @@ class StreamingSession(BasePrefixCache):
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
-                total += allocated - max(
-                    slot.cache_protected_len, slot.kv.swa_evicted_seqlen
+                total += max(
+                    0,
+                    allocated
+                    - max(slot.cache_protected_len, slot.kv.swa_evicted_seqlen),
                 )
         return total
 
