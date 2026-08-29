@@ -2706,9 +2706,23 @@ class Scheduler(
             self._release_unadmitted_streaming_session(req)
         if not self._set_or_validate_priority(req):
             return
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.NULL
+            and self._abort_on_queued_limit(req)
+        ):
+            return
+        if self.disaggregation_mode not in (
+            DisaggregationMode.NULL,
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+        if not req.finished():
+            self._admit_streaming_session_request(req)
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if self._abort_on_queued_limit(req):
-                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2724,8 +2738,6 @@ class Scheduler(
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
                 req.time_stats.set_retract_time()
-        else:
-            raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2767,9 +2779,9 @@ class Scheduler(
             req.session.abort_req()
 
     def _admit_streaming_session_request(self, req: Req) -> None:
-        """Commit a streaming-session transaction at model admission.
+        """Commit a streaming-session transaction at scheduler admission.
 
-        :param req: Request selected for an executable prefill attempt.
+        :param req: Request accepted into scheduler-owned work.
         """
         if (
             req.session is not None
@@ -3351,7 +3363,6 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            self._admit_streaming_session_request(req)
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

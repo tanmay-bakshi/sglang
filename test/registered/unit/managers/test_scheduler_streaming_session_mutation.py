@@ -7,6 +7,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
     GetSessionInfoReqErrorOutput,
@@ -79,6 +80,7 @@ class TestStreamingSessionAdmission(CustomTestCase):
             time_stats=SimpleNamespace(
                 trace_ctx=MagicMock(),
                 wait_queue_entry_time=0.0,
+                set_wait_queue_entry_time=MagicMock(),
             ),
         )
         session.commit_prepared_req.side_effect = lambda request, tree_cache: setattr(
@@ -86,7 +88,7 @@ class TestStreamingSessionAdmission(CustomTestCase):
         )
         return req
 
-    def test_admission_commits_once_at_model_selection(self):
+    def test_admission_commits_once(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.tree_cache = MagicMock()
         req = self._request()
@@ -99,6 +101,46 @@ class TestStreamingSessionAdmission(CustomTestCase):
         )
         self.assertTrue(req.streaming_session_admitted)
         req.session.abort_req.assert_not_called()
+
+    def test_queue_rejection_precedes_transaction_commit(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler._set_or_validate_priority = MagicMock(return_value=True)
+        scheduler._abort_on_queued_limit = MagicMock(return_value=True)
+        scheduler.waiting_queue = []
+        req = self._request()
+
+        Scheduler._add_request_to_queue(scheduler, req)
+
+        req.session.commit_prepared_req.assert_not_called()
+        self.assertFalse(req.streaming_session_admitted)
+        self.assertEqual(scheduler.waiting_queue, [])
+
+    def test_queue_acceptance_commits_before_publication(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.tree_cache = MagicMock()
+        scheduler._set_or_validate_priority = MagicMock(return_value=True)
+        scheduler._abort_on_queued_limit = MagicMock(return_value=False)
+        scheduler.waiting_queue = []
+        req = self._request()
+
+        def assert_admitted_before_prefetch(request) -> None:
+            self.assertIs(request, req)
+            self.assertTrue(request.streaming_session_admitted)
+
+        scheduler._prefetch_kvcache = MagicMock(
+            side_effect=assert_admitted_before_prefetch
+        )
+
+        Scheduler._add_request_to_queue(scheduler, req)
+
+        req.session.commit_prepared_req.assert_called_once_with(
+            req, scheduler.tree_cache
+        )
+        scheduler._prefetch_kvcache.assert_called_once_with(req)
+        self.assertEqual(scheduler.waiting_queue, [req])
+        req.time_stats.set_wait_queue_entry_time.assert_called_once_with()
 
     def test_pre_admission_rejection_releases_session_owner(self):
         req = self._request()
