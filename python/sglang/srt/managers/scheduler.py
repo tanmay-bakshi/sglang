@@ -4245,7 +4245,6 @@ class Scheduler(
         if self.spec_algorithm.is_dflash() and self.draft_worker is not None:
             ret.update(self.draft_worker.cuda_graph_profile())
 
-
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0

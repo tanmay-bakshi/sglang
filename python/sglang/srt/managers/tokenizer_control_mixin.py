@@ -902,9 +902,7 @@ class TokenizerControlMixin:
         correlation_id = uuid.uuid4().hex
         future: asyncio.Future[
             GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput
-        ] = (
-            asyncio.get_running_loop().create_future()
-        )
+        ] = asyncio.get_running_loop().create_future()
         self.session_info_futures[correlation_id] = future
         self._dispatch_to_scheduler(
             GetSessionInfoReqInput(
