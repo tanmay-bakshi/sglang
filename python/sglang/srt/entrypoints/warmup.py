@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Final, List
 
 import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
+    GenerateReqInput,
+    OpenSessionReqInput,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -15,6 +19,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__file__)
 
 _warmup_registry = {}
+
+_STREAMING_SESSION_PREFIX_TOKENS: Final = 40_960
+_STREAMING_SESSION_DELTA_TOKENS: Final = 64
+_STREAMING_SESSION_BURST_TOKENS: Final = 8
+_STREAMING_SESSION_TOKEN_BASE: Final = 2_048
+_STREAMING_SESSION_TOKEN_SPAN: Final = 4_096
+_STREAMING_SESSION_EXTRA_KEY: Final = "streaming-session-small-extend-warmup-v1"
 
 
 def warmup(name: str):
@@ -36,6 +47,103 @@ async def execute_warmups(
             continue
         logger.info(f"Running warmup {warmup_name}")
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+
+
+def _streaming_session_warmup_tokens(length: int, offset: int = 0) -> list[int]:
+    """Build deterministic in-vocabulary token IDs for session warmup.
+
+    :param length: Number of token IDs to build.
+    :param offset: Offset within the deterministic token cycle.
+    :returns: Stable token IDs independent of tokenizer state.
+    """
+    return [
+        _STREAMING_SESSION_TOKEN_BASE
+        + ((offset + index) % _STREAMING_SESSION_TOKEN_SPAN)
+        for index in range(length)
+    ]
+
+
+async def _drain_streaming_session_warmup_request(
+    tokenizer_manager: TokenizerManager,
+    request: GenerateReqInput,
+) -> None:
+    """Consume one warmup request through its terminal response.
+
+    :param tokenizer_manager: Manager serving the warmup request.
+    :param request: Raw-token generation request to drain.
+    """
+    async for _ in tokenizer_manager.generate_request(request, None):
+        pass
+
+
+@warmup("streaming_session_small_extend")
+async def streaming_session_small_extend(
+    disaggregation_mode: str,
+    tokenizer_manager: TokenizerManager,
+) -> None:
+    """Warm the deep-session 64-token extend and 8-token decode shape.
+
+    :param disaggregation_mode: Active prefill/decode disaggregation mode.
+    :param tokenizer_manager: Manager that owns the streaming session.
+    :raises ValueError: If invoked for a disaggregated server.
+    """
+    if disaggregation_mode != "null":
+        raise ValueError(
+            "streaming_session_small_extend requires disaggregation_mode='null'."
+        )
+
+    session_id = await tokenizer_manager.open_session(
+        OpenSessionReqInput(
+            capacity_of_str_len=0,
+            streaming=True,
+        ),
+        None,
+    )
+    if session_id is None:
+        raise RuntimeError("Failed to open the streaming-session warmup session.")
+
+    try:
+        await _drain_streaming_session_warmup_request(
+            tokenizer_manager,
+            GenerateReqInput(
+                input_ids=_streaming_session_warmup_tokens(
+                    _STREAMING_SESSION_PREFIX_TOKENS
+                ),
+                session_params={"id": session_id, "rid": None},
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": 0,
+                },
+                stream=False,
+                log_metrics=False,
+                extra_key=_STREAMING_SESSION_EXTRA_KEY,
+            ),
+        )
+        await _drain_streaming_session_warmup_request(
+            tokenizer_manager,
+            GenerateReqInput(
+                input_ids=_streaming_session_warmup_tokens(
+                    _STREAMING_SESSION_DELTA_TOKENS,
+                    offset=_STREAMING_SESSION_PREFIX_TOKENS,
+                ),
+                session_params={"id": session_id, "rid": None},
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": _STREAMING_SESSION_BURST_TOKENS,
+                    "ignore_eos": True,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+                stream=True,
+                log_metrics=False,
+                extra_key=_STREAMING_SESSION_EXTRA_KEY,
+            ),
+        )
+    finally:
+        await tokenizer_manager.close_session(
+            CloseSessionReqInput(session_id=session_id),
+            None,
+        )
 
 
 @warmup("whisper_autodetect")
