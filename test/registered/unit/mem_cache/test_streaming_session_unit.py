@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,9 +15,13 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeAllocator:
     def __init__(self):
         self.freed = []
+        self.freed_swa = []
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
+
+    def free_swa(self, free_index: torch.Tensor):
+        self.freed_swa.append(free_index.clone())
 
 
 class _FakeReqToTokenPool:
@@ -29,10 +34,18 @@ class _FakeReqToTokenPool:
 
 
 class _FakeInnerCache:
-    def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
+    def __init__(
+        self,
+        req_to_token_pool,
+        allocator,
+        page_size,
+        match_results=None,
+        sliding_window_size=None,
+    ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
+        self.sliding_window_size = sliding_window_size
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
 
@@ -49,6 +62,9 @@ class _FakeInnerCache:
 
     def supports_mamba(self):
         return False
+
+    def supports_swa(self):
+        return self.sliding_window_size is not None
 
     def sanity_check(self):
         return None
@@ -72,7 +88,10 @@ class _FakeReq:
             swa_evicted_seqlen=0,
         )
         self.origin_input_ids = list(range(committed))
+        self.origin_input_ids_unpadded = self.origin_input_ids
         self.output_ids = []
+        self.streaming_session_floor = 0
+        self.streaming_session_commit_to = None
         self.extra_key = None
         self.last_node = None
         self.cache_protected_len = 0
@@ -85,6 +104,11 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.c4_state_alloc_offset = 0
+        self.c128_state_alloc_offset = 0
+        self.time_stats = SimpleNamespace(
+            increment_streaming_session_abort_with_slot_preserved=lambda: None
+        )
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -197,6 +221,64 @@ def test_nth_mid_abort_preserves_session_slot():
     assert req.kv is None
 
 
+def test_committed_append_becomes_abort_rollback_boundary():
+    page_size = 1
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=70, allocated=75)
+    req.streaming_session_commit_to = 60
+    req.streaming_session_floor = 60
+    req.finished_reason = FINISH_ABORT("client disconnected")
+
+    tree_cache.cache_finished_req(req)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 70
+    assert slot.kv.kv_allocated_len == 70
+    assert slot.streaming_session_floor == 60
+    assert allocator.freed[0].tolist() == list(range(70, 75))
+
+
+def test_incomplete_committed_append_retires_physical_slot():
+    page_size = 1
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
+    req.origin_input_ids = list(range(70))
+    req.origin_input_ids_unpadded = req.origin_input_ids
+    req.streaming_session_commit_to = 60
+    req.streaming_session_floor = 60
+    req.finished_reason = FINISH_ABORT("prefill interrupted")
+
+    tree_cache.cache_finished_req(req)
+
+    assert "session-a" not in tree_cache.slots
+    assert req.req_pool_idx is None
+    assert req.kv is None
+    assert req_to_token_pool.free_slots == [0]
+    assert allocator.freed[0].tolist() == list(range(65))
+
+
 # Shrink tests removed: streaming sessions are append-only after the
 # rollback fix in session_controller (rollback_aborted_req).  The shrink
 # code path in cache_finished_req no longer exists.
@@ -287,6 +369,97 @@ def test_truncate_below_protected_reprefills_partial_shared_page():
     assert slot.cache_protected_len == 32
     assert slot.tree_protected_len == 64
     assert allocator.freed[0].tolist() == list(range(64, 80))
+
+
+def test_floor_round_trip_and_detached_swa_reconciliation():
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            req_to_token_pool,
+            allocator,
+            page_size,
+            sliding_window_size=32,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=112,
+        kv=SimpleNamespace(kv_allocated_len=112, swa_evicted_seqlen=32),
+        streaming_session_floor=64,
+        cache_protected_len=32,
+    )
+    assert tree_cache.session_held_swa_tokens() == 80
+
+    tree_cache.commit_session("session-a", 96)
+    tree_cache.commit_session("session-a", 96)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.streaming_session_floor == 96
+    assert slot.kv.swa_evicted_seqlen == 64
+    assert len(allocator.freed_swa) == 1
+    assert allocator.freed_swa[0].tolist() == list(range(32, 64))
+    assert tree_cache.session_held_swa_tokens() == 48
+
+    req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
+    slot.restore_to_req(req)
+    assert req.streaming_session_floor == 96
+
+    tree_cache.commit_session("session-a", 112)
+    assert slot.kv.swa_evicted_seqlen == 80
+    assert tree_cache.session_held_swa_tokens() == 32
+
+
+def test_active_swa_eviction_is_clamped_by_streaming_floor():
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        cache_protected_len=0,
+        swa_evict_floor=0,
+        streaming_session_floor=80,
+        kv=SimpleNamespace(swa_evicted_seqlen=0),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        112,
+        sliding_window_size=32,
+        page_size=16,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.swa_evicted_seqlen == 48
+    assert allocator.freed_swa[0].tolist() == list(range(48))
+
+
+def test_non_session_swa_eviction_keeps_existing_frontier():
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        req_pool_idx=0,
+        cache_protected_len=0,
+        swa_evict_floor=0,
+        streaming_session_floor=None,
+        kv=SimpleNamespace(swa_evicted_seqlen=0),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        112,
+        sliding_window_size=32,
+        page_size=16,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.swa_evicted_seqlen == 80
+    assert allocator.freed_swa[0].tolist() == list(range(80))
 
 
 def test_subpage_truncate_retires_slot_and_reallocates_fresh_owner():

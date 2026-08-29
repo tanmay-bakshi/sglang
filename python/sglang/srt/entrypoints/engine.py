@@ -1179,6 +1179,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        manual_commit: bool = False,
     ) -> str:
         """Open a session for multi-turn conversation with shared context.
 
@@ -1189,6 +1190,8 @@ class Engine(EngineScoreMixin, EngineBase):
             timeout: If set, the session is automatically closed after being inactive
                 for this many seconds. Inactivity is measured from session open or the
                 most recent request submission.
+            manual_commit: Advance the streaming-session rollback floor only through
+                explicit ``commit_to`` request riders.
 
         Returns:
             The session ID (either the provided one or a newly generated UUID).
@@ -1198,6 +1201,7 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             streaming=streaming,
             timeout=timeout,
+            manual_commit=manual_commit,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.open_session(obj, None)

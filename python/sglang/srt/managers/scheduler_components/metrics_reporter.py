@@ -932,6 +932,9 @@ class SchedulerMetricsReporter:
             self.stats.streaming_session_held_tokens = (
                 self.scheduler.pool_stats_observer.session_held_tokens()
             )
+            self.stats.streaming_session_held_swa_tokens = (
+                self.scheduler.pool_stats_observer.session_held_swa_tokens()
+            )
 
             # Routing key metrics
             # (to reduce the overhead, we only compute this when all requests have routing_key)
@@ -1142,6 +1145,9 @@ class SchedulerMetricsReporter:
         )
         self.stats.streaming_session_held_tokens = (
             self.scheduler.pool_stats_observer.session_held_tokens()
+        )
+        self.stats.streaming_session_held_swa_tokens = (
+            self.scheduler.pool_stats_observer.session_held_swa_tokens()
         )
 
         priority_enabled = self.scheduler.enable_priority_scheduling

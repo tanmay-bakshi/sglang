@@ -135,6 +135,9 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Absolute token position to retain before appending this request's input.
     # Streaming sessions apply the truncation only after request validation.
     truncate_to: int | None = None
+    # Absolute token position to commit as the session rollback floor after
+    # truncation and append have been applied.
+    commit_to: int | None = None
 
 
 # Type definitions for multimodal input data
@@ -2073,6 +2076,7 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
+    manual_commit: bool = False
 
 
 class CloseSessionReqInput(BaseReq, kw_only=True):

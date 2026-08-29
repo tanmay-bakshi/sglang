@@ -625,6 +625,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    def increment_streaming_session_truncation(self) -> None:
+        if self.enable_metrics:
+            self.metrics_collector.increment_streaming_session_truncation()
+
+    def increment_streaming_session_commit(self) -> None:
+        if self.enable_metrics:
+            self.metrics_collector.increment_streaming_session_commit()
+
+    def increment_streaming_session_abort_with_slot_preserved(self) -> None:
+        if self.enable_metrics:
+            self.metrics_collector.increment_streaming_session_abort_with_slot_preserved()
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:

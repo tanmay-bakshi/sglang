@@ -44,6 +44,27 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+def streaming_session_swa_eviction_threshold(
+    pre_len: int,
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    streaming_session_floor: int | None,
+    is_chunk_cache: bool = False,
+) -> int:
+    """Return the page-aligned SWA eviction frontier for one request."""
+    if streaming_session_floor is not None:
+        pre_len = min(pre_len, streaming_session_floor)
+
+    retention = (
+        sliding_window_size if is_chunk_cache else max(sliding_window_size, page_size)
+    )
+    threshold = max(0, pre_len - retention)
+    if page_size > 1:
+        threshold = page_align_floor(threshold, page_size)
+    return threshold
+
+
 def free_swa_out_of_window_slots(
     req: Req,
     pre_len: int,
@@ -66,16 +87,13 @@ def free_swa_out_of_window_slots(
         evict_floor = -(-evict_floor // page_size) * page_size
     req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
 
-    if is_chunk_cache:
-        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
-        # up to the window boundary (the trailing floor keeps it page-aligned).
-        evict_threshold = pre_len - sliding_window_size
-    else:
-        # Radix cache: keep max(window, page). The trailing floor page-aligns the
-        # frontier, and subtracting at least one page keeps it below the insert
-        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
-        # No extra page margin is needed.
-        evict_threshold = pre_len - max(sliding_window_size, page_size)
+    evict_threshold = streaming_session_swa_eviction_threshold(
+        pre_len,
+        sliding_window_size=sliding_window_size,
+        page_size=page_size,
+        streaming_session_floor=getattr(req, "streaming_session_floor", None),
+        is_chunk_cache=is_chunk_cache,
+    )
     new_swa_evicted_seqlen = max(
         req.kv.swa_evicted_seqlen,
         evict_threshold,

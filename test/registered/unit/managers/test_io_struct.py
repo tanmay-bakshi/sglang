@@ -1,7 +1,11 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    OpenSessionReqInput,
+    SessionParams,
+)
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -617,6 +621,13 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req.is_single)
         self.assertEqual(req.batch_size, 1)
         self.assertEqual(req.sampling_params["max_new_tokens"], 0)
+
+    def test_streaming_session_commit_fields_have_safe_defaults(self):
+        params = SessionParams(id="session-a")
+        open_req = OpenSessionReqInput(capacity_of_str_len=0)
+
+        self.assertIsNone(params.commit_to)
+        self.assertFalse(open_req.manual_commit)
 
     def test_ordinary_request_rejects_empty_token_input(self):
         req = GenerateReqInput(input_ids=[])

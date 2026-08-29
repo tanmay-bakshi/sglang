@@ -781,6 +781,10 @@ class Req(ReqDllmMixin):
         self.session = session
         self.session_id = session_id
         self.streaming_session_truncate_to: int | None = None
+        self.streaming_session_commit_to: int | None = None
+        # None distinguishes ordinary requests from a streaming session whose
+        # valid rollback floor is token zero.
+        self.streaming_session_floor: int | None = None
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
@@ -3125,6 +3129,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # evictable so SWA LRU can reclaim it under pressure.
                     if (
                         release_leaf_lock
+                        and getattr(req, "streaming_session_floor", None) is None
                         and not req.swa_prefix_lock_released
                         and req.swa_uuid_for_lock is not None
                         and req.last_node is not None

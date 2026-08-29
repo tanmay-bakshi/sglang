@@ -89,9 +89,12 @@ _OWNER_SITES = {
     (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 2,
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
-    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 2,
-    # Inherit the authoritative finished length (not the lagging req clock).
-    (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    # The third allocated-length mutation retires an incomplete physical slot
+    # while preserving an explicitly committed logical append for rebuild.
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 3,
+    # Inherit the authoritative finished length (not the lagging req clock),
+    # including the pre-burst boundary established by an explicit commit.
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 2,
     (_SS, "StreamingSession.truncate_session", "kv_allocated_len"): 1,
     (_SS, "StreamingSession.truncate_session", "kv_committed_len"): 1,
 }

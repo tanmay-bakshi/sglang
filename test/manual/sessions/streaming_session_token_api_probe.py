@@ -145,7 +145,7 @@ def _qualify_truncate_case(
     :param target: Absolute truncation target.
     :param delta: Tokens appended after truncation.
     """
-    hot_session = client.open()
+    hot_session = client.open(manual_commit=True)
     fresh_session = client.open()
     try:
         seed = client.generate(
@@ -187,7 +187,7 @@ def run_truncate_qualification(base_url: str) -> None:
     _qualify_truncate_case(client, base_context, 1_900, delta)
     _qualify_truncate_case(client, base_context, 35, delta)
 
-    session_id = client.open()
+    session_id = client.open(manual_commit=True)
     try:
         seed = client.generate(session_id, base_context, max_new_tokens=8)
         no_op = client.generate(
@@ -232,15 +232,119 @@ def run_truncate_qualification(base_url: str) -> None:
         client.close(session_id)
 
 
+def _qualify_commit_case(
+    client: SessionClient,
+    base_context: list[int],
+    floor: int,
+    target: int,
+    delta: list[int],
+) -> None:
+    """Compare a floor-pinned rewind with an exact fresh-session oracle.
+
+    :param client: Live session client.
+    :param base_context: Context extending more than one SWA window past floor.
+    :param floor: Explicit rollback floor.
+    :param target: Truncation target at or above floor.
+    :param delta: Tokens appended after truncation.
+    """
+    hot_session = client.open(manual_commit=True)
+    fresh_session = client.open()
+    try:
+        client.generate(
+            hot_session,
+            base_context[:floor],
+            max_new_tokens=0,
+            commit_to=floor,
+        )
+        extended = client.generate(
+            hot_session,
+            base_context[floor:],
+            max_new_tokens=0,
+        )
+        assert extended.tip == len(base_context)
+
+        hot = client.generate(
+            hot_session,
+            delta,
+            max_new_tokens=16,
+            truncate_to=target,
+        )
+        fresh = client.generate(
+            fresh_session,
+            base_context[:target] + delta,
+            max_new_tokens=16,
+        )
+        assert hot.output_ids == fresh.output_ids, (
+            f"floor-pinned greedy mismatch at floor={floor}, target={target}: "
+            f"hot={hot.output_ids}, fresh={fresh.output_ids}"
+        )
+    finally:
+        client.close(hot_session)
+        client.close(fresh_session)
+
+
+def run_commit_qualification(base_url: str) -> None:
+    """Run Stage 3 commit-floor and SWA-pin acceptance cases.
+
+    :param base_url: Live inference server URL.
+    """
+    client = SessionClient(base_url)
+    base_context = list(range(10_000, 14_608))
+    floor = 2_048
+    delta = list(range(20_000, 20_064))
+    assert len(base_context) - floor > 1_024
+
+    for target in (floor, floor + 257, len(base_context) - 1):
+        _qualify_commit_case(client, base_context, floor, target, delta)
+
+    session_id = client.open(manual_commit=True)
+    try:
+        seeded = client.generate(
+            session_id,
+            base_context,
+            max_new_tokens=0,
+            commit_to=floor,
+        )
+        committed = client.generate(
+            session_id,
+            [],
+            max_new_tokens=0,
+            commit_to=seeded.tip,
+        )
+        assert committed.tip == seeded.tip
+
+        response = requests.post(
+            base_url.rstrip("/") + "/generate",
+            json={
+                "input_ids": [],
+                "session_params": {
+                    "id": session_id,
+                    "rid": None,
+                    "commit_to": floor - 1,
+                },
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+            },
+            timeout=30,
+        )
+        assert response.status_code == 400, response.text
+
+        recovery = client.generate(session_id, delta, max_new_tokens=4)
+        assert recovery.cached_tokens in {seeded.tip - 1, seeded.tip}
+    finally:
+        client.close(session_id)
+
+
 def main() -> None:
     """Run the requested live qualification stage."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:32300")
-    parser.add_argument("--stage", choices=("truncate",), required=True)
+    parser.add_argument("--stage", choices=("truncate", "commit"), required=True)
     args = parser.parse_args()
 
     if args.stage == "truncate":
         run_truncate_qualification(args.base_url)
+    elif args.stage == "commit":
+        run_commit_qualification(args.base_url)
     print(f"streaming-session {args.stage} qualification passed")
 
 

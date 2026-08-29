@@ -150,6 +150,7 @@ class SchedulerStats:
     # Streaming session metrics
     num_streaming_sessions: int = 0
     streaming_session_held_tokens: int = 0
+    streaming_session_held_swa_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -658,6 +659,27 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            self.streaming_session_held_swa_tokens = Gauge(
+                name="sglang:streaming_session_held_swa_tokens",
+                documentation="The number of sliding-window KV tokens currently held by streaming session slots.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.streaming_session_truncations_total = Counter(
+                name="sglang:streaming_session_truncations_total",
+                documentation="Number of accepted streaming-session truncate riders.",
+                labelnames=labels.keys(),
+            )
+            self.streaming_session_commits_total = Counter(
+                name="sglang:streaming_session_commits_total",
+                documentation="Number of accepted streaming-session commit riders.",
+                labelnames=labels.keys(),
+            )
+            self.streaming_session_aborts_with_slot_preserved_total = Counter(
+                name="sglang:streaming_session_aborts_with_slot_preserved_total",
+                documentation="Number of streaming-session aborts that preserved a reusable KV slot.",
+                labelnames=labels.keys(),
+            )
 
         # =================================================================
         # Routing key metrics
@@ -1119,6 +1141,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
 
+    def increment_streaming_session_truncation(self) -> None:
+        self.streaming_session_truncations_total.labels(**self.labels).inc(1)
+
+    def increment_streaming_session_commit(self) -> None:
+        self.streaming_session_commits_total.labels(**self.labels).inc(1)
+
+    def increment_streaming_session_abort_with_slot_preserved(self) -> None:
+        self.streaming_session_aborts_with_slot_preserved_total.labels(
+            **self.labels
+        ).inc(1)
+
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
 
@@ -1366,6 +1399,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
             self._log_gauge(
                 self.streaming_session_held_tokens, stats.streaming_session_held_tokens
+            )
+            self._log_gauge(
+                self.streaming_session_held_swa_tokens,
+                stats.streaming_session_held_swa_tokens,
             )
 
         # Routing key metrics

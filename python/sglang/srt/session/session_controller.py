@@ -87,12 +87,15 @@ class Session:
         streaming: bool = False,
         timeout: Optional[float] = None,
         supports_mamba: bool = False,
+        manual_commit: bool = False,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
         self.supports_mamba = supports_mamba
+        self.manual_commit = manual_commit
+        self.floor: int = 0
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
@@ -103,6 +106,7 @@ class Session:
         self.committed_origin_len: Optional[int] = None
         self.committed_unpadded_len: Optional[int] = None
         self.committed_fill_len: Optional[int] = None
+        self.committed_output_len: Optional[int] = None
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -141,7 +145,8 @@ class Session:
         new input. Returns (input_ids, input_ids_unpadded, carry_fill);
         carry_fill (== the new origin) spares the first fill_ids rebuild.
         """
-        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+        assert self.committed_output_len is not None
+        out_tail = last_req.output_ids[: self.committed_output_len]
 
         input_ids = last_req.origin_input_ids
         del input_ids[self.committed_origin_len :]
@@ -180,13 +185,10 @@ class Session:
         """Materialize the last successful context from its split arrays."""
         assert self.committed_origin_len is not None
         assert self.committed_unpadded_len is not None
+        assert self.committed_output_len is not None
 
-        output_ids = last_req.output_ids[
-            : last_req.sampling_params.max_new_tokens
-        ]
-        input_ids = array(
-            "q", last_req.origin_input_ids[: self.committed_origin_len]
-        )
+        output_ids = last_req.output_ids[: self.committed_output_len]
+        input_ids = array("q", last_req.origin_input_ids[: self.committed_origin_len])
         input_ids.extend(output_ids)
 
         input_ids_unpadded = array(
@@ -215,13 +217,19 @@ class Session:
         self.committed_origin_len = len(input_ids)
         self.committed_unpadded_len = len(input_ids_unpadded)
         self.committed_fill_len = len(input_ids)
+        self.committed_output_len = 0
 
-    @staticmethod
     def _concat_token_arrays(
-        last_req: Req, req: TokenizedGenerateReqInput, session_params
+        self, last_req: Req, req: TokenizedGenerateReqInput, session_params
     ):
         """Copy-based assembly for replace/offset/drop_previous_output turns."""
-        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+        output_len = (
+            self.committed_output_len
+            if self.streaming
+            else last_req.sampling_params.max_new_tokens
+        )
+        assert output_len is not None
+        out_tail = last_req.output_ids[:output_len]
 
         input_ids = last_req.origin_input_ids + out_tail
         if session_params.drop_previous_output:
@@ -279,23 +287,50 @@ class Session:
                 [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
 
-            if not abort and session_params.truncate_to is not None:
+            if last_req is not None:
+                self._strip_bos_token(req, tokenizer)
+
+            if not abort:
                 if last_req is None:
                     tip = 0
                 else:
                     input_ids, _ = self._committed_token_arrays(last_req)
                     tip = len(input_ids)
+
+                truncate_target = session_params.truncate_to
+                if truncate_target is None:
+                    truncate_target = tip
+
+            if not abort and session_params.truncate_to is not None:
                 if not 0 <= session_params.truncate_to <= tip:
                     abort = True
                     abort_message = (
-                        "Streaming session truncate_to must be between 0 and "
+                        "Streaming session truncate_to must be between the commit "
+                        f"floor ({self.floor}) and "
                         f"the current tip ({tip}), got {session_params.truncate_to}."
+                    )
+                elif session_params.truncate_to < self.floor:
+                    abort = True
+                    abort_message = (
+                        "Streaming session truncate_to must be between the commit "
+                        f"floor ({self.floor}) and the current tip ({tip}), got "
+                        f"{session_params.truncate_to}."
                     )
                 elif self.supports_mamba and session_params.truncate_to < tip:
                     abort = True
                     abort_message = (
                         "Streaming sessions backed by recurrent state do not support "
                         "truncate_to below the current tip."
+                    )
+
+            if not abort and session_params.commit_to is not None:
+                post_append_tip = truncate_target + len(req.input_ids)
+                if not self.floor <= session_params.commit_to <= post_append_tip:
+                    abort = True
+                    abort_message = (
+                        "Streaming session commit_to must be between the current "
+                        f"commit floor ({self.floor}) and the post-append tip "
+                        f"({post_append_tip}), got {session_params.commit_to}."
                     )
         elif len(req.input_ids) == 0:
             abort = True
@@ -328,7 +363,6 @@ class Session:
 
         carry_fill = None
         if last_req is not None:
-            self._strip_bos_token(req, tokenizer)
             # In-place sharing is only safe for the plain streaming append:
             # streaming sessions allow a single inflight request, last_req has
             # finished, and the committed_* lengths recorded by finish_req let
@@ -336,10 +370,12 @@ class Session:
             # offset / drop_previous_output rewrite history and must copy.
             can_share_token_arrays = (
                 self.streaming
+                and not abort
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
                 and not (session_params.offset and session_params.offset != 0)
                 and session_params.truncate_to is None
+                and session_params.commit_to is None
             )
             if self.streaming and session_params.truncate_to is not None and not abort:
                 input_ids, input_ids_unpadded = self._committed_token_arrays(last_req)
@@ -403,6 +439,12 @@ class Session:
             new_req.full_untruncated_fill_ids = carry_fill
         if not abort:
             new_req.streaming_session_truncate_to = session_params.truncate_to
+            new_req.streaming_session_commit_to = session_params.commit_to
+            new_req.streaming_session_floor = (
+                session_params.commit_to
+                if session_params.commit_to is not None
+                else self.floor
+            )
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
@@ -419,25 +461,60 @@ class Session:
 
     def commit_prepared_req(self, req: Req, tree_cache: BasePrefixCache) -> None:
         """Commit irreversible session mutations after scheduler validation."""
-        target = req.streaming_session_truncate_to
-        if target is None:
+        truncate_target = req.streaming_session_truncate_to
+        if truncate_target is not None:
+            tree_cache.truncate_session(self.session_id, truncate_target)
+            self._truncate_token_arrays(truncate_target)
+            req.time_stats.increment_streaming_session_truncation()
+
+        commit_target = req.streaming_session_commit_to
+        if commit_target is None:
             return
 
-        tree_cache.truncate_session(self.session_id, target)
-        self._truncate_token_arrays(target)
+        self.floor = commit_target
+        req.streaming_session_floor = commit_target
+        self._adopt_preburst_context(req)
+        tree_cache.commit_session(self.session_id, commit_target)
+        req.time_stats.increment_streaming_session_commit()
+
+    def _adopt_preburst_context(self, req: Req) -> None:
+        """Make an explicitly committed append the durable abort boundary."""
+        if len(self.req_nodes) > 0:
+            [prev_node] = self.req_nodes.values()
+            if prev_node.req is not req:
+                prev_node.req.session = None
+            self.req_nodes.clear()
+        self.req_nodes[req.rid] = SessionReqNode(req)
+
+        req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
+        self.committed_origin_len = len(req.origin_input_ids)
+        self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
+        self.committed_fill_len = len(req.full_untruncated_fill_ids)
+        self.committed_output_len = 0
 
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
-            prev_node.req.session = None
+            if prev_node.req is not req:
+                prev_node.req.session = None
             self.req_nodes.clear()
         self.req_nodes[req.rid] = SessionReqNode(req)
+
+        finished_len = (
+            req.finished_len if req.finished_len is not None else len(req.output_ids)
+        )
+        tip = len(req.origin_input_ids) + finished_len
+        if not self.manual_commit:
+            self.floor = tip
+        req.streaming_session_floor = self.floor
+
         # Confirm this req's token arrays as the session's rollback point.
         self.committed_origin_len = len(req.origin_input_ids)
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
+        self.committed_output_len = finished_len
 
     def abort_req(self):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
@@ -471,6 +548,7 @@ class SessionController:
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
                 supports_mamba=self.tree_cache.supports_mamba(),
+                manual_commit=recv_req.manual_commit,
             )
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"

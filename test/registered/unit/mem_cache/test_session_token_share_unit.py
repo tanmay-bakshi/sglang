@@ -25,7 +25,13 @@ from sglang.test.test_utils import CustomTestCase
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8, truncate_to=None):
+def _recv(
+    rid,
+    input_ids,
+    max_new_tokens=8,
+    truncate_to=None,
+    commit_to=None,
+):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
@@ -37,6 +43,7 @@ def _recv(rid, input_ids, max_new_tokens=8, truncate_to=None):
             replace=False,
             drop_previous_output=False,
             truncate_to=truncate_to,
+            commit_to=commit_to,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
@@ -61,7 +68,12 @@ def _recv(rid, input_ids, max_new_tokens=8, truncate_to=None):
 class TestSessionTokenShare(CustomTestCase):
 
     def setUp(self):
-        self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
+        self.session = Session(
+            capacity_of_str_len=0,
+            session_id="s",
+            streaming=True,
+            manual_commit=True,
+        )
 
     def test_controller_captures_recurrent_cache_capability(self):
         tree_cache = SimpleNamespace(supports_mamba=lambda: True)
@@ -78,13 +90,21 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertTrue(result.success)
         self.assertTrue(controller.get("mamba-session").supports_mamba)
 
-    def _create(self, rid, input_ids, max_new_tokens=8, truncate_to=None):
+    def _create(
+        self,
+        rid,
+        input_ids,
+        max_new_tokens=8,
+        truncate_to=None,
+        commit_to=None,
+    ):
         return self.session.create_req(
             _recv(
                 rid,
                 input_ids,
                 max_new_tokens=max_new_tokens,
                 truncate_to=truncate_to,
+                commit_to=commit_to,
             ),
             tokenizer=None,
             vocab_size=VOCAB,
@@ -220,6 +240,79 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertFalse(self.session._inflight)
         self.assertEqual(list(r1.origin_input_ids), origin_before)
         self.assertEqual(list(r1.output_ids), output_before)
+
+    def test_default_mode_auto_commits_successful_tip(self):
+        session = Session(
+            capacity_of_str_len=0,
+            session_id="auto",
+            streaming=True,
+        )
+        first = session.create_req(
+            _recv("r1", [1, 2, 3]),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        first.output_ids.extend([4, 5])
+        first._refresh_fill_ids()
+        session.finish_req(first)
+
+        self.assertEqual(session.floor, 5)
+        self.assertEqual(first.streaming_session_floor, 5)
+
+    def test_manual_commit_persists_appended_context_across_abort(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4, 5])
+        self.assertEqual(self.session.floor, 0)
+
+        second = self._create("r2", [6, 7], commit_to=7)
+        cache = SimpleNamespace(calls=[])
+        cache.truncate_session = lambda session_id, target: cache.calls.append(
+            ("truncate", session_id, target)
+        )
+        cache.commit_session = lambda session_id, floor: cache.calls.append(
+            ("commit", session_id, floor)
+        )
+        self.session.commit_prepared_req(second, cache)
+
+        self.assertEqual(cache.calls, [("commit", "s", 7)])
+        self.assertEqual(self.session.floor, 7)
+        second.output_ids.extend([8, 9])
+        second._refresh_fill_ids()
+        self.session.abort_req()
+
+        third = self._create("r3", [10])
+        self.assertEqual(list(third.origin_input_ids), list(range(1, 8)) + [10])
+        self.assertEqual(third.streaming_session_floor, 7)
+
+    def test_commit_and_truncate_validation_are_non_destructive(self):
+        first = self._create("r1", [1, 2, 3, 4])
+        self._decode_and_finish(first, [5, 6])
+
+        commit = self._create("commit", [], max_new_tokens=0, commit_to=4)
+        cache = SimpleNamespace(
+            truncate_session=lambda session_id, target: None,
+            commit_session=lambda session_id, floor: None,
+        )
+        self.session.commit_prepared_req(commit, cache)
+        commit.update_finish_state()
+        self.session.finish_req(commit)
+        self.assertEqual(self.session.floor, 4)
+
+        origin_before = list(commit.origin_input_ids)
+        output_before = list(commit.output_ids)
+        with get_parallel().override(tp_rank=0):
+            below_floor = self._create("below", [9], truncate_to=3)
+        self.assertIsNotNone(below_floor.to_finish)
+        self.assertFalse(self.session._inflight)
+        self.assertEqual(list(commit.origin_input_ids), origin_before)
+        self.assertEqual(list(commit.output_ids), output_before)
+
+        with get_parallel().override(tp_rank=0):
+            past_post_append_tip = self._create("past", [9], commit_to=8)
+        self.assertIsNotNone(past_post_append_tip.to_finish)
+        self.assertFalse(self.session._inflight)
+        self.assertEqual(list(commit.origin_input_ids), origin_before)
+        self.assertEqual(list(commit.output_ids), output_before)
 
     def test_recurrent_session_rejects_rewind_non_destructively(self):
         session = Session(

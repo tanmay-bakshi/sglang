@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_evict_dsv4_state_on_swa,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -19,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import streaming_session_swa_eviction_threshold
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -48,6 +52,7 @@ class SessionSlot:
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
     kv: Optional[ReqKvInfo] = None
+    streaming_session_floor: int = 0
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
@@ -62,6 +67,11 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
+    # DSV4 compressed-state watermarks follow the same detached ownership as
+    # the request row and must advance with an off-request SWA reconciliation.
+    c4_state_alloc_offset: int = 0
+    c128_state_alloc_offset: int = 0
+
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -72,6 +82,8 @@ class SessionSlot:
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv = copy.copy(req.kv)
+        assert req.streaming_session_floor is not None
+        self.streaming_session_floor = req.streaming_session_floor
 
         if is_first:
             self.last_node = req.last_node
@@ -84,6 +96,8 @@ class SessionSlot:
         self.mamba_next_track_idx = req.mamba_next_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
+        self.c4_state_alloc_offset = getattr(req, "c4_state_alloc_offset", 0)
+        self.c128_state_alloc_offset = getattr(req, "c128_state_alloc_offset", 0)
 
         # Ownership has transferred to the slot. Null *all* of the req's
         # references so any later alloc()/free path that inspects the req
@@ -107,12 +121,15 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
+        req.streaming_session_floor = self.streaming_session_floor
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+        req.c4_state_alloc_offset = self.c4_state_alloc_offset
+        req.c128_state_alloc_offset = self.c128_state_alloc_offset
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -333,12 +350,32 @@ class StreamingSession(BasePrefixCache):
                 return True
 
             rollback_len = slot.kv_committed_len
+            durable_commit = req.streaming_session_commit_to is not None
+            if durable_commit:
+                rollback_len = len(req.origin_input_ids)
+                if (
+                    req.kv_committed_len < rollback_len
+                    or req.kv.kv_allocated_len < rollback_len
+                ):
+                    slot.kv.kv_allocated_len = max(
+                        slot.kv.kv_allocated_len, req.kv.kv_allocated_len
+                    )
+                    self.release_session(session_id)
+                    req.req_pool_idx = None
+                    req.kv = None
+                    req.mamba_pool_idx = None
+                    req.mamba_ping_pong_track_buffer = None
+                    req.session.abort_req()
+                    return True
+
             slot.kv.kv_allocated_len = max(
                 slot.kv.kv_allocated_len, req.kv.kv_allocated_len
             )
             self._free_tail(slot, req, rollback_len)
             slot.save_from_req(req, is_first=False)
+            slot.kv_committed_len = rollback_len
             req.session.abort_req()
+            req.time_stats.increment_streaming_session_abort_with_slot_preserved()
             return True
 
         if is_first:
@@ -351,15 +388,14 @@ class StreamingSession(BasePrefixCache):
         target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
+        req.session.finish_req(req)
         slot.save_from_req(req, is_first=is_first)
         # Inherit the authoritative finished length on the slot, not the lagging
         # req clock (under overlap + honest committed the clock lags the in-flight
         # verify by ~1, which would short-change inheritance). Clamp to allocated
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
-
-        # Update req_nodes to this successfully finished request.
-        req.session.finish_req(req)
+        self._reconcile_slot_swa(slot)
 
         return True
 
@@ -468,6 +504,14 @@ class StreamingSession(BasePrefixCache):
             return
 
         old_protected_len = slot.cache_protected_len
+        if self.supports_swa() and target >= old_protected_len:
+            retention = max(self.sliding_window_size, self.page_size)
+            latest_safe_watermark = max(old_protected_len, target - retention)
+            assert slot.kv.swa_evicted_seqlen <= latest_safe_watermark, (
+                "streaming-session SWA pin invariant violated: required rollback "
+                f"KV was already evicted ({slot.kv.swa_evicted_seqlen=} > "
+                f"{latest_safe_watermark=})"
+            )
         retained_len = target
         if target < old_protected_len:
             # A partial shared page cannot be overwritten in place. Retain
@@ -486,16 +530,55 @@ class StreamingSession(BasePrefixCache):
             return
 
         free_start = max(target, old_protected_len)
-        self._free_kv_aligned(
-            slot.req_pool_idx, free_start, slot.kv.kv_allocated_len
-        )
+        self._free_kv_aligned(slot.req_pool_idx, free_start, slot.kv.kv_allocated_len)
         slot.cache_protected_len = min(old_protected_len, retained_len)
 
         slot.kv.kv_allocated_len = min(slot.kv.kv_allocated_len, retained_len)
         slot.kv_committed_len = retained_len
-        slot.kv.swa_evicted_seqlen = min(
-            slot.kv.swa_evicted_seqlen, retained_len
+        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, retained_len)
+
+    def commit_session(self, session_id: str, floor: int) -> None:
+        """Advance a detached slot's rollback floor and release obsolete SWA."""
+        slot = self.slots.get(session_id)
+        if slot is None:
+            return
+
+        assert floor >= slot.streaming_session_floor
+        slot.streaming_session_floor = floor
+        self._reconcile_slot_swa(slot)
+
+    def _reconcile_slot_swa(self, slot: SessionSlot) -> None:
+        """Apply the active-request SWA frontier to a detached session slot."""
+        if not slot.is_holding_kv or not self.supports_swa():
+            return
+
+        threshold = streaming_session_swa_eviction_threshold(
+            slot.kv_committed_len,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            streaming_session_floor=slot.streaming_session_floor,
         )
+        new_watermark = max(
+            slot.kv.swa_evicted_seqlen,
+            slot.cache_protected_len,
+            threshold,
+        )
+        if self.page_size > 1:
+            new_watermark = (new_watermark // self.page_size) * self.page_size
+        if new_watermark <= slot.kv.swa_evicted_seqlen:
+            return
+
+        free_slots = self.req_to_token_pool.req_to_token[
+            slot.req_pool_idx, slot.kv.swa_evicted_seqlen : new_watermark
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots)
+        maybe_evict_dsv4_state_on_swa(
+            self.token_to_kv_pool_allocator,
+            self.req_to_token_pool,
+            slot,
+            new_watermark,
+        )
+        slot.kv.swa_evicted_seqlen = new_watermark
 
     def release_radix_session(self, session_id: str) -> None:
         self.inner.release_radix_session(session_id)
