@@ -884,19 +884,31 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     ):
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        terminal_completion = asyncio.Event()
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
+                    meta_info = out.get("meta_info")
+                    if (
+                        isinstance(meta_info, dict)
+                        and meta_info.get("finish_reason") is not None
+                    ):
+                        terminal_completion.set()
                     yield b"data: " + dumps_json(out) + b"\n\n"
+                terminal_completion.set()
             except StreamingSessionConflictError as error:
+                terminal_completion.set()
                 yield (
                     b"data: "
                     + dumps_json(_streaming_session_conflict_error_payload(error))
                     + b"\n\n"
                 )
+            except HTTPException:
+                terminal_completion.set()
+                raise
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -914,13 +926,17 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     }
                 }
                 logger.error(f"[http_server] Error: {e}")
+                terminal_completion.set()
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_results(),
             media_type="text/event-stream",
-            background=_global_state.tokenizer_manager.create_abort_task(obj),
+            background=_global_state.tokenizer_manager.create_abort_task(
+                obj,
+                terminal_completion=terminal_completion,
+            ),
         )
     else:
         try:

@@ -2598,13 +2598,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         freeze_gc("Tokenizer Manager")
         return None
 
-    def create_abort_task(self, obj: GenerateReqInput):
+    def create_abort_task(
+        self,
+        obj: GenerateReqInput,
+        terminal_completion: asyncio.Event | None = None,
+    ) -> BackgroundTasks:
+        """Create disconnect cleanup for one streaming HTTP response.
+
+        :param obj: Generation request owned by the response.
+        :param terminal_completion: Response-local signal that the scheduler has
+            already terminalized this generation.
+        :returns: Deferred disconnect cleanup.
+        """
         if obj.decode_reservation_grant_id is not None:
             return BackgroundTasks()
 
         # Abort the request if the client is disconnected.
-        async def abort_request():
+        async def abort_request() -> None:
+            if terminal_completion is not None and terminal_completion.is_set():
+                return
             await asyncio.sleep(2)
+            if terminal_completion is not None and terminal_completion.is_set():
+                return
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
