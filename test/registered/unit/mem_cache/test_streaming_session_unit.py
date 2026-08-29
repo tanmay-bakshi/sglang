@@ -463,7 +463,7 @@ def test_streaming_floor_preserves_radix_owned_rollback_window():
     assert allocator.freed_swa == []
 
 
-def test_streaming_floor_preserves_forced_evict_prefix():
+def test_streaming_floor_rejects_unpersisted_forced_evict_prefix():
     req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
@@ -475,18 +475,18 @@ def test_streaming_floor_preserves_forced_evict_prefix():
         kv=SimpleNamespace(swa_evicted_seqlen=32),
     )
 
-    free_swa_out_of_window_slots(
-        req,
-        256,
-        sliding_window_size=64,
-        page_size=16,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=allocator,
-    )
+    with pytest.raises(RuntimeError, match="prefill-aware SWA"):
+        free_swa_out_of_window_slots(
+            req,
+            256,
+            sliding_window_size=64,
+            page_size=16,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+        )
 
-    assert req.kv.swa_evicted_seqlen == 192
-    assert len(allocator.freed_swa) == 1
-    assert allocator.freed_swa[0].tolist() == list(range(96, 192))
+    assert req.kv.swa_evicted_seqlen == 32
+    assert allocator.freed_swa == []
 
 
 def test_detached_floor_frees_only_session_owned_swa():
@@ -542,6 +542,60 @@ def test_truncate_rejects_logically_evicted_rollback_window():
 
     with pytest.raises(AssertionError, match="SWA pin invariant"):
         tree_cache.truncate_session("session-a", 2_048)
+
+
+def test_below_protected_truncate_rejects_evicted_rollback_window():
+    req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            req_to_token_pool,
+            allocator,
+            page_size=16,
+            sliding_window_size=32,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=128,
+        kv=SimpleNamespace(kv_allocated_len=128, swa_evicted_seqlen=32),
+        streaming_session_floor=16,
+        cache_protected_len=64,
+    )
+
+    with pytest.raises(AssertionError, match="SWA pin invariant"):
+        tree_cache.truncate_session("session-a", 48)
+
+
+def test_below_protected_truncate_keeps_page_aligned_rollback_window():
+    req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            req_to_token_pool,
+            allocator,
+            page_size=16,
+            sliding_window_size=32,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=128,
+        kv=SimpleNamespace(kv_allocated_len=128, swa_evicted_seqlen=16),
+        streaming_session_floor=16,
+        cache_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", 48)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.kv_committed_len == 48
+    assert slot.kv.kv_allocated_len == 48
+    assert slot.kv.swa_evicted_seqlen == 16
+    assert slot.cache_protected_len == 48
+    assert allocator.freed[0].tolist() == list(range(64, 128))
 
 
 def test_non_session_swa_eviction_keeps_existing_frontier():

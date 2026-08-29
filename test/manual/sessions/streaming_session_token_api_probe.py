@@ -1,10 +1,68 @@
 """Live qualification probe for the raw-token streaming-session API."""
 
 import argparse
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import requests
+from transformers import AutoTokenizer
+
+
+MODEL_PATH = "/models/gemma-4-31B-it-NVFP4"
+
+
+def _build_gemma4_context() -> tuple[list[int], list[int]]:
+    """Build a natural-token context with rollback-sensitive sentinels.
+
+    :returns: A 4,608-token context and a raw-token question delta.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    context = [tokenizer.bos_token_id]
+    context.extend(tokenizer.encode("<start_of_turn>user\n", add_special_tokens=False))
+    filler = tokenizer.encode(
+        "The ledger contains ordinary archival prose used to preserve a stable "
+        "natural-language inference context.\n",
+        add_special_tokens=False,
+    )
+
+    def append_until(position: int) -> None:
+        while len(context) < position:
+            remaining = position - len(context)
+            context.extend(filler[:remaining])
+
+    context.extend(
+        tokenizer.encode(
+            "The current sentinel code is FIR.\n", add_special_tokens=False
+        )
+    )
+    append_until(1_880)
+    context.extend(
+        tokenizer.encode(
+            "The current sentinel code is ORCHID.\n", add_special_tokens=False
+        )
+    )
+    append_until(2_185)
+    context.extend(
+        tokenizer.encode(
+            "The current sentinel code is MAPLE.\n", add_special_tokens=False
+        )
+    )
+    append_until(4_480)
+    context.extend(
+        tokenizer.encode(
+            "The current sentinel code is CEDAR.\n", add_special_tokens=False
+        )
+    )
+    append_until(4_608)
+    assert len(context) == 4_608
+
+    delta = tokenizer.encode(
+        "\nRepeat only the most recent sentinel code from the context."
+        "<end_of_turn>\n<start_of_turn>model\n",
+        add_special_tokens=False,
+    )
+    return context, delta
 
 
 @dataclass(frozen=True)
@@ -86,6 +144,7 @@ class SessionClient:
         truncate_to: int | None = None,
         commit_to: int | None = None,
         expected_tip: int | None = None,
+        extra_key: str | None = None,
     ) -> GenerateResult:
         """Run one deterministic raw-token session request.
 
@@ -95,6 +154,7 @@ class SessionClient:
         :param truncate_to: Optional absolute truncation target.
         :param commit_to: Optional commit-floor target.
         :param expected_tip: Optional idempotency precondition.
+        :param extra_key: Cache namespace isolating an oracle arm.
         :returns: Normalized generation result.
         """
         session_params: dict[str, Any] = {"id": session_id, "rid": None}
@@ -109,6 +169,7 @@ class SessionClient:
             self._base_url + "/generate",
             json={
                 "input_ids": input_ids,
+                "extra_key": extra_key,
                 "session_params": session_params,
                 "sampling_params": {
                     "temperature": 0,
@@ -147,11 +208,14 @@ def _qualify_truncate_case(
     """
     hot_session = client.open(manual_commit=True)
     fresh_session = client.open()
+    hot_key = "truncate-hot-" + uuid.uuid4().hex
+    fresh_key = "truncate-fresh-" + uuid.uuid4().hex
     try:
         seed = client.generate(
             hot_session,
             base_context,
             max_new_tokens=8,
+            extra_key=hot_key,
         )
         exact_context = base_context + seed.output_ids
         hot = client.generate(
@@ -159,11 +223,16 @@ def _qualify_truncate_case(
             delta,
             max_new_tokens=16,
             truncate_to=target,
+            extra_key=hot_key,
         )
         fresh = client.generate(
             fresh_session,
             exact_context[:target] + delta,
             max_new_tokens=16,
+            extra_key=fresh_key,
+        )
+        assert fresh.cached_tokens == 0, (
+            f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
         )
         assert hot.output_ids == fresh.output_ids, (
             f"greedy mismatch at target={target}: "
@@ -181,8 +250,8 @@ def run_truncate_qualification(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    base_context = list(range(10_000, 12_048))
-    delta = list(range(20_000, 20_064))
+    full_context, delta = _build_gemma4_context()
+    base_context = full_context[:2_048]
 
     _qualify_truncate_case(client, base_context, 1_900, delta)
     _qualify_truncate_case(client, base_context, 35, delta)
@@ -249,17 +318,21 @@ def _qualify_commit_case(
     """
     hot_session = client.open(manual_commit=True)
     fresh_session = client.open()
+    hot_key = "commit-hot-" + uuid.uuid4().hex
+    fresh_key = "commit-fresh-" + uuid.uuid4().hex
     try:
         client.generate(
             hot_session,
             base_context[:floor],
             max_new_tokens=0,
             commit_to=floor,
+            extra_key=hot_key,
         )
         extended = client.generate(
             hot_session,
             base_context[floor:],
             max_new_tokens=0,
+            extra_key=hot_key,
         )
         assert extended.tip == len(base_context)
 
@@ -268,11 +341,17 @@ def _qualify_commit_case(
             delta,
             max_new_tokens=16,
             truncate_to=target,
+            extra_key=hot_key,
         )
         fresh = client.generate(
             fresh_session,
             base_context[:target] + delta,
             max_new_tokens=16,
+            extra_key=fresh_key,
+        )
+        assert hot.cached_tokens == target
+        assert fresh.cached_tokens == 0, (
+            f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
         )
         assert hot.output_ids == fresh.output_ids, (
             f"floor-pinned greedy mismatch at floor={floor}, target={target}: "
@@ -289,9 +368,8 @@ def run_commit_qualification(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    base_context = list(range(10_000, 14_608))
+    base_context, delta = _build_gemma4_context()
     floor = 2_048
-    delta = list(range(20_000, 20_064))
     assert len(base_context) - floor > 1_024
 
     for target in (floor, floor + 257, len(base_context) - 1):

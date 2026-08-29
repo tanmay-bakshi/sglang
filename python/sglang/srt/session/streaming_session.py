@@ -504,7 +504,7 @@ class StreamingSession(BasePrefixCache):
             return
 
         old_protected_len = slot.cache_protected_len
-        if self.supports_swa() and target >= old_protected_len:
+        if self.supports_swa():
             retention = max(self.sliding_window_size, self.page_size)
             latest_safe_watermark = max(0, target - retention)
             if self.page_size > 1:

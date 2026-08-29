@@ -99,6 +99,12 @@ def streaming_session_swa_eviction_plan(
 
     if page_size > 1 and forced_evict_floor > 0:
         forced_evict_floor = -(-forced_evict_floor // page_size) * page_size
+    # The forced prefix remains physically live but is not persisted on a
+    # detached slot, so accepting it would corrupt the next turn's frontier.
+    if forced_evict_floor > cache_protected_len:
+        raise RuntimeError(
+            "Streaming sessions do not support prefill-aware SWA eviction floors."
+        )
 
     threshold = streaming_session_swa_eviction_threshold(
         pre_len,
@@ -107,11 +113,7 @@ def streaming_session_swa_eviction_plan(
         streaming_session_floor=streaming_session_floor,
         is_chunk_cache=is_chunk_cache,
     )
-    logical_watermark = max(
-        current_watermark,
-        forced_evict_floor,
-        threshold,
-    )
+    logical_watermark = max(current_watermark, threshold)
     physical_free_start = max(
         current_watermark,
         cache_protected_len,
