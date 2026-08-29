@@ -468,11 +468,6 @@ class StreamingSession(BasePrefixCache):
             return
 
         old_protected_len = slot.cache_protected_len
-        free_start = max(target, old_protected_len)
-        self._free_kv_aligned(
-            slot.req_pool_idx, free_start, slot.kv.kv_allocated_len
-        )
-
         retained_len = target
         if target < old_protected_len:
             # A partial shared page cannot be overwritten in place. Retain
@@ -480,11 +475,27 @@ class StreamingSession(BasePrefixCache):
             # page from token IDs on the next turn.
             if self.page_size > 1:
                 retained_len = (target // self.page_size) * self.page_size
-            slot.cache_protected_len = retained_len
+
+        # With no complete page to inherit, the cache slot has no reusable
+        # ownership. Retire it through the ordinary lifecycle so its request
+        # row, session-owned tail, auxiliary state, and tree lock are each
+        # released exactly once. The logical Session remains open and this
+        # request will rebuild its truncated context through the raw cache path.
+        if retained_len == 0:
+            self.release_session(session_id)
+            return
+
+        free_start = max(target, old_protected_len)
+        self._free_kv_aligned(
+            slot.req_pool_idx, free_start, slot.kv.kv_allocated_len
+        )
+        slot.cache_protected_len = min(old_protected_len, retained_len)
 
         slot.kv.kv_allocated_len = min(slot.kv.kv_allocated_len, retained_len)
-        slot.kv_committed_len = target
-        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, target)
+        slot.kv_committed_len = retained_len
+        slot.kv.swa_evicted_seqlen = min(
+            slot.kv.swa_evicted_seqlen, retained_len
+        )
 
     def release_radix_session(self, session_id: str) -> None:
         self.inner.release_radix_session(session_id)

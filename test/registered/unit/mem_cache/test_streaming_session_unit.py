@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -272,7 +273,7 @@ def test_truncate_below_protected_reprefills_partial_shared_page():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=80,
-        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=0),
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=70),
         cache_protected_len=64,
         tree_protected_len=64,
     )
@@ -280,11 +281,47 @@ def test_truncate_below_protected_reprefills_partial_shared_page():
     tree_cache.truncate_session("session-a", 35)
 
     slot = tree_cache.slots["session-a"]
-    assert slot.kv_committed_len == 35
+    assert slot.kv_committed_len == 32
     assert slot.kv.kv_allocated_len == 32
+    assert slot.kv.swa_evicted_seqlen == 32
     assert slot.cache_protected_len == 32
     assert slot.tree_protected_len == 64
     assert allocator.freed[0].tolist() == list(range(64, 80))
+
+
+def test_subpage_truncate_retires_slot_and_reallocates_fresh_owner():
+    pool = ReqToTokenPool(
+        size=1,
+        max_context_len=128,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    first_owner = SimpleNamespace(req_pool_idx=None)
+    assert pool.alloc([first_owner]) == [1]
+    pool.req_to_token[1, :80] = torch.arange(80, dtype=torch.int32)
+
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(pool, allocator, page_size=64)
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=1,
+        kv_committed_len=80,
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=70),
+        last_node="first-turn-node",
+        cache_protected_len=64,
+        tree_protected_len=64,
+    )
+
+    tree_cache.truncate_session("session-a", 35)
+
+    assert "session-a" not in tree_cache.slots
+    assert allocator.freed[0].tolist() == list(range(64, 80))
+    assert pool.free_slots == [1]
+    assert inner.dec_lock_ref_calls == ["first-turn-node"]
+
+    replacement = SimpleNamespace(req_pool_idx=None)
+    assert pool.alloc([replacement]) == [1]
+    assert int(pool.req_generation[1].item()) == 2
 
 
 if __name__ == "__main__":
