@@ -763,6 +763,19 @@ def _wait_for_inflight(
     )
 
 
+def _is_terminal_abort(body: dict[str, Any]) -> bool:
+    """Return whether one streamed response carries an abort finish reason.
+
+    :param body: Decoded streaming response chunk.
+    :returns: Whether the chunk is the terminal abort response.
+    """
+    meta_info = body.get("meta_info")
+    if not isinstance(meta_info, dict):
+        return False
+    finish_reason = meta_info.get("finish_reason")
+    return isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+
+
 def _abort_request_and_assert_recovery(
     client: SessionClient,
     session_id: str,
@@ -864,8 +877,7 @@ def _abort_request_and_assert_recovery(
                 stream_response.close()
 
     assert any(
-        body.get("meta_info", {}).get("finish_reason", {}).get("type") == "abort"
-        for body in streamed_bodies
+        _is_terminal_abort(body) for body in streamed_bodies
     ), f"aborted stream omitted its terminal reason: {streamed_bodies!r}"
     _wait_for_inflight(client, session_id, False, timeout=30)
     healed = client.session_info(session_id)
