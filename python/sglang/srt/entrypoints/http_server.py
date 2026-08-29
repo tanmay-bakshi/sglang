@@ -174,6 +174,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.session.errors import StreamingSessionConflictError
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -887,6 +888,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
+            except StreamingSessionConflictError as error:
+                yield (
+                    b"data: "
+                    + dumps_json(_streaming_session_conflict_error_payload(error))
+                    + b"\n\n"
+                )
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -918,6 +925,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 obj, request
             ).__anext__()
             return orjson_response(ret)
+        except StreamingSessionConflictError as error:
+            return ORJSONResponse(
+                content=_streaming_session_conflict_error_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
@@ -2066,6 +2078,25 @@ def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
+
+
+def _streaming_session_conflict_error_payload(
+    error: StreamingSessionConflictError,
+) -> dict[str, dict[str, object]]:
+    """Build the stable native-session conflict envelope.
+
+    :param error: Reconstructed conflict with its request correlation identity.
+    :returns: Public conflict payload shared by JSON and SSE transports.
+    """
+    return {
+        "error": {
+            "message": str(error),
+            "type": "streaming_session_conflict",
+            "code": HTTPStatus.CONFLICT.value,
+            "retryable": False,
+            "correlation_id": error.correlation_id,
+        }
+    }
 
 
 # FIXME: In theory we should configure ADMIN_FORCE for some entrypoints, but doing so

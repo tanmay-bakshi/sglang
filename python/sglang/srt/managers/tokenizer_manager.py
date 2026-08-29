@@ -134,6 +134,10 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_tokenizer,
 )
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionConflictError,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -2176,6 +2180,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for normal flow. Raises ValueError or HTTPException for non-stream aborts.
         """
         finish_reason = out["meta_info"]["finish_reason"]
+        if (
+            finish_reason.get("type") == "abort"
+            and finish_reason.get("status_code") == HTTPStatus.CONFLICT
+            and finish_reason.get("err_type") == STREAMING_SESSION_CONFLICT_ERROR_TYPE
+        ):
+            raise StreamingSessionConflictError(
+                finish_reason["message"],
+                state.obj.rid,
+            )
 
         if (
             finish_reason.get("type") == "abort"
