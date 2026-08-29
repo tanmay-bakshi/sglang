@@ -35,6 +35,9 @@ _SESSION_INFO_FIELDS = frozenset(
 _CONFLICT_ERROR_FIELDS = frozenset(
     {"message", "type", "code", "retryable", "correlation_id"}
 )
+_SESSION_TIMEOUT_SECONDS = 1.25
+_SESSION_REAP_INTERVAL_SECONDS = 1.0
+_SESSION_INFO_POLL_SECONDS = 0.1
 
 
 def _assert_session_conflict(body: object, correlation_id: str) -> None:
@@ -164,9 +167,9 @@ class StreamingSessionKitMixin:
         # No logprob
         asyncio.run(_concurrent_logprob_run(self.base_url, self.tokenizer))
         time.sleep(3)
-        assert requests.get(self.base_url + "/health").status_code == 200, (
-            "Server unhealthy after concurrent logprob sessions."
-        )
+        assert (
+            requests.get(self.base_url + "/health").status_code == 200
+        ), "Server unhealthy after concurrent logprob sessions."
 
     def test_stress_concurrent_sessions(self) -> None:
         """High concurrency streaming + non-streaming with retract pressure;
@@ -475,6 +478,7 @@ class StreamingSessionKitMixin:
         )
         self.assertEqual(open_response.status_code, 200, open_response.text)
         session_id = open_response.json()
+        hot_extra_key = "session-idempotency-hot-" + uuid.uuid4().hex
 
         try:
             initial_response = requests.get(
@@ -499,11 +503,13 @@ class StreamingSessionKitMixin:
             )
 
             request_rid = "session-idempotency-" + uuid.uuid4().hex
+            seed_input_ids = self.tokenizer.encode(
+                "The first idempotent streaming-session request."
+            )
             request_payload = {
                 "rid": request_rid,
-                "input_ids": self.tokenizer.encode(
-                    "The first idempotent streaming-session request."
-                ),
+                "input_ids": seed_input_ids,
+                "extra_key": hot_extra_key,
                 "session_params": {
                     "id": session_id,
                     "rid": None,
@@ -520,6 +526,8 @@ class StreamingSessionKitMixin:
             self.assertEqual(accepted_response.status_code, 200, accepted_response.text)
             accepted = accepted_response.json()
             self.assertEqual(accepted["meta_info"]["id"], request_rid)
+            accepted_output_ids = accepted["output_ids"]
+            self.assertIsInstance(accepted_output_ids, list)
 
             info_response = requests.get(
                 self.base_url + "/session_info",
@@ -557,6 +565,7 @@ class StreamingSessionKitMixin:
             stream_payload = {
                 "rid": stream_rid,
                 "input_ids": self.tokenizer.encode("A stale high-tip append."),
+                "extra_key": hot_extra_key,
                 "session_params": {
                     "id": session_id,
                     "rid": None,
@@ -585,11 +594,19 @@ class StreamingSessionKitMixin:
             self.assertEqual(high_after, stable)
 
             recovery_rid = "session-idempotency-recovery-" + uuid.uuid4().hex
+            recovery_input_ids = self.tokenizer.encode("A valid exact-tip append.")
+            recovery_delta = recovery_input_ids
+            if (
+                len(recovery_delta) > 0
+                and recovery_delta[0] == self.tokenizer.bos_token_id
+            ):
+                recovery_delta = recovery_delta[1:]
             recovery_response = requests.post(
                 self.base_url + "/generate",
                 json={
                     "rid": recovery_rid,
-                    "input_ids": self.tokenizer.encode("A valid exact-tip append."),
+                    "input_ids": recovery_input_ids,
+                    "extra_key": hot_extra_key,
                     "session_params": {
                         "id": session_id,
                         "rid": None,
@@ -600,7 +617,57 @@ class StreamingSessionKitMixin:
                 timeout=30,
             )
             self.assertEqual(recovery_response.status_code, 200, recovery_response.text)
-            self.assertEqual(recovery_response.json()["meta_info"]["id"], recovery_rid)
+            recovery = recovery_response.json()
+            self.assertEqual(recovery["meta_info"]["id"], recovery_rid)
+
+            cold_open_response = requests.post(
+                self.base_url + "/open_session",
+                json={"capacity_of_str_len": 1000, "streaming": True},
+                timeout=30,
+            )
+            self.assertEqual(
+                cold_open_response.status_code,
+                200,
+                cold_open_response.text,
+            )
+            cold_session_id = cold_open_response.json()
+            try:
+                cold_response = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "rid": "session-idempotency-cold-" + uuid.uuid4().hex,
+                        "input_ids": (
+                            seed_input_ids + accepted_output_ids + recovery_delta
+                        ),
+                        "extra_key": ("session-idempotency-cold-" + uuid.uuid4().hex),
+                        "session_params": {"id": cold_session_id, "rid": None},
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                    },
+                    timeout=30,
+                )
+                self.assertEqual(
+                    cold_response.status_code,
+                    200,
+                    cold_response.text,
+                )
+                cold = cold_response.json()
+                self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
+                self.assertEqual(
+                    cold["meta_info"]["prompt_tokens"],
+                    recovery["meta_info"]["prompt_tokens"],
+                )
+                self.assertEqual(cold["output_ids"], recovery["output_ids"])
+            finally:
+                cold_close_response = requests.post(
+                    self.base_url + "/close_session",
+                    json={"session_id": cold_session_id},
+                    timeout=30,
+                )
+                self.assertEqual(
+                    cold_close_response.status_code,
+                    200,
+                    cold_close_response.text,
+                )
         finally:
             close_response = requests.post(
                 self.base_url + "/close_session",
@@ -617,20 +684,27 @@ class StreamingSessionKitMixin:
         self.assertEqual(closed_response.status_code, 200, closed_response.text)
         closed = closed_response.json()
         self.assertEqual(set(closed), _SESSION_INFO_FIELDS)
-        self.assertFalse(closed["exists"])
-        self.assertFalse(closed["inflight"])
-        self.assertIn(closed["held_tokens"], (None, 0))
-        self.assertIsNone(closed["last_rid"])
+        self.assertEqual(
+            closed,
+            {
+                "exists": False,
+                "tip": 0,
+                "floor": 0,
+                "protected": 0,
+                "inflight": False,
+                "held_tokens": 0,
+                "last_rid": None,
+            },
+        )
 
     def test_session_info_does_not_refresh_timeout(self) -> None:
         """Repeated recovery reads do not keep an idle session alive."""
-        session_timeout = 1.25
         open_response = requests.post(
             self.base_url + "/open_session",
             json={
                 "capacity_of_str_len": 1000,
                 "streaming": True,
-                "timeout": session_timeout,
+                "timeout": _SESSION_TIMEOUT_SECONDS,
             },
             timeout=30,
         )
@@ -640,7 +714,13 @@ class StreamingSessionKitMixin:
         live_reads = 0
         info: dict[str, object] = {"exists": True}
         try:
-            while time.monotonic() - started < 5.0:
+            deadline = (
+                started
+                + _SESSION_TIMEOUT_SECONDS
+                + _SESSION_REAP_INTERVAL_SECONDS
+                + 1.0
+            )
+            while time.monotonic() < deadline:
                 info_response = requests.get(
                     self.base_url + "/session_info",
                     params={"session_id": session_id},
@@ -652,12 +732,36 @@ class StreamingSessionKitMixin:
                 if info["exists"] is False:
                     break
                 live_reads += 1
-                time.sleep(0.1)
+                time.sleep(_SESSION_INFO_POLL_SECONDS)
 
             self.assertGreaterEqual(live_reads, 2)
+            elapsed = time.monotonic() - started
             self.assertFalse(
                 info["exists"],
-                "session_info reads refreshed the inactivity timeout",
+                "session_info reads refreshed the inactivity timeout: "
+                f"elapsed={elapsed:.3f}s",
+            )
+            self.assertGreaterEqual(
+                elapsed,
+                _SESSION_TIMEOUT_SECONDS - _SESSION_INFO_POLL_SECONDS,
+                f"session reaped before its inactivity lease: elapsed={elapsed:.3f}s",
+            )
+            self.assertLessEqual(
+                elapsed,
+                _SESSION_TIMEOUT_SECONDS + _SESSION_REAP_INTERVAL_SECONDS + 1.5,
+                f"session reaping exceeded its bounded lease: elapsed={elapsed:.3f}s",
+            )
+            self.assertEqual(
+                info,
+                {
+                    "exists": False,
+                    "tip": 0,
+                    "floor": 0,
+                    "protected": 0,
+                    "inflight": False,
+                    "held_tokens": 0,
+                    "last_rid": None,
+                },
             )
         finally:
             if info["exists"] is True:

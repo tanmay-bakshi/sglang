@@ -27,6 +27,9 @@ CONFLICT_ERROR_FIELDS = frozenset(
     {"message", "type", "code", "retryable", "correlation_id"}
 )
 CONFLICT_METRIC_NAME = "sglang:streaming_session_idempotency_conflicts_total"
+SESSION_TIMEOUT_SECONDS = 1.25
+SESSION_REAP_INTERVAL_SECONDS = 1.0
+SESSION_INFO_POLL_SECONDS = 0.1
 
 
 def _build_gemma4_context() -> tuple[list[int], list[int], PreTrainedTokenizerBase]:
@@ -113,20 +116,20 @@ class SessionInfo:
     """Normalized streaming-session recovery state.
 
     :ivar exists: Whether the session is present.
-    :ivar tip: Current logical context length, when present.
-    :ivar floor: Current rollback floor, when present.
-    :ivar protected: Radix-owned prefix boundary, when present.
+    :ivar tip: Current logical context length, or zero when absent.
+    :ivar floor: Current rollback floor, or zero when absent.
+    :ivar protected: Radix-owned prefix boundary, or zero when absent.
     :ivar inflight: Whether one request currently owns the session.
-    :ivar held_tokens: KV tokens held by the session, when present.
+    :ivar held_tokens: KV tokens held by the session, or zero when absent.
     :ivar last_rid: Last successfully adopted request identifier.
     """
 
     exists: bool
-    tip: int | None
-    floor: int | None
-    protected: int | None
+    tip: int
+    floor: int
+    protected: int
     inflight: bool
-    held_tokens: int | None
+    held_tokens: int
     last_rid: str | None
 
     @classmethod
@@ -146,18 +149,23 @@ class SessionInfo:
 
         for field in ("tip", "floor", "protected", "held_tokens"):
             value = body[field]
-            assert value is None or type(value) is int, (
-                f"session_info {field} must be an integer or null, got {value!r}"
-            )
-            assert value is None or value >= 0
+            assert (
+                type(value) is int
+            ), f"session_info {field} must be an integer, got {value!r}"
+            assert value >= 0
 
         last_rid = body["last_rid"]
         assert last_rid is None or isinstance(last_rid, str)
-        if body["exists"]:
-            assert type(body["tip"]) is int
-            assert type(body["floor"]) is int
-            assert type(body["protected"]) is int
-            assert type(body["held_tokens"]) is int
+        if body["exists"] is False:
+            assert body == {
+                "exists": False,
+                "tip": 0,
+                "floor": 0,
+                "protected": 0,
+                "inflight": False,
+                "held_tokens": 0,
+                "last_rid": None,
+            }, f"missing-session sentinel changed: {body!r}"
 
         return cls(
             exists=body["exists"],
@@ -483,9 +491,9 @@ def _qualify_truncate_case(
             max_new_tokens=16,
             extra_key=fresh_key,
         )
-        assert fresh.cached_tokens == 0, (
-            f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
-        )
+        assert (
+            fresh.cached_tokens == 0
+        ), f"fresh truncate oracle inherited {fresh.cached_tokens} cached tokens"
         assert hot.output_ids == fresh.output_ids, (
             f"greedy mismatch at target={target}: "
             f"hot={hot.output_ids}, fresh={fresh.output_ids}"
@@ -608,9 +616,9 @@ def _qualify_commit_case(
             ignore_eos=False,
         )
         assert hot.cached_tokens == target
-        assert fresh.cached_tokens == 0, (
-            f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
-        )
+        assert (
+            fresh.cached_tokens == 0
+        ), f"fresh commit oracle inherited {fresh.cached_tokens} cached tokens"
         assert hot.output_ids == fresh.output_ids, (
             f"floor-pinned greedy mismatch at floor={floor}, target={target}: "
             f"hot={hot.output_ids}, fresh={fresh.output_ids}"
@@ -711,9 +719,9 @@ def _assert_conflict_preserves_state(
         if is_streaming:
             assert response.status_code == 200, response.text
             sse_data = _read_sse_data(response)
-            assert len(sse_data) == 2, (
-                f"conflict stream must contain one event and [DONE], got {sse_data!r}"
-            )
+            assert (
+                len(sse_data) == 2
+            ), f"conflict stream must contain one event and [DONE], got {sse_data!r}"
             assert sse_data[1] == "[DONE]", sse_data
             _assert_conflict_error(json.loads(sse_data[0]), request_rid)
         else:
@@ -721,9 +729,9 @@ def _assert_conflict_preserves_state(
             _assert_conflict_error(response.json(), request_rid)
 
     after = client.session_info(session_id)
-    assert after == before, (
-        f"stale request mutated session state: before={before}, after={after}"
-    )
+    assert (
+        after == before
+    ), f"stale request mutated session state: before={before}, after={after}"
 
 
 def _wait_for_inflight(
@@ -753,35 +761,273 @@ def _wait_for_inflight(
     )
 
 
+def _abort_request_and_assert_recovery(
+    client: SessionClient,
+    session_id: str,
+    payload: dict[str, Any],
+    *,
+    expected_tip: int,
+    expected_floor: int,
+    expected_last_rid: str,
+) -> SessionInfo:
+    """Abort one long burst and prove its durable state and cache heal.
+
+    :param client: Live session client.
+    :param session_id: Session mutated by the request.
+    :param payload: Long-running generation request.
+    :param expected_tip: Durable tip after prepared mutations apply.
+    :param expected_floor: Durable floor after prepared mutations apply.
+    :param expected_last_rid: Durable request identity after mutations apply.
+    :returns: Healed post-abort session state.
+    """
+    request_rid = payload.get("rid")
+    assert isinstance(request_rid, str)
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    stream_response: requests.Response | None = None
+    streamed_bodies: list[dict[str, Any]] = []
+    abort_sent = False
+    try:
+        stream_response = client.post_generate(
+            stream_payload,
+            stream_response=True,
+        )
+        assert stream_response.status_code == 200, stream_response.text
+        stream_lines = stream_response.iter_lines()
+        for raw_line in stream_lines:
+            if len(raw_line) == 0:
+                continue
+            line = raw_line.decode("utf-8")
+            assert line.startswith("data:"), line
+            data = line[len("data:") :].strip()
+            assert data != "[DONE]", "long abort request ended before decode"
+            body = json.loads(data)
+            assert isinstance(body, dict), body
+            streamed_bodies.append(body)
+            output_ids = body.get("output_ids")
+            if isinstance(output_ids, list) and len(output_ids) > 0:
+                break
+
+        deadline = time.monotonic() + 30
+        inflight = client.session_info(session_id)
+        while time.monotonic() < deadline:
+            inflight = client.session_info(session_id)
+            assert inflight.exists
+            if (
+                inflight.inflight
+                and inflight.tip == expected_tip
+                and inflight.floor == expected_floor
+                and inflight.last_rid == expected_last_rid
+            ):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(
+                "session did not expose its prepared durable state: "
+                f"tip={expected_tip}, floor={expected_floor}, "
+                f"last_rid={expected_last_rid}, actual={inflight}"
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as info_executor:
+            concurrent_info = list(
+                info_executor.map(client.session_info, [session_id] * 16)
+            )
+        assert concurrent_info == [inflight] * 16, (
+            "session_info returned a torn in-flight snapshot: "
+            f"expected={inflight}, actual={concurrent_info}"
+        )
+
+        assert client.session_info(session_id).inflight
+        client.abort(request_rid)
+        abort_sent = True
+        for raw_line in stream_lines:
+            if len(raw_line) == 0:
+                continue
+            line = raw_line.decode("utf-8")
+            assert line.startswith("data:"), line
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                break
+            body = json.loads(data)
+            assert isinstance(body, dict), body
+            streamed_bodies.append(body)
+        else:
+            raise AssertionError("aborted stream omitted [DONE]")
+    finally:
+        try:
+            if stream_response is not None and abort_sent is False:
+                client.abort(request_rid)
+        finally:
+            if stream_response is not None:
+                stream_response.close()
+
+    assert any(
+        body.get("meta_info", {}).get("finish_reason", {}).get("type") == "abort"
+        for body in streamed_bodies
+    ), f"aborted stream omitted its terminal reason: {streamed_bodies!r}"
+    _wait_for_inflight(client, session_id, False, timeout=30)
+    healed = client.session_info(session_id)
+    assert healed.exists
+    assert healed.inflight is False
+    assert healed.tip == expected_tip
+    assert healed.floor == expected_floor
+    assert healed.last_rid == expected_last_rid
+    return healed
+
+
 def _qualify_timeout_reads(client: SessionClient) -> None:
     """Prove recovery reads do not extend a session's inactivity lease.
 
     :param client: Live session client.
     """
-    session_timeout = 1.25
-    session_id = client.open(timeout=session_timeout)
+    session_id = client.open(timeout=SESSION_TIMEOUT_SECONDS)
     started = time.monotonic()
     reads_while_live = 0
     last_info = client.session_info(session_id)
     try:
-        while time.monotonic() - started < 5.0:
+        deadline = (
+            started + SESSION_TIMEOUT_SECONDS + SESSION_REAP_INTERVAL_SECONDS + 1.0
+        )
+        while time.monotonic() < deadline:
             last_info = client.session_info(session_id)
-            if not last_info.exists:
+            if last_info.exists is False:
                 break
             reads_while_live += 1
-            time.sleep(0.1)
+            time.sleep(SESSION_INFO_POLL_SECONDS)
 
         assert reads_while_live >= 2
-        assert not last_info.exists, (
+        elapsed = time.monotonic() - started
+        assert last_info.exists is False, (
             "session_info reads refreshed the inactivity timeout: "
-            f"elapsed={time.monotonic() - started:.3f}s"
+            f"elapsed={elapsed:.3f}s"
         )
-        assert last_info.inflight is False
-        assert last_info.held_tokens in {None, 0}
-        assert last_info.last_rid is None
+        assert (
+            elapsed >= SESSION_TIMEOUT_SECONDS - SESSION_INFO_POLL_SECONDS
+        ), f"session reaped before its inactivity lease: elapsed={elapsed:.3f}s"
+        assert elapsed <= (
+            SESSION_TIMEOUT_SECONDS + SESSION_REAP_INTERVAL_SECONDS + 1.5
+        ), f"session reaping exceeded its bounded lease: elapsed={elapsed:.3f}s"
+        assert last_info == SessionInfo(
+            exists=False,
+            tip=0,
+            floor=0,
+            protected=0,
+            inflight=False,
+            held_tokens=0,
+            last_rid=None,
+        )
     finally:
         if last_info.exists:
             client.close(session_id)
+
+
+def _qualify_prepared_mutation_abort_recovery(
+    client: SessionClient,
+    context: list[int],
+) -> None:
+    """Exercise truncate and commit durability through live abort completion.
+
+    :param client: Live session client.
+    :param context: Natural Gemma-4 token context.
+    """
+    truncate_session_id = client.open(manual_commit=True)
+    truncate_key = "stage4-truncate-abort-" + uuid.uuid4().hex
+    try:
+        seeded = client.generate(
+            truncate_session_id,
+            context[:256],
+            max_new_tokens=4,
+            extra_key=truncate_key,
+        )
+        seeded_info = client.session_info(truncate_session_id)
+        assert seeded_info.tip == seeded.tip
+        assert seeded_info.floor == 0
+
+        truncate_target = 128
+        truncate_rid = "stage4-truncate-abort-" + uuid.uuid4().hex
+        truncate_payload = client.generate_payload(
+            truncate_session_id,
+            [],
+            max_new_tokens=100_000,
+            truncate_to=truncate_target,
+            expected_tip=seeded.tip,
+            extra_key=truncate_key,
+            ignore_eos=True,
+            request_rid=truncate_rid,
+        )
+        truncated = _abort_request_and_assert_recovery(
+            client,
+            truncate_session_id,
+            truncate_payload,
+            expected_tip=truncate_target,
+            expected_floor=0,
+            expected_last_rid=truncate_rid,
+        )
+        assert truncated.tip == truncate_target
+        assert truncated.last_rid == truncate_rid
+
+        truncate_resume = client.generate(
+            truncate_session_id,
+            context[256:260],
+            max_new_tokens=1,
+            expected_tip=truncate_target,
+            extra_key=truncate_key,
+        )
+        assert truncate_resume.cached_tokens in {
+            truncate_target - 1,
+            truncate_target,
+        }
+    finally:
+        client.close(truncate_session_id)
+
+    commit_session_id = client.open(manual_commit=True)
+    commit_key = "stage4-commit-abort-" + uuid.uuid4().hex
+    try:
+        seeded = client.generate(
+            commit_session_id,
+            context[:128],
+            max_new_tokens=4,
+            extra_key=commit_key,
+        )
+        seeded_info = client.session_info(commit_session_id)
+        assert seeded_info.tip == seeded.tip
+        assert seeded_info.floor == 0
+
+        commit_delta = context[128:160]
+        commit_target = seeded.tip + len(commit_delta)
+        commit_rid = "stage4-commit-abort-" + uuid.uuid4().hex
+        commit_payload = client.generate_payload(
+            commit_session_id,
+            commit_delta,
+            max_new_tokens=100_000,
+            commit_to=commit_target,
+            expected_tip=seeded.tip,
+            extra_key=commit_key,
+            ignore_eos=True,
+            request_rid=commit_rid,
+        )
+        committed = _abort_request_and_assert_recovery(
+            client,
+            commit_session_id,
+            commit_payload,
+            expected_tip=commit_target,
+            expected_floor=commit_target,
+            expected_last_rid=commit_rid,
+        )
+        assert committed.tip == commit_target
+        assert committed.floor == commit_target
+        assert committed.last_rid == commit_rid
+
+        commit_resume = client.generate(
+            commit_session_id,
+            context[160:164],
+            max_new_tokens=1,
+            expected_tip=commit_target,
+            extra_key=commit_key,
+        )
+        assert commit_resume.cached_tokens in {commit_target - 1, commit_target}
+    finally:
+        client.close(commit_session_id)
 
 
 def run_recovery_qualification(base_url: str) -> None:
@@ -792,8 +1038,12 @@ def run_recovery_qualification(base_url: str) -> None:
     client = SessionClient(base_url)
     context, _, _ = _build_gemma4_context()
     session_id = client.open()
+    hot_extra_key = "stage4-recovery-hot-" + uuid.uuid4().hex
     conflict_count = 0
     conflict_metric_before = _read_counter(base_url, CONFLICT_METRIC_NAME)
+    assert (
+        conflict_metric_before is not None
+    ), f"required metric is not exposed: {CONFLICT_METRIC_NAME}"
 
     try:
         empty = client.session_info(session_id)
@@ -813,7 +1063,7 @@ def run_recovery_qualification(base_url: str) -> None:
             context[:96],
             max_new_tokens=4,
             expected_tip=0,
-            extra_key="stage4-recovery-" + uuid.uuid4().hex,
+            extra_key=hot_extra_key,
             request_rid=seed_rid,
         )
         seed = client.parse_generate(client.post_generate(seed_payload))
@@ -823,10 +1073,8 @@ def run_recovery_qualification(base_url: str) -> None:
         assert stable.exists
         assert stable.tip == seed.tip
         assert stable.floor == seed.tip
-        assert stable.protected is not None
-        assert stable.floor is not None
         assert stable.protected <= stable.floor
-        assert stable.held_tokens is not None and stable.held_tokens > 0
+        assert stable.held_tokens > 0
         assert stable.inflight is False
         assert stable.last_rid == seed_rid
 
@@ -838,13 +1086,13 @@ def run_recovery_qualification(base_url: str) -> None:
         )
         conflict_count += 1
 
-        assert stable.tip is not None
         high_rid = "stage4-high-" + uuid.uuid4().hex
         high_payload = client.generate_payload(
             session_id,
             context[96:112],
             max_new_tokens=4,
             expected_tip=stable.tip + 1,
+            extra_key=hot_extra_key,
             request_rid=high_rid,
         )
         _assert_conflict_preserves_state(
@@ -861,6 +1109,7 @@ def run_recovery_qualification(base_url: str) -> None:
             context[96:112],
             max_new_tokens=4,
             expected_tip=stable.tip - 1,
+            extra_key=hot_extra_key,
             request_rid=low_stream_rid,
             stream=True,
         )
@@ -878,6 +1127,7 @@ def run_recovery_qualification(base_url: str) -> None:
             context[96:112],
             max_new_tokens=4,
             expected_tip=stable.tip + 1,
+            extra_key=hot_extra_key,
             request_rid=high_stream_rid,
             stream=True,
         )
@@ -890,20 +1140,45 @@ def run_recovery_qualification(base_url: str) -> None:
         conflict_count += 1
 
         conflict_metric_after = _read_counter(base_url, CONFLICT_METRIC_NAME)
-        if conflict_metric_before is not None or conflict_metric_after is not None:
-            assert conflict_metric_before is not None
-            assert conflict_metric_after is not None
-            assert conflict_metric_after - conflict_metric_before == conflict_count
+        assert (
+            conflict_metric_after is not None
+        ), f"required metric disappeared: {CONFLICT_METRIC_NAME}"
+        assert conflict_metric_after - conflict_metric_before == conflict_count
 
+        accepted_delta = context[112:128]
         accepted_rid = "stage4-accepted-" + uuid.uuid4().hex
         accepted = client.generate(
             session_id,
-            context[112:128],
+            accepted_delta,
             max_new_tokens=4,
             expected_tip=stable.tip,
+            extra_key=hot_extra_key,
             request_rid=accepted_rid,
         )
         assert accepted.rid == accepted_rid
+
+        cold_session_id = client.open()
+        cold_extra_key = "stage4-recovery-cold-" + uuid.uuid4().hex
+        try:
+            cold = client.generate(
+                cold_session_id,
+                context[:96] + seed.output_ids + accepted_delta,
+                max_new_tokens=4,
+                extra_key=cold_extra_key,
+                request_rid="stage4-cold-" + uuid.uuid4().hex,
+            )
+            assert cold.cached_tokens == 0, (
+                "cold recovery oracle inherited radix state: "
+                f"cached_tokens={cold.cached_tokens}"
+            )
+            assert cold.prompt_tokens == accepted.prompt_tokens
+            assert cold.output_ids == accepted.output_ids, (
+                "conflict recovery changed greedy content: "
+                f"hot={accepted.output_ids}, cold={cold.output_ids}"
+            )
+        finally:
+            client.close(cold_session_id)
+
         accepted_info = client.session_info(session_id)
         assert accepted_info.tip == accepted.tip
         assert accepted_info.last_rid == accepted_rid
@@ -912,35 +1187,28 @@ def run_recovery_qualification(base_url: str) -> None:
             concurrent_info = list(executor.map(client.session_info, [session_id] * 32))
         assert concurrent_info == [accepted_info] * 32
 
-        assert accepted_info.tip is not None
         abort_rid = "stage4-abort-" + uuid.uuid4().hex
         abort_payload = client.generate_payload(
             session_id,
             context[128:144],
             max_new_tokens=100_000,
             expected_tip=accepted_info.tip,
+            extra_key=hot_extra_key,
             ignore_eos=True,
             request_rid=abort_rid,
         )
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            abort_future = executor.submit(client.post_generate, abort_payload)
-            _wait_for_inflight(client, session_id, True, timeout=30)
-
-            inflight_info = list(executor.map(client.session_info, [session_id] * 16))
-            assert all(info.exists and info.inflight for info in inflight_info)
-            assert all(info.tip == accepted_info.tip for info in inflight_info)
-
-            client.abort(abort_rid)
-            abort_response = abort_future.result(timeout=60)
-
-        assert abort_response.status_code == 200, abort_response.text
-        abort_body = abort_response.json()
-        assert abort_body["meta_info"]["finish_reason"]["type"] == "abort"
-        _wait_for_inflight(client, session_id, False, timeout=30)
-        healed = client.session_info(session_id)
-        assert healed == accepted_info, (
-            f"aborted request did not heal to its pre-burst state: {healed}"
+        assert accepted_info.last_rid is not None
+        healed = _abort_request_and_assert_recovery(
+            client,
+            session_id,
+            abort_payload,
+            expected_tip=accepted_info.tip,
+            expected_floor=accepted_info.floor,
+            expected_last_rid=accepted_info.last_rid,
         )
+        assert (
+            healed == accepted_info
+        ), f"aborted request did not heal to its pre-burst state: {healed}"
 
         recovery_rid = "stage4-recovery-" + uuid.uuid4().hex
         recovery = client.generate(
@@ -948,6 +1216,7 @@ def run_recovery_qualification(base_url: str) -> None:
             context[144:160],
             max_new_tokens=4,
             expected_tip=accepted_info.tip,
+            extra_key=hot_extra_key,
             request_rid=recovery_rid,
         )
         assert recovery.rid == recovery_rid
@@ -958,10 +1227,16 @@ def run_recovery_qualification(base_url: str) -> None:
         client.close(session_id)
 
     closed = client.session_info(session_id)
-    assert not closed.exists
-    assert closed.inflight is False
-    assert closed.held_tokens in {None, 0}
-    assert closed.last_rid is None
+    assert closed == SessionInfo(
+        exists=False,
+        tip=0,
+        floor=0,
+        protected=0,
+        inflight=False,
+        held_tokens=0,
+        last_rid=None,
+    )
+    _qualify_prepared_mutation_abort_recovery(client, context)
     _qualify_timeout_reads(client)
 
 
