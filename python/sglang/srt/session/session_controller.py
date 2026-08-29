@@ -86,11 +86,13 @@ class Session:
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        supports_mamba: bool = False,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
+        self.supports_mamba = supports_mamba
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
@@ -289,6 +291,15 @@ class Session:
                         "Streaming session truncate_to must be between 0 and "
                         f"the current tip ({tip}), got {session_params.truncate_to}."
                     )
+                elif self.supports_mamba and session_params.truncate_to < tip:
+                    abort = True
+                    abort_message = (
+                        "Streaming sessions backed by recurrent state do not support "
+                        "truncate_to below the current tip."
+                    )
+        elif len(req.input_ids) == 0:
+            abort = True
+            abort_message = "Non-streaming sessions do not support empty input_ids."
         elif session_params.replace:
             if session_params.rid is None:
                 for _, req_node in self.req_nodes.items():
@@ -448,6 +459,7 @@ class SessionController:
                 session_id,
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
+                supports_mamba=self.tree_cache.supports_mamba(),
             )
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"

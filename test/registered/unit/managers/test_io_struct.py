@@ -605,6 +605,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
+    def test_streaming_session_accepts_empty_token_delta(self):
+        req = GenerateReqInput(
+            input_ids=[],
+            session_params={"id": "session-a", "truncate_to": 32},
+            sampling_params={"max_new_tokens": 0},
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.batch_size, 1)
+
+    def test_ordinary_request_rejects_empty_token_input(self):
+        req = GenerateReqInput(input_ids=[])
+
+        with self.assertRaisesRegex(ValueError, "input_ids cannot be empty"):
+            req.normalize_batch_and_arguments()
+
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided

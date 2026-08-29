@@ -82,16 +82,18 @@ _OWNER_SITES = {
         "alloc_for_decode_prealloc_hisparse",
         "kv_allocated_len",
     ): 1,
-    # streaming session slot save/restore and tail trimming
+    # streaming session slot save/restore, rollback, and explicit truncation
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
     (_SS, "StreamingSession._free_tail", "kv_committed_len"): 2,
     (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 2,
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
-    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 2,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    (_SS, "StreamingSession.truncate_session", "kv_allocated_len"): 1,
+    (_SS, "StreamingSession.truncate_session", "kv_committed_len"): 1,
 }
 
 

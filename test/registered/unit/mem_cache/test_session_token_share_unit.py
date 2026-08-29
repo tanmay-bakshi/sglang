@@ -16,9 +16,10 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.io_struct import OpenSessionReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.session.session_controller import Session
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
@@ -61,6 +62,21 @@ class TestSessionTokenShare(CustomTestCase):
 
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
+
+    def test_controller_captures_recurrent_cache_capability(self):
+        tree_cache = SimpleNamespace(supports_mamba=lambda: True)
+        controller = SessionController(tree_cache)
+
+        result = controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="mamba-session",
+                streaming=True,
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(controller.get("mamba-session").supports_mamba)
 
     def _create(self, rid, input_ids, max_new_tokens=8, truncate_to=None):
         return self.session.create_req(
@@ -204,6 +220,75 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertFalse(self.session._inflight)
         self.assertEqual(list(r1.origin_input_ids), origin_before)
         self.assertEqual(list(r1.output_ids), output_before)
+
+    def test_recurrent_session_rejects_rewind_non_destructively(self):
+        session = Session(
+            capacity_of_str_len=0,
+            session_id="mamba-session",
+            streaming=True,
+            supports_mamba=True,
+        )
+        first = session.create_req(
+            _recv("r1", [1, 2, 3]),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        first.output_ids.extend([4, 5])
+        first._refresh_fill_ids()
+        session.finish_req(first)
+        origin_before = list(first.origin_input_ids)
+        output_before = list(first.output_ids)
+
+        with get_parallel().override(tp_rank=0):
+            rejected = session.create_req(
+                _recv("rewind", [9], truncate_to=4),
+                tokenizer=None,
+                vocab_size=VOCAB,
+            )
+
+        self.assertIsNotNone(rejected.to_finish)
+        self.assertFalse(session._inflight)
+        self.assertEqual(list(first.origin_input_ids), origin_before)
+        self.assertEqual(list(first.output_ids), output_before)
+
+    def test_recurrent_session_allows_truncate_to_tip_noop(self):
+        session = Session(
+            capacity_of_str_len=0,
+            session_id="mamba-session",
+            streaming=True,
+            supports_mamba=True,
+        )
+        first = session.create_req(
+            _recv("r1", [1, 2, 3]),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        first.output_ids.extend([4, 5])
+        first._refresh_fill_ids()
+        session.finish_req(first)
+
+        no_op = session.create_req(
+            _recv("no-op", [], max_new_tokens=0, truncate_to=5),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+
+        self.assertIsNone(no_op.to_finish)
+        self.assertTrue(session._inflight)
+        self.assertEqual(list(no_op.origin_input_ids), [1, 2, 3, 4, 5])
+
+    def test_non_streaming_session_rejects_empty_token_input(self):
+        session = Session(capacity_of_str_len=0, session_id="ordinary")
+
+        with get_parallel().override(tp_rank=0):
+            rejected = session.create_req(
+                _recv("empty", [], max_new_tokens=0),
+                tokenizer=None,
+                vocab_size=VOCAB,
+            )
+
+        self.assertIsNotNone(rejected.to_finish)
+        self.assertFalse(session._inflight)
 
 
 if __name__ == "__main__":
