@@ -138,6 +138,9 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Absolute token position to commit as the session rollback floor after
     # truncation and append have been applied.
     commit_to: int | None = None
+    # Idempotency precondition for the durable streaming-session context.
+    # A mismatch rejects the request without mutating the session.
+    expected_tip: int | None = None
 
 
 # Type definitions for multimodal input data

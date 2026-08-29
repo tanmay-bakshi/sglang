@@ -627,6 +627,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         open_req = OpenSessionReqInput(capacity_of_str_len=0)
 
         self.assertIsNone(params.commit_to)
+        self.assertIsNone(params.expected_tip)
         self.assertFalse(open_req.manual_commit)
 
     def test_ordinary_request_rejects_empty_token_input(self):

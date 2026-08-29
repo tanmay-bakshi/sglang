@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
+    StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -2010,6 +2011,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_mamba_slots(active_pool_idxs)
+
+    def streaming_session_cache_snapshot(
+        self, session_id: str
+    ) -> StreamingSessionCacheSnapshot:
+        """Return durable cache ownership for one streaming session.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The composed streaming-session cache snapshot.
+        """
+        return self.session.streaming_session_cache_snapshot(session_id)
 
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()

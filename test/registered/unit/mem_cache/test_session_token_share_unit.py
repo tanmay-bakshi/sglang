@@ -14,11 +14,17 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 import unittest
 from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import OpenSessionReqInput
+from sglang.srt.mem_cache.base_prefix_cache import StreamingSessionCacheSnapshot
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionConflictError,
+)
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +37,7 @@ def _recv(
     max_new_tokens=8,
     truncate_to=None,
     commit_to=None,
+    expected_tip=None,
 ):
     return SimpleNamespace(
         rid=rid,
@@ -44,6 +51,7 @@ def _recv(
             drop_previous_output=False,
             truncate_to=truncate_to,
             commit_to=commit_to,
+            expected_tip=expected_tip,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
@@ -75,6 +83,12 @@ class TestSessionTokenShare(CustomTestCase):
             manual_commit=True,
         )
 
+    def test_conflict_error_preserves_request_correlation(self):
+        error = StreamingSessionConflictError("stale session", "request-rid")
+
+        self.assertEqual(str(error), "stale session")
+        self.assertEqual(error.correlation_id, "request-rid")
+
     def test_controller_captures_recurrent_cache_capability(self):
         tree_cache = SimpleNamespace(supports_mamba=lambda: True)
         controller = SessionController(tree_cache)
@@ -97,6 +111,7 @@ class TestSessionTokenShare(CustomTestCase):
         max_new_tokens=8,
         truncate_to=None,
         commit_to=None,
+        expected_tip=None,
     ):
         return self.session.create_req(
             _recv(
@@ -105,6 +120,7 @@ class TestSessionTokenShare(CustomTestCase):
                 max_new_tokens=max_new_tokens,
                 truncate_to=truncate_to,
                 commit_to=commit_to,
+                expected_tip=expected_tip,
             ),
             tokenizer=None,
             vocab_size=VOCAB,
@@ -240,6 +256,99 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertFalse(self.session._inflight)
         self.assertEqual(list(r1.origin_input_ids), origin_before)
         self.assertEqual(list(r1.output_ids), output_before)
+
+    def test_expected_tip_conflict_is_typed_and_non_destructive(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4, 5])
+        self.assertEqual(self.session.current_tip(), 5)
+        self.assertEqual(self.session.last_rid, "r1")
+
+        origin_before = list(first.origin_input_ids)
+        output_before = list(first.output_ids)
+        last_active_before = self.session.last_active_time
+        with get_parallel().override(tp_rank=0):
+            conflict = self._create(
+                "stale-rid",
+                [9],
+                truncate_to=0,
+                commit_to=0,
+                expected_tip=4,
+            )
+
+        finish = conflict.to_finish
+        self.assertEqual(finish.status_code, HTTPStatus.CONFLICT)
+        self.assertEqual(finish.err_type, STREAMING_SESSION_CONFLICT_ERROR_TYPE)
+        self.assertEqual(conflict.rid, "stale-rid")
+        self.assertEqual(
+            finish.message,
+            "Streaming session expected_tip conflict for session s: expected 4, "
+            "current tip is 5.",
+        )
+        self.assertEqual(list(first.origin_input_ids), origin_before)
+        self.assertEqual(list(first.output_ids), output_before)
+        self.assertEqual(self.session.current_tip(), 5)
+        self.assertEqual(self.session.floor, 0)
+        self.assertEqual(self.session.last_rid, "r1")
+        self.assertEqual(self.session.last_active_time, last_active_before)
+        self.assertFalse(self.session._inflight)
+
+    def test_matching_expected_tip_tracks_only_durable_context(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4])
+
+        second = self._create("r2", [5, 6], expected_tip=4)
+        self.assertIsNone(second.finished_reason)
+        self.assertEqual(self.session.current_tip(), 4)
+        self.assertEqual(self.session.last_rid, "r1")
+        self.session.abort_req()
+        self.assertEqual(self.session.current_tip(), 4)
+        self.assertEqual(self.session.last_rid, "r1")
+
+    def test_inflight_rejection_precedes_expected_tip_conflict(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4])
+        active = self._create("active", [5], expected_tip=4)
+        self.assertIsNone(active.to_finish)
+
+        with get_parallel().override(tp_rank=0):
+            rejected = self._create("concurrent", [6], expected_tip=0)
+
+        self.assertEqual(rejected.to_finish.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertEqual(rejected.to_finish.err_type, "BadRequestError")
+        self.assertIn("already has an active request", rejected.to_finish.message)
+        self.session.abort_req()
+
+    def test_durable_tip_and_last_rid_follow_prepared_mutations(self):
+        first = self._create("r1", [1, 2, 3, 4])
+        self._decode_and_finish(first, [5, 6])
+        self.assertEqual(
+            (self.session.current_tip(), self.session.last_rid),
+            (6, "r1"),
+        )
+
+        truncate = self._create("truncate", [], max_new_tokens=0, truncate_to=4)
+        cache = SimpleNamespace(
+            truncate_session=lambda session_id, target: None,
+            commit_session=lambda session_id, floor: None,
+        )
+        self.session.commit_prepared_req(truncate, cache)
+        self.assertEqual(
+            (self.session.current_tip(), self.session.last_rid),
+            (4, "truncate"),
+        )
+        self.session.abort_req()
+        self.assertEqual(
+            (self.session.current_tip(), self.session.last_rid),
+            (4, "truncate"),
+        )
+
+        commit = self._create("commit", [7, 8], max_new_tokens=0, commit_to=6)
+        self.session.commit_prepared_req(commit, cache)
+        self.assertEqual(
+            (self.session.current_tip(), self.session.last_rid),
+            (6, "commit"),
+        )
+        self.session.abort_req()
 
     def test_default_mode_auto_commits_successful_tip(self):
         session = Session(
@@ -383,6 +492,31 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertIsNotNone(rejected.to_finish)
         self.assertFalse(session._inflight)
 
+    def test_non_streaming_session_rejects_streaming_mutation_riders(self):
+        for riders in (
+            {"truncate_to": 0},
+            {"commit_to": 0},
+            {"expected_tip": 0},
+        ):
+            with self.subTest(riders=riders):
+                session = Session(capacity_of_str_len=0, session_id="ordinary")
+                with get_parallel().override(tp_rank=0):
+                    rejected = session.create_req(
+                        _recv("bad", [1], **riders),
+                        tokenizer=None,
+                        vocab_size=VOCAB,
+                    )
+
+                self.assertEqual(
+                    rejected.to_finish.status_code,
+                    HTTPStatus.BAD_REQUEST,
+                )
+                self.assertEqual(
+                    rejected.to_finish.err_type,
+                    "BadRequestError",
+                )
+                self.assertEqual(len(session.req_nodes), 0)
+
     def test_empty_first_turn_is_prepared_only_for_mutation_completion(self):
         empty = self._create("empty", [], max_new_tokens=0, truncate_to=0)
 
@@ -408,6 +542,58 @@ class TestSessionTokenShare(CustomTestCase):
 
         self.assertIsNotNone(rejected.to_finish)
         self.assertFalse(self.session._inflight)
+
+    def test_controller_info_is_read_only_and_durable(self):
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False,
+            streaming_session_cache_snapshot=lambda session_id: (
+                StreamingSessionCacheSnapshot(protected=64, held_tokens=192)
+            ),
+        )
+        controller = SessionController(tree_cache)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="info-session",
+                streaming=True,
+                manual_commit=True,
+            )
+        )
+        session = controller.get("info-session")
+        session.committed_origin_len = 224
+        session.committed_output_len = 32
+        session.floor = 128
+        session.last_rid = "last-rid"
+        session._inflight = True
+        last_active_before = session.last_active_time
+
+        info = controller.get_info("info-session")
+
+        self.assertEqual(
+            info,
+            type(info)(
+                exists=True,
+                tip=256,
+                floor=128,
+                protected=64,
+                inflight=True,
+                held_tokens=192,
+                last_rid="last-rid",
+            ),
+        )
+        self.assertEqual(session.last_active_time, last_active_before)
+        self.assertEqual(
+            controller.get_info("missing"),
+            type(info)(
+                exists=False,
+                tip=0,
+                floor=0,
+                protected=0,
+                inflight=False,
+                held_tokens=0,
+                last_rid=None,
+            ),
+        )
 
 
 if __name__ == "__main__":

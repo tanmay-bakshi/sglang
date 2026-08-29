@@ -16,6 +16,8 @@ import logging
 import time
 import uuid
 from array import array
+from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -25,12 +27,26 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.session.errors import STREAMING_SESSION_CONFLICT_ERROR_TYPE
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSessionInfo:
+    """Read-only durable state of a streaming session."""
+
+    exists: bool
+    tip: int
+    floor: int
+    protected: int
+    inflight: bool
+    held_tokens: int
+    last_rid: str | None
 
 
 class SessionReqNode:
@@ -96,6 +112,7 @@ class Session:
         self.supports_mamba = supports_mamba
         self.manual_commit = manual_commit
         self.floor: int = 0
+        self.last_rid: str | None = None
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
@@ -112,6 +129,17 @@ class Session:
         if self.timeout is None:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
+
+    def current_tip(self) -> int:
+        """Return the durable context length in constant time.
+
+        :returns: The tip at the latest successful or prepared durable boundary.
+        """
+        if self.committed_origin_len is None:
+            assert self.committed_output_len is None
+            return 0
+        assert self.committed_output_len is not None
+        return self.committed_origin_len + self.committed_output_len
 
     @staticmethod
     def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -264,11 +292,25 @@ class Session:
         last_req = None
         abort = False
         abort_message = ""
+        abort_status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST
+        abort_err_type = "BadRequestError"
         if self.streaming:
-            # Streaming sessions: only simple appends allowed; reject otherwise.
             if self._inflight:
                 abort = True
                 abort_message = "Streaming session already has an active request."
+            elif (
+                session_params.expected_tip is not None
+                and session_params.expected_tip != self.current_tip()
+            ):
+                current_tip = self.current_tip()
+                abort = True
+                abort_message = (
+                    "Streaming session expected_tip conflict for session "
+                    f"{self.session_id}: expected {session_params.expected_tip}, "
+                    f"current tip is {current_tip}."
+                )
+                abort_status_code = HTTPStatus.CONFLICT
+                abort_err_type = STREAMING_SESSION_CONFLICT_ERROR_TYPE
             elif session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
@@ -291,12 +333,7 @@ class Session:
                 self._strip_bos_token(req, tokenizer)
 
             if not abort:
-                if last_req is None:
-                    tip = 0
-                else:
-                    input_ids, _ = self._committed_token_arrays(last_req)
-                    tip = len(input_ids)
-
+                tip = self.current_tip()
                 truncate_target = session_params.truncate_to
                 if truncate_target is None:
                     truncate_target = tip
@@ -332,6 +369,16 @@ class Session:
                         f"commit floor ({self.floor}) and the post-append tip "
                         f"({post_append_tip}), got {session_params.commit_to}."
                     )
+        elif (
+            session_params.truncate_to is not None
+            or session_params.commit_to is not None
+            or session_params.expected_tip is not None
+        ):
+            abort = True
+            abort_message = (
+                "Non-streaming sessions do not support truncate_to, commit_to, "
+                "or expected_tip."
+            )
         elif len(req.input_ids) == 0:
             abort = True
             abort_message = "Non-streaming sessions do not support empty input_ids."
@@ -447,7 +494,11 @@ class Session:
             )
 
         if abort:
-            new_req.set_finish_with_abort(abort_message)
+            new_req.set_finish_with_abort(
+                abort_message,
+                status_code=abort_status_code,
+                err_type=abort_err_type,
+            )
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
             self.last_active_time = time.monotonic()
@@ -465,6 +516,7 @@ class Session:
         if truncate_target is not None:
             tree_cache.truncate_session(self.session_id, truncate_target)
             self._truncate_token_arrays(truncate_target)
+            self.last_rid = req.rid
             req.time_stats.increment_streaming_session_truncation()
 
         commit_target = req.streaming_session_commit_to
@@ -491,6 +543,7 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
         self.committed_output_len = 0
+        self.last_rid = req.rid
 
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
@@ -506,6 +559,7 @@ class Session:
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
         tip = len(req.origin_input_ids) + finished_len
+        self.last_rid = req.rid
         if not self.manual_commit:
             self.floor = tip
         req.streaming_session_floor = self.floor
@@ -532,6 +586,35 @@ class SessionController:
 
     def get(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
+
+    def get_info(self, session_id: str) -> StreamingSessionInfo:
+        """Return a durable session snapshot without refreshing its timeout.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Current durable state, or an explicit missing-session snapshot.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            return StreamingSessionInfo(
+                exists=False,
+                tip=0,
+                floor=0,
+                protected=0,
+                inflight=False,
+                held_tokens=0,
+                last_rid=None,
+            )
+
+        cache = self.tree_cache.streaming_session_cache_snapshot(session_id)
+        return StreamingSessionInfo(
+            exists=True,
+            tip=session.current_tip(),
+            floor=session.floor,
+            protected=cache.protected,
+            inflight=session._inflight,
+            held_tokens=cache.held_tokens,
+            last_rid=session.last_rid,
+        )
 
     def open(self, recv_req: OpenSessionReqInput) -> OpenSessionReqOutput:
         session_id = recv_req.session_id

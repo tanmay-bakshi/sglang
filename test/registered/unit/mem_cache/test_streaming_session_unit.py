@@ -112,6 +112,29 @@ class _FakeReq:
         )
 
 
+def test_per_session_cache_snapshot_reports_durable_slot_ownership():
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            _FakeReqToTokenPool(req_to_token),
+            _FakeAllocator(),
+            page_size=16,
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=91,
+        kv=SimpleNamespace(kv_allocated_len=93, swa_evicted_seqlen=0),
+        cache_protected_len=32,
+    )
+
+    snapshot = tree_cache.streaming_session_cache_snapshot("session-a")
+
+    assert snapshot.protected == 32
+    assert snapshot.held_tokens == 64
+    assert tree_cache.streaming_session_cache_snapshot("missing").held_tokens == 0
+
+
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""

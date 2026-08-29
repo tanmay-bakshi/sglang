@@ -637,6 +637,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.enable_metrics:
             self.metrics_collector.increment_streaming_session_abort_with_slot_preserved()
 
+    def increment_streaming_session_idempotency_conflict(self) -> None:
+        if self.enable_metrics:
+            self.metrics_collector.increment_streaming_session_idempotency_conflict()
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
         if not self.enable_metrics:

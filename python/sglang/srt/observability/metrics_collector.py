@@ -680,6 +680,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 documentation="Number of streaming-session aborts that preserved a reusable KV slot.",
                 labelnames=labels.keys(),
             )
+            self.streaming_session_idempotency_conflicts_total = Counter(
+                name="sglang:streaming_session_idempotency_conflicts_total",
+                documentation="Number of streaming-session requests rejected by expected_tip.",
+                labelnames=labels.keys(),
+            )
 
         # =================================================================
         # Routing key metrics
@@ -1151,6 +1156,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.streaming_session_aborts_with_slot_preserved_total.labels(
             **self.labels
         ).inc(1)
+
+    def increment_streaming_session_idempotency_conflict(self) -> None:
+        self.streaming_session_idempotency_conflicts_total.labels(**self.labels).inc(1)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)

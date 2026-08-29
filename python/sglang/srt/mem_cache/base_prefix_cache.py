@@ -107,6 +107,14 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class StreamingSessionCacheSnapshot:
+    """Read-only per-session KV ownership summary."""
+
+    protected: int = 0
+    held_tokens: int = 0
+
+
 @dataclasses.dataclass
 class IncLockRefResult:
     """Result of an inc_lock_ref operation."""
@@ -449,6 +457,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
+
+    def streaming_session_cache_snapshot(
+        self, session_id: str
+    ) -> StreamingSessionCacheSnapshot:
+        """Return the durable KV ownership for one streaming session.
+
+        :param session_id: Session identifier to inspect.
+        :returns: An empty snapshot for caches without streaming-session state.
+        """
+        return StreamingSessionCacheSnapshot()
 
     def is_chunk_cache(self) -> bool:
         return False

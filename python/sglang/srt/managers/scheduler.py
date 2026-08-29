@@ -269,6 +269,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.session.errors import STREAMING_SESSION_CONFLICT_ERROR_TYPE
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -2320,7 +2321,13 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
-            if isinstance(req.finished_reason, FINISH_ABORT):
+            if (
+                isinstance(req.to_finish, FINISH_ABORT)
+                and req.to_finish.err_type == STREAMING_SESSION_CONFLICT_ERROR_TYPE
+            ):
+                req.time_stats.increment_streaming_session_idempotency_conflict()
+            finish_reason = req.finished_reason
+            if isinstance(finish_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return

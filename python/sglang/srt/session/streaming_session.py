@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
+    StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.common import streaming_session_swa_eviction_plan
 from sglang.srt.utils.common import ceil_align
@@ -599,6 +600,28 @@ class StreamingSession(BasePrefixCache):
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
                 total += max(0, allocated - slot.cache_protected_len)
         return total
+
+    def streaming_session_cache_snapshot(
+        self, session_id: str
+    ) -> StreamingSessionCacheSnapshot:
+        """Return durable cache ownership for one streaming session.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The session's tree-protected and exclusively held token counts.
+        """
+        slot = self.slots.get(session_id)
+        if slot is None:
+            return StreamingSessionCacheSnapshot()
+        if not slot.is_holding_kv:
+            return StreamingSessionCacheSnapshot(
+                protected=slot.cache_protected_len,
+            )
+
+        allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+        return StreamingSessionCacheSnapshot(
+            protected=slot.cache_protected_len,
+            held_tokens=max(0, allocated - slot.cache_protected_len),
+        )
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """An alias to align the naming style of SWA"""
