@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from sglang.srt import runtime_context
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.entrypoints.engine import Engine, SchedulerInitResult
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.server_args import ServerArgs
@@ -37,27 +38,30 @@ class TestApiKeyFile(CustomTestCase):
             path = self._write_secret(directory, "file-secret\n")
 
             server_args = ServerArgs(model_path="dummy", api_key_file=path)
+            server_args.resolve_once()
 
-            self.assertEqual(server_args.api_key, "file-secret")
+            self.assertEqual(resolution_result(server_args, "api_key"), "file-secret")
             self.assertEqual(server_args.api_key_file, path)
 
     def test_inline_and_file_keys_are_mutually_exclusive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_secret(directory, "file-secret")
 
+            server_args = ServerArgs(
+                model_path="dummy",
+                api_key="inline-secret",
+                api_key_file=path,
+            )
             with self.assertRaisesRegex(ValueError, "cannot be combined"):
-                ServerArgs(
-                    model_path="dummy",
-                    api_key="inline-secret",
-                    api_key_file=path,
-                )
+                server_args.resolve_once()
 
     def test_group_or_other_permissions_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_secret(directory, "file-secret", mode=0o640)
 
+            server_args = ServerArgs(model_path="dummy", api_key_file=path)
             with self.assertRaisesRegex(ValueError, "group or other"):
-                ServerArgs(model_path="dummy", api_key_file=path)
+                server_args.resolve_once()
 
     def test_symbolic_link_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -65,8 +69,9 @@ class TestApiKeyFile(CustomTestCase):
             link = os.path.join(directory, "api-key-link")
             os.symlink(target, link)
 
+            server_args = ServerArgs(model_path="dummy", api_key_file=link)
             with self.assertRaisesRegex(ValueError, "symbolic link"):
-                ServerArgs(model_path="dummy", api_key_file=link)
+                server_args.resolve_once()
 
     def test_empty_and_multiline_files_are_rejected(self) -> None:
         for value, message in (("", "must not be empty"), ("a\nb\n", "one line")):
@@ -75,8 +80,9 @@ class TestApiKeyFile(CustomTestCase):
                 tempfile.TemporaryDirectory() as directory,
             ):
                 path = self._write_secret(directory, value)
+                server_args = ServerArgs(model_path="dummy", api_key_file=path)
                 with self.assertRaisesRegex(ValueError, message):
-                    ServerArgs(model_path="dummy", api_key_file=path)
+                    server_args.resolve_once()
 
 
 class TestServerArgumentSecretRedaction(CustomTestCase):
@@ -123,7 +129,7 @@ class TestServerArgumentSecretRedaction(CustomTestCase):
 
     def test_grpc_server_info_remains_redacted(self) -> None:
         handle = object.__new__(RuntimeHandle)
-        handle.server_args = self._secret_server_args()
+        handle.tokenizer_manager = _TokenizerManagerStub(self._secret_server_args())
         handle.scheduler_info = {"max_req_input_len": 1024}
         handle.scheduler_info["api_key"] = "scheduler-secret"
 
@@ -143,7 +149,6 @@ class TestServerArgumentSecretRedaction(CustomTestCase):
             scheduler_infos=[
                 {
                     "api_key": "scheduler-secret",
-                    "pd_runtime_capabilities": None,
                 }
             ]
         )
@@ -163,6 +168,7 @@ class _TokenizerManagerStub:
     """Minimal embedded-engine tokenizer-manager boundary."""
 
     server_args: ServerArgs
+    startup_time: dict[str, object] | None = None
 
     def __init__(self, server_args: ServerArgs) -> None:
         """

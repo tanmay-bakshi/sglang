@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import concurrent.futures
 import dataclasses
-import hashlib
 import logging
 import threading
 import time
-import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -30,10 +26,6 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
-from sglang.srt.disaggregation.common.decode_allocation_lease import (
-    DecodeAllocationLease,
-    DecodeAllocationLeaseAuthority,
-)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -44,7 +36,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -52,19 +48,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket_on_host,
 )
 
-if TYPE_CHECKING:
-    from sglang.srt.disaggregation.nixl.packed_staging_request import (
-        PackedDecodeRequestTransaction,
-        PackedRequestPublication,
-    )
-
 logger = logging.getLogger(__name__)
-
-NIXL_BOOTSTRAP_PEER_PROTOCOL = "nixl-peer-handle-v1"
-SERIALIZED_RANK_LIMIT = 1 << 32
-NIXL_AGENT_NAME_MAX_BYTES = 256
-NIXL_AGENT_METADATA_MAX_BYTES = 512 * 1024
-NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH = 4 * ((NIXL_AGENT_METADATA_MAX_BYTES + 2) // 3)
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -153,29 +137,10 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
-    attn_dp_rank: int
-    attn_cp_rank: int
-    attn_tp_rank: int
-    pp_rank: int
-    transfer_source_rank: int | None = None
-    transport_protocol: str | None = None
-    nixl_agent_name: str | None = None
-    nixl_agent_metadata: str | None = None
-    nixl_agent_metadata_sha256: str | None = None
-    process_generation: str | None = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
-        self.attn_dp_rank = int(self.attn_dp_rank)
-        self.attn_cp_rank = int(self.attn_cp_rank)
-        self.attn_tp_rank = int(self.attn_tp_rank)
-        self.pp_rank = int(self.pp_rank)
-        self.transfer_source_rank = (
-            int(self.transfer_source_rank)
-            if self.transfer_source_rank is not None
-            else None
-        )
 
 
 class CommonKVManager(BaseKVManager):
@@ -185,9 +150,9 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
-        defer_prefill_bootstrap_registration: bool = False,
     ):
         self.kv_args = args
+        self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -199,27 +164,34 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_deferred_decode_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
+        self._dcp_pack_buffers = None
         # for p/d multi node infer
-        self.bootstrap_host = server_args.host
-        self.bootstrap_port = server_args.disaggregation_bootstrap_port
-        self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
+        self.bootstrap_host = get_serving().host
+        self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.dist_init_addr = get_parallel().dist_init_addr
+        parallel = get_parallel()
+        self.attn_tp_size = parallel.attn_tp_size
+        self.attn_tp_rank = parallel.attn_tp_rank
+        self.attn_cp_size = parallel.attn_cp_size
+        self.attn_cp_rank = parallel.attn_cp_rank
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
-            1 if server_args.enable_dp_attention else server_args.dp_size
+            1 if get_parallel().enable_dp_attention else get_parallel().dp_size
         )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = server_args.pp_size
+        self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -234,6 +206,11 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        # Raise libzmq's per-context socket cap because this manager caches two
+        # sockets per decode endpoint, so large fleets can exceed the default.
+        self._zmq_ctx.set(
+            zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+        )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
@@ -242,6 +219,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -261,9 +239,11 @@ class CommonKVManager(BaseKVManager):
             self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
                 self.bootstrap_port
             )
-            if not defer_prefill_bootstrap_registration:
-                self.register_to_bootstrap()
+            self.register_to_bootstrap()
             self.transfer_infos = {}
+            # Deferred KV release: aborted room -> (decode_ip, decode_port);
+            # ack held until the transfer drains.
+            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -282,6 +262,10 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Deferred KV release: room -> prefill ranks that acked their transfer
+            # drained. Entry exists only while the room is held, so a stale/late
+            # ack for a reused bootstrap_room is dropped.
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -309,144 +293,71 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def supports_packed_decode_request_transactions(self) -> bool:
-        """Return whether the complete packed request runtime is initialized.
+    def _should_skip_cp_replicated_state_transfer(self) -> bool:
+        """Whether this prefill rank should omit CP-replicated state.
 
-        :returns: ``False`` for managers without request-scoped packed actors.
+        Prefill CP materializes global token order before writing state pools, so
+        every CP rank holds the same state. When all CP ranks transfer their KV
+        shards, only rank 0 needs to send that state. Cache layer split is the
+        exception because each CP rank owns different state layers.
         """
+        return (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not get_parallel().enable_dsa_cache_layer_split
+        )
 
-        return False
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self.dcp_size == dst_dcp_size:
+            if self.dcp_rank != dst_dcp_rank:
+                raise RuntimeError(
+                    "PD peers must connect matching DCP ranks, got "
+                    f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
+                )
+            return False
 
-    def prepared_grant_protocol(self) -> str | None:
-        """Return the live prefill actor protocol for prepared decoder grants.
+        if (
+            self.dcp_size == 1
+            and dst_dcp_size > 1
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            return True
 
-        :returns: A closed protocol identifier, otherwise ``None``.
-        """
+        raise RuntimeError(
+            f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
+        )
 
-        return None
+    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
+        page_size = self.kv_args.page_size
+        src_token_lens = [
+            item_len // page_size for item_len in self.kv_args.kv_item_lens
+        ]
+        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
+        if src_token_lens != dst_token_lens:
+            raise RuntimeError(
+                "PD DCP source/destination KV geometry differs: "
+                f"src={src_token_lens}, dst={dst_token_lens}"
+            )
+        return src_token_lens
 
-    def attach_packed_decode_scheduler(
-        self,
-        metadata_allocator: object,
-        consumer_authority: object,
-    ) -> None:
-        """Attach scheduler-owned metadata resources to a packed actor.
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support staging memory registration"
+        )
 
-        Managers without a packed decode actor intentionally ignore the
-        attachment. Their capability remains unavailable through
-        :meth:`supports_packed_decode_request_transactions`.
+    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+        if self._dcp_pack_buffers is not None:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
-        :param metadata_allocator: Existing decode metadata-row allocator.
-        :param consumer_authority: Scheduler queue that consumes row contents.
-        """
-
-        del metadata_allocator, consumer_authority
-
-    def prepare_packed_decode_request_transaction(
-        self,
-        *,
-        room_id: int,
-        request_owner: object,
-        metadata_buffer_index: int,
-        allocation_lease: DecodeAllocationLease,
-        allocation_authority: DecodeAllocationLeaseAuthority,
-        lifecycle_authority: object,
-        source_tp_size: int,
-    ) -> PackedDecodeRequestTransaction | None:
-        """Construct a request transaction before allocation publication.
-
-        :param room_id: Decoder-minted non-recycled bootstrap room.
-        :param request_owner: Exact retained decode request.
-        :param metadata_buffer_index: Exact reserved auxiliary metadata slot.
-        :param allocation_lease: Prepared decode allocation lease.
-        :param allocation_authority: Exact allocation lease authority.
-        :param lifecycle_authority: Trusted transport lifecycle authority.
-        :param source_tp_size: Source attention tensor-parallel width.
-        :returns: A prepared transaction, otherwise ``None`` when unavailable.
-        """
-
-        return None
-
-    def send_packed_decode_request_metadata(
-        self,
-        *,
-        transaction: PackedDecodeRequestTransaction,
-        publication: PackedRequestPublication,
-        receiver: CommonKVReceiver,
-        page_indices: npt.NDArray[np.int32],
-        metadata_buffer_index: int,
-        state_indices: list[object] | None,
-        decode_prefix_len: int,
-    ) -> None:
-        """Enter published metadata into a request-scoped packed actor.
-
-        :param transaction: Exact retained request transaction.
-        :param publication: Matching irreversible publication.
-        :param receiver: Exact retained decode receiver.
-        :param page_indices: Complete destination main-KV page array.
-        :param metadata_buffer_index: Reserved auxiliary metadata slot.
-        :param state_indices: Complete destination state page arrays.
-        :param decode_prefix_len: Decoder-reused prefix length.
-        :raises RuntimeError: If the packed request runtime is unavailable.
-        """
-
-        raise RuntimeError("packed decode request runtime is unavailable")
-
-    def poll_packed_decode_request_transaction(
-        self,
-        transaction: PackedDecodeRequestTransaction,
-    ) -> KVPoll:
-        """Advance one packed decode transaction on the scheduler thread.
-
-        :param transaction: Exact request transaction.
-        :returns: Current packed transfer state.
-        :raises RuntimeError: If the manager has no packed decode actor.
-        """
-
-        del transaction
-        raise RuntimeError("packed decode request runtime is unavailable")
-
-    def cancel_unpublished_packed_decode_request_transaction(
-        self,
-        transaction: PackedDecodeRequestTransaction,
-    ) -> object:
-        """Cancel and retire one request before metadata publication.
-
-        :param transaction: Exact prepared request transaction.
-        :returns: Exact retained request owner.
-        :raises RuntimeError: If the manager has no packed decode actor.
-        """
-
-        del transaction
-        raise RuntimeError("packed decode request runtime is unavailable")
-
-    def complete_packed_decode_request_metadata_consumption(
-        self,
-        transaction: PackedDecodeRequestTransaction,
-    ) -> None:
-        """Release one packed metadata row after scheduler consumption.
-
-        :param transaction: Exact committed request transaction.
-        :raises RuntimeError: If the manager has no packed decode actor.
-        """
-
-        del transaction
-        raise RuntimeError("packed decode request runtime is unavailable")
-
-    def quarantine_packed_decode_request_transaction(
-        self,
-        transaction: PackedDecodeRequestTransaction,
-        reason: str,
-    ) -> None:
-        """Quarantine every resource retained by one packed transaction.
-
-        :param transaction: Exact request transaction.
-        :param reason: Stable failure reason.
-        :raises RuntimeError: If the manager has no packed decode actor.
-        """
-
-        del transaction, reason
-        raise RuntimeError("packed decode request runtime is unavailable")
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_staging_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+            dcp_size,
+        )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -471,6 +382,69 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
+        from a prior request that reused this bootstrap_room."""
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+
+    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
+        """Record a prefill rank's drain ack (decode receiver thread). Only counts
+        while the room is held; grabs the set by reference to avoid racing clear."""
+        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if acks is not None:
+            acks.add(prefill_rank)
+
+    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+        """True once every prefill rank that could still write these pages has acked."""
+        return (
+            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
+            >= required_acks
+        )
+
+    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
+
+    def _prefill_unique_rank(self) -> int:
+        """Stable per-sender id, matching what the transfer worker syncs on Success."""
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        """Send the deferred ack once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once."""
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        target = self._deferred_ack_targets.pop(room, None)
+        if target is not None:
+            self._send_abort_ack(target[0], target[1], room)
+
+    def register_deferred_ack_target(
+        self, room: int, decode_ip: str, decode_port: int
+    ) -> None:
+        """Hold this room's ack until its transfer drains. Callers must mark the
+        room Failed FIRST -- registering while it still accepts chunks lets the
+        worker ack, then a new chunk writes pages the decode already released."""
+        self._deferred_ack_targets[room] = (decode_ip, decode_port)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -649,7 +623,11 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?"
+                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
+                f"target_tp_rank={-1}&target_pp_rank={-1}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -673,13 +651,24 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != get_model().kv_cache_dtype
+            and info.kv_cache_dtype != self.kv_cache_dtype_str
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
+
+        if self.dcp_size > 1:
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError(
+                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                )
+            if info.attn_cp_size != 1:
+                raise RuntimeError(
+                    "PD decode DCP currently requires prefill attention CP=1, "
+                    f"got {info.attn_cp_size}."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -779,7 +768,7 @@ class CommonKVManager(BaseKVManager):
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
         """
-        if not self.dist_init_addr or self.server_args.nnodes == 1:
+        if not self.dist_init_addr or get_parallel().nnodes == 1:
             return local_port
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -830,41 +819,32 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": get_model().kv_cache_dtype,
-            "load_balance_method": self.server_args.load_balance_method,
-            "enable_dsa_cache_layer_split": getattr(
-                self.server_args, "enable_dsa_cache_layer_split", False
-            ),
+            "kv_cache_dtype": self.kv_cache_dtype_str,
+            "load_balance_method": get_parallel().load_balance_method,
+            "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": self.server_args.port,
+            "prefill_http_port": get_serving().port,
         }
-        payload.update(self._bootstrap_transport_registration())
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
-        last_failure = "bootstrap registration was not attempted"
         for attempt in range(max_retries):
             try:
                 response = requests.put(url, json=payload, timeout=5)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
-                last_failure = f"HTTP {response.status_code}: {response.text[:256]}"
                 logger.warning(
-                    "Prefill register attempt %d/%d failed: %s",
-                    attempt + 1,
-                    max_retries,
-                    last_failure,
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
-            except requests.RequestException as error:
-                last_failure = f"{type(error).__name__}: {error}"
+            except Exception as e:
+                # Walk to root cause to skip misleading urllib3 wrapper messages
+                cause = e
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
                 logger.warning(
-                    "Prefill register attempt %d/%d failed: %s",
-                    attempt + 1,
-                    max_retries,
-                    last_failure,
-                    exc_info=True,
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
                 )
             if attempt == max_retries - 1:
                 break
@@ -872,18 +852,9 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
-        raise RuntimeError(
-            "Prefill instance failed to register to bootstrap server after "
-            f"{max_retries} attempts: {last_failure}"
+        logger.error(
+            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
-
-    def _bootstrap_transport_registration(self) -> dict[str, object]:
-        """Return transport-owned fields for one prefill rank registration.
-
-        :returns: Transport registration fields, empty for common backends.
-        """
-
-        return {}
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:
@@ -922,7 +893,17 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
+            self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
+
+    def _send_multipart_locked(
+        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
+    ):
+        # Cached sockets are shared across sender threads and zmq sockets are
+        # not thread-safe; serialize sends per endpoint.
+        sock = self._connect(endpoint, is_ipv6=is_ipv6)
+        with self._socket_send_locks[endpoint]:
+            sock.send_multipart(parts)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1168,8 +1149,8 @@ class CommonKVManager(BaseKVManager):
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
 
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
+            possible_affected_rooms = list(
+                self.addr_to_rooms_tracker.get(failed_bootstrap_addr, [])
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
 
@@ -1222,12 +1203,11 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if self.kv_mgr.server_args.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
-            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
+            if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank
-                != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
@@ -1238,7 +1218,7 @@ class CommonKVSender(BaseKVSender):
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
                         f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
+                        f"{self.bootstrap_room % get_parallel().dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                         f"to allow mixed routing.",
                     )
@@ -1312,7 +1292,7 @@ class CommonKVSender(BaseKVSender):
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
+            and not get_parallel().enable_dsa_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -1333,6 +1313,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         pass
 
@@ -1355,18 +1336,16 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def poll(self) -> KVPoll:
-        pass
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
-
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+            # Drop a held ack target if the room concluded without draining
+            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
+            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1379,6 +1358,7 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+    _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
@@ -1396,6 +1376,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1442,7 +1423,10 @@ class CommonKVReceiver(BaseKVReceiver):
         for target_cp_rank in self.target_cp_ranks:
             bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
 
-            if bootstrap_key not in self.kv_mgr.connection_pool:
+            with self.kv_mgr.connection_lock:
+                cached_bootstrap_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
+
+            if cached_bootstrap_infos is None:
                 bootstrap_infos = []
                 for target_tp_rank in self.target_tp_ranks:
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
@@ -1477,23 +1461,42 @@ class CommonKVReceiver(BaseKVReceiver):
                                 self.bootstrap_room, KVPoll.Failed
                             )
                             self.bootstrap_infos = None
+                            self.invalidate_cached_bootstrap_infos()
                             return
 
                 self.bootstrap_infos = bootstrap_infos
+                self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
                 # Register kv_args only once to prefill KVManager according to the info fetched
                 # from the bootstrap server. Do this before caching in connection_pool so a failed
                 # registration does not leave a stale entry that later requests would reuse.
                 if not self._register_kv_args():
+                    self.invalidate_cached_bootstrap_infos()
                     return
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+
+                with self.kv_mgr.connection_lock:
+                    cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
+                        bootstrap_key, self.bootstrap_infos
+                    )
+
+                if cached_bootstrap_infos is not self.bootstrap_infos:
+                    self.bootstrap_infos = cached_bootstrap_infos
             else:
-                self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+                self.bootstrap_infos = cached_bootstrap_infos
+
+            self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
 
         self.bootstrap_infos = all_bootstrap_infos
+
+    def invalidate_cached_bootstrap_infos(self) -> None:
+        with self.kv_mgr.connection_lock:
+            for bootstrap_key, bootstrap_infos in self._connection_pool_entries.items():
+                if self.kv_mgr.connection_pool.get(bootstrap_key) is bootstrap_infos:
+                    del self.kv_mgr.connection_pool[bootstrap_key]
+            self._connection_pool_entries.clear()
 
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
@@ -1504,6 +1507,7 @@ class CommonKVReceiver(BaseKVReceiver):
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                bootstrap_info["pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
@@ -1604,6 +1608,7 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.invalidate_cached_bootstrap_infos()
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
@@ -1612,9 +1617,6 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
         return KVPoll.Failed
-
-    def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
@@ -1660,208 +1662,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 )
 
 
-def _resolve_bootstrap_int(
-    current: int | None,
-    candidate: int,
-    field: str,
-) -> int:
-    """Resolve one immutable integer bootstrap attribute.
-
-    :param current: Previously registered value.
-    :param candidate: Value supplied by the current rank.
-    :param field: Attribute name for diagnostics.
-    :returns: The process-wide value.
-    """
-
-    if current is not None and current != candidate:
-        raise ValueError(f"inconsistent bootstrap {field}: {candidate} != {current}")
-    return candidate
-
-
-def _resolve_bootstrap_str(
-    current: str | None,
-    candidate: str,
-    field: str,
-) -> str:
-    """Resolve one immutable string bootstrap attribute.
-
-    :param current: Previously registered value.
-    :param candidate: Value supplied by the current rank.
-    :param field: Attribute name for diagnostics.
-    :returns: The process-wide value.
-    """
-
-    if current is not None and current != candidate:
-        raise ValueError(
-            f"inconsistent bootstrap {field}: {candidate!r} != {current!r}"
-        )
-    return candidate
-
-
-def _resolve_bootstrap_bool(
-    current: bool | None,
-    candidate: bool,
-    field: str,
-) -> bool:
-    """Resolve one immutable boolean bootstrap attribute.
-
-    :param current: Previously registered value.
-    :param candidate: Value supplied by the current rank.
-    :param field: Attribute name for diagnostics.
-    :returns: The process-wide value.
-    """
-
-    if current is not None and current != candidate:
-        raise ValueError(f"inconsistent bootstrap {field}: {candidate} != {current}")
-    return candidate
-
-
-def validate_serialized_rank(value: object, field: str) -> int:
-    """Validate one unsigned 32-bit rank received across a process boundary.
-
-    :param value: Candidate serialized rank.
-    :param field: Attribute name for diagnostics.
-    :returns: Validated rank.
-    :raises ValueError: If the value is not a JSON integer in the uint32 range.
-    """
-
-    if type(value) is not int or value < 0 or value >= SERIALIZED_RANK_LIMIT:
-        raise ValueError(f"invalid serialized {field}")
-    return value
-
-
-def validate_nixl_agent_name(value: object) -> str:
-    """Validate one bounded ASCII NIXL agent name.
-
-    :param value: Candidate serialized agent name.
-    :returns: Validated agent name.
-    :raises ValueError: If the value is empty, non-ASCII, or too large.
-    """
-
-    if type(value) is not str or len(value) == 0:
-        raise ValueError("invalid NIXL agent name")
-    try:
-        encoded_name = value.encode("ascii")
-    except UnicodeEncodeError as error:
-        raise ValueError("NIXL agent name must be ASCII") from error
-    if len(encoded_name) > NIXL_AGENT_NAME_MAX_BYTES:
-        raise ValueError(f"NIXL agent name exceeds {NIXL_AGENT_NAME_MAX_BYTES} bytes")
-    return value
-
-
-def validate_nixl_agent_metadata(value: object) -> bytes:
-    """Validate one bounded raw NIXL metadata document.
-
-    :param value: Candidate native metadata.
-    :returns: Validated metadata.
-    :raises ValueError: If the value is empty, not bytes, or too large.
-    """
-
-    if type(value) is not bytes or len(value) == 0:
-        raise ValueError("invalid NIXL agent metadata")
-    if len(value) > NIXL_AGENT_METADATA_MAX_BYTES:
-        raise ValueError(
-            f"NIXL agent metadata exceeds {NIXL_AGENT_METADATA_MAX_BYTES} bytes"
-        )
-    return value
-
-
-def decode_nixl_agent_metadata(value: object) -> bytes:
-    """Decode one bounded canonical base64 NIXL metadata document.
-
-    :param value: Candidate serialized metadata.
-    :returns: Decoded metadata.
-    :raises ValueError: If the value is empty, malformed, noncanonical, or too large.
-    """
-
-    if type(value) is not str or len(value) == 0:
-        raise ValueError("invalid NIXL agent metadata")
-    if len(value) > NIXL_AGENT_METADATA_MAX_ENCODED_LENGTH:
-        raise ValueError("encoded NIXL agent metadata exceeds the bounded decoded size")
-    try:
-        metadata = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("invalid NIXL agent metadata encoding") from error
-    validate_nixl_agent_metadata(metadata)
-    if base64.b64encode(metadata).decode("ascii") != value:
-        raise ValueError("NIXL agent metadata is not canonical base64")
-    return metadata
-
-
-def _parse_bootstrap_transport_registration(
-    data: dict[str, object],
-) -> dict[str, object | None]:
-    """Validate one optional transport-specific rank identity.
-
-    :param data: Bootstrap registration JSON.
-    :returns: Normalized fields for :class:`PrefillRankInfo`.
-    :raises ValueError: If the registration is partial or internally inconsistent.
-    """
-
-    field_names = (
-        "nixl_agent_name",
-        "nixl_agent_metadata",
-        "nixl_agent_metadata_sha256",
-        "process_generation",
-        "transfer_source_rank",
-    )
-    transport_protocol = data.get("transport_protocol")
-    if transport_protocol is None:
-        if any(data.get(field_name) is not None for field_name in field_names):
-            raise ValueError(
-                "transport_protocol is required with transport peer identity"
-            )
-        return {
-            "transport_protocol": None,
-            **{field_name: None for field_name in field_names},
-        }
-
-    if transport_protocol != NIXL_BOOTSTRAP_PEER_PROTOCOL:
-        raise ValueError(
-            f"unsupported bootstrap transport_protocol: {transport_protocol!r}"
-        )
-
-    string_fields = (
-        "nixl_agent_metadata_sha256",
-        "process_generation",
-    )
-    for field_name in string_fields:
-        value = data.get(field_name)
-        if type(value) is not str or len(value) == 0:
-            raise ValueError(f"invalid bootstrap {field_name}")
-
-    nixl_agent_name = validate_nixl_agent_name(data.get("nixl_agent_name"))
-    encoded_metadata = data.get("nixl_agent_metadata")
-    metadata = decode_nixl_agent_metadata(encoded_metadata)
-    metadata_sha256 = data["nixl_agent_metadata_sha256"]
-    process_generation = data["process_generation"]
-    assert isinstance(metadata_sha256, str)
-    assert isinstance(process_generation, str)
-
-    if hashlib.sha256(metadata).hexdigest() != metadata_sha256:
-        raise ValueError("bootstrap nixl_agent_metadata digest mismatch")
-
-    try:
-        parsed_generation = uuid.UUID(process_generation)
-    except ValueError as error:
-        raise ValueError("invalid bootstrap process_generation") from error
-    if str(parsed_generation) != process_generation:
-        raise ValueError("bootstrap process_generation must be a canonical UUID")
-
-    transfer_source_rank = validate_serialized_rank(
-        data.get("transfer_source_rank"), "transfer_source_rank"
-    )
-
-    return {
-        "transport_protocol": transport_protocol,
-        "nixl_agent_name": nixl_agent_name,
-        "nixl_agent_metadata": encoded_metadata,
-        "nixl_agent_metadata_sha256": metadata_sha256,
-        "process_generation": process_generation,
-        "transfer_source_rank": transfer_source_rank,
-    }
-
-
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
@@ -1883,11 +1683,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
-        self._registered_ranks: set[tuple[int, int, int, int]] = set()
-        self._ready_event = threading.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._runner: web.AppRunner | None = None
-        self._cleanup_task: asyncio.Task | None = None
+        self._registered_count = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -1899,79 +1695,28 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def run(self):
         self.thread.start()
 
-    @property
-    def registered_count(self) -> int:
-        """Return the number of unique registered transfer ranks.
-
-        :returns: Unique rank count.
-        """
-
-        return len(self._registered_ranks)
-
-    def _expected_rank_count(self) -> int | None:
-        """Return the complete topology size once its dimensions are known.
-
-        :returns: Expected unique rank count, otherwise ``None``.
-        """
-
+    def _is_ready(self) -> bool:
         if (
             self.attn_tp_size is None
             or self.attn_cp_size is None
             or self.pp_size is None
             or self.dp_size is None
         ):
-            return None
-        return self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
-
-    def _is_ready(self) -> bool:
-        expected = self._expected_rank_count()
-        if expected is None:
             return False
+        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
-            "Expected %d prefill servers to be registered, %d registered so far",
-            expected,
-            self.registered_count,
+            f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
         )
-        return self.registered_count == expected
-
-    def wait_until_ready(self, timeout_s: float) -> None:
-        """Wait until every expected prefill transfer rank has registered.
-
-        :param timeout_s: Maximum wait in seconds.
-        :raises RuntimeError: If the bootstrap topology remains incomplete.
-        """
-
-        if timeout_s <= 0:
-            raise ValueError("bootstrap readiness timeout must be positive")
-        if self._ready_event.wait(timeout_s):
-            return
-
-        expected = self._expected_rank_count()
-        raise RuntimeError(
-            "Prefill bootstrap did not become ready: "
-            f"{self.registered_count}/{expected} ranks registered"
-        )
+        return self._registered_count >= expected
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
-        self.app.router.add_get("/ready", self._handle_readiness_check)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
-
-    async def _handle_readiness_check(self, request: web.Request) -> web.Response:
-        if self._is_ready():
-            return web.Response(text="READY", status=200)
-        return web.Response(
-            text=(
-                "Prefill bootstrap is not ready "
-                f"({self.registered_count}/{self._expected_rank_count()} ranks)"
-            ),
-            status=503,
-        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1986,180 +1731,76 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
-        try:
-            attn_tp_size = int(data["attn_tp_size"])
-            attn_tp_rank = validate_serialized_rank(
-                data["attn_tp_rank"], "attn_tp_rank"
+        attn_tp_size = data["attn_tp_size"]
+        attn_tp_rank = data["attn_tp_rank"]
+        attn_cp_size = data["attn_cp_size"]
+        attn_cp_rank = data["attn_cp_rank"]
+        attn_dp_size = data["attn_dp_size"]
+        attn_dp_rank = data["attn_dp_rank"]
+        pp_size = data["pp_size"]
+        pp_rank = data["pp_rank"]
+        system_dp_size = data["system_dp_size"]
+        system_dp_rank = data["system_dp_rank"]
+        rank_ip = data["rank_ip"]
+        rank_port = int(data["rank_port"])
+        page_size = int(data["page_size"])
+        kv_cache_dtype = data["kv_cache_dtype"]
+        prefill_http_port = data.get("prefill_http_port")
+
+        if self.attn_tp_size is None:
+            self.attn_tp_size = attn_tp_size
+
+        if self.attn_cp_size is None:
+            self.attn_cp_size = attn_cp_size
+
+        if self.dp_size is None:
+            self.dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
+
+        if self.pp_size is None:
+            self.pp_size = pp_size
+
+        if self.page_size is None and page_size is not None:
+            self.page_size = page_size
+
+        if self.kv_cache_dtype is None and kv_cache_dtype is not None:
+            self.kv_cache_dtype = kv_cache_dtype
+
+        if self.prefill_http_port is None and prefill_http_port is not None:
+            self.prefill_http_port = int(prefill_http_port)
+
+        if self.follow_bootstrap_room is None:
+            load_balance_method = data.get(
+                "load_balance_method", "follow_bootstrap_room"
             )
-            attn_cp_size = int(data["attn_cp_size"])
-            attn_cp_rank = validate_serialized_rank(
-                data["attn_cp_rank"], "attn_cp_rank"
-            )
-            attn_dp_size = int(data["attn_dp_size"])
-            attn_dp_rank = validate_serialized_rank(
-                data["attn_dp_rank"], "attn_dp_rank"
-            )
-            pp_size = int(data["pp_size"])
-            pp_rank = validate_serialized_rank(data["pp_rank"], "pp_rank")
-            system_dp_size = int(data["system_dp_size"])
-            system_dp_rank = validate_serialized_rank(
-                data["system_dp_rank"], "system_dp_rank"
-            )
-            rank_port = int(data["rank_port"])
-            page_size = int(data["page_size"])
-            prefill_http_port = int(data["prefill_http_port"])
-            transport_registration = _parse_bootstrap_transport_registration(data)
-        except (KeyError, TypeError, ValueError) as error:
-            return web.Response(
-                text=f"Invalid bootstrap registration: {error}",
-                status=400,
+            self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+
+        if self.enable_dsa_cache_layer_split is None:
+            self.enable_dsa_cache_layer_split = bool(
+                data.get("enable_dsa_cache_layer_split", False)
             )
 
-        rank_ip = data.get("rank_ip")
-        kv_cache_dtype = data.get("kv_cache_dtype")
-        load_balance_method = data.get("load_balance_method", "follow_bootstrap_room")
-        enable_dsa_cache_layer_split = data.get("enable_dsa_cache_layer_split", False)
-        if type(rank_ip) is not str or len(rank_ip) == 0:
-            return web.Response(text="Invalid bootstrap rank_ip", status=400)
-        if type(kv_cache_dtype) is not str or len(kv_cache_dtype) == 0:
-            return web.Response(text="Invalid bootstrap kv_cache_dtype", status=400)
-        if type(load_balance_method) is not str:
-            return web.Response(
-                text="Invalid bootstrap load_balance_method",
-                status=400,
-            )
-        if type(enable_dsa_cache_layer_split) is not bool:
-            return web.Response(
-                text="Invalid bootstrap enable_dsa_cache_layer_split",
-                status=400,
-            )
+        if system_dp_size == 1:
+            dp_group = attn_dp_rank
+        else:
+            dp_group = system_dp_rank
 
-        parallel_sizes = (
-            attn_tp_size,
-            attn_cp_size,
-            attn_dp_size,
-            pp_size,
-            system_dp_size,
-        )
-        if any(size <= 0 for size in parallel_sizes):
-            return web.Response(
-                text="Bootstrap parallel sizes must be positive",
-                status=400,
-            )
-        ranks_and_sizes = (
-            (attn_tp_rank, attn_tp_size),
-            (attn_cp_rank, attn_cp_size),
-            (attn_dp_rank, attn_dp_size),
-            (pp_rank, pp_size),
-            (system_dp_rank, system_dp_size),
-        )
-        if any(rank < 0 or rank >= size for rank, size in ranks_and_sizes):
-            return web.Response(
-                text="Bootstrap rank is outside its parallel dimension",
-                status=400,
-            )
-        if (
-            not 1 <= rank_port <= 65535
-            or not 1 <= prefill_http_port <= 65535
-            or page_size <= 0
-        ):
-            return web.Response(
-                text="Bootstrap ports and page_size must be positive and valid",
-                status=400,
-            )
-
-        dp_size = attn_dp_size if system_dp_size == 1 else system_dp_size
-        dp_group = attn_dp_rank if system_dp_size == 1 else system_dp_rank
-        follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
-
+        # Add lock to make sure thread-safe
         async with self.lock:
-            try:
-                resolved_attn_tp_size = _resolve_bootstrap_int(
-                    self.attn_tp_size, attn_tp_size, "attn_tp_size"
-                )
-                resolved_attn_cp_size = _resolve_bootstrap_int(
-                    self.attn_cp_size, attn_cp_size, "attn_cp_size"
-                )
-                resolved_dp_size = _resolve_bootstrap_int(
-                    self.dp_size, dp_size, "dp_size"
-                )
-                resolved_pp_size = _resolve_bootstrap_int(
-                    self.pp_size, pp_size, "pp_size"
-                )
-                resolved_page_size = _resolve_bootstrap_int(
-                    self.page_size, page_size, "page_size"
-                )
-                resolved_kv_cache_dtype = _resolve_bootstrap_str(
-                    self.kv_cache_dtype, kv_cache_dtype, "kv_cache_dtype"
-                )
-                resolved_prefill_http_port = _resolve_bootstrap_int(
-                    self.prefill_http_port,
-                    prefill_http_port,
-                    "prefill_http_port",
-                )
-                resolved_follow_bootstrap_room = _resolve_bootstrap_bool(
-                    self.follow_bootstrap_room,
-                    follow_bootstrap_room,
-                    "follow_bootstrap_room",
-                )
-                resolved_dsa_cache_layer_split = _resolve_bootstrap_bool(
-                    self.enable_dsa_cache_layer_split,
-                    enable_dsa_cache_layer_split,
-                    "enable_dsa_cache_layer_split",
-                )
-            except ValueError as error:
-                return web.Response(text=str(error), status=409)
-
-            self.attn_tp_size = resolved_attn_tp_size
-            self.attn_cp_size = resolved_attn_cp_size
-            self.dp_size = resolved_dp_size
-            self.pp_size = resolved_pp_size
-            self.page_size = resolved_page_size
-            self.kv_cache_dtype = resolved_kv_cache_dtype
-            self.prefill_http_port = resolved_prefill_http_port
-            self.follow_bootstrap_room = resolved_follow_bootstrap_room
-            self.enable_dsa_cache_layer_split = resolved_dsa_cache_layer_split
-
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
-            rank_info = PrefillRankInfo(
+            tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
-                attn_dp_rank=dp_group,
-                attn_cp_rank=attn_cp_rank,
-                attn_tp_rank=attn_tp_rank,
-                pp_rank=pp_rank,
-                **transport_registration,
             )
-            existing_rank_info = tp_group_table.get(pp_rank)
-            if existing_rank_info is not None and existing_rank_info != rank_info:
-                return web.Response(
-                    text=(
-                        "conflicting bootstrap registration for "
-                        f"DP{dp_group} CP{attn_cp_rank} "
-                        f"TP{attn_tp_rank} PP{pp_rank}"
-                    ),
-                    status=409,
-                )
-            tp_group_table[pp_rank] = rank_info
-            self._registered_ranks.add((dp_group, attn_cp_rank, attn_tp_rank, pp_rank))
-            if self._is_ready():
-                self._ready_event.set()
 
-        expected = self._expected_rank_count()
+            self._registered_count += 1
+
+        expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
-            "Register prefill bootstrap: DP%d CP%d TP%d PP%d at %s:%d "
-            "(%d/%s registered)",
-            dp_group,
-            attn_cp_rank,
-            attn_tp_rank,
-            pp_rank,
-            rank_ip,
-            rank_port,
-            self.registered_count,
-            expected,
+            f"Register prefill bootstrap: DP{dp_group} CP{attn_cp_rank} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+            f" ({self._registered_count}/{expected} registered)"
         )
 
         return web.Response(text="OK", status=200)
@@ -2186,7 +1827,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             if not self._is_ready():
                 return web.Response(
                     text=f"Prefill server not fully registered yet"
-                    f" ({self.registered_count} workers registered).",
+                    f" ({self._registered_count} workers registered).",
                     status=503,
                 )
             info = PrefillServerInfo(
@@ -2209,7 +1850,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if not self._is_ready():
             return web.Response(
                 text=f"Prefill server not fully registered yet"
-                f" ({self.registered_count} workers registered).",
+                f" ({self._registered_count} workers registered).",
                 status=503,
             )
 
@@ -2275,7 +1916,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._cleanup_task = self._loop.create_task(self._cleanup_expired_entries())
+            self._loop.create_task(self._cleanup_expired_entries())
 
             access_log = None
             if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
@@ -2293,16 +1934,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
-            if self._loop is None:
-                return
-            if self._cleanup_task is not None:
-                self._cleanup_task.cancel()
-                try:
-                    self._loop.run_until_complete(self._cleanup_task)
-                except asyncio.CancelledError:
-                    pass
-            if self._runner is not None:
-                self._loop.run_until_complete(self._runner.cleanup())
+            # Cleanup
+            self._loop.run_until_complete(self._runner.cleanup())
             self._loop.close()
 
     def close(self):

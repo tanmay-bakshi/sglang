@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rand::{distr::Alphanumeric, Rng};
@@ -15,7 +11,7 @@ use smg::{
         TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
         DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
-    core::{ConnectionMode, PdTopology},
+    core::ConnectionMode,
     observability::{
         metrics::PrometheusConfig,
         otel_trace::{is_otel_enabled, shutdown_otel},
@@ -206,10 +202,6 @@ struct CliArgs {
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
-
-    /// Immutable strict prefill-decode topology JSON document
-    #[arg(long, value_name = "PATH", help_heading = "PD Disaggregation")]
-    pd_topology_file: Option<PathBuf>,
 
     /// Specific policy for prefill nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
@@ -570,21 +562,8 @@ struct CliArgs {
 
     // ==================== Control Plane Authentication ====================
     /// API key for worker authorization
-    #[arg(
-        long,
-        conflicts_with = "api_key_file",
-        help_heading = "Control Plane Authentication"
-    )]
+    #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
-
-    /// File containing the API key for worker authorization
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "api_key",
-        help_heading = "Control Plane Authentication"
-    )]
-    api_key_file: Option<PathBuf>,
 
     /// JWT issuer URL for OIDC authentication
     #[arg(
@@ -712,17 +691,6 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
 }
 
 impl CliArgs {
-    fn resolve_api_key(&self) -> ConfigResult<Option<String>> {
-        match (&self.api_key, &self.api_key_file) {
-            (Some(api_key), None) => Ok(Some(api_key.clone())),
-            (None, Some(path)) => load_api_key_file(path).map(Some),
-            (None, None) => Ok(None),
-            (Some(_), Some(_)) => Err(ConfigError::IncompatibleConfig {
-                reason: "api_key and api_key_file cannot both be configured".to_string(),
-            }),
-        }
-    }
-
     /// Build control plane authentication configuration from CLI args.
     fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
         // Build JWT config if issuer and audience are provided
@@ -938,46 +906,16 @@ impl CliArgs {
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
-        let api_key = self.resolve_api_key()?;
-        let topology = self
-            .pd_topology_file
-            .as_ref()
-            .map(PdTopology::from_path)
-            .transpose()
-            .map_err(|error| ConfigError::InvalidValue {
-                field: "pd_topology_file".to_string(),
-                value: self
-                    .pd_topology_file
-                    .as_ref()
-                    .map_or_else(String::new, |path| path.display().to_string()),
-                reason: error.to_string(),
-            })?;
-
-        if topology.is_some()
-            && (!prefill_urls.is_empty()
-                || !self.decode.is_empty()
-                || !self.worker_urls.is_empty()
-                || self.prefill_policy.is_some()
-                || self.decode_policy.is_some()
-                || self.service_discovery)
-        {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "--pd-topology-file cannot be combined with flat workers, generic PD policies, or service discovery"
-                    .to_string(),
-            });
-        }
-
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
         let mode = if matches!(self.backend, Backend::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
-        } else if self.pd_disaggregation || topology.is_some() {
+        } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
-                topology,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
@@ -1024,17 +962,12 @@ impl CliArgs {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
-                topology,
                 ..
             } => {
-                if let Some(topology) = topology {
-                    all_urls.extend(topology.origins().map(ToString::to_string));
-                } else {
-                    for (url, _) in prefill_urls {
-                        all_urls.push(url.clone());
-                    }
-                    all_urls.extend(decode_urls.clone());
+                for (url, _) in prefill_urls {
+                    all_urls.push(url.clone());
                 }
+                all_urls.extend(decode_urls.clone());
             }
             RoutingMode::OpenAI { .. } => {}
         }
@@ -1114,7 +1047,7 @@ impl CliArgs {
             })
             .history_backend(history_backend)
             .log_level(&self.log_level)
-            .maybe_api_key(api_key.as_ref())
+            .maybe_api_key(self.api_key.as_ref())
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -1250,136 +1183,6 @@ impl CliArgs {
             control_plane_auth,
             mesh_server_config,
         }
-    }
-}
-
-fn load_api_key_file(path: &Path) -> ConfigResult<String> {
-    let contents = fs::read_to_string(path).map_err(|error| ConfigError::InvalidValue {
-        field: "api_key_file".to_string(),
-        value: "<redacted>".to_string(),
-        reason: format!("failed to read API key file: {error}"),
-    })?;
-    let api_key = contents
-        .strip_suffix("\r\n")
-        .or_else(|| contents.strip_suffix('\n'))
-        .unwrap_or(&contents);
-    if api_key.is_empty() || api_key.contains('\r') || api_key.contains('\n') {
-        return Err(ConfigError::InvalidValue {
-            field: "api_key_file".to_string(),
-            value: "<redacted>".to_string(),
-            reason: "API key file must contain exactly one nonempty line".to_string(),
-        });
-    }
-    Ok(api_key.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_test_topology() -> (tempfile::TempDir, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("pd-topology.json");
-        fs::write(
-            &path,
-            r#"{
-                "schema": "pd-topology-v1",
-                "groups": [{
-                    "id": "group-0",
-                    "prefill": {
-                        "origin": "http://prefill.test:30000",
-                        "tensor_parallel_size": 2,
-                        "bootstrap_endpoint": {"host": "prefill-transfer.test", "port": 50051}
-                    },
-                    "decoders": [{
-                        "origin": "http://decode.test:30001",
-                        "tensor_parallel_size": 1
-                    }]
-                }]
-            }"#,
-        )
-        .unwrap();
-        (directory, path)
-    }
-
-    #[test]
-    fn api_key_file_loads_one_line_without_retaining_the_terminator() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("worker-api-key");
-        fs::write(&path, "secret-value\r\n").unwrap();
-
-        let api_key = load_api_key_file(&path).unwrap();
-
-        assert_eq!(api_key, "secret-value");
-    }
-
-    #[test]
-    fn api_key_file_rejects_empty_and_multiline_values_without_disclosure() {
-        let directory = tempfile::tempdir().unwrap();
-        for (name, contents) in [("empty", "\n"), ("multiline", "first\nsecond\n")] {
-            let path = directory.path().join(name);
-            fs::write(&path, contents).unwrap();
-
-            let error = load_api_key_file(&path).unwrap_err().to_string();
-
-            assert!(error.contains("exactly one nonempty line"));
-            assert!(!error.contains(contents));
-        }
-    }
-
-    #[test]
-    fn inline_and_file_api_keys_are_mutually_exclusive() {
-        let result = Cli::try_parse_from([
-            "sgl-model-gateway",
-            "--api-key",
-            "inline-secret",
-            "--api-key-file",
-            "/run/secrets/worker-api-key",
-        ]);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn topology_file_builds_only_the_strict_pd_mode() {
-        let (_directory, topology_path) = write_test_topology();
-        let topology_path = topology_path.to_str().unwrap();
-        let cli = Cli::try_parse_from(["sgl-model-gateway", "--pd-topology-file", topology_path])
-            .unwrap();
-        let config = cli.router_args.to_router_config(Vec::new()).unwrap();
-
-        assert!(config.mode.pd_topology().is_some());
-        assert_eq!(config.mode.worker_count(), 2);
-    }
-
-    #[test]
-    fn topology_file_rejects_every_flat_cli_ownership_source() {
-        let (_directory, topology_path) = write_test_topology();
-        let topology_path = topology_path.to_str().unwrap();
-        for conflicting_args in [
-            vec!["--decode", "http://decode.test:30001"],
-            vec!["--worker-urls", "http://worker.test:30002"],
-            vec!["--prefill-policy", "random"],
-            vec!["--decode-policy", "random"],
-            vec!["--service-discovery"],
-        ] {
-            let mut args = vec!["sgl-model-gateway", "--pd-topology-file", topology_path];
-            args.extend(conflicting_args);
-            let cli = Cli::try_parse_from(args).unwrap();
-
-            assert!(matches!(
-                cli.router_args.to_router_config(Vec::new()),
-                Err(ConfigError::IncompatibleConfig { .. })
-            ));
-        }
-
-        let cli = Cli::try_parse_from(["sgl-model-gateway", "--pd-topology-file", topology_path])
-            .unwrap();
-        assert!(matches!(
-            cli.router_args
-                .to_router_config(vec![("http://prefill.test:30000".to_string(), None,)]),
-            Err(ConfigError::IncompatibleConfig { .. })
-        ));
     }
 }
 

@@ -10,7 +10,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     LoadBackResult,
 )
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
 
@@ -66,34 +65,6 @@ class TestLoadBackResult(unittest.TestCase):
         self.assertFalse(result.queued_any_component)
         self.assertEqual(result.full_tokens, 0)
         self.assertEqual(result.swa_tokens, 0)
-
-    def test_mamba_only_success_reports_queued_component(self) -> None:
-        node = SimpleNamespace(
-            evicted=False,
-            id=23,
-            mamba_evicted=True,
-            mamba_backuped=True,
-        )
-        empty_full_indices = torch.empty(0, dtype=torch.int64)
-        cache = SimpleNamespace(
-            load_back=MagicMock(return_value=empty_full_indices),
-        )
-
-        result = HiMambaRadixCache.init_load_back(
-            cache,
-            InitLoadBackParams(
-                best_match_node=node,
-                host_hit_length=0,
-                req=SimpleNamespace(rid="mamba-only"),
-            ),
-        )
-
-        self.assertIs(result.restored_node, node)
-        self.assertIs(result.new_full_device_indices, empty_full_indices)
-        self.assertTrue(result.queued_any_component)
-        self.assertEqual(result.full_tokens, 0)
-        self.assertEqual(result.swa_tokens, 0)
-
 
 if __name__ == "__main__":
     unittest.main()

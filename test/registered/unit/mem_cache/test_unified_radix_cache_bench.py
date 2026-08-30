@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --bench --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -10,6 +10,7 @@ import gc
 import logging
 import random
 import statistics
+import sys
 import time
 import unittest
 from array import array
@@ -821,7 +822,8 @@ _TREE_CONFIGS = {
     "legacy-swa": ((ComponentType.FULL, ComponentType.SWA), SWARadixCache),
 }
 
-if __name__ == "__main__":
+
+def _run_bench_cli():
     parser = argparse.ArgumentParser(description="UnifiedRadixCache benchmark")
     parser.add_argument("--num-seqs", type=int, default=5000)
     parser.add_argument("--chunk-len", type=int, default=256)
@@ -857,3 +859,12 @@ if __name__ == "__main__":
             tree_cls=tree_cls,
             page_size=args.page_size,
         )
+
+
+if __name__ == "__main__":
+    # CI runs `python3 file.py`; it must execute the TestBench_* classes
+    if "--bench" in sys.argv:
+        sys.argv.remove("--bench")
+        _run_bench_cli()
+    else:
+        unittest.main()

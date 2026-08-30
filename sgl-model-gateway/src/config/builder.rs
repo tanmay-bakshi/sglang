@@ -5,7 +5,7 @@ use super::{
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
     RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
-use crate::core::{ConnectionMode, PdTopology};
+use crate::core::ConnectionMode;
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -58,7 +58,6 @@ impl RouterConfigBuilder {
         self.config.mode = RoutingMode::PrefillDecode {
             prefill_urls,
             decode_urls,
-            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -76,21 +75,8 @@ impl RouterConfigBuilder {
         self.config.mode = RoutingMode::PrefillDecode {
             prefill_urls,
             decode_urls,
-            topology: None,
             prefill_policy,
             decode_policy,
-        };
-        self
-    }
-
-    /// Configure strict prefill-decode routing from an immutable topology.
-    pub fn prefill_decode_topology_mode(mut self, topology: PdTopology) -> Self {
-        self.config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: Vec::new(),
-            decode_urls: Vec::new(),
-            topology: Some(topology),
-            prefill_policy: None,
-            decode_policy: None,
         };
         self
     }

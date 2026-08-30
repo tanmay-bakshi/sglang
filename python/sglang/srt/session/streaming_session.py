@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-    maybe_evict_dsv4_state_on_swa,
-)
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -24,10 +22,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.common import streaming_session_swa_eviction_plan
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+    from sglang.srt.managers.schedule_batch import Req
 
 
 logger = logging.getLogger(__name__)
@@ -49,10 +47,10 @@ class SessionSlot:
 
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
-    # KV pool state (None means no KV is currently held by this slot)
+    # KV pool state
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
-    kv: Optional[ReqKvInfo] = None
+    kv: ReqKvInfo = field(default_factory=ReqKvInfo)
     streaming_session_floor: int = 0
 
     # First req's radix tree node (for dec_lock_ref on session close)
@@ -60,11 +58,15 @@ class SessionSlot:
     cache_protected_len: int = 0
     tree_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
+    # components the first req skipped locking on last_node, so release dec
+    # releases only what it took (may share the node with another req).
+    skip_lock_node_ids: dict = field(default_factory=dict)
 
     # Mamba states
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
     mamba_next_track_idx: Any = None
+    mamba_last_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
@@ -76,7 +78,7 @@ class SessionSlot:
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
-        return self.kv is not None
+        return self.req_pool_idx is not None
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -91,10 +93,12 @@ class SessionSlot:
             self.cache_protected_len = req.cache_protected_len
             self.tree_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
+            self.skip_lock_node_ids = req.skip_lock_node_ids
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
         self.mamba_next_track_idx = req.mamba_next_track_idx
+        self.mamba_last_track_idx = req.mamba_last_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
         self.c4_state_alloc_offset = getattr(req, "c4_state_alloc_offset", 0)
@@ -109,10 +113,11 @@ class SessionSlot:
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
-        req.kv = None
+        req.kv = ReqKvInfo()
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
+        req.mamba_last_track_idx = None
         req.mamba_last_track_seqlen = None
         req.mamba_branching_seqlen = None
 
@@ -123,10 +128,12 @@ class SessionSlot:
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.streaming_session_floor = self.streaming_session_floor
+        req.skip_lock_node_ids = self.skip_lock_node_ids
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
         req.mamba_next_track_idx = self.mamba_next_track_idx
+        req.mamba_last_track_idx = self.mamba_last_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
         req.c4_state_alloc_offset = self.c4_state_alloc_offset
@@ -233,7 +240,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or slot.kv is None:
+        if slot is None or not slot.is_holding_kv:
             return None
         if req.to_finish is not None:
             if req.streaming_session_owns_inflight:
@@ -261,6 +268,21 @@ class StreamingSession(BasePrefixCache):
             return None
 
         req = params.req
+
+        # [NPU] When aligned context < page_size, release the slot's KV and
+        # fall back to radix cache (full prefill). Once context >= page_size,
+        # streaming session kicks in with page-aligned KV reuse.
+        if is_npu() and self.page_size > 1:
+            expected_prefix_len = min(slot.kv_committed_len, len(params.key))
+            aligned_prefix_len = (
+                expected_prefix_len // self.page_size
+            ) * self.page_size
+            if aligned_prefix_len < slot.cache_protected_len or aligned_prefix_len == 0:
+                # Release KV to avoid leak and fallback to full prefill.
+                # req remains unassigned, so alloc_for_extend treats it as new.
+                self.release_session(req.session.session_id)
+                return None
+
         slot.restore_to_req(req)
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -286,6 +308,12 @@ class StreamingSession(BasePrefixCache):
             f"streaming session prefix shrank: {prefix_len=} < "
             f"cache_protected_len={slot.cache_protected_len}"
         )
+
+        # Floor-align prefix_len to page boundary (NPU workaround).
+        if is_npu() and self.page_size > 1:
+            prefix_len = (prefix_len // self.page_size) * self.page_size
+            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
 
         # Free orphaned tail: alloc_for_extend will overwrite
         # req_to_token[prefix_len:] with new indices. The range
@@ -359,6 +387,7 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    skip_lock_node_ids=req.skip_lock_node_ids,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -372,7 +401,7 @@ class StreamingSession(BasePrefixCache):
                 )
                 self.release_session(session_id)
                 req.req_pool_idx = None
-                req.kv = None
+                req.kv = ReqKvInfo()
                 req.session.abort_req(req)
                 return True
 
@@ -391,7 +420,7 @@ class StreamingSession(BasePrefixCache):
                     )
                     self.release_session(session_id)
                     req.req_pool_idx = None
-                    req.kv = None
+                    req.kv = ReqKvInfo()
                     req.mamba_pool_idx = None
                     req.mamba_ping_pong_track_buffer = None
                     req.session.abort_req(req)
@@ -469,6 +498,9 @@ class StreamingSession(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        return self.inner.evict_for_alloc(params)
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.try_inc_lock_ref(node)
         if result is not None:
@@ -501,13 +533,13 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(
-                    lock_node,
-                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
-                )
-            else:
-                self.inner.dec_lock_ref(lock_node)
+            self.inner.dec_lock_ref(
+                lock_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
+                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                ),
+            )
 
         if slot.is_holding_kv:
             start = protected_len
@@ -602,12 +634,6 @@ class StreamingSession(BasePrefixCache):
                 slot.req_pool_idx, physical_free_start:new_watermark
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
-        maybe_evict_dsv4_state_on_swa(
-            self.token_to_kv_pool_allocator,
-            self.req_to_token_pool,
-            slot,
-            new_watermark,
-        )
         slot.kv.swa_evicted_seqlen = new_watermark
 
     def release_radix_session(self, session_id: str) -> None:
@@ -791,9 +817,6 @@ class StreamingSession(BasePrefixCache):
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
-
-    def flush_write_through_acks(self) -> None:
-        return self.inner.flush_write_through_acks()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()

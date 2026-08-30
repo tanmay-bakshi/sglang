@@ -38,8 +38,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=240, stage="extra-b", runner_config="8-gpu-h200")
-# Nightly sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand the parameter sweep.
-register_cuda_ci(est_time=240, suite="nightly-kernel-8-gpu-h200", nightly=True)
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
+register_cuda_ci(est_time=70, stage="nightly", runner_config="8-gpu-h200")
 
 # ---------------------------------------------------------------------------
 # Test parameters

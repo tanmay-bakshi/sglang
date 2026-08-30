@@ -16,10 +16,7 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    core::{
-        worker::worker_to_info, worker_registry::WorkerId, HttpOrigin, Job, JobQueue,
-        WorkerRegistry,
-    },
+    core::{worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, WorkerRegistry},
     protocols::worker_spec::{
         WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest,
     },
@@ -32,8 +29,6 @@ pub enum WorkerServiceError {
     NotFound { worker_id: String },
     /// Invalid worker ID format (expected UUID)
     InvalidId { raw: String, message: String },
-    /// Invalid canonical origin for a PD process.
-    InvalidWorkerOrigin { message: String },
     /// Job queue not initialized
     QueueNotInitialized,
     /// Failed to submit job to queue
@@ -46,7 +41,6 @@ impl WorkerServiceError {
             Self::NotFound { .. } => "WORKER_NOT_FOUND",
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
-            Self::InvalidWorkerOrigin { .. } => "BAD_REQUEST",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
         }
     }
@@ -56,7 +50,6 @@ impl WorkerServiceError {
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidWorkerOrigin { .. } => StatusCode::BAD_REQUEST,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -74,9 +67,6 @@ impl std::fmt::Display for WorkerServiceError {
                 )
             }
             Self::QueueNotInitialized => write!(f, "Job queue not initialized"),
-            Self::InvalidWorkerOrigin { message } => {
-                write!(f, "Invalid PD worker origin: {message}")
-            }
             Self::QueueSubmitFailed { message } => write!(f, "{}", message),
         }
     }
@@ -236,23 +226,6 @@ impl WorkerService {
         &self,
         mut config: WorkerConfigRequest,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
-        config.dp_aware = self.router_config.dp_aware;
-
-        let worker_url = config.url.clone();
-        let pd_origin = match config.worker_type.as_deref() {
-            Some("prefill" | "decode") => {
-                Some(HttpOrigin::parse(&config.url).map_err(|error| {
-                    WorkerServiceError::InvalidWorkerOrigin {
-                        message: error.to_string(),
-                    }
-                })?)
-            }
-            _ => None,
-        };
-        if let Some(origin) = &pd_origin {
-            config.url = origin.as_str().to_string();
-        }
-
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
@@ -262,10 +235,10 @@ impl WorkerService {
             );
         }
 
-        let worker_id = pd_origin.map_or_else(
-            || self.worker_registry.reserve_id_for_url(&worker_url),
-            |origin| self.worker_registry.reserve_id_for_origin(&origin),
-        );
+        config.dp_aware = self.router_config.dp_aware;
+
+        let worker_url = config.url.clone();
+        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
 
         let job = Job::AddWorker {
             config: Box::new(config),
@@ -389,22 +362,5 @@ impl WorkerService {
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
         Ok(UpdateWorkerResult { worker_id, url })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_pd_origin_error_does_not_echo_credentials() {
-        let secret = "do-not-reflect-this";
-        let parse_error =
-            HttpOrigin::parse(&format!("http://user:{secret}@decode.test")).unwrap_err();
-        let error = WorkerServiceError::InvalidWorkerOrigin {
-            message: parse_error.to_string(),
-        };
-
-        assert!(!error.to_string().contains(secret));
     }
 }

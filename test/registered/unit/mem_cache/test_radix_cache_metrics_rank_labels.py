@@ -32,13 +32,13 @@ class CacheStub:
         self.metrics_collector = None
 
 
-class ServerArgsStub:
+class ObservabilityStub:
     """Expose operator-owned extra metric labels."""
 
     extra_metric_labels: dict[str, object]
 
     def __init__(self, extra_metric_labels: dict[str, object]) -> None:
-        """Create one server-argument stub.
+        """Create one observability-config stub.
 
         :param extra_metric_labels: Candidate extra Prometheus labels.
         """
@@ -131,7 +131,7 @@ class RankLocalRadixCacheMetricsTests(unittest.TestCase):
         """Eviction and load-back series retain their owning cache rank."""
 
         cache = CacheStub()
-        server_args = ServerArgsStub(
+        observability = ObservabilityStub(
             {
                 "deployment": "acceptance",
                 "pp_rank": "operator-value",
@@ -141,8 +141,8 @@ class RankLocalRadixCacheMetricsTests(unittest.TestCase):
         parallel = ParallelStub(pp_rank=0, tp_rank=1)
         with (
             patch(
-                "sglang.srt.runtime_context.get_server_args",
-                return_value=server_args,
+                "sglang.srt.mem_cache.base_prefix_cache.get_observability",
+                return_value=observability,
             ),
             patch(
                 "sglang.srt.runtime_context.get_parallel",
@@ -190,15 +190,15 @@ class RankLocalRadixCacheMetricsTests(unittest.TestCase):
         ):
             collector = RadixCacheMetricsCollector(labels=labels)
             collector.increment_eviction_num_tokens(1024)
-            collector.increment_load_back_num_tokens(448)
+            collector.increment_load_back_num_tokens(448, pool="kv")
 
         metrics = {metric.name: metric for metric in RecordingMetric.instances}
         eviction = metrics["sglang:evicted_tokens_total"]
         load_back = metrics["sglang:load_back_tokens_total"]
         self.assertEqual(eviction.labelnames, tuple(labels))
-        self.assertEqual(load_back.labelnames, tuple(labels))
+        self.assertEqual(load_back.labelnames, (*labels, "pool"))
         self.assertEqual(eviction.child_labels, [labels])
-        self.assertEqual(load_back.child_labels, [labels])
+        self.assertEqual(load_back.child_labels, [labels | {"pool": "kv"}])
         self.assertEqual(eviction.increments, [1024])
         self.assertEqual(load_back.increments, [448])
 

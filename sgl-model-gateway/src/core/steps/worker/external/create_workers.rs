@@ -3,12 +3,11 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::core::{
     circuit_breaker::CircuitBreakerConfig,
-    model_card::ModelCard,
     steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
     worker::{HealthConfig, RuntimeType, WorkerType},
     BasicWorkerBuilder, ConnectionMode, Worker,
@@ -23,33 +22,7 @@ fn normalize_external_url(url: &str) -> String {
     }
 }
 
-fn build_external_process_worker(
-    url: &str,
-    models: Vec<ModelCard>,
-    api_key: Option<&str>,
-    labels: &HashMap<String, String>,
-    circuit_breaker_config: CircuitBreakerConfig,
-    health_config: HealthConfig,
-) -> Arc<dyn Worker> {
-    let initially_healthy = health_config.disable_health_check;
-    let mut builder = BasicWorkerBuilder::new(url)
-        .models(models)
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Http)
-        .runtime_type(RuntimeType::External)
-        .labels(labels.clone())
-        .circuit_breaker_config(circuit_breaker_config)
-        .health_config(health_config)
-        .initially_healthy(initially_healthy);
-
-    if let Some(api_key) = api_key {
-        builder = builder.api_key(api_key);
-    }
-
-    Arc::new(builder.build())
-}
-
-/// Step 2: Create one process worker containing every discovered model.
+/// Step 2: Create worker objects for each discovered model.
 pub struct CreateExternalWorkersStep;
 
 #[async_trait]
@@ -101,28 +74,87 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
         // Normalize URL (ensure https:// for external APIs)
         let normalized_url = normalize_external_url(&config.url);
 
-        let worker = build_external_process_worker(
-            &normalized_url,
-            model_cards.clone(),
-            config.api_key.as_deref(),
-            &labels,
-            circuit_breaker_config,
-            health_config,
-        );
+        let mut workers = Vec::new();
 
+        // Handle wildcard mode: create a single worker with empty models list
         if model_cards.is_empty() {
+            debug!("Creating wildcard worker (no models) for {}", config.url);
+
+            let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
+                .models(vec![]) // Empty models = accepts any model
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::External)
+                .circuit_breaker_config(circuit_breaker_config.clone())
+                .health_config(health_config.clone());
+
+            if let Some(ref api_key) = config.api_key {
+                builder = builder.api_key(api_key.clone());
+            }
+
+            if !labels.is_empty() {
+                builder = builder.labels(labels.clone());
+            }
+
+            let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
+            if health_config.disable_health_check {
+                worker.set_healthy(true);
+            } else {
+                worker.set_healthy(false);
+            }
+
             info!(
                 "Created wildcard worker at {} (accepts any model, user auth forwarded)",
                 normalized_url
             );
+
+            workers.push(worker);
         } else {
-            info!(
-                "Created one external process worker for {} models at {}",
+            debug!(
+                "Creating {} external workers for {}",
                 model_cards.len(),
-                normalized_url
+                config.url
+            );
+
+            // Create a worker for each model
+            for model_card in model_cards.iter() {
+                let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
+                    .model(model_card.clone())
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::External)
+                    .circuit_breaker_config(circuit_breaker_config.clone())
+                    .health_config(health_config.clone());
+
+                if let Some(ref api_key) = config.api_key {
+                    builder = builder.api_key(api_key.clone());
+                }
+
+                if !labels.is_empty() {
+                    builder = builder.labels(labels.clone());
+                }
+
+                let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
+                if health_config.disable_health_check {
+                    worker.set_healthy(true);
+                } else {
+                    worker.set_healthy(false);
+                }
+
+                debug!(
+                    "Created external worker for model {} at {}",
+                    model_card.id, normalized_url
+                );
+
+                workers.push(worker);
+            }
+
+            info!(
+                "Created {} external workers from {}",
+                workers.len(),
+                config.url
             );
         }
-        let workers = vec![worker];
 
         // Store results in workflow data
         context.data.workers = Some(WorkerList::from_workers(&workers));
@@ -133,59 +165,5 @@ impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::UNKNOWN_MODEL_ID;
-
-    #[test]
-    fn external_process_worker_owns_all_discovered_models() {
-        let models = vec![
-            ModelCard::new("model-a").with_alias("model-a-versioned"),
-            ModelCard::new("model-b"),
-        ];
-
-        let worker = build_external_process_worker(
-            "https://provider.test",
-            models,
-            Some("secret"),
-            &HashMap::new(),
-            CircuitBreakerConfig::default(),
-            HealthConfig::default(),
-        );
-
-        assert_eq!(worker.models().len(), 2);
-        assert_eq!(
-            worker.model_ids(),
-            vec!["model-a", "model-a-versioned", "model-b"]
-        );
-        assert!(worker.supports_model("model-a"));
-        assert!(worker.supports_model("model-a-versioned"));
-        assert!(worker.supports_model("model-b"));
-        assert_eq!(worker.api_key().as_deref(), Some("secret"));
-        assert!(!worker.is_healthy());
-    }
-
-    #[test]
-    fn wildcard_external_process_retains_wildcard_identity_and_health_policy() {
-        let worker = build_external_process_worker(
-            "https://provider.test",
-            Vec::new(),
-            None,
-            &HashMap::new(),
-            CircuitBreakerConfig::default(),
-            HealthConfig {
-                disable_health_check: true,
-                ..HealthConfig::default()
-            },
-        );
-
-        assert!(worker.models().is_empty());
-        assert_eq!(worker.model_ids(), vec![UNKNOWN_MODEL_ID]);
-        assert!(worker.supports_model("any-model"));
-        assert!(worker.is_healthy());
     }
 }

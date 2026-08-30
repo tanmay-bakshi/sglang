@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -26,12 +26,16 @@ class _FakeAllocator:
 
 
 class _FakeReqToTokenPool:
-    def __init__(self, req_to_token: torch.Tensor):
+    def __init__(self, req_to_token: torch.Tensor) -> None:
         self.req_to_token = req_to_token
         self.free_slots = []
 
     def release_detached_request_slot(self, pool_idx: int) -> None:
         self.free_slots.append(pool_idx)
+
+    def free(self, req: "_FakeReq") -> None:
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
 
 class _FakeInnerCache:
@@ -49,6 +53,7 @@ class _FakeInnerCache:
         self.sliding_window_size = sliding_window_size
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
+        self.dec_lock_ref_params = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -60,6 +65,7 @@ class _FakeInnerCache:
 
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
+        self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
 
     def supports_mamba(self):
         return False
@@ -97,7 +103,7 @@ class _FakeReq:
         self.streaming_session_owns_inflight = True
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
             kv_allocated_len=allocated,
             swa_evicted_seqlen=0,
         )
@@ -110,12 +116,15 @@ class _FakeReq:
         self.streaming_session_admitted = True
         self.streaming_session_preburst_mutation = False
         self.extra_key = None
+        self.cache_salt = None
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
+        self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.to_finish = None
@@ -149,6 +158,21 @@ def test_per_session_cache_snapshot_reports_durable_slot_ownership():
     assert snapshot.protected == 32
     assert snapshot.held_tokens == 64
     assert tree_cache.streaming_session_cache_snapshot("missing").held_tokens == 0
+
+
+def test_held_empty_slot_remains_owned_during_resume() -> None:
+    slot = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=0,
+        kv=ReqKvInfo(),
+    )
+    req = _FakeReq("session-a", req_pool_idx=1, committed=0, allocated=0)
+
+    slot.restore_to_req(req)
+
+    assert slot.is_holding_kv
+    assert req.req_pool_idx == 0
+    assert req.kv.is_released
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -246,7 +270,7 @@ def test_first_mid_abort_preserves_complete_preburst_slot():
     assert slot.kv.kv_allocated_len == 40
     assert allocator.freed[0].tolist() == list(range(40, 45))
     assert req.req_pool_idx is None
-    assert req.kv is None
+    assert req.kv.is_released
     assert req_to_token_pool.free_slots == []
 
 
@@ -285,7 +309,7 @@ def test_nth_mid_abort_preserves_session_slot():
 
     # Ownership moved back to the slot.
     assert req.req_pool_idx is None
-    assert req.kv is None
+    assert req.kv.is_released
 
 
 def test_committed_append_becomes_abort_rollback_boundary():
@@ -402,9 +426,40 @@ def test_incomplete_committed_append_retires_physical_slot():
 
     assert "session-a" not in tree_cache.slots
     assert req.req_pool_idx is None
-    assert req.kv is None
+    assert req.kv.is_released
     assert req_to_token_pool.free_slots == [0]
     assert allocator.freed[0].tolist() == list(range(65))
+
+
+def test_release_session_threads_mamba_skip_ids():
+    """release_session must forward the slot's skip_lock_node_ids to
+    dec_lock_ref. The first req's last_node may be full-only-locked (mamba
+    skipped at inc), so without the skip set the release would drop a mamba
+    lock the session never took -- another request's, on a shared node."""
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        last_node=lock_node,
+        cache_protected_len=0,
+        skip_lock_node_ids={ComponentType.MAMBA: {42}},
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    params = inner.dec_lock_ref_params[0]
+    assert params is not None
+    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
 
 
 # Shrink tests removed: streaming sessions are append-only after the
@@ -656,11 +711,12 @@ def test_active_swa_eviction_is_clamped_by_streaming_floor():
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     req = SimpleNamespace(
+        is_holding_kv=True,
         req_pool_idx=0,
         cache_protected_len=0,
         swa_evict_floor=0,
         streaming_session_floor=80,
-        kv=SimpleNamespace(swa_evicted_seqlen=0),
+        kv=ReqKvInfo(kv_allocated_len=112, swa_evicted_seqlen=0),
     )
 
     free_swa_out_of_window_slots(
@@ -676,16 +732,43 @@ def test_active_swa_eviction_is_clamped_by_streaming_floor():
     assert allocator.freed_swa[0].tolist() == list(range(48))
 
 
+def test_held_empty_request_skips_swa_eviction_before_allocation() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        is_holding_kv=True,
+        req_pool_idx=0,
+        cache_protected_len=0,
+        swa_evict_floor=0,
+        streaming_session_floor=80,
+        kv=ReqKvInfo(),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        112,
+        sliding_window_size=32,
+        page_size=16,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.is_released
+    assert allocator.freed_swa == []
+
+
 def test_streaming_floor_preserves_radix_owned_rollback_window():
     req_to_token = torch.arange(9_216, dtype=torch.int32).reshape(2, 4_608)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     req = SimpleNamespace(
+        is_holding_kv=True,
         req_pool_idx=0,
         cache_protected_len=2_048,
         swa_evict_floor=0,
         streaming_session_floor=2_048,
-        kv=SimpleNamespace(swa_evicted_seqlen=0),
+        kv=ReqKvInfo(kv_allocated_len=4_608, swa_evicted_seqlen=0),
     )
 
     free_swa_out_of_window_slots(
@@ -706,11 +789,12 @@ def test_streaming_floor_rejects_unpersisted_forced_evict_prefix():
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     req = SimpleNamespace(
+        is_holding_kv=True,
         req_pool_idx=0,
         cache_protected_len=64,
         swa_evict_floor=96,
         streaming_session_floor=256,
-        kv=SimpleNamespace(swa_evicted_seqlen=32),
+        kv=ReqKvInfo(kv_allocated_len=256, swa_evicted_seqlen=32),
     )
 
     with pytest.raises(RuntimeError, match="prefill-aware SWA"):
@@ -841,11 +925,12 @@ def test_non_session_swa_eviction_keeps_existing_frontier():
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     req = SimpleNamespace(
+        is_holding_kv=True,
         req_pool_idx=0,
         cache_protected_len=0,
         swa_evict_floor=0,
         streaming_session_floor=None,
-        kv=SimpleNamespace(swa_evicted_seqlen=0),
+        kv=ReqKvInfo(kv_allocated_len=112, swa_evicted_seqlen=0),
     )
 
     free_swa_out_of_window_slots(

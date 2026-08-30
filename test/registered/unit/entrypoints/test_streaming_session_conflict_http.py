@@ -39,20 +39,6 @@ class _DeterministicTokenizerManager:
         self.error = error
         self.terminal_completion = None
 
-    async def attach_decode_inference(
-        self,
-        inference_route: str,
-        request_body: bytes,
-    ) -> GenerateReqInput | None:
-        """Decline decode-reservation attachment.
-
-        :param inference_route: Native inference route.
-        :param request_body: Exact incoming request body.
-        :returns: No attached request.
-        """
-        del inference_route, request_body
-        return None
-
     async def generate_request(
         self,
         obj: GenerateReqInput,
@@ -409,7 +395,13 @@ class StreamingDisconnectAbortGuardTest(unittest.IsolatedAsyncioTestCase):
             terminal_completion=completion,
         )
 
-        with patch.object(asyncio, "sleep", AsyncMock()):
+        with (
+            patch.object(asyncio, "sleep", AsyncMock()),
+            patch(
+                "sglang.srt.managers.tokenizer_manager.get_serving",
+                return_value=manager.server_args,
+            ),
+        ):
             await background()
 
         self.assertEqual(len(dispatched), 1)

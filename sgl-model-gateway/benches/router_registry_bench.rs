@@ -1,12 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use smg::core::{
-    BasicWorkerBuilder, CircuitBreakerConfig, HttpOrigin, KvTransferProtocol, PdMetadataSchema,
-    PdProcessMetadata, PdProcessRegistration, PdProcessRole, PreparedGrantProtocol, WorkerRegistry,
-    WorkerType,
-};
-use uuid::Uuid;
+use smg::core::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType};
 
 // Helper to populate registry
 fn setup_registry(count: usize) -> Arc<WorkerRegistry> {
@@ -22,37 +17,13 @@ fn setup_registry(count: usize) -> Arc<WorkerRegistry> {
             WorkerType::Decode
         };
 
-        let url = format!("http://worker-{i}:8000");
-        let mut builder = BasicWorkerBuilder::new(&url)
+        let worker = BasicWorkerBuilder::new(format!("http://worker-{}:8000", i))
             .worker_type(worker_type)
             .labels(labels)
-            .circuit_breaker_config(CircuitBreakerConfig::default());
-        if i % 2 != 0 {
-            let metadata = PdProcessMetadata::new(
-                PdMetadataSchema::V1,
-                Uuid::from_u128(i as u128 + 1),
-                PdProcessRole::Decode,
-                1,
-                1,
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "bf16",
-                64,
-                KvTransferProtocol::PackedV4,
-                PreparedGrantProtocol::V1,
-                None,
-            )
-            .expect("benchmark PD metadata must be valid");
-            builder = builder.pd_process(PdProcessRegistration::new(
-                HttpOrigin::parse(&url).expect("benchmark worker URL must be a valid HTTP origin"),
-                metadata,
-            ));
-        }
-        let worker = builder.build();
+            .circuit_breaker_config(CircuitBreakerConfig::default())
+            .build();
 
-        registry
-            .register(Arc::from(worker))
-            .expect("benchmark worker registration must succeed");
+        registry.register(Arc::from(worker));
     }
     registry
 }

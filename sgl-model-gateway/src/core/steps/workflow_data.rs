@@ -26,7 +26,7 @@ pub use crate::protocols::worker_spec::{
 };
 use crate::{
     app_context::AppContext,
-    core::{model_card::ModelCard, PdProcessAdvertisement, Worker},
+    core::{model_card::ModelCard, Worker},
     protocols::worker_spec::{
         WorkerConfigRequest as ProtocolWorkerConfigRequest,
         WorkerUpdateRequest as ProtocolWorkerUpdateRequest,
@@ -115,7 +115,6 @@ pub struct LocalWorkerWorkflowData {
     pub config: ProtocolWorkerConfigRequest,
     pub connection_mode: Option<crate::core::ConnectionMode>,
     pub discovered_labels: HashMap<String, String>,
-    pub pd_process_advertisement: Option<PdProcessAdvertisement>,
     pub dp_info: Option<super::worker::local::DpInfo>,
     pub workers: Option<WorkerList>,
     pub final_labels: HashMap<String, String>,

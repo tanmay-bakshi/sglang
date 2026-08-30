@@ -309,9 +309,17 @@ class TestUnifiedLoadBackCompletion(unittest.TestCase):
             ongoing_load_back={node_id: (object(), object(), object())},
             dec_lock_ref=MagicMock(),
             dec_host_lock_ref=MagicMock(),
+            buffer_pipeline=None,
             metrics_collector=None,
             pp_rank=0,
+            tree_core=SimpleNamespace(
+                finish_load_back=MagicMock(),
+                write_back_duplicate_reclaim_digest=0,
+            ),
             _all_reduce=MagicMock(),
+        )
+        cache._count_ready_acks = lambda queue: UnifiedRadixCache._count_ready_acks(
+            cache, queue
         )
         cache.loading_check = MagicMock(
             side_effect=lambda: UnifiedRadixCache.loading_check(cache)
@@ -370,13 +378,19 @@ class TestUnifiedLoadBackCompletion(unittest.TestCase):
                     self._make_cache(event, node_id=rank + 1)
                     for rank, event in enumerate(events)
                 ]
-                for cache in caches:
-                    cache._all_reduce.side_effect = lambda value, _op: value.fill_(
-                        min(
-                            int(event.full_complete and event.swa_complete)
-                            for event in events
-                        )
+                def reduce_ready(value: torch.Tensor, reduction: object) -> None:
+                    del reduction
+                    ready = min(
+                        int(event.full_complete and event.swa_complete)
+                        for event in events
                     )
+                    if value.numel() == 1:
+                        value.fill_(ready)
+                        return
+                    value[0] = ready
+
+                for cache in caches:
+                    cache._all_reduce.side_effect = reduce_ready
                 decode_reqs = [self._make_decode_req() for _ in range(tp_size)]
 
                 self.assertEqual(
@@ -489,6 +503,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
 
         controller.load.side_effect = load
         cache.cache_controller = controller
+        cache.buffer_pipeline = None
         cache._components_tuple = ()
         cache.inc_host_lock_ref = MagicMock(return_value=IncLockRefResult(delta=0))
         cache.inc_lock_ref = MagicMock(return_value=IncLockRefResult(delta=0))

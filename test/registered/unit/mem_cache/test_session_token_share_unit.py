@@ -42,6 +42,8 @@ def _recv(
     offset=None,
     input_text=None,
 ):
+    sampling_params = SamplingParams(max_new_tokens=max_new_tokens)
+    sampling_params.normalize(tokenizer=None)
     return SimpleNamespace(
         rid=rid,
         input_text=input_text,
@@ -57,7 +59,7 @@ def _recv(
             commit_to=commit_to,
             expected_tip=expected_tip,
         ),
-        sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+        sampling_params=sampling_params,
         lora_id=None,
         custom_logit_processor=None,
         stream=False,
@@ -72,6 +74,7 @@ def _recv(
         priority=None,
         routing_key=None,
         extra_key=None,
+        cache_salt=None,
         http_worker_ipc=None,
         time_stats=None,
     )
@@ -705,6 +708,7 @@ class TestSessionTokenShare(CustomTestCase):
         released: list[str] = []
         tree_cache = SimpleNamespace(
             supports_mamba=lambda: False,
+            release_radix_session=lambda session_id: None,
             release_session=released.append,
         )
         controller = SessionController(tree_cache, causes.append)
@@ -738,6 +742,7 @@ class TestSessionTokenShare(CustomTestCase):
         released: list[str] = []
         tree_cache = SimpleNamespace(
             supports_mamba=lambda: False,
+            release_radix_session=lambda session_id: None,
             release_session=released.append,
         )
         controller = SessionController(tree_cache, causes.append)
@@ -765,6 +770,7 @@ class TestSessionTokenShare(CustomTestCase):
         released: list[str] = []
         tree_cache = SimpleNamespace(
             supports_mamba=lambda: False,
+            release_radix_session=lambda session_id: None,
             release_session=released.append,
         )
         controller = SessionController(tree_cache, causes.append)

@@ -5,7 +5,7 @@ pub use data_connector::{HistoryBackend, OracleConfig, PostgresConfig, RedisConf
 use serde::{Deserialize, Serialize};
 
 use super::ConfigResult;
-use crate::core::{ConnectionMode, PdTopology};
+use crate::core::ConnectionMode;
 
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -13,7 +13,7 @@ pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
 /// Main router configuration
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
@@ -26,7 +26,6 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
-    #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -100,49 +99,6 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
-}
-
-impl std::fmt::Debug for RouterConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RouterConfig")
-            .field("mode", &self.mode)
-            .field("connection_mode", &self.connection_mode)
-            .field("policy", &self.policy)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("max_payload_size", &self.max_payload_size)
-            .field("request_timeout_secs", &self.request_timeout_secs)
-            .field(
-                "worker_startup_timeout_secs",
-                &self.worker_startup_timeout_secs,
-            )
-            .field("dp_aware", &self.dp_aware)
-            .field("api_key_configured", &self.api_key.is_some())
-            .field("discovery", &self.discovery)
-            .field("metrics", &self.metrics)
-            .field("trace_config", &self.trace_config)
-            .field("log_dir", &self.log_dir)
-            .field("log_level", &self.log_level)
-            .field("max_concurrent_requests", &self.max_concurrent_requests)
-            .field("retry", &self.retry)
-            .field("circuit_breaker", &self.circuit_breaker)
-            .field("health_check", &self.health_check)
-            .field("enable_igw", &self.enable_igw)
-            .field("model_path", &self.model_path)
-            .field("tokenizer_path", &self.tokenizer_path)
-            .field("history_backend", &self.history_backend)
-            .field("oracle_configured", &self.oracle.is_some())
-            .field("postgres_configured", &self.postgres.is_some())
-            .field("redis_configured", &self.redis.is_some())
-            .field("server_cert_configured", &self.server_cert.is_some())
-            .field("server_key_configured", &self.server_key.is_some())
-            .field(
-                "client_identity_configured",
-                &self.client_identity.is_some(),
-            )
-            .finish_non_exhaustive()
-    }
 }
 
 /// Tokenizer cache configuration
@@ -230,9 +186,6 @@ pub enum RoutingMode {
         /// With optional bootstrap ports
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
-        /// Immutable deployment topology for strict HTTP PD routing.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        topology: Option<PdTopology>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,26 +200,14 @@ impl RoutingMode {
         matches!(self, RoutingMode::PrefillDecode { .. })
     }
 
-    /// Return the immutable topology when strict PD routing is configured.
-    pub fn pd_topology(&self) -> Option<&PdTopology> {
-        match self {
-            RoutingMode::PrefillDecode { topology, .. } => topology.as_ref(),
-            RoutingMode::Regular { .. } | RoutingMode::OpenAI { .. } => None,
-        }
-    }
-
     pub fn worker_count(&self) -> usize {
         match self {
             RoutingMode::Regular { worker_urls } => worker_urls.len(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
-                topology,
                 ..
-            } => topology.as_ref().map_or_else(
-                || prefill_urls.len() + decode_urls.len(),
-                |topology| topology.origins().count(),
-            ),
+            } => prefill_urls.len() + decode_urls.len(),
             RoutingMode::OpenAI { .. } => 1,
         }
     }
@@ -765,32 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn test_router_config_redacts_api_key_from_debug_and_serialization() {
-        const SECRET: &str = "router-api-key-that-must-not-leak";
-
-        let config = RouterConfig {
-            api_key: Some(SECRET.to_string()),
-            ..RouterConfig::default()
-        };
-
-        let debug = format!("{config:?}");
-        assert!(!debug.contains(SECRET));
-        assert!(debug.contains("api_key_configured: true"));
-
-        let serialized = serde_json::to_string(&config).unwrap();
-        assert!(!serialized.contains(SECRET));
-        assert!(!serialized.contains("\"api_key\""));
-
-        let mut input = serde_json::to_value(RouterConfig::default()).unwrap();
-        input
-            .as_object_mut()
-            .unwrap()
-            .insert("api_key".to_string(), SECRET.into());
-        let deserialized: RouterConfig = serde_json::from_value(input).unwrap();
-        assert_eq!(deserialized.api_key.as_deref(), Some(SECRET));
-    }
-
-    #[test]
     fn test_router_config_http_client_deserialization_defaults() {
         let config = RouterConfig::default();
         let mut json = serde_json::to_value(&config).unwrap();
@@ -827,7 +742,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -855,7 +769,6 @@ mod tests {
                 "http://decode2".to_string(),
                 "http://decode3".to_string(),
             ],
-            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -879,7 +792,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -1339,7 +1251,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1370,7 +1281,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1399,7 +1309,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1424,7 +1333,6 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            topology: None,
             prefill_policy: None,
             decode_policy: None,
         };

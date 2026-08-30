@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_memory, get_spec
 from sglang.srt.utils import create_device_stream, device_stream_context
 
 try:
@@ -110,7 +110,7 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_memory().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -230,7 +230,12 @@ class LMCRadixCache(RadixCache):
         if token_ids is key.token_ids:
             token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
-            key=RadixKey(token_ids, key.extra_key, key.is_bigram),
+            key=RadixKey(
+                token_ids,
+                key.extra_key,
+                key.is_bigram,
+                cache_salt=key.cache_salt,
+            ),
             value_numel=int(value.numel()),
         )
         return MatchResult(
@@ -388,8 +393,8 @@ class LMCRadixCache(RadixCache):
             self._update_leaf_status(last_node)
             self._update_leaf_status(new_node)
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node.parent)
+            self.kv_events.record_store(new_node)
 
             return token_slots[:fetched], new_node
 
@@ -457,8 +462,7 @@ class LMCRadixCache(RadixCache):
                 self.lmcache_connector.end_session(req.rid)
             return
 
-        global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
+        topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len
@@ -474,7 +478,13 @@ class LMCRadixCache(RadixCache):
 
         # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.
         match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None

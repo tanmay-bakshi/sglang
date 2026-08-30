@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Job types for control plane operations
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Job {
     AddWorker {
         config: Box<WorkerConfigRequest>,
@@ -63,15 +63,6 @@ pub enum Job {
     RemoveTokenizer {
         request: Box<TokenizerRemovalRequest>,
     },
-}
-
-impl std::fmt::Debug for Job {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Job")
-            .field("job_type", &self.job_type())
-            .finish_non_exhaustive()
-    }
 }
 
 impl Job {
@@ -143,36 +134,6 @@ impl std::fmt::Debug for JobQueue {
         f.debug_struct("JobQueue")
             .field("status_count", &self.status_map.len())
             .finish()
-    }
-}
-
-fn configured_local_worker_request(
-    router_config: &RouterConfig,
-    url: String,
-    worker_type: &str,
-    bootstrap_port: Option<u16>,
-) -> WorkerConfigRequest {
-    WorkerConfigRequest {
-        url,
-        api_key: router_config.api_key.clone(),
-        worker_type: Some(worker_type.to_string()),
-        labels: HashMap::new(),
-        model_id: router_config.model_path.clone(),
-        priority: None,
-        cost: None,
-        runtime: None,
-        tokenizer_path: None,
-        reasoning_parser: None,
-        tool_parser: None,
-        chat_template: router_config.chat_template.clone(),
-        bootstrap_port,
-        health_check_timeout_secs: router_config.health_check.timeout_secs,
-        health_check_interval_secs: router_config.health_check.check_interval_secs,
-        health_success_threshold: router_config.health_check.success_threshold,
-        health_failure_threshold: router_config.health_check.failure_threshold,
-        disable_health_check: router_config.health_check.disable_health_check,
-        max_connection_attempts: router_config.health_check.success_threshold * 10,
-        dp_aware: router_config.dp_aware,
     }
 }
 
@@ -533,6 +494,7 @@ impl JobQueue {
                     .await
             }
             Job::InitializeWorkersFromConfig { router_config } => {
+                let api_key = router_config.api_key.clone();
                 let mut worker_count = 0;
 
                 // Create iterator of (url, worker_type, bootstrap_port) tuples based on mode
@@ -544,34 +506,16 @@ impl JobQueue {
                     RoutingMode::PrefillDecode {
                         prefill_urls,
                         decode_urls,
-                        topology,
                         ..
                     } => {
-                        if let Some(topology) = topology {
-                            let mut workers = Vec::with_capacity(topology.origins().count());
-                            for group in &topology.groups {
-                                workers.push((
-                                    group.prefill.origin.to_string(),
-                                    "prefill",
-                                    Some(group.prefill.bootstrap_endpoint.port),
-                                ));
-                                workers.extend(
-                                    group.decoders.iter().map(|decoder| {
-                                        (decoder.origin.to_string(), "decode", None)
-                                    }),
-                                );
-                            }
-                            workers
-                        } else {
-                            let prefill_workers = prefill_urls
-                                .iter()
-                                .map(|(url, port)| (url.clone(), "prefill", *port));
+                        let prefill_workers = prefill_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "prefill", *port));
 
-                            let decode_workers =
-                                decode_urls.iter().map(|url| (url.clone(), "decode", None));
+                        let decode_workers =
+                            decode_urls.iter().map(|url| (url.clone(), "decode", None));
 
-                            prefill_workers.chain(decode_workers).collect()
-                        }
+                        prefill_workers.chain(decode_workers).collect()
                     }
                     RoutingMode::OpenAI { worker_urls } => {
                         // OpenAI mode: submit AddWorker jobs with runtime: "external"
@@ -652,12 +596,28 @@ impl JobQueue {
                 // Process all workers with unified loop
                 for (url, worker_type, bootstrap_port) in workers {
                     let url_for_error = url.clone(); // Clone for error message
-                    let config = configured_local_worker_request(
-                        router_config,
+                    let config = WorkerConfigRequest {
                         url,
-                        worker_type,
+                        api_key: api_key.clone(),
+                        worker_type: Some(worker_type.to_string()),
+                        labels: HashMap::new(),
+                        model_id: None,
+                        priority: None,
+                        cost: None,
+                        runtime: None,
+                        tokenizer_path: None,
+                        reasoning_parser: None,
+                        tool_parser: None,
+                        chat_template: router_config.chat_template.clone(),
                         bootstrap_port,
-                    );
+                        health_check_timeout_secs: router_config.health_check.timeout_secs,
+                        health_check_interval_secs: router_config.health_check.check_interval_secs,
+                        health_success_threshold: router_config.health_check.success_threshold,
+                        health_failure_threshold: router_config.health_check.failure_threshold,
+                        disable_health_check: router_config.health_check.disable_health_check,
+                        max_connection_attempts: router_config.health_check.success_threshold * 10,
+                        dp_aware: router_config.dp_aware,
+                    };
 
                     let job = Job::AddWorker {
                         config: Box::new(config),
@@ -833,38 +793,6 @@ impl JobQueue {
                 "Cleaned up old job statuses, remaining: {}",
                 status_map.len()
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configured_pd_workers_use_the_authoritative_model_path() {
-        let model_path = "/models/gemma-4-31B-it-NVFP4";
-        let router_config = RouterConfig::builder()
-            .prefill_decode_mode(
-                vec![("http://prefill.test:30000".to_string(), Some(40000))],
-                vec!["http://decode.test:30001".to_string()],
-            )
-            .model_path(model_path)
-            .build_unchecked();
-
-        for (url, worker_type, bootstrap_port) in [
-            ("http://prefill.test:30000", "prefill", Some(40000)),
-            ("http://decode.test:30001", "decode", None),
-        ] {
-            let request = configured_local_worker_request(
-                &router_config,
-                url.to_string(),
-                worker_type,
-                bootstrap_port,
-            );
-
-            assert_eq!(request.model_id.as_deref(), Some(model_path));
-            assert_eq!(request.worker_type.as_deref(), Some(worker_type));
         }
     }
 }

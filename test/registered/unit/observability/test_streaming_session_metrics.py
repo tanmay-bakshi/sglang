@@ -35,6 +35,26 @@ class _ContextOnlyCollector(SchedulerMetricsCollector):
 class TestStreamingSessionMetrics(unittest.TestCase):
     """Exercise streaming-session metric ownership and surface."""
 
+    def setUp(self) -> None:
+        """Disable unrelated MoE reporting in isolated collector fixtures."""
+        balancedness_patch = patch(
+            "sglang.srt.observability.metrics_collector."
+            "exports_expert_balancedness_to_prometheus",
+            return_value=False,
+        )
+        balancedness_patch.start()
+        self.addCleanup(balancedness_patch.stop)
+        schedule_patch = patch(
+            "sglang.srt.observability.metrics_collector.get_schedule",
+            return_value=SimpleNamespace(
+                prefill_delayer_max_delay_passes=200,
+                prefill_delayer_forward_passes_buckets=None,
+                prefill_delayer_wait_seconds_buckets=None,
+            ),
+        )
+        schedule_patch.start()
+        self.addCleanup(schedule_patch.stop)
+
     @staticmethod
     def _server_args(
         *,
@@ -140,21 +160,52 @@ class TestStreamingSessionMetrics(unittest.TestCase):
                 is_output_rank=is_output_rank,
                 enable_all_schedulers=enable_all_schedulers,
             ):
-                context = SchedulerMetricsCollector.init_new(
-                    server_args=self._server_args(
-                        enable_metrics=enable_metrics,
-                        enable_streaming_session=enable_streaming_session,
-                        enable_metrics_for_all_schedulers=enable_all_schedulers,
-                    ),
-                    ps=ps,
-                    tp_rank=1,
-                    pp_rank=0,
-                    dp_rank=None,
-                    enable_priority_scheduling=False,
-                    enable_lora=False,
-                    enable_hierarchical_cache=False,
-                    is_streaming_session_output_rank=is_output_rank,
+                observability = SimpleNamespace(
+                    enable_metrics=enable_metrics,
+                    enable_metrics_for_all_schedulers=enable_all_schedulers,
+                    kv_events_config=None,
+                    extra_metric_labels=None,
+                    stat_loggers={STAT_LOGGER_ROLE_SCHEDULER: _ContextOnlyCollector},
                 )
+                serving = SimpleNamespace(
+                    enable_streaming_session=enable_streaming_session,
+                    served_model_name="gemma-4",
+                )
+                disaggregation = SimpleNamespace(disaggregation_mode="null")
+                with (
+                    patch(
+                        "sglang.srt.observability.metrics_collector.get_observability",
+                        return_value=observability,
+                    ),
+                    patch(
+                        "sglang.srt.observability.metrics_collector.get_serving",
+                        return_value=serving,
+                    ),
+                    patch(
+                        "sglang.srt.observability.metrics_collector.get_disagg",
+                        return_value=disaggregation,
+                    ),
+                    patch(
+                        "sglang.srt.observability.metrics_collector."
+                        "resolve_collector_class",
+                        return_value=_ContextOnlyCollector,
+                    ),
+                ):
+                    context = SchedulerMetricsCollector.init_new(
+                        server_args=self._server_args(
+                            enable_metrics=enable_metrics,
+                            enable_streaming_session=enable_streaming_session,
+                            enable_metrics_for_all_schedulers=enable_all_schedulers,
+                        ),
+                        ps=ps,
+                        tp_rank=1,
+                        pp_rank=0,
+                        dp_rank=None,
+                        enable_priority_scheduling=False,
+                        enable_lora=False,
+                        enable_hierarchical_cache=False,
+                        is_streaming_session_output_rank=is_output_rank,
+                    )
 
                 self.assertEqual(
                     context.streaming_session_metrics_enabled,

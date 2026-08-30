@@ -9,7 +9,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode, HttpOrigin},
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
 };
 
@@ -91,41 +91,6 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         &self,
         context: &mut WorkflowContext<LocalWorkerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        if matches!(
-            context.data.config.worker_type.as_deref(),
-            Some("prefill" | "decode")
-        ) {
-            if context.data.config.dp_aware {
-                return Err(WorkflowError::StepFailed {
-                    step_id: StepId::new("detect_connection_mode"),
-                    message: "PD process registration does not support DP-aware expansion"
-                        .to_string(),
-                });
-            }
-            if context
-                .data
-                .config
-                .api_key
-                .as_deref()
-                .is_none_or(str::is_empty)
-            {
-                return Err(WorkflowError::StepFailed {
-                    step_id: StepId::new("detect_connection_mode"),
-                    message: "PD process discovery requires a nonempty API key".to_string(),
-                });
-            }
-
-            let origin = HttpOrigin::parse(&context.data.config.url).map_err(|error| {
-                WorkflowError::StepFailed {
-                    step_id: StepId::new("detect_connection_mode"),
-                    message: format!("Invalid PD worker origin: {error}"),
-                }
-            })?;
-            context.data.config.url = origin.as_str().to_string();
-            context.data.connection_mode = Some(ConnectionMode::Http);
-            return Ok(StepResult::Success);
-        }
-
         let config = &context.data.config;
         let app_context = context
             .data

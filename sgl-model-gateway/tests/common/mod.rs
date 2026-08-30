@@ -381,10 +381,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
                     .models(models)
                     .build(),
             );
-            app_context
-                .worker_registry
-                .register(worker)
-                .expect("external test worker registration must succeed");
+            app_context.worker_registry.register(worker);
         }
     }
 
@@ -508,10 +505,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
                     .models(models)
                     .build(),
             );
-            app_context
-                .worker_registry
-                .register(worker)
-                .expect("external test worker registration must succeed");
+            app_context.worker_registry.register(worker);
         }
     }
 
@@ -635,10 +629,7 @@ pub async fn create_test_context_with_mcp_config(
                     .models(models)
                     .build(),
             );
-            app_context
-                .worker_registry
-                .register(worker)
-                .expect("external test worker registration must succeed");
+            app_context.worker_registry.register(worker);
         }
     }
 

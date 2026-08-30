@@ -16,7 +16,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import (
     Scheduler,
     _validate_streaming_session_topology,
@@ -85,7 +85,8 @@ class TestEmptyStreamingSessionMutation(CustomTestCase):
             session=session,
             sampling_params=SimpleNamespace(max_new_tokens=0),
             req_pool_idx=None,
-            kv=None,
+            is_holding_kv=False,
+            kv=ReqKvInfo(),
             time_stats=time_stats,
             update_finish_state=update_finish_state,
             finished=lambda: finished,

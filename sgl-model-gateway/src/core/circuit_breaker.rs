@@ -123,6 +123,8 @@ impl CircuitBreaker {
 
     /// Create a new circuit breaker with custom configuration and metric label
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
+        let init_state = CircuitState::Closed;
+        Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             consecutive_failures: AtomicU32::new(0),
@@ -139,11 +141,6 @@ impl CircuitBreaker {
     /// Get the metric label
     pub fn metric_label(&self) -> &str {
         &self.metric_label
-    }
-
-    /// Return the immutable transition policy used by this circuit breaker.
-    pub fn config(&self) -> &CircuitBreakerConfig {
-        &self.config
     }
 
     /// Check if a request can be executed (lock-free hot path)
@@ -374,12 +371,6 @@ impl CircuitBreaker {
             time_since_last_failure: self.time_since_last_failure(),
             time_since_last_state_change: self.time_since_last_state_change(),
         }
-    }
-
-    /// Publish the current circuit-breaker gauges after its worker becomes registered.
-    pub fn publish_metrics(&self) {
-        Metrics::set_worker_cb_state(&self.metric_label, self.state.load(Ordering::Acquire));
-        self.publish_gauge_metrics();
     }
 
     fn publish_gauge_metrics(&self) {

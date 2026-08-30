@@ -319,7 +319,6 @@ pub fn create_local_worker_workflow_data(
         config,
         connection_mode: None,
         discovered_labels: std::collections::HashMap::new(),
-        pd_process_advertisement: None,
         dp_info: None,
         workers: None,
         final_labels: std::collections::HashMap::new(),

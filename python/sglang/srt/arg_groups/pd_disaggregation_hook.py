@@ -1,11 +1,15 @@
-import ipaddress
+from __future__ import annotations
+
+import dataclasses
 import logging
 import os
-import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from sglang.srt.disaggregation.runtime_capabilities import (
-    PdProcessRuntimeCapabilities,
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    model_config_of,
+    resolved_view,
+    resolving_view,
 )
 from sglang.srt.environ import envs
 
@@ -14,216 +18,246 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CANONICAL_DIGEST = re.compile(r"[0-9a-f]{64}")
 
-
-def _validate_fingerprint(value: str | None, flag: str) -> str:
-    """Validate one operator-owned compatibility fingerprint.
-
-    :param value: Candidate fingerprint.
-    :param flag: CLI flag used in validation errors.
-    :returns: The canonical fingerprint.
-    """
-    if value is None or _CANONICAL_DIGEST.fullmatch(value) is None:
-        raise ValueError(
-            f"{flag} must be a canonical lowercase 64-character hex digest"
-        )
-    return value
-
-
-def _validate_bootstrap_host(value: str | None) -> str:
-    """Validate an explicitly advertised non-local bootstrap host.
-
-    :param value: Candidate DNS name or IP literal.
-    :returns: The validated host.
-    """
-    if (
-        value is None
-        or len(value) == 0
-        or value.strip() != value
-        or any(
-            ord(character) < 32 or 127 <= ord(character) <= 159 for character in value
-        )
-        or "://" in value
-        or "/" in value
-    ):
-        raise ValueError(
-            "--pd-prefill-bootstrap-advertise-host must be an explicit "
-            "non-local host without a scheme or port"
-        )
-
-    normalized = value.lower().rstrip(".")
-    if normalized == "localhost" or normalized.endswith(".localhost"):
-        raise ValueError(
-            "--pd-prefill-bootstrap-advertise-host cannot advertise localhost"
-        )
-
-    address_value = (
-        value[1:-1] if value.startswith("[") and value.endswith("]") else value
-    )
-    try:
-        address = ipaddress.ip_address(address_value)
-    except ValueError:
-        if ":" in value:
-            raise ValueError(
-                "--pd-prefill-bootstrap-advertise-host must bracket IPv6 literals"
-            ) from None
-        return value
-
-    if address.is_loopback or address.is_unspecified or address.is_multicast:
-        raise ValueError(
-            "--pd-prefill-bootstrap-advertise-host must be non-local and usable"
-        )
-    return value
-
-
-def build_pd_process_advertisement(
-    server_args: "ServerArgs",
-    *,
-    runtime_capabilities: PdProcessRuntimeCapabilities | None,
-) -> dict[str, object] | None:
-    """Build the versioned PD process-generation capability contract.
-
-    :param server_args: Fully resolved server configuration.
-    :param runtime_capabilities: Runtime-proven transfer and control capabilities.
-    :returns: The advertisement for a PD process, otherwise ``None``.
-    """
-    if server_args.disaggregation_mode not in ("prefill", "decode"):
-        return None
-    if runtime_capabilities is None:
-        return None
-    if not runtime_capabilities.advertises_pd_process:
-        return None
-    if server_args.api_key is None or len(server_args.api_key) == 0:
-        raise ValueError("PD process advertisement requires --api-key")
-    if server_args.tokenizer_worker_num != 1:
-        raise ValueError("PD process advertisement requires --tokenizer-worker-num 1")
-
-    model_fingerprint = _validate_fingerprint(
-        server_args.pd_model_fingerprint, "--pd-model-fingerprint"
-    )
-    logical_kv_layout_fingerprint = _validate_fingerprint(
-        server_args.pd_logical_kv_layout_fingerprint,
-        "--pd-logical-kv-layout-fingerprint",
-    )
-    kv_dtype = runtime_capabilities.kv_dtype
-    page_size = runtime_capabilities.page_size
-    if server_args.tp_size <= 0:
-        raise ValueError("PD process advertisement requires a positive tp_size")
-    if server_args.dp_size != 1:
-        raise ValueError(
-            "PD process advertisement supports only DP1, "
-            f"received DP{server_args.dp_size}"
-        )
-
-    bootstrap_endpoint = None
-    if server_args.disaggregation_mode == "prefill":
-        bootstrap_host = _validate_bootstrap_host(
-            server_args.pd_prefill_bootstrap_advertise_host
-        )
-        if not 1 <= server_args.disaggregation_bootstrap_port <= 65535:
-            raise ValueError(
-                "--disaggregation-bootstrap-port must be between 1 and 65535"
-            )
-        bootstrap_endpoint = {
-            "host": bootstrap_host,
-            "port": server_args.disaggregation_bootstrap_port,
-        }
-    elif server_args.pd_prefill_bootstrap_advertise_host is not None:
-        raise ValueError(
-            "decode processes cannot set --pd-prefill-bootstrap-advertise-host"
-        )
-
-    return {
-        "schema": "v1",
-        "launch_instance_id": server_args.launch_instance_id,
-        "role": server_args.disaggregation_mode,
-        "tensor_parallel_size": server_args.tp_size,
-        "data_parallel_size": server_args.dp_size,
-        "model_fingerprint": model_fingerprint,
-        "logical_kv_layout_fingerprint": logical_kv_layout_fingerprint,
-        "kv_dtype": kv_dtype,
-        "page_size": page_size,
-        "kv_transfer_protocol": runtime_capabilities.kv_transfer_protocol,
-        "prepared_grant_protocol": runtime_capabilities.prepared_grant_protocol,
-        "prefill_bootstrap_endpoint": bootstrap_endpoint,
-    }
-
-
-def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
-    """Validate and normalize PD-disaggregation server args.
-
-    :param server_args: Fully resolved server configuration.
-    """
+def handle_pd_disaggregation(server_args: ServerArgs) -> None:
+    """Validate and normalize PD-disaggregation server args."""
+    cfg = resolving_view(server_args)
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
-    if server_args.disaggregation_transfer_backend == "mooncake_tcp":
+    if cfg.disaggregation_transfer_backend == "mooncake_tcp":
         os.environ.setdefault("MC_FORCE_TCP", "1")
-        server_args.disaggregation_transfer_backend = "mooncake"
-        server_args.disaggregation_ib_device = None
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_transfer_backend="mooncake",
+        )
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_ib_device=None,
+        )
         logger.info(
             "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
-    if server_args.disaggregation_mode == "decode":
-        if server_args.disaggregation_decode_enable_radix_cache:
-            if server_args.enable_hisparse:
+    if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
+        logger.warning(
+            "DCP on a PD prefill server is supported when prefill and decode "
+            "use the same DCP layout, but it usually adds communication "
+            "overhead without improving prefill performance."
+        )
+
+    if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
+        # Fake transfer moves no KV and is only used for synthetic decode
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
+        if cfg.disaggregation_transfer_backend not in (
+            "mooncake",
+            "nixl",
+            "fake",
+        ):
+            raise ValueError(
+                "PD decode DCP requires --disaggregation-transfer-backend "
+                "mooncake, nixl, or fake for synthetic benchmarking, got "
+                f"{cfg.disaggregation_transfer_backend!r}."
+            )
+        if cfg.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--disaggregation-decode-enable-radix-cache is not supported."
+            )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--enable-hierarchical-cache is not supported."
+            )
+
+    if cfg.disaggregation_mode == "decode":
+        if cfg.disaggregation_decode_enable_radix_cache:
+            if cfg.enable_hisparse:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
                 )
-            if server_args.disaggregation_transfer_backend == "fake":
+            if cfg.disaggregation_transfer_backend == "fake":
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm not in (None, "DFLASH"):
+            if cfg.speculative_algorithm is not None:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
+                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
                     "Requires prefix-aware DP rank routing for optimal cache hits."
                 )
-            server_args.disable_radix_cache = False
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disable_radix_cache=False,
+            )
             logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
         else:
-            server_args.disable_radix_cache = True
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disable_radix_cache=True,
+            )
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the
         # max_running_requests-derived pool. Large batches get none; small
         # per-worker batches reserve 2x the batch as cheap overlap headroom.
-        if server_args.disaggregation_decode_extra_slots is None:
+        if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
-            if server_args.max_running_requests is not None:
-                per_worker = server_args.max_running_requests // max(
-                    1, server_args.dp_size
-                )
+            if cfg.max_running_requests is not None:
+                per_worker = cfg.max_running_requests // max(1, cfg.dp_size)
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
-            server_args.disaggregation_decode_extra_slots = extra_slots
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disaggregation_decode_extra_slots=extra_slots,
+            )
 
-    elif server_args.disaggregation_mode == "prefill":
+    elif cfg.disaggregation_mode == "prefill":
         assert (
-            server_args.disaggregation_transfer_backend != "fake"
+            cfg.disaggregation_transfer_backend != "fake"
         ), "Prefill server does not support 'fake' as the transfer backend"
 
-    if (
-        server_args.disaggregation_mode in ("prefill", "decode")
-        and envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
+        if envs.SGLANG_RUST_SERVER.get():
+            _alias_bootstrap_port_to_api_port(server_args)
+
+    if cfg.disaggregation_mode in ("prefill", "decode"):
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+        ):
+            raise ValueError(
+                f"SGLANG_DISAGG_STAGING_BUFFER requires "
+                f"disaggregation_transfer_backend='mooncake' or 'nixl', "
+                f"got '{cfg.disaggregation_transfer_backend}'."
+            )
+
+
+def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
+    """Rust-server prefill serves the KV bootstrap registry on the api listener
+    itself, so the resolved bootstrap port must BE the api port — every internal
+    consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
+    field and agrees automatically. Decode is untouched: there the field names
+    the PREFILL side's bootstrap port and must stay as the operator set it.
+    """
+    cfg = resolving_view(server_args)
+    default_port = next(
+        f.default
+        for f in dataclasses.fields(server_args)
+        if f.name == "disaggregation_bootstrap_port"
+    )
+    if cfg.disaggregation_bootstrap_port not in (
+        default_port,
+        cfg.port,
     ):
         raise ValueError(
-            f"SGLANG_DISAGG_STAGING_BUFFER requires "
-            f"disaggregation_transfer_backend='mooncake' or 'nixl', "
-            f"got '{server_args.disaggregation_transfer_backend}'."
+            "SGLANG_RUST_SERVER serves the PD KV bootstrap registry on the api "
+            "port itself; --disaggregation-bootstrap-port "
+            f"{cfg.disaggregation_bootstrap_port} conflicts with --port "
+            f"{cfg.port}. Drop --disaggregation-bootstrap-port (decode "
+            "nodes and the PD router must then target the prefill api port)."
+        )
+    if cfg.disaggregation_bootstrap_port != cfg.port:
+        logger.info(
+            "SGLANG_RUST_SERVER: KV bootstrap registry is served on the api "
+            "port; disaggregation_bootstrap_port %d -> %d",
+            cfg.disaggregation_bootstrap_port,
+            cfg.port,
+        )
+        declare_resolution(
+            server_args,
+            "_alias_bootstrap_port_to_api_port",
+            disaggregation_bootstrap_port=cfg.port,
+        )
+
+
+def handle_encoder_disaggregation(server_args: Any):
+    from sglang.srt.arg_groups.model_hook import handle_language_model_only
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+    from sglang.srt.server_args import resolve_encoder_transfer_backend
+
+    cfg = resolving_view(server_args)
+    handle_language_model_only(server_args)
+    if cfg.enable_prefix_mm_cache and not cfg.encoder_only:
+        raise ValueError(
+            "--enable-prefix-mm-cache requires --encoder-only to be enabled"
+        )
+    if cfg.encoder_only and cfg.language_only:
+        raise ValueError("Cannot set --encoder-only and --language-only together")
+    if cfg.encoder_only and not cfg.disaggregation_mode == "null":
+        raise ValueError(
+            "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
+        )
+
+    if cfg.language_only and len(cfg.encoder_urls) == 0:
+        logger.info(
+            "--language-only is set without --encoder-urls. Encoders are "
+            "expected to register dynamically via the "
+            "EncoderBootstrapServer."
+        )
+
+    # Validate IB devices when mooncake backend is used
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and cfg.disaggregation_mode in ("prefill", "decode")
+    ) or cfg.encoder_transfer_backend == "mooncake":
+        declare_resolution(
+            server_args,
+            "_handle_encoder_disaggregation",
+            disaggregation_ib_device=validate_ib_devices(cfg.disaggregation_ib_device),
+        )
+
+    # Validate model type for encoder disaggregation
+    hf_config = model_config_of(server_args).hf_config
+    model_arch = hf_config.architectures[0]
+    if cfg.encoder_transfer_backend == "auto":
+        declare_resolution(
+            server_args,
+            "_handle_encoder_disaggregation",
+            encoder_transfer_backend=resolve_encoder_transfer_backend(
+                cfg.encoder_transfer_backend, model_arch, cfg.tp_size
+            ),
+        )
+        if cfg.encoder_only or cfg.language_only:
+            logger.info(
+                "Encoder transfer backend auto-resolved to %s for %s at TP%d.",
+                cfg.encoder_transfer_backend,
+                model_arch,
+                cfg.tp_size,
+            )
+    if (cfg.encoder_only or cfg.language_only) and model_arch not in [
+        "Qwen2VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen2AudioForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
+        "Dots3NoteForCausalLM",
+        "KimiVLForConditionalGeneration",
+        "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+    ]:
+        raise ValueError(
+            f"Model type {model_arch} is not supported for encoder disaggregation. "
+            f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
         )

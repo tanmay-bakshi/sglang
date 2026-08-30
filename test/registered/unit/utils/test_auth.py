@@ -303,28 +303,5 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertTrue(decision.allowed)
 
-    def test_endpoint_auth_is_delegated_with_request_scoped_bearer(self):
-        decision = decide_request_auth(
-            method="POST",
-            path="/_internal/pd/v1/decode-reservations/grant-id/promote",
-            authorization_header="Bearer request-scoped-grant-token",
-            api_key="process-api-key",
-            admin_api_key="admin-api-key",
-            auth_level=AuthLevel.ENDPOINT,
-        )
-        self.assertTrue(decision.allowed)
-
-    def test_endpoint_auth_is_delegated_without_process_keys(self):
-        decision = decide_request_auth(
-            method="POST",
-            path="/_internal/pd/v1/decode-reservations/grant-id/bind",
-            authorization_header=None,
-            api_key=None,
-            admin_api_key=None,
-            auth_level=AuthLevel.ENDPOINT,
-        )
-        self.assertTrue(decision.allowed)
-
-
 if __name__ == "__main__":
     unittest.main()

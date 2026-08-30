@@ -4,11 +4,10 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
-use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    core::{steps::workflow_data::WorkerRemovalWorkflowData, WorkerRemovalOutcome},
-    observability::metrics::Metrics,
+    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::Metrics,
 };
 
 /// Step to remove workers from the worker registry.
@@ -34,39 +33,28 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
             worker_urls.len()
         );
 
-        let mut unique_configs = HashSet::new();
-        for worker_url in worker_urls {
-            if let Some(worker) = app_context.worker_registry.get_by_url(worker_url) {
-                let metadata = worker.metadata();
-                for model_id in worker.model_ids() {
-                    unique_configs.insert((
-                        metadata.worker_type.clone(),
-                        metadata.connection_mode.clone(),
-                        model_id.to_string(),
-                    ));
-                }
-            }
-        }
+        // Collect unique worker configurations before removal for pool size updates
+        let unique_configs: HashSet<_> = worker_urls
+            .iter()
+            .filter_map(|url| app_context.worker_registry.get_by_url(url))
+            .map(|w| {
+                let meta = w.metadata();
+                (
+                    meta.worker_type.clone(),
+                    meta.connection_mode.clone(),
+                    w.model_id().to_string(),
+                )
+            })
+            .collect();
 
         let mut removed_count = 0;
         for worker_url in worker_urls.iter() {
-            let outcome = app_context
+            if app_context
                 .worker_registry
                 .remove_by_url(worker_url)
-                .map_err(|error| WorkflowError::StepFailed {
-                    step_id: StepId::new("remove_from_worker_registry"),
-                    message: error.to_string(),
-                })?;
-            match outcome {
-                WorkerRemovalOutcome::Removed(_) => removed_count += 1,
-                WorkerRemovalOutcome::Draining { block, .. } => {
-                    debug!(
-                        "Unpublished worker {} while its PD generation drains retained ownership: {:?}",
-                        worker_url, block
-                    );
-                    removed_count += 1;
-                }
-                WorkerRemovalOutcome::NotFound => {}
+                .is_some()
+            {
+                removed_count += 1;
             }
         }
 

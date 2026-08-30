@@ -15,10 +15,10 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    DecodeReservationPrepareReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -27,6 +27,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -36,6 +37,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.managers.rust_server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -45,7 +47,7 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -104,6 +106,15 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
+                # Rust ringbuffer backend: drain the in-process ring fed by the
+                # embedded Rust TokenizerManager instead of a zmq socket. Same
+                # non-blocking, msgpack-decoded contract as the zmq path below.
+                if envs.SGLANG_RUST_SERVER.get():
+                    recv_reqs.extend(
+                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                    )
+                    return recv_reqs
+
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
@@ -140,7 +151,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
@@ -169,8 +180,8 @@ class SchedulerRequestReceiver:
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
             _local_ctrl = (
-                self.server_args.enable_dp_attention_local_control_broadcast
-                or self.server_args.is_ep_scale_joiner
+                get_parallel().enable_dp_attention_local_control_broadcast
+                or is_ep_scale_joiner()
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
@@ -216,16 +227,13 @@ class SchedulerRequestReceiver:
             ):
                 for sub_req in req:
                     sub_req.unwrap_pickle_fields()
-            elif isinstance(req, DecodeReservationPrepareReqInput):
-                for tokenized_request in req.tokenized_requests:
-                    tokenized_request.unwrap_pickle_fields()
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
@@ -250,7 +258,7 @@ class SchedulerRequestReceiver:
                 # peer ranks may still be unpickling ShmPointerMMData
                 # (-> shm_open).  Synchronize the same CPU groups that carried
                 # SHM-backed work requests before materialize() unlinks them.
-                if self.server_args.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     if self.ps.attn_tp_size > 1:
                         barrier(group=self.attn_tp_cpu_group)
                     if self.ps.attn_cp_size > 1:

@@ -9,9 +9,8 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
     extract::{Json, Path, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -19,10 +18,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use futures_util::stream::{self, StreamExt};
-use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::json;
 use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
@@ -57,35 +54,6 @@ pub struct MockWorker {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-static DISCONNECT_AFTER_PROMOTE: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-static DISCONNECT_NEXT_INFERENCE: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-
-fn disconnect_after_promote_ports() -> &'static Mutex<HashSet<u16>> {
-    DISCONNECT_AFTER_PROMOTE.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn disconnect_next_inference_ports() -> &'static Mutex<HashSet<u16>> {
-    DISCONNECT_NEXT_INFERENCE.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-pub fn set_disconnect_after_promote(port: u16) {
-    disconnect_after_promote_ports()
-        .lock()
-        .unwrap()
-        .insert(port);
-}
-
-pub fn clear_disconnect_after_promote(port: u16) {
-    disconnect_after_promote_ports()
-        .lock()
-        .unwrap()
-        .remove(&port);
-    disconnect_next_inference_ports()
-        .lock()
-        .unwrap()
-        .remove(&port);
-}
-
 impl MockWorker {
     pub fn new(config: MockWorkerConfig) -> Self {
         Self {
@@ -115,14 +83,6 @@ impl MockWorker {
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
             .route("/server_info", get(server_info_handler))
-            .route(
-                "/_internal/pd/v1/decode-reservations/reserve",
-                post(pd_reserve_handler),
-            )
-            .route(
-                "/_internal/pd/v1/decode-reservations/{grant_id}/{operation}",
-                post(pd_control_handler),
-            )
             .route("/model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
@@ -267,7 +227,7 @@ async fn health_generate_handler(State(config): State<Arc<RwLock<MockWorkerConfi
 async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
-    if matches!(config.worker_type, WorkerType::Regular) && should_fail(&config).await {
+    if should_fail(&config).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -277,7 +237,6 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
             .into_response();
     }
 
-    let pd_process = mock_pd_process_advertisement(&config);
     Json(json!({
         "model_path": "mock-model-path",
         "tokenizer_path": "mock-tokenizer-path",
@@ -309,417 +268,12 @@ async fn server_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>
         "schedule_policy": "lpm",
         "schedule_conservativeness": 1.0,
         "version": "0.3.0",
-        "pd_process": pd_process,
         "internal_states": [{
             "waiting_queue_size": 0,
             "running_queue_size": 0
         }]
     }))
     .into_response()
-}
-
-fn mock_pd_process_advertisement(config: &MockWorkerConfig) -> JsonValue {
-    let (role, tensor_parallel_size, prefill_bootstrap_endpoint) = match &config.worker_type {
-        WorkerType::Regular => return JsonValue::Null,
-        WorkerType::Prefill => (
-            "prefill",
-            2,
-            json!({
-                "host": "prefill-bootstrap.test",
-                "port": 8998
-            }),
-        ),
-        WorkerType::Decode => ("decode", 1, JsonValue::Null),
-    };
-
-    json!({
-        "schema": "v1",
-        "launch_instance_id": Uuid::from_u128(u128::from(config.port) + 1),
-        "role": role,
-        "tensor_parallel_size": tensor_parallel_size,
-        "data_parallel_size": 1,
-        "model_fingerprint":
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "logical_kv_layout_fingerprint":
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "kv_dtype": "bf16",
-        "page_size": 64,
-        "kv_transfer_protocol": "packed-v4",
-        "prepared_grant_protocol": "control-v1",
-        "prefill_bootstrap_endpoint": prefill_bootstrap_endpoint
-    })
-}
-
-const MOCK_CONTROL_SCHEMA_VERSION: u32 = 1;
-const MOCK_GRANT_TOKEN_BYTES: usize = 32;
-const MOCK_GRANT_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-grant-v4";
-const MOCK_RESERVATION_DIGEST_DOMAIN: &[u8] = b"sglang-pd-decoder-reservation-v1";
-
-#[derive(Clone, Debug, Deserialize)]
-struct MockReserveRequest {
-    schema_version: u32,
-    prefill_process: JsonValue,
-    prefill_bootstrap_endpoint: JsonValue,
-    decoder_process: JsonValue,
-    logical_request_chain_id: Uuid,
-    reservation_attempt_id: Uuid,
-    reserve_attempt_digest: String,
-    source_tp_size: usize,
-    prepared_ttl_ms: u64,
-    inference_route: String,
-    request_shape: String,
-    base_request_body_json: String,
-    child_request_ids: Vec<Uuid>,
-}
-
-#[derive(Clone, Debug)]
-struct MockControlAllocation {
-    child_request_id: Uuid,
-    decoder_slot_generation: Uuid,
-    bootstrap_room: u64,
-    request_slot: u64,
-    request_generation: u64,
-    writer_manifest_digest: [u8; 32],
-    allocation_digest: [u8; 32],
-    reserved_kv_tokens: u64,
-    remaining_decode_tokens: u64,
-}
-
-#[derive(Clone, Debug)]
-struct MockControlGrant {
-    grant_id: Uuid,
-    grant_token: String,
-    prefill_process: JsonValue,
-    prefill_bootstrap_endpoint: JsonValue,
-    decoder_process: JsonValue,
-    logical_request_chain_id: Uuid,
-    reservation_attempt_id: Uuid,
-    reserve_attempt_digest: String,
-    source_tp_size: usize,
-    prepared_ttl_ms: u64,
-    prepared_expires_at_unix_ms: u64,
-    inference_route: String,
-    request_shape: String,
-    allocations: Vec<MockControlAllocation>,
-    reservation_digest: String,
-    grant_digest: Option<String>,
-}
-
-static PD_CONTROL_GRANTS: OnceLock<Mutex<HashMap<Uuid, MockControlGrant>>> = OnceLock::new();
-
-fn pd_control_grants() -> &'static Mutex<HashMap<Uuid, MockControlGrant>> {
-    PD_CONTROL_GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-}
-
-fn mock_digest_hex(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn mock_reservation_digest(
-    grant_id: Uuid,
-    reserve_attempt_digest: &str,
-    prepared_expires_at_unix_ms: u64,
-    allocations: &[MockControlAllocation],
-) -> String {
-    let reserve_attempt_digest = blake3::Hash::from_hex(reserve_attempt_digest)
-        .expect("gateway reserve-attempt digests are valid BLAKE3 hex");
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(MOCK_RESERVATION_DIGEST_DOMAIN);
-    hasher.update(grant_id.as_bytes());
-    hasher.update(reserve_attempt_digest.as_bytes());
-    hasher.update(&prepared_expires_at_unix_ms.to_le_bytes());
-    hasher.update(&(allocations.len() as u64).to_le_bytes());
-    for (index, allocation) in allocations.iter().enumerate() {
-        hasher.update(&(index as u64).to_le_bytes());
-        hasher.update(allocation.child_request_id.as_bytes());
-        hasher.update(allocation.decoder_slot_generation.as_bytes());
-        hasher.update(&allocation.bootstrap_room.to_le_bytes());
-        hasher.update(&allocation.request_slot.to_le_bytes());
-        hasher.update(&allocation.request_generation.to_le_bytes());
-        hasher.update(&allocation.writer_manifest_digest);
-        hasher.update(&allocation.allocation_digest);
-        hasher.update(&allocation.reserved_kv_tokens.to_le_bytes());
-        hasher.update(&allocation.remaining_decode_tokens.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-fn mock_grant_digest(reservation_digest: &str, request_body: &[u8]) -> String {
-    let reservation_digest = blake3::Hash::from_hex(reservation_digest)
-        .expect("mock reservation digests are valid BLAKE3 hex");
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(MOCK_GRANT_DIGEST_DOMAIN);
-    hasher.update(reservation_digest.as_bytes());
-    hasher.update(&(request_body.len() as u64).to_le_bytes());
-    hasher.update(request_body);
-    hasher.finalize().to_hex().to_string()
-}
-
-fn mock_allocation_json(allocation: &MockControlAllocation) -> JsonValue {
-    json!({
-        "child_request_id": allocation.child_request_id,
-        "decoder_slot_generation": allocation.decoder_slot_generation,
-        "bootstrap_room": allocation.bootstrap_room,
-        "request_slot": allocation.request_slot,
-        "request_generation": allocation.request_generation,
-        "writer_manifest_digest": mock_digest_hex(&allocation.writer_manifest_digest),
-        "allocation_digest": mock_digest_hex(&allocation.allocation_digest),
-        "reserved_kv_tokens": allocation.reserved_kv_tokens,
-        "remaining_decode_tokens": allocation.remaining_decode_tokens,
-    })
-}
-
-fn mock_control_receipt(grant: &MockControlGrant, operation: &str, state: &str) -> JsonValue {
-    let grant_digest = grant
-        .grant_digest
-        .as_ref()
-        .expect("bound mock grants have a final grant digest");
-    json!({
-        "schema_version": MOCK_CONTROL_SCHEMA_VERSION,
-        "grant_id": grant.grant_id,
-        "reservation_attempt_id": grant.reservation_attempt_id,
-        "reserve_attempt_digest": grant.reserve_attempt_digest,
-        "prefill_process": grant.prefill_process,
-        "prefill_bootstrap_endpoint": grant.prefill_bootstrap_endpoint,
-        "decoder_process": grant.decoder_process,
-        "logical_request_chain_id": grant.logical_request_chain_id,
-        "source_tp_size": grant.source_tp_size,
-        "inference_route": grant.inference_route,
-        "request_shape": grant.request_shape,
-        "prepared_ttl_ms": grant.prepared_ttl_ms,
-        "prepared_expires_at_unix_ms": grant.prepared_expires_at_unix_ms,
-        "child_request_ids": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.child_request_id)
-            .collect::<Vec<_>>(),
-        "decoder_slot_generations": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.decoder_slot_generation)
-            .collect::<Vec<_>>(),
-        "bootstrap_rooms": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.bootstrap_room)
-            .collect::<Vec<_>>(),
-        "reservation_digest": grant.reservation_digest,
-        "grant_digest": grant_digest,
-        "operation": operation,
-        "state": state,
-        "receipt_id": Uuid::new_v4(),
-        "receipt_digest": "77".repeat(32),
-        "take_once": true,
-    })
-}
-
-fn mock_unbound_cancellation_receipt(
-    grant: &MockControlGrant,
-    attempted_grant_digest: JsonValue,
-) -> JsonValue {
-    json!({
-        "schema_version": MOCK_CONTROL_SCHEMA_VERSION,
-        "grant_id": grant.grant_id,
-        "reservation_attempt_id": grant.reservation_attempt_id,
-        "reserve_attempt_digest": grant.reserve_attempt_digest,
-        "prefill_process": grant.prefill_process,
-        "prefill_bootstrap_endpoint": grant.prefill_bootstrap_endpoint,
-        "decoder_process": grant.decoder_process,
-        "logical_request_chain_id": grant.logical_request_chain_id,
-        "source_tp_size": grant.source_tp_size,
-        "inference_route": grant.inference_route,
-        "request_shape": grant.request_shape,
-        "prepared_ttl_ms": grant.prepared_ttl_ms,
-        "prepared_expires_at_unix_ms": grant.prepared_expires_at_unix_ms,
-        "child_request_ids": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.child_request_id)
-            .collect::<Vec<_>>(),
-        "decoder_slot_generations": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.decoder_slot_generation)
-            .collect::<Vec<_>>(),
-        "bootstrap_rooms": grant
-            .allocations
-            .iter()
-            .map(|allocation| allocation.bootstrap_room)
-            .collect::<Vec<_>>(),
-        "reservation_digest": grant.reservation_digest,
-        "attempted_grant_digest": attempted_grant_digest,
-        "operation": "cancel",
-        "state": "cancelled",
-        "receipt_id": Uuid::new_v4(),
-        "receipt_digest": "72".repeat(32),
-        "take_once": true,
-    })
-}
-
-async fn pd_reserve_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    headers: HeaderMap,
-    Json(request): Json<MockReserveRequest>,
-) -> Response {
-    let worker_type = config.read().await.worker_type.clone();
-    if !matches!(worker_type, WorkerType::Decode) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if bearer_token(&headers).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if request.schema_version != MOCK_CONTROL_SCHEMA_VERSION
-        || request.child_request_ids.is_empty()
-        || request.base_request_body_json.is_empty()
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let grant_id = Uuid::new_v4();
-    let now_unix_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_millis(),
-    )
-    .expect("current Unix time fits in u64 milliseconds");
-    let prepared_expires_at_unix_ms = now_unix_ms.saturating_add(request.prepared_ttl_ms);
-    let allocations = request
-        .child_request_ids
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, child_request_id)| {
-            let index_u64 = u64::try_from(index).expect("mock child index fits in u64");
-            let digest_byte =
-                u8::try_from(index % 200 + 1).expect("bounded mock digest byte fits in u8");
-            MockControlAllocation {
-                child_request_id,
-                decoder_slot_generation: Uuid::new_v4(),
-                bootstrap_room: 10_000 + index_u64,
-                request_slot: 20_000 + index_u64,
-                request_generation: 30_000 + index_u64,
-                writer_manifest_digest: [digest_byte; 32],
-                allocation_digest: [digest_byte + 32; 32],
-                reserved_kv_tokens: 512 + index_u64,
-                remaining_decode_tokens: 64 + index_u64,
-            }
-        })
-        .collect::<Vec<_>>();
-    let reservation_digest = mock_reservation_digest(
-        grant_id,
-        &request.reserve_attempt_digest,
-        prepared_expires_at_unix_ms,
-        &allocations,
-    );
-    let grant_token = URL_SAFE_NO_PAD.encode([0x5a; MOCK_GRANT_TOKEN_BYTES]);
-    let grant = MockControlGrant {
-        grant_id,
-        grant_token: grant_token.clone(),
-        prefill_process: request.prefill_process.clone(),
-        prefill_bootstrap_endpoint: request.prefill_bootstrap_endpoint.clone(),
-        decoder_process: request.decoder_process.clone(),
-        logical_request_chain_id: request.logical_request_chain_id,
-        reservation_attempt_id: request.reservation_attempt_id,
-        reserve_attempt_digest: request.reserve_attempt_digest.clone(),
-        source_tp_size: request.source_tp_size,
-        prepared_ttl_ms: request.prepared_ttl_ms,
-        prepared_expires_at_unix_ms,
-        inference_route: request.inference_route.clone(),
-        request_shape: request.request_shape.clone(),
-        allocations,
-        reservation_digest: reservation_digest.clone(),
-        grant_digest: None,
-    };
-    let allocation_json = grant
-        .allocations
-        .iter()
-        .map(mock_allocation_json)
-        .collect::<Vec<_>>();
-    let response = json!({
-        "schema_version": MOCK_CONTROL_SCHEMA_VERSION,
-        "state": "prepared",
-        "grant_id": grant_id,
-        "grant_token": grant_token,
-        "prefill_process": request.prefill_process,
-        "prefill_bootstrap_endpoint": request.prefill_bootstrap_endpoint,
-        "decoder_process": request.decoder_process,
-        "logical_request_chain_id": request.logical_request_chain_id,
-        "reservation_attempt_id": request.reservation_attempt_id,
-        "reserve_attempt_digest": request.reserve_attempt_digest,
-        "source_tp_size": request.source_tp_size,
-        "prepared_ttl_ms": request.prepared_ttl_ms,
-        "inference_route": request.inference_route,
-        "request_shape": request.request_shape,
-        "reservation_digest": reservation_digest,
-        "allocations": allocation_json,
-        "prepared_expires_at_unix_ms": prepared_expires_at_unix_ms,
-    });
-    pd_control_grants().lock().unwrap().insert(grant_id, grant);
-    Json(response).into_response()
-}
-
-async fn pd_control_handler(
-    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
-    Path((grant_id, operation)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let worker_port = config.read().await.port;
-    let grant_id = match Uuid::parse_str(&grant_id) {
-        Ok(grant_id) => grant_id,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let mut grants = pd_control_grants().lock().unwrap();
-    let Some(grant) = grants.get_mut(&grant_id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if bearer_token(&headers) != Some(grant.grant_token.as_str()) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let disconnect_after_promote = operation == "promote"
-        && disconnect_after_promote_ports()
-            .lock()
-            .unwrap()
-            .remove(&worker_port);
-    let receipt = match operation.as_str() {
-        "bind" => {
-            grant.grant_digest = Some(mock_grant_digest(&grant.reservation_digest, &body));
-            mock_control_receipt(grant, "bind", "prepared")
-        }
-        "promote" => mock_control_receipt(grant, "promote", "promoted"),
-        "complete" => mock_control_receipt(grant, "complete", "completed"),
-        "abort" => mock_control_receipt(grant, "abort", "aborted"),
-        "quarantine" => mock_control_receipt(grant, "quarantine", "quarantined"),
-        "cancel" if grant.grant_digest.is_some() => {
-            mock_control_receipt(grant, "cancel", "cancelled")
-        }
-        "cancel" => {
-            let attempted_grant_digest = serde_json::from_slice::<JsonValue>(&body)
-                .ok()
-                .and_then(|request| request.get("attempted_grant_digest").cloned())
-                .unwrap_or(JsonValue::Null);
-            mock_unbound_cancellation_receipt(grant, attempted_grant_digest)
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    drop(grants);
-    if disconnect_after_promote {
-        disconnect_next_inference_ports()
-            .lock()
-            .unwrap()
-            .insert(worker_port);
-    }
-    Json(receipt).into_response()
 }
 
 async fn model_info_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
@@ -754,13 +308,6 @@ async fn generate_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
-    if disconnect_next_inference_ports()
-        .lock()
-        .unwrap()
-        .remove(&config.port)
-    {
-        panic!("simulated inference transport disconnect");
-    }
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {

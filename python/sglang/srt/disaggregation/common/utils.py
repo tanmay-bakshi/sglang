@@ -25,126 +25,15 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    num_kv_tokens: Optional[int] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
-
-
-@dataclasses.dataclass(frozen=True)
-class TensorParallelShard:
-    """Contiguous byte range transferred between two tensor-parallel ranks.
-
-    :ivar source_offset_bytes: Offset within one source token.
-    :ivar destination_offset_bytes: Offset within one destination token.
-    :ivar length_bytes: Number of bytes transferred for one token.
-    """
-
-    source_offset_bytes: int
-    destination_offset_bytes: int
-    length_bytes: int
-
-
-def compute_tensor_parallel_shard(
-    source_token_bytes: int,
-    destination_token_bytes: int,
-    source_parallel_size: int,
-    destination_parallel_size: int,
-    source_rank: int,
-    destination_rank: int,
-) -> TensorParallelShard:
-    """Compute a contiguous non-replicated tensor-parallel token slice.
-
-    :param source_token_bytes: Bytes occupied by one token on the source rank.
-    :param destination_token_bytes: Bytes occupied by one token on the destination
-        rank.
-    :param source_parallel_size: Source attention tensor-parallel width.
-    :param destination_parallel_size: Destination attention tensor-parallel width.
-    :param source_rank: Source attention tensor-parallel rank.
-    :param destination_rank: Destination attention tensor-parallel rank.
-    :returns: The source offset, destination offset, and transfer length.
-    :raises ValueError: If the layouts are not compatible contiguous partitions or
-        the ranks are not connected by the expected tensor-parallel mapping.
-    """
-
-    positive_values = {
-        "source_token_bytes": source_token_bytes,
-        "destination_token_bytes": destination_token_bytes,
-        "source_parallel_size": source_parallel_size,
-        "destination_parallel_size": destination_parallel_size,
-    }
-    for name, value in positive_values.items():
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
-
-    if source_rank < 0 or source_rank >= source_parallel_size:
-        raise ValueError(
-            f"source_rank must be in [0, {source_parallel_size}), got {source_rank}"
-        )
-    if destination_rank < 0 or destination_rank >= destination_parallel_size:
-        raise ValueError(
-            "destination_rank must be in "
-            f"[0, {destination_parallel_size}), got {destination_rank}"
-        )
-
-    source_total_bytes = source_token_bytes * source_parallel_size
-    destination_total_bytes = destination_token_bytes * destination_parallel_size
-    if source_total_bytes != destination_total_bytes:
-        raise ValueError(
-            "Tensor-parallel state must be a non-replicated contiguous partition: "
-            f"source has {source_total_bytes} aggregate bytes per token, destination "
-            f"has {destination_total_bytes}"
-        )
-
-    if source_parallel_size == destination_parallel_size:
-        if source_rank != destination_rank:
-            raise ValueError(
-                "Equal-width tensor-parallel ranks must match, got "
-                f"source rank {source_rank} and destination rank {destination_rank}"
-            )
-        return TensorParallelShard(0, 0, source_token_bytes)
-
-    if source_parallel_size > destination_parallel_size:
-        if source_parallel_size % destination_parallel_size != 0:
-            raise ValueError(
-                "Source tensor-parallel width must be divisible by destination "
-                f"width, got {source_parallel_size} and {destination_parallel_size}"
-            )
-        sources_per_destination = source_parallel_size // destination_parallel_size
-        expected_destination_rank = source_rank // sources_per_destination
-        if destination_rank != expected_destination_rank:
-            raise ValueError(
-                f"Source rank {source_rank} maps to destination rank "
-                f"{expected_destination_rank}, not {destination_rank}"
-            )
-        destination_offset_bytes = (
-            source_rank % sources_per_destination
-        ) * source_token_bytes
-        return TensorParallelShard(
-            source_offset_bytes=0,
-            destination_offset_bytes=destination_offset_bytes,
-            length_bytes=source_token_bytes,
-        )
-
-    if destination_parallel_size % source_parallel_size != 0:
-        raise ValueError(
-            "Destination tensor-parallel width must be divisible by source width, "
-            f"got {destination_parallel_size} and {source_parallel_size}"
-        )
-    destinations_per_source = destination_parallel_size // source_parallel_size
-    expected_source_rank = destination_rank // destinations_per_source
-    if source_rank != expected_source_rank:
-        raise ValueError(
-            f"Destination rank {destination_rank} maps to source rank "
-            f"{expected_source_rank}, not {source_rank}"
-        )
-    source_offset_bytes = (
-        destination_rank % destinations_per_source
-    ) * destination_token_bytes
-    return TensorParallelShard(
-        source_offset_bytes=source_offset_bytes,
-        destination_offset_bytes=0,
-        length_bytes=destination_token_bytes,
-    )
+    # Set when the staging worker first counts this chunk toward the per-room
+    # outstanding count; stays set across re-enqueue on a watermark defer.
+    staging_counted: bool = False
+    # Mori early-send: CUDA event to synchronize before RDMA (optional).
+    wait_event: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
@@ -244,3 +133,71 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+@dataclasses.dataclass(frozen=True)
+class DCPTokenTransferPlan:
+    src_token_indices: npt.NDArray[np.int64]
+    dst_token_indices: npt.NDArray[np.int64]
+
+
+def build_dcp_token_transfer_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    src_page_offset: int = 0,
+    decode_prefix_len: int = 0,
+    num_kv_tokens: Optional[int] = None,
+) -> DCPTokenTransferPlan:
+    virtual_page_size = physical_page_size * dcp_size
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP transfer requires decode_prefix_len to align to the virtual "
+            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    source_capacity = src_pages.size * physical_page_size
+    if num_kv_tokens is None:
+        num_kv_tokens = source_capacity
+    if not 0 <= num_kv_tokens <= source_capacity:
+        raise ValueError(
+            "num_kv_tokens must fit in the provided source pages, "
+            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
+
+    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
+    first_owned_offset = (dcp_rank - chunk_start) % dcp_size
+    owned_offsets = np.arange(
+        first_owned_offset, num_kv_tokens, dcp_size, dtype=np.int64
+    )
+    src_token_indices = (
+        src_pages[owned_offsets // physical_page_size] * physical_page_size
+        + owned_offsets % physical_page_size
+    )
+
+    relative_positions = src_page_offset * physical_page_size + owned_offsets
+    dst_local_offsets = relative_positions // dcp_size
+    dst_page_ordinals = dst_local_offsets // physical_page_size
+    if dst_page_ordinals.size and (
+        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
+    ):
+        required_pages = int(dst_page_ordinals.max()) + 1
+        raise ValueError(
+            "Insufficient destination DCP pages: "
+            f"required={required_pages}, provided={dst_pages.size}, "
+            f"src_page_offset={src_page_offset}, dcp_rank={dcp_rank}"
+        )
+
+    dst_token_indices = (
+        dst_pages[dst_page_ordinals] * physical_page_size
+        + dst_local_offsets % physical_page_size
+    )
+    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)

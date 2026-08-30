@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
 use crate::{core::steps::workflow_data::WorkerRegistrationData, observability::metrics::Metrics};
@@ -34,33 +34,28 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         let mut worker_ids = Vec::with_capacity(workers.len());
 
         for worker in workers.iter() {
-            let worker_id = app_context
-                .worker_registry
-                .register(Arc::clone(worker))
-                .map_err(|error| WorkflowError::StepFailed {
-                    step_id: StepId::new("register_workers"),
-                    message: error.to_string(),
-                })?;
+            let worker_id = app_context.worker_registry.register(Arc::clone(worker));
             debug!(
-                "Registered worker {} (models: {:?}) with ID {:?}",
+                "Registered worker {} (model: {}) with ID {:?}",
                 worker.url(),
-                worker.model_ids(),
+                worker.model_id(),
                 worker_id
             );
             worker_ids.push(worker_id);
         }
 
-        let mut unique_configs = HashSet::new();
-        for worker in workers {
-            let metadata = worker.metadata();
-            for model_id in worker.model_ids() {
-                unique_configs.insert((
-                    metadata.worker_type.clone(),
-                    metadata.connection_mode.clone(),
-                    model_id.to_string(),
-                ));
-            }
-        }
+        // Collect unique worker configurations to avoid redundant metric updates
+        let unique_configs: HashSet<_> = workers
+            .iter()
+            .map(|w| {
+                let meta = w.metadata();
+                (
+                    meta.worker_type.clone(),
+                    meta.connection_mode.clone(),
+                    w.model_id().to_string(),
+                )
+            })
+            .collect();
 
         // Update Layer 3 worker pool size metrics per unique type/connection/model
         for (worker_type, connection_mode, model_id) in unique_configs {

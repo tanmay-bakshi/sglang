@@ -46,7 +46,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -68,6 +68,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # beam_width > 1 turns the request into a beam search request; n then means
+    # "number of returned sequences" rather than parallel samples (n <= beam_width).
+    beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -134,6 +137,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
 
+        # An empty grammar constraint means "unset", not "constrain to nothing".
+        self.json_schema = self.json_schema or None
+        self.regex = self.regex or None
+        self.ebnf = self.ebnf or None
+        self.structural_tag = self.structural_tag or None
+
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
@@ -143,6 +152,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width is not None and self.beam_width < 1:
+            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -196,9 +207,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings

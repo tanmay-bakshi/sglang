@@ -102,18 +102,12 @@ async fn liveness() -> Response {
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
-    let topology_status = state.context.worker_registry.pd_topology_status();
 
     let is_ready = if state.context.router_config.enable_igw {
         !healthy_workers.is_empty()
     } else {
         match &state.context.router_config.mode {
-            RoutingMode::PrefillDecode {
-                topology: Some(_), ..
-            } => topology_status
-                .as_ref()
-                .is_some_and(|status| status.fully_registered),
-            RoutingMode::PrefillDecode { topology: None, .. } => {
+            RoutingMode::PrefillDecode { .. } => {
                 let has_prefill = healthy_workers
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
@@ -128,16 +122,12 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     };
 
     if is_ready {
-        let topology_sha256 = topology_status
-            .as_ref()
-            .map(|status| status.topology_sha256.clone());
         (
             StatusCode::OK,
             Json(json!({
                 "status": "ready",
                 "healthy_workers": healthy_workers.len(),
-                "total_workers": workers.len(),
-                "pd_topology_sha256": topology_sha256,
+                "total_workers": workers.len()
             })),
         )
             .into_response()
@@ -150,19 +140,6 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             })),
         )
             .into_response()
-    }
-}
-
-async fn get_pd_topology_status(State(state): State<Arc<AppState>>) -> Response {
-    match state.context.worker_registry.pd_topology_status() {
-        Some(status) => (StatusCode::OK, Json(status)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "strict PD topology is not configured"
-            })),
-        )
-            .into_response(),
     }
 }
 
@@ -654,7 +631,6 @@ pub fn build_app(
 
     // Build worker routes
     let worker_routes = Router::new()
-        .route("/pd/topology", get(get_pd_topology_status))
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
@@ -938,13 +914,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
-    let _health_checker = app_context
-        .worker_registry
-        .start_health_checker(config.router_config.health_check.check_interval_secs);
-    debug!(
-        "Started registry maintenance and health monitoring with {}s interval",
-        config.router_config.health_check.check_interval_secs
-    );
+    if !config.router_config.health_check.disable_health_check {
+        let _health_checker = app_context
+            .worker_registry
+            .start_health_checker(config.router_config.health_check.check_interval_secs);
+        debug!(
+            "Started health checker for workers with {}s interval",
+            config.router_config.health_check.check_interval_secs
+        );
+    } else {
+        info!("Global health checks disabled via CLI/config; skipping health checker");
+    }
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;

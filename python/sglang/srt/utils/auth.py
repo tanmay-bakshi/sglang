@@ -23,7 +23,6 @@ class AuthLevel(str, Enum):
     NORMAL = "normal"
     ADMIN_OPTIONAL = "admin_optional"
     ADMIN_FORCE = "admin_force"
-    ENDPOINT = "endpoint"
 
 
 def auth_level(level: AuthLevel):
@@ -99,12 +98,6 @@ def decide_request_auth(
         return AuthDecision(allowed=True)
 
     if path.startswith("/health") or path.startswith("/metrics"):
-        return AuthDecision(allowed=True)
-
-    # The endpoint validates a request-scoped capability that is intentionally
-    # different from the process API key. Decoder reservation grant routes use
-    # this level so middleware does not reject the grant bearer first.
-    if auth_level == AuthLevel.ENDPOINT:
         return AuthDecision(allowed=True)
 
     def _check_bearer_token(

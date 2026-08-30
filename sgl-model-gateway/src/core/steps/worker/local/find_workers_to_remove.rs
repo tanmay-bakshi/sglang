@@ -62,12 +62,10 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             .map(|w| w.url().to_string())
             .collect();
 
-        let mut affected_models = HashSet::new();
-        for worker in &workers_to_remove {
-            for model_id in worker.model_ids() {
-                affected_models.insert(model_id.to_string());
-            }
-        }
+        let affected_models: HashSet<String> = workers_to_remove
+            .iter()
+            .map(|w| w.model_id().to_string())
+            .collect();
 
         // Update workflow data
         context.data.workers_to_remove = Some(WorkerList::from_workers(&workers_to_remove));

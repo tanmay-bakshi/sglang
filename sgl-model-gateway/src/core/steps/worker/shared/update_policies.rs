@@ -1,6 +1,6 @@
 //! Unified policy update step.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
@@ -8,10 +8,7 @@ use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::{
-    core::{steps::workflow_data::WorkerRegistrationData, Worker, WorkerRegistry},
-    policies::PolicyRegistry,
-};
+use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -81,30 +78,6 @@ impl UpdatePoliciesStep {
             }
         }
     }
-
-    fn update_worker_models(
-        &self,
-        worker_registry: &WorkerRegistry,
-        policy_registry: &PolicyRegistry,
-        worker: &Arc<dyn Worker>,
-        policy_hint: Option<&str>,
-    ) -> Vec<String> {
-        let mut updated_models = Vec::new();
-        for model_id in worker.model_ids() {
-            policy_registry.on_worker_added(model_id, policy_hint);
-
-            let all_workers = worker_registry.get_by_model(model_id);
-            self.check_worker_conflicts(model_id, &all_workers);
-            if let Some(policy) = policy_registry.get_policy(model_id) {
-                if policy.name() == "cache_aware" {
-                    policy_registry.init_cache_aware_policy(model_id, &all_workers);
-                }
-            }
-
-            updated_models.push(model_id.to_string());
-        }
-        updated_models
-    }
 }
 
 #[async_trait]
@@ -128,15 +101,33 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
-        let mut updated_models = HashSet::new();
+        // Track unique model IDs we've updated policies for
+        let mut updated_models = Vec::new();
 
         for worker in workers.iter() {
-            updated_models.extend(self.update_worker_models(
-                &app_context.worker_registry,
-                &app_context.policy_registry,
-                worker,
-                policy_hint,
-            ));
+            let model_id = worker.model_id().to_string();
+
+            // Notify policy registry
+            app_context
+                .policy_registry
+                .on_worker_added(&model_id, policy_hint);
+
+            // Initialize cache-aware policy if configured
+            let all_workers = app_context.worker_registry.get_by_model(&model_id);
+
+            // Check for configuration conflicts between prefill and decode
+            self.check_worker_conflicts(&model_id, &all_workers);
+            if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
+                if policy.name() == "cache_aware" {
+                    app_context
+                        .policy_registry
+                        .init_cache_aware_policy(&model_id, &all_workers);
+                }
+            }
+
+            if !updated_models.contains(&model_id) {
+                updated_models.push(model_id);
+            }
         }
 
         // Initialize bucket policies for prefill workers (local workers only)
@@ -178,54 +169,5 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        config::PolicyConfig,
-        core::{BasicWorkerBuilder, ModelCard, RuntimeType},
-    };
-
-    #[test]
-    fn multi_model_worker_registers_a_policy_for_every_identity() {
-        let worker_registry = WorkerRegistry::new();
-        let policy_registry = PolicyRegistry::new(PolicyConfig::Random);
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("https://provider.test")
-                .runtime_type(RuntimeType::External)
-                .models(vec![
-                    ModelCard::new("model-a").with_alias("model-a-versioned"),
-                    ModelCard::new("model-b"),
-                ])
-                .build(),
-        );
-        worker_registry.register(Arc::clone(&worker)).unwrap();
-
-        let updated_models = UpdatePoliciesStep.update_worker_models(
-            &worker_registry,
-            &policy_registry,
-            &worker,
-            None,
-        );
-
-        assert_eq!(
-            updated_models.into_iter().collect::<HashSet<_>>(),
-            HashSet::from([
-                "model-a".to_string(),
-                "model-a-versioned".to_string(),
-                "model-b".to_string(),
-            ])
-        );
-        assert_eq!(
-            policy_registry.get_worker_counts(),
-            std::collections::HashMap::from([
-                ("model-a".to_string(), 1),
-                ("model-a-versioned".to_string(), 1),
-                ("model-b".to_string(), 1),
-            ])
-        );
     }
 }
