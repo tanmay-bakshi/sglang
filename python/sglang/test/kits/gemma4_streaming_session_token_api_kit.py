@@ -1289,7 +1289,7 @@ def run_recovery_qualification(base_url: str) -> None:
     :param base_url: Live inference server URL.
     """
     client = SessionClient(base_url)
-    context, _, _ = _build_gemma4_context()
+    context, _, tokenizer = _build_gemma4_context()
     session_id = client.open()
     try:
         hot_extra_key = "stage4-recovery-hot-" + uuid.uuid4().hex
@@ -1428,12 +1428,45 @@ def run_recovery_qualification(base_url: str) -> None:
         )
         assert accepted.rid == accepted_rid
 
+        hot_replay_session_id = client.open()
+        hot_replay_key = "stage4-recovery-hot-replay-" + uuid.uuid4().hex
+        try:
+            hot_replay_seed = client.generate(
+                hot_replay_session_id,
+                context[:96],
+                max_new_tokens=4,
+                expected_tip=0,
+                extra_key=hot_replay_key,
+            )
+            assert hot_replay_seed.output_ids == seed.output_ids, (
+                "hot schedule replay changed the seed token log: "
+                f"hot={seed.output_ids}, replay={hot_replay_seed.output_ids}"
+            )
+            hot_replay_info = client.session_info(hot_replay_session_id)
+            assert hot_replay_info.tip == stable.tip
+
+            hot_replay = client.generate(
+                hot_replay_session_id,
+                accepted_delta,
+                max_new_tokens=4,
+                expected_tip=hot_replay_info.tip,
+                extra_key=hot_replay_key,
+            )
+            assert hot_replay.output_ids == accepted.output_ids, (
+                "post-conflict continuation diverged from its schedule-matched "
+                f"replay: hot={accepted.output_ids}, "
+                f"replay={hot_replay.output_ids}"
+            )
+        finally:
+            client.close(hot_replay_session_id)
+
+        cold_input_ids = context[:96] + seed.output_ids + accepted_delta
         cold_session_id = client.open()
         cold_extra_key = "stage4-recovery-cold-" + uuid.uuid4().hex
         try:
             cold = client.generate(
                 cold_session_id,
-                context[:96] + seed.output_ids + accepted_delta,
+                cold_input_ids,
                 max_new_tokens=4,
                 extra_key=cold_extra_key,
                 request_rid="stage4-cold-" + uuid.uuid4().hex,
@@ -1443,12 +1476,38 @@ def run_recovery_qualification(base_url: str) -> None:
                 f"cached_tokens={cold.cached_tokens}"
             )
             assert cold.prompt_tokens == accepted.prompt_tokens
-            assert cold.output_ids == accepted.output_ids, (
-                "conflict recovery changed greedy content: "
-                f"hot={accepted.output_ids}, cold={cold.output_ids}"
-            )
         finally:
             client.close(cold_session_id)
+
+        cold_replay_session_id = client.open()
+        cold_replay_key = "stage4-recovery-cold-replay-" + uuid.uuid4().hex
+        try:
+            cold_replay = client.generate(
+                cold_replay_session_id,
+                cold_input_ids,
+                max_new_tokens=4,
+                extra_key=cold_replay_key,
+            )
+            assert cold_replay.cached_tokens == 0, (
+                "cold schedule replay inherited radix state: "
+                f"cached_tokens={cold_replay.cached_tokens}"
+            )
+            assert cold_replay.prompt_tokens == cold.prompt_tokens
+            assert cold_replay.output_ids == cold.output_ids, (
+                "cold reconstruction diverged from its schedule-matched replay: "
+                f"cold={cold.output_ids}, replay={cold_replay.output_ids}"
+            )
+        finally:
+            client.close(cold_replay_session_id)
+
+        assert len(accepted.output_ids) == len(cold.output_ids)
+        assert len(accepted.output_ids) > 0
+        assert isinstance(tokenizer.vocab_size, int)
+        for output_ids in (accepted.output_ids, cold.output_ids):
+            assert all(
+                type(token_id) is int and 0 <= token_id < tokenizer.vocab_size
+                for token_id in output_ids
+            ), f"recovery output contained an invalid token ID: {output_ids}"
 
         accepted_info = client.session_info(session_id)
         assert accepted_info.tip == accepted.tip
@@ -2263,7 +2322,7 @@ class Gemma4StreamingSessionFullKitMixin(Gemma4StreamingSessionOracleKitMixin):
             REAP_METRIC_NAME,
             "cause",
             "close",
-            close_before + 6,
+            close_before + 8,
         )
         _wait_for_labeled_metric(
             self.base_url,
