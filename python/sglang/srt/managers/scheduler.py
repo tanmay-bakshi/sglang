@@ -725,6 +725,7 @@ class Scheduler(
             enable_priority_scheduling=self.enable_priority_scheduling,
             enable_lora=self.enable_lora,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            is_streaming_session_output_rank=_is_streaming_session_output_rank(self.ps),
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
@@ -1116,8 +1117,7 @@ class Scheduler(
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         reap_observer = (
             self.metrics_collector.increment_streaming_session_reap
-            if _is_streaming_session_output_rank(self.ps)
-            and self.server_args.enable_streaming_session
+            if self.metrics_collector_context.streaming_session_metrics_enabled
             and self.metrics_collector is not None
             else None
         )
@@ -4915,7 +4915,7 @@ class Scheduler(
 
         :param req: Rejected streaming-session request.
         """
-        if _is_streaming_session_output_rank(self.ps):
+        if self.metrics_collector_context.streaming_session_metrics_enabled:
             req.time_stats.increment_streaming_session_idempotency_conflict()
 
     def maybe_sleep_on_idle(self):

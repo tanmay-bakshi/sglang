@@ -233,18 +233,19 @@ class SchedulerMetricsCollectorContext:
     enable_metrics: bool
     is_stats_logging_rank: bool
     current_scheduler_metrics_enabled: bool
+    streaming_session_metrics_enabled: bool
     enable_kv_cache_events: bool
     collector: Optional[SchedulerMetricsCollector]
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
         enable_streaming_session: bool = False,
+        streaming_session_metrics_enabled: bool = False,
         server_args: Optional[ServerArgs] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -262,6 +263,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
+        self.streaming_session_metrics_enabled = streaming_session_metrics_enabled
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -1092,11 +1094,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
+        is_streaming_session_output_rank: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = server_args.enable_metrics
         is_stats_logging_rank = ps.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank or server_args.enable_metrics_for_all_schedulers
+        )
+        streaming_session_metrics_enabled = (
+            enable_metrics
+            and server_args.enable_streaming_session
+            and (
+                is_streaming_session_output_rank
+                or server_args.enable_metrics_for_all_schedulers
+            )
         )
         enable_kv_cache_events = bool(
             server_args.kv_events_config
@@ -1130,12 +1141,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 enable_lora=enable_lora,
                 enable_hierarchical_cache=enable_hierarchical_cache,
                 enable_streaming_session=server_args.enable_streaming_session,
+                streaming_session_metrics_enabled=streaming_session_metrics_enabled,
                 server_args=server_args,
             )
         return SchedulerMetricsCollectorContext(
             enable_metrics=enable_metrics,
             is_stats_logging_rank=is_stats_logging_rank,
             current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
+            streaming_session_metrics_enabled=streaming_session_metrics_enabled,
             enable_kv_cache_events=enable_kv_cache_events,
             collector=collector,
         )
@@ -1162,22 +1175,32 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         histogram.labels(**self.labels).observe(data)
 
     def increment_streaming_session_truncation(self) -> None:
+        if not self.streaming_session_metrics_enabled:
+            return
         self.streaming_session_truncations_total.labels(**self.labels).inc(1)
 
     def increment_streaming_session_commit(self) -> None:
+        if not self.streaming_session_metrics_enabled:
+            return
         self.streaming_session_commits_total.labels(**self.labels).inc(1)
 
     def increment_streaming_session_abort_with_slot_preserved(self) -> None:
+        if not self.streaming_session_metrics_enabled:
+            return
         self.streaming_session_aborts_with_slot_preserved_total.labels(
             **self.labels
         ).inc(1)
 
     def increment_streaming_session_idempotency_conflict(self) -> None:
+        if not self.streaming_session_metrics_enabled:
+            return
         self.streaming_session_idempotency_conflicts_total.labels(**self.labels).inc(1)
 
     def increment_streaming_session_reap(
         self, cause: StreamingSessionReapCause
     ) -> None:
+        if not self.streaming_session_metrics_enabled:
+            return
         self.streaming_session_reaps_total.labels(**self.labels, cause=cause).inc(1)
 
     def increment_bootstrap_failed_reqs(self) -> None:
@@ -1423,7 +1446,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
 
         # Streaming session metrics
-        if self.enable_streaming_session:
+        if self.streaming_session_metrics_enabled:
             self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
             self._log_gauge(
                 self.streaming_session_held_tokens, stats.streaming_session_held_tokens

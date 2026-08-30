@@ -447,6 +447,9 @@ class TestStreamingSessionTopologyAndMetrics(CustomTestCase):
                 attn_dp_rank=tp_rank // 2,
                 attn_dp_size=2,
             )
+            scheduler.metrics_collector_context = SimpleNamespace(
+                streaming_session_metrics_enabled=tp_rank == 0
+            )
             req = SimpleNamespace(time_stats=time_stats)
 
             Scheduler._record_streaming_session_idempotency_conflict(scheduler, req)
@@ -463,6 +466,22 @@ class TestStreamingSessionTopologyAndMetrics(CustomTestCase):
         ].increment_streaming_session_idempotency_conflict.assert_called_once_with()
         for time_stats in time_stats_by_rank[1:]:
             time_stats.increment_streaming_session_idempotency_conflict.assert_not_called()
+
+    def test_all_scheduler_metrics_escape_counts_each_rank(self):
+        """Let the explicit all-schedulers mode expose rank-local counters."""
+        time_stats_by_rank = [MagicMock(), MagicMock()]
+
+        for time_stats in time_stats_by_rank:
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.metrics_collector_context = SimpleNamespace(
+                streaming_session_metrics_enabled=True
+            )
+            req = SimpleNamespace(time_stats=time_stats)
+
+            Scheduler._record_streaming_session_idempotency_conflict(scheduler, req)
+
+        for time_stats in time_stats_by_rank:
+            time_stats.increment_streaming_session_idempotency_conflict.assert_called_once_with()
 
     def test_non_streaming_info_error_is_typed_on_unique_output_rank(self):
         """Map controller rejection to one correlated IPC error."""
