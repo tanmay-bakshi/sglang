@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.entrypoints.warmup import GEMMA4_STREAMING_SESSION_WARMUPS
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.server_fixtures.gemma4_streaming_session_fixture import (
     GEMMA4_DFLASH_MODEL_PATH,
@@ -52,7 +53,7 @@ def _server_info(arm: Gemma4StreamingSessionArm) -> dict[str, object]:
         "enable_request_time_stats_logging": True,
         "enable_metrics": True,
         "enable_streaming_session": True,
-        "warmups": ["streaming_session_small_extend"],
+        "warmups": list(GEMMA4_STREAMING_SESSION_WARMUPS),
         "speculative_algorithm": None,
     }
     if arm.use_dflash:
@@ -105,7 +106,7 @@ class Gemma4StreamingSessionFixtureTest(unittest.TestCase):
         self.assertIn("--enable-metrics", arguments)
         self.assertEqual(
             _argument_value(arguments, "--warmups"),
-            "streaming_session_small_extend",
+            ",".join(GEMMA4_STREAMING_SESSION_WARMUPS),
         )
 
     def test_no_spec_arguments_exclude_every_dflash_flag(self) -> None:

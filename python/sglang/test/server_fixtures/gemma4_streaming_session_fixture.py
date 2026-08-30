@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import requests
 
+from sglang.srt.entrypoints.warmup import GEMMA4_STREAMING_SESSION_WARMUPS
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -93,7 +94,7 @@ def build_gemma4_streaming_session_server_args(
         "--enable-metrics",
         "--enable-streaming-session",
         "--warmups",
-        "streaming_session_small_extend",
+        ",".join(GEMMA4_STREAMING_SESSION_WARMUPS),
         "--trust-remote-code",
         "--nccl-port",
         str(arm.port + 2_000),
@@ -174,12 +175,15 @@ def assert_gemma4_streaming_session_server_info(
     for field, expected in expected_fields.items():
         _assert_server_info_value(server_info, field, expected)
 
-    warmups = server_info.get("warmups")
-    if warmups not in (
-        "streaming_session_small_extend",
-        ["streaming_session_small_extend"],
-    ):
-        raise AssertionError(f"unexpected resolved warmups: {warmups!r}")
+    resolved_warmups = server_info.get("warmups")
+    if isinstance(resolved_warmups, str):
+        warmups = tuple(resolved_warmups.split(","))
+    elif isinstance(resolved_warmups, list):
+        warmups = tuple(resolved_warmups)
+    else:
+        raise AssertionError(f"unexpected resolved warmups: {resolved_warmups!r}")
+    if warmups != GEMMA4_STREAMING_SESSION_WARMUPS:
+        raise AssertionError(f"unexpected resolved warmups: {resolved_warmups!r}")
 
     speculative_algorithm = server_info.get("speculative_algorithm")
     if arm.use_dflash is False:

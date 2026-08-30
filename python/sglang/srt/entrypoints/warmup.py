@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Final, List
+import time
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 import tqdm
@@ -26,6 +27,34 @@ _STREAMING_SESSION_BURST_TOKENS: Final = 8
 _STREAMING_SESSION_TOKEN_BASE: Final = 2_048
 _STREAMING_SESSION_TOKEN_SPAN: Final = 4_096
 _STREAMING_SESSION_EXTRA_KEY: Final = "streaming-session-small-extend-warmup-v1"
+_STREAMING_SESSION_SHALLOW_SEED_TOKENS: Final = 96
+_STREAMING_SESSION_SHALLOW_SEED_OUTPUT_TOKENS: Final = 4
+_STREAMING_SESSION_SHALLOW_EXTEND_TOKENS: Final = 16
+_STREAMING_SESSION_SHALLOW_EXTEND_OUTPUT_TOKENS: Final = 4
+# The characterized continuation consumes context[112:128] after seeding
+# context[:96]; the skipped span carried rejected conflict requests.
+_STREAMING_SESSION_SHALLOW_EXTEND_OFFSET: Final = 112
+_STREAMING_SESSION_SHALLOW_EXPECTED_TIP: Final = (
+    _STREAMING_SESSION_SHALLOW_SEED_TOKENS
+    + _STREAMING_SESSION_SHALLOW_SEED_OUTPUT_TOKENS
+)
+_STREAMING_SESSION_SHALLOW_EXTRA_KEY: Final = (
+    "streaming-session-shallow-eager-extend-warmup-v1"
+)
+_STOCHASTIC_SAMPLING_INPUT_TOKENS: Final = 8
+_STOCHASTIC_SAMPLING_EXTRA_KEY: Final = "stochastic-sampling-first-use-warmup-v1"
+
+_STREAMING_SESSION_SMALL_EXTEND_WARMUP: Final = "streaming_session_small_extend"
+_STREAMING_SESSION_SHALLOW_EAGER_EXTEND_WARMUP: Final = (
+    "streaming_session_shallow_eager_extend"
+)
+_STOCHASTIC_SAMPLING_FIRST_USE_WARMUP: Final = "stochastic_sampling_first_use"
+
+GEMMA4_STREAMING_SESSION_WARMUPS: Final[tuple[str, ...]] = (
+    _STREAMING_SESSION_SMALL_EXTEND_WARMUP,
+    _STREAMING_SESSION_SHALLOW_EAGER_EXTEND_WARMUP,
+    _STOCHASTIC_SAMPLING_FIRST_USE_WARMUP,
+)
 
 
 def warmup(name: str):
@@ -38,7 +67,7 @@ def warmup(name: str):
 
 async def execute_warmups(
     disaggregation_mode: str,
-    warmup_names: List[str],
+    warmup_names: list[str],
     tokenizer_manager: TokenizerManager,
 ):
     for warmup_name in warmup_names:
@@ -46,7 +75,13 @@ async def execute_warmups(
             logger.warning(f"Could not find custom warmup {warmup_name}")
             continue
         logger.info(f"Running warmup {warmup_name}")
+        started_at = time.perf_counter()
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+        logger.info(
+            "Finished warmup %s in %.3f seconds",
+            warmup_name,
+            time.perf_counter() - started_at,
+        )
 
 
 def _streaming_session_warmup_tokens(length: int, offset: int = 0) -> list[int]:
@@ -63,7 +98,7 @@ def _streaming_session_warmup_tokens(length: int, offset: int = 0) -> list[int]:
     ]
 
 
-async def _drain_streaming_session_warmup_request(
+async def _drain_warmup_request(
     tokenizer_manager: TokenizerManager,
     request: GenerateReqInput,
 ) -> None:
@@ -76,7 +111,21 @@ async def _drain_streaming_session_warmup_request(
         pass
 
 
-@warmup("streaming_session_small_extend")
+def _require_unified_streaming_session(
+    disaggregation_mode: str,
+    warmup_name: str,
+) -> None:
+    """Reject a session warmup outside unified serving.
+
+    :param disaggregation_mode: Active prefill/decode disaggregation mode.
+    :param warmup_name: Name reported when the mode is unsupported.
+    :raises ValueError: If the server is disaggregated.
+    """
+    if disaggregation_mode != "null":
+        raise ValueError(f"{warmup_name} requires disaggregation_mode='null'.")
+
+
+@warmup(_STREAMING_SESSION_SMALL_EXTEND_WARMUP)
 async def streaming_session_small_extend(
     disaggregation_mode: str,
     tokenizer_manager: TokenizerManager,
@@ -87,10 +136,10 @@ async def streaming_session_small_extend(
     :param tokenizer_manager: Manager that owns the streaming session.
     :raises ValueError: If invoked for a disaggregated server.
     """
-    if disaggregation_mode != "null":
-        raise ValueError(
-            "streaming_session_small_extend requires disaggregation_mode='null'."
-        )
+    _require_unified_streaming_session(
+        disaggregation_mode,
+        _STREAMING_SESSION_SMALL_EXTEND_WARMUP,
+    )
 
     session_id = await tokenizer_manager.open_session(
         OpenSessionReqInput(
@@ -103,7 +152,7 @@ async def streaming_session_small_extend(
         raise RuntimeError("Failed to open the streaming-session warmup session.")
 
     try:
-        await _drain_streaming_session_warmup_request(
+        await _drain_warmup_request(
             tokenizer_manager,
             GenerateReqInput(
                 input_ids=_streaming_session_warmup_tokens(
@@ -119,7 +168,7 @@ async def streaming_session_small_extend(
                 extra_key=_STREAMING_SESSION_EXTRA_KEY,
             ),
         )
-        await _drain_streaming_session_warmup_request(
+        await _drain_warmup_request(
             tokenizer_manager,
             GenerateReqInput(
                 input_ids=_streaming_session_warmup_tokens(
@@ -144,6 +193,124 @@ async def streaming_session_small_extend(
             CloseSessionReqInput(session_id=session_id),
             None,
         )
+
+
+@warmup(_STREAMING_SESSION_SHALLOW_EAGER_EXTEND_WARMUP)
+async def streaming_session_shallow_eager_extend(
+    disaggregation_mode: str,
+    tokenizer_manager: TokenizerManager,
+) -> None:
+    """Warm the cached-prefix shallow eager continuation path.
+
+    :param disaggregation_mode: Active prefill/decode disaggregation mode.
+    :param tokenizer_manager: Manager that owns the streaming session.
+    :raises ValueError: If invoked for a disaggregated server.
+    """
+    _require_unified_streaming_session(
+        disaggregation_mode,
+        _STREAMING_SESSION_SHALLOW_EAGER_EXTEND_WARMUP,
+    )
+
+    session_id = await tokenizer_manager.open_session(
+        OpenSessionReqInput(
+            capacity_of_str_len=0,
+            streaming=True,
+        ),
+        None,
+    )
+    if session_id is None:
+        raise RuntimeError("Failed to open the streaming-session warmup session.")
+
+    try:
+        await _drain_warmup_request(
+            tokenizer_manager,
+            GenerateReqInput(
+                input_ids=_streaming_session_warmup_tokens(
+                    _STREAMING_SESSION_SHALLOW_SEED_TOKENS
+                ),
+                session_params={"id": session_id, "rid": None, "expected_tip": 0},
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": _STREAMING_SESSION_SHALLOW_SEED_OUTPUT_TOKENS,
+                    "ignore_eos": True,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+                stream=False,
+                log_metrics=False,
+                extra_key=_STREAMING_SESSION_SHALLOW_EXTRA_KEY,
+            ),
+        )
+        await _drain_warmup_request(
+            tokenizer_manager,
+            GenerateReqInput(
+                input_ids=_streaming_session_warmup_tokens(
+                    _STREAMING_SESSION_SHALLOW_EXTEND_TOKENS,
+                    offset=_STREAMING_SESSION_SHALLOW_EXTEND_OFFSET,
+                ),
+                session_params={
+                    "id": session_id,
+                    "rid": None,
+                    "expected_tip": _STREAMING_SESSION_SHALLOW_EXPECTED_TIP,
+                },
+                sampling_params={
+                    "temperature": 0.0,
+                    "max_new_tokens": (
+                        _STREAMING_SESSION_SHALLOW_EXTEND_OUTPUT_TOKENS
+                    ),
+                    "ignore_eos": True,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+                stream=False,
+                log_metrics=False,
+                extra_key=_STREAMING_SESSION_SHALLOW_EXTRA_KEY,
+            ),
+        )
+    finally:
+        await tokenizer_manager.close_session(
+            CloseSessionReqInput(session_id=session_id),
+            None,
+        )
+
+
+@warmup(_STOCHASTIC_SAMPLING_FIRST_USE_WARMUP)
+async def stochastic_sampling_first_use(
+    disaggregation_mode: str,
+    tokenizer_manager: TokenizerManager,
+) -> None:
+    """Warm FlashInfer's production stochastic-sampling module.
+
+    :param disaggregation_mode: Active prefill/decode disaggregation mode.
+    :param tokenizer_manager: Manager serving the warmup request.
+    :raises ValueError: If invoked for a disaggregated server.
+    """
+    if disaggregation_mode != "null":
+        raise ValueError(
+            "stochastic_sampling_first_use requires disaggregation_mode='null'."
+        )
+
+    await _drain_warmup_request(
+        tokenizer_manager,
+        GenerateReqInput(
+            input_ids=_streaming_session_warmup_tokens(
+                _STOCHASTIC_SAMPLING_INPUT_TOKENS
+            ),
+            sampling_params={
+                "temperature": 0.4,
+                "top_k": 64,
+                "top_p": 0.95,
+                "min_p": 0.0,
+                "max_new_tokens": 1,
+                "ignore_eos": True,
+                "no_stop_trim": True,
+                "skip_special_tokens": False,
+            },
+            stream=False,
+            log_metrics=False,
+            extra_key=_STOCHASTIC_SAMPLING_EXTRA_KEY,
+        ),
+    )
 
 
 @warmup("whisper_autodetect")
