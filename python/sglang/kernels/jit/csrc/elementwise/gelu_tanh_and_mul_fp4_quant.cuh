@@ -17,6 +17,8 @@
 #include <limits>
 #include <type_traits>
 
+namespace sglang {
+
 namespace {
 
 namespace tk = tensorrt_llm::kernels;
@@ -249,3 +251,5 @@ struct GeluTanhMulFP4QuantKernel {
 };
 
 }  // namespace
+
+}  // namespace sglang

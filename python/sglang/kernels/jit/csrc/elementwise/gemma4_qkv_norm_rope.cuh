@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstdint>
 
+namespace sglang {
+
 namespace {
 
 constexpr uint32_t kThreadsPerBlock = 256;
@@ -203,3 +205,5 @@ void gemma4_qkv_norm_rope(
 }
 
 }  // namespace
+
+}  // namespace sglang
