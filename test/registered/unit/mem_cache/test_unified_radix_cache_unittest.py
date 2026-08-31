@@ -7207,6 +7207,92 @@ class _InsertWalkSuite(CustomTestCase):
     )
 
 
+class TestHiCacheWritePolicyApplication(CustomTestCase):
+    """HiCache write policy mapping is shared by startup and L3 attach."""
+
+    def test_unified_tree_policy_mapping(self) -> None:
+        """Every policy selects its canonical threshold and write-back mode."""
+
+        cache: UnifiedRadixCache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = mock.Mock()
+        cache.tree_core = mock.Mock()
+
+        cases: tuple[tuple[str, int, bool], ...] = (
+            ("write_through", 1, False),
+            ("write_through_selective", 2, False),
+            ("write_back", 2, True),
+        )
+        for policy, threshold, is_write_back in cases:
+            with self.subTest(policy=policy):
+                cache._apply_hicache_write_policy(policy)
+                self.assertEqual(cache.cache_controller.write_policy, policy)
+                self.assertEqual(cache.write_through_threshold, threshold)
+                self.assertEqual(cache.is_write_back, is_write_back)
+
+    def test_storage_attach_delegates_write_policy(self) -> None:
+        """Runtime L3 attach updates policy through the L2-owned transition."""
+
+        cache: mock.Mock = mock.Mock()
+
+        StorageAttachment(cache)._apply_policies(None, "write_back")
+
+        cache._apply_hicache_write_policy.assert_called_once_with("write_back")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestHiCacheWritePolicyInitialization(_InsertWalkSuite):
+    """Startup arms L2 backup without requiring an L3 backend."""
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL,),
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def test_write_through_without_storage_preserves_oldest_prefix_on_host(
+        self,
+    ) -> None:
+        """A two-pool sequential build must retain its oldest prefix in L2."""
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        server_args: ServerArgs = ServerArgs(
+            model_path="dummy",
+            page_size=self.cfg.page_size,
+            hicache_io_backend="kernel",
+            hicache_write_policy="write_through",
+            hicache_storage_backend=None,
+        )
+        set_global_server_args_for_scheduler(server_args)
+        cache.init_hicache(server_args, cache.cache_init_params)
+        self.addCleanup(cache.release_host_resources)
+        cache.load_back_threshold = 0
+
+        self.assertFalse(cache.enable_storage)
+        self.assertEqual(cache.cache_controller.write_policy, "write_through")
+        self.assertEqual(cache.write_through_threshold, 1)
+
+        prefix_len: int = 4 * self.cfg.page_size
+        prefixes: list[list[int]] = [
+            self._make_seq(1 + index * 10_000, 4)
+            for index in range(2 * self.cfg.kv_size // prefix_len)
+        ]
+        for prefix in prefixes:
+            shortfall: int = prefix_len - allocator.available_size()
+            if shortfall > 0:
+                cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            self._insert(cache, allocator, req_to_token_pool, prefix)
+            cache.writing_check(write_back=True)
+
+        oldest: MatchResult = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefixes[0])))
+        )
+        self.assertEqual(len(oldest.device_indices), 0)
+        self.assertEqual(oldest.host_hit_length, prefix_len)
+        self.assertNotEqual(oldest.last_host_node, cache.root_node_handle())
+        cache.sanity_check()
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestResumableInsertWalk(_InsertWalkSuite):
     cfg = CacheConfig()

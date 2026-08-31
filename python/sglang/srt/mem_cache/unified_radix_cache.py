@@ -483,14 +483,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 lambda: self.buffer_pipeline.write_staged_tokens_
             )
 
-        # State initialization
-        self.write_through_threshold = (
-            1 if get_memory().hicache_write_policy == "write_through" else 2
-        )
-        self.is_write_back = (
-            self.cache_controller is not None
-            and self.cache_controller.write_policy == "write_back"
-        )
+        # L2 backup policy is independent of whether an L3 backend is attached.
+        self._apply_hicache_write_policy(get_memory().hicache_write_policy)
         # Pre-seed the dropped-tokens series at 0 per pool
         if self.metrics_collector is not None and self.cache_controller is not None:
             for ct in self.tree_components:
@@ -517,6 +511,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+    def _apply_hicache_write_policy(self, write_policy: str) -> None:
+        """Apply the host-backup policy to the controller and unified tree.
+
+        :param write_policy: Validated HiCache write policy.
+        """
+
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache write policy requires a cache controller")
+        self.cache_controller.write_policy = write_policy
+        self.write_through_threshold = 1 if write_policy == "write_through" else 2
+        self.is_write_back = write_policy == "write_back"
+        logger.info("Set hicache_write_policy to %s", write_policy)
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None

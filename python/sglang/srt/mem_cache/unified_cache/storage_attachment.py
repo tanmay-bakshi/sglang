@@ -337,12 +337,7 @@ class StorageAttachment:
                 f"{hicache_storage_prefetch_policy}"
             )
         if hicache_write_policy is not None:
-            cache.cache_controller.write_policy = hicache_write_policy
-            cache.write_through_threshold = (
-                1 if hicache_write_policy == "write_through" else 2
-            )
-            cache.is_write_back = hicache_write_policy == "write_back"
-            logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+            cache._apply_hicache_write_policy(hicache_write_policy)
 
     def _release_pending_storage_ops(self) -> None:
         """Release the host pages and locks that still-tracked ops hold.
