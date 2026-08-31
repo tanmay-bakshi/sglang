@@ -64,6 +64,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.session = None
 
     def finished(self):
         return self._finished
@@ -130,6 +131,31 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
         )
+
+    def test_lineage_generation_is_aligned_for_mixed_batches(self):
+        """Carry scheduler-owned lineage only for streaming-session output."""
+        session_request = _FakeReq("session", [10])
+        session_request.session = SimpleNamespace(
+            streaming=True,
+            lineage_generation=5,
+        )
+        ordinary_request = _FakeReq("ordinary", [20])
+        accumulator = _accumulator()
+
+        accumulator.accept(req=session_request)
+        accumulator.accept(req=ordinary_request)
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(payload.session_lineage_generations, [5, None])
+
+    def test_lineage_generation_is_omitted_for_ordinary_batch(self):
+        """Avoid adding session metadata to ordinary generation payloads."""
+        accumulator = _accumulator()
+        accumulator.accept(req=_FakeReq("ordinary", [10]))
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.session_lineage_generations)
 
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):

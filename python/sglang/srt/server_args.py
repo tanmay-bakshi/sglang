@@ -1433,6 +1433,11 @@ class ServerArgs:
         "Enable streaming session mode and StreamingSession wrapper.",
         NS("serving"),
     ] = False
+    streaming_session_journal_size: A[
+        int,
+        "Maximum number of streaming-session SSE data events retained for reconnect replay.",
+        NS("serving"),
+    ] = 256
     enable_session_radix_cache: A[
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",

@@ -26,6 +26,7 @@ _CONFLICT_MESSAGE = (
 )
 _OBSERVED_DIGEST = "sha256:v1:observed"
 _OBSERVED_TIP = 128
+_LINEAGE_GENERATION = 4
 
 
 class _DeterministicTokenizerManager:
@@ -153,6 +154,7 @@ class StreamingSessionConflictReconstructionTest(unittest.IsolatedAsyncioTestCas
                     "err_type": STREAMING_SESSION_CONFLICT_ERROR_TYPE,
                     "observed_tip": _OBSERVED_TIP,
                     "observed_digest": _OBSERVED_DIGEST,
+                    "lineage_generation": _LINEAGE_GENERATION,
                 }
             }
         }
@@ -164,6 +166,10 @@ class StreamingSessionConflictReconstructionTest(unittest.IsolatedAsyncioTestCas
         self.assertEqual(raised.exception.correlation_id, _CORRELATION_ID)
         self.assertEqual(raised.exception.observed_tip, _OBSERVED_TIP)
         self.assertEqual(raised.exception.observed_digest, _OBSERVED_DIGEST)
+        self.assertEqual(
+            raised.exception.lineage_generation,
+            _LINEAGE_GENERATION,
+        )
 
     async def test_unmarked_conflict_is_not_promoted(self) -> None:
         """Leave unrelated 409 aborts on the pre-existing generic path."""
@@ -215,6 +221,7 @@ class StreamingSessionConflictHttpTest(unittest.IsolatedAsyncioTestCase):
                 _CORRELATION_ID,
                 _OBSERVED_TIP,
                 _OBSERVED_DIGEST,
+                _LINEAGE_GENERATION,
             ),
             stream=False,
         )
@@ -234,6 +241,7 @@ class StreamingSessionConflictHttpTest(unittest.IsolatedAsyncioTestCase):
                 _CORRELATION_ID,
                 _OBSERVED_TIP,
                 _OBSERVED_DIGEST,
+                _LINEAGE_GENERATION,
             ),
             stream=True,
         )

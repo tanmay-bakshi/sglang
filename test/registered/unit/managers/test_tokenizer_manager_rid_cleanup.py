@@ -640,6 +640,28 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         self.assertEqual(out["meta_info"]["id"], rid)
         self.assertEqual(out["text"], "hello")
 
+    def test_session_lineage_generation_reaches_internal_meta_info(self):
+        """Carry scheduler-owned lineage through the tokenizer response."""
+        tm = _make_tokenizer_manager(self)
+        tm.request_logger = Mock()
+        tm.request_metrics_exporter_manager = MagicMock()
+        tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        rid = "session_lineage_rid"
+        state = _make_req_state(rid)
+        state.obj.background = True
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        batch_output.session_lineage_generations = [6]
+
+        async def drive():
+            waiter = tm._wait_one_response(state.obj, None)
+            await tm._handle_batch_output(batch_output)
+            return await waiter.__anext__()
+
+        out = asyncio.run(drive())
+
+        self.assertEqual(out["meta_info"]["_session_lineage_generation"], 6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

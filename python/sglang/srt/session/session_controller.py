@@ -393,6 +393,7 @@ class Session:
                 abort_error_data = {
                     "observed_tip": current_tip,
                     "observed_digest": self.current_digest(),
+                    "lineage_generation": self.lineage_generation,
                 }
             elif (
                 session_params.expected_digest is not None
@@ -411,6 +412,7 @@ class Session:
                 abort_error_data = {
                     "observed_tip": current_tip,
                     "observed_digest": current_digest,
+                    "lineage_generation": self.lineage_generation,
                 }
             elif session_params.replace:
                 abort = True

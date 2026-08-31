@@ -1540,6 +1540,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # Streaming-session lineage generation aligned with rids. None on batches
+    # without streaming-session output.
+    session_lineage_generations: Optional[List[Optional[int]]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
@@ -1634,6 +1637,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    session_lineage_generations: Optional[List[Optional[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

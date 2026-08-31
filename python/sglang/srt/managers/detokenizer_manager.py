@@ -463,6 +463,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
+            session_lineage_generations=recv_obj.session_lineage_generations,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,

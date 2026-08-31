@@ -105,12 +105,14 @@ class TestSessionTokenShare(CustomTestCase):
             "request-rid",
             17,
             "sha256:v1:observed",
+            3,
         )
 
         self.assertEqual(str(error), "stale session")
         self.assertEqual(error.correlation_id, "request-rid")
         self.assertEqual(error.observed_tip, 17)
         self.assertEqual(error.observed_digest, "sha256:v1:observed")
+        self.assertEqual(error.lineage_generation, 3)
 
     def test_lineage_digest_has_a_frozen_canonical_encoding(self):
         self.assertEqual(
@@ -396,6 +398,7 @@ class TestSessionTokenShare(CustomTestCase):
             {
                 "observed_tip": 5,
                 "observed_digest": self.session.current_digest(),
+                "lineage_generation": 0,
             },
         )
         self.assertEqual(conflict.rid, "stale-rid")
@@ -452,6 +455,7 @@ class TestSessionTokenShare(CustomTestCase):
             {
                 "observed_tip": 5,
                 "observed_digest": self.session.current_digest(),
+                "lineage_generation": 1,
             },
         )
         self.assertIn("expected_digest conflict", conflict.to_finish.message)

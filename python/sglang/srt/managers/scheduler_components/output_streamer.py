@@ -335,6 +335,7 @@ class _GenerationStreamAccumulator:
     spaces_between_special_tokens: list = field(default_factory=list)
     no_stop_trim: list = field(default_factory=list)
     prompt_tokens: list = field(default_factory=list)
+    session_lineage_generations: list[int | None] = field(default_factory=list)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     cached_tokens: list = field(default_factory=list)
@@ -460,6 +461,12 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        session = req.session
+        self.session_lineage_generations.append(
+            session.lineage_generation
+            if session is not None and session.streaming
+            else None
+        )
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -712,6 +719,14 @@ class _GenerationStreamAccumulator:
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             no_stop_trim=self.no_stop_trim,
             prompt_tokens=self.prompt_tokens,
+            session_lineage_generations=(
+                self.session_lineage_generations
+                if any(
+                    generation is not None
+                    for generation in self.session_lineage_generations
+                )
+                else None
+            ),
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,

@@ -25,6 +25,7 @@ import ssl
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -169,7 +170,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.errors import (
     StreamingSessionConflictError,
     StreamingSessionInfoUnavailableError,
+    StreamingSessionJournalBehindError,
 )
+from sglang.srt.session.event_journal import JournalBehindError
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -911,6 +914,15 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        session_stream = _streaming_session_coordinates(obj)
+        if session_stream is not None:
+            session_id, request_id = session_stream
+            return await _generate_streaming_session_request(
+                obj,
+                request,
+                session_id=session_id,
+                request_id=request_id,
+            )
         terminal_completion = asyncio.Event()
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -979,6 +991,218 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+def _streaming_session_coordinates(
+    obj: GenerateReqInput,
+) -> tuple[str, str] | None:
+    """Resolve a single streaming-session request before normalization.
+
+    :param obj: Native generation request.
+    :returns: Session and request identifiers, or ``None`` for ordinary streams.
+    :raises ValueError: If a session stream uses a batched request identity.
+    """
+    if obj.session_params is None:
+        return None
+    session_id = obj.session_params.get("id")
+    if not isinstance(session_id, str):
+        return None
+    if obj.rid is None:
+        obj.rid = uuid.uuid4().hex
+    if not isinstance(obj.rid, str):
+        raise ValueError("Streaming-session SSE requests must be single requests.")
+    return session_id, obj.rid
+
+
+async def _generate_streaming_session_request(
+    obj: GenerateReqInput,
+    request: Request,
+    *,
+    session_id: str,
+    request_id: str,
+) -> Response:
+    """Produce or resume a journal-backed streaming-session response.
+
+    :param obj: Native generation request.
+    :param request: Incoming HTTP request.
+    :param session_id: Owning streaming session.
+    :param request_id: Stable request identity.
+    :returns: Live/replayed SSE response or a typed journal-behind conflict.
+    """
+    manager = _global_state.tokenizer_manager
+    journal = manager.session_event_journal
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id is not None:
+        try:
+            subscription = journal.prepare_resume(
+                session_id,
+                request_id,
+                last_event_id,
+            )
+        except JournalBehindError:
+            info = await manager.get_session_info(session_id)
+            if info.lineage_digest is None:
+                raise StreamingSessionInfoUnavailableError(
+                    f"Session {session_id} has no durable lineage."
+                )
+            error = StreamingSessionJournalBehindError(
+                current_tip=info.tip,
+                current_digest=info.lineage_digest,
+            )
+            return ORJSONResponse(
+                content=_streaming_session_journal_behind_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
+        return StreamingResponse(
+            journal.stream(subscription),
+            media_type="text/event-stream",
+        )
+
+    try:
+        subscription = journal.begin_stream(session_id, request_id)
+    except ValueError as error:
+        return _create_error_response(error)
+
+    async def produce() -> None:
+        lineage_generation: int | None = None
+        current_offset: int | None = None
+        producer_failure_message: str | None = None
+        try:
+            async for out in manager.generate_request(obj, None):
+                meta_info = out.get("meta_info")
+                if not isinstance(meta_info, dict):
+                    raise RuntimeError(
+                        "Streaming-session output is missing event metadata."
+                    )
+                raw_generation = meta_info.pop("_session_lineage_generation", None)
+                if not isinstance(raw_generation, int):
+                    raise RuntimeError(
+                        "Streaming-session output is missing lineage generation."
+                    )
+                prompt_offset = meta_info.get("prompt_tokens")
+                completion_tokens = meta_info.get("completion_tokens")
+                if not isinstance(prompt_offset, int) or not isinstance(
+                    completion_tokens, int
+                ):
+                    raise RuntimeError(
+                        "Streaming-session output is missing token offsets."
+                    )
+                lineage_generation = raw_generation
+                current_offset = prompt_offset + completion_tokens
+                await journal.append(
+                    session_id,
+                    request_id,
+                    lineage_generation,
+                    prompt_offset,
+                    current_offset,
+                    b"data: " + dumps_json(out) + b"\n\n",
+                )
+        except StreamingSessionConflictError as error:
+            lineage_generation = error.lineage_generation
+            current_offset = error.observed_tip
+            await journal.append(
+                session_id,
+                request_id,
+                lineage_generation,
+                current_offset,
+                current_offset,
+                b"data: "
+                + dumps_json(_streaming_session_conflict_error_payload(error))
+                + b"\n\n",
+            )
+        except HTTPException as error:
+            lineage_generation, current_offset = await _resolve_session_cursor(
+                manager,
+                session_id,
+                lineage_generation,
+                current_offset,
+            )
+            payload = {
+                "error": {
+                    "message": str(error.detail),
+                    "type": "invalid_request_error",
+                    "code": error.status_code,
+                    "retryable": False,
+                }
+            }
+            await journal.append(
+                session_id,
+                request_id,
+                lineage_generation,
+                current_offset,
+                current_offset,
+                b"data: " + dumps_json(payload) + b"\n\n",
+            )
+        except ValueError as error:
+            lineage_generation, current_offset = await _resolve_session_cursor(
+                manager,
+                session_id,
+                lineage_generation,
+                current_offset,
+            )
+            payload = {
+                "error": {
+                    "message": str(error),
+                    "type": "invalid_request_error",
+                    "code": getattr(error, "status_code", 400),
+                    "retryable": False,
+                }
+            }
+            logger.error("[http_server] Session stream error: %s", error)
+            await journal.append(
+                session_id,
+                request_id,
+                lineage_generation,
+                current_offset,
+                current_offset,
+                b"data: " + dumps_json(payload) + b"\n\n",
+            )
+        except Exception:
+            logger.error(
+                "Streaming-session journal producer failed:\n%s",
+                traceback.format_exc(),
+            )
+            producer_failure_message = "Streaming-session journal producer failed."
+        finally:
+            await journal.finish(
+                session_id,
+                request_id,
+                failure_message=producer_failure_message,
+            )
+
+    producer = asyncio.create_task(produce())
+    journal.set_producer(session_id, request_id, producer)
+    return StreamingResponse(
+        journal.stream(subscription),
+        media_type="text/event-stream",
+    )
+
+
+async def _resolve_session_cursor(
+    manager: TokenizerManager,
+    session_id: str,
+    lineage_generation: int | None,
+    current_offset: int | None,
+) -> tuple[int, int]:
+    """Resolve missing error-event coordinates from recovery inventory.
+
+    :param manager: Tokenizer manager serving the request.
+    :param session_id: Owning streaming session.
+    :param lineage_generation: Generation already observed from output.
+    :param current_offset: Offset already observed from output.
+    :returns: Complete generation and absolute offset.
+    :raises RuntimeError: If the session is no longer in inventory.
+    """
+    if lineage_generation is not None and current_offset is not None:
+        return lineage_generation, current_offset
+    inventory = await manager.list_sessions()
+    entry = next(
+        (session for session in inventory.sessions if session.session_id == session_id),
+        None,
+    )
+    if entry is None:
+        raise RuntimeError(f"Session {session_id} is unavailable for SSE recovery.")
+    return entry.lineage_generation, entry.tip
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -2189,6 +2413,27 @@ def _streaming_session_conflict_error_payload(
             "correlation_id": error.correlation_id,
             "observed_tip": error.observed_tip,
             "observed_digest": error.observed_digest,
+        }
+    }
+
+
+def _streaming_session_journal_behind_payload(
+    error: StreamingSessionJournalBehindError,
+) -> dict[str, dict[str, object]]:
+    """Build the stable session-journal recovery error envelope.
+
+    :param error: Typed journal-behind state with reconciliation coordinates.
+    :returns: Public recovery payload.
+    """
+    return {
+        "error": {
+            "message": str(error),
+            "type": "journal_behind",
+            "code": HTTPStatus.CONFLICT.value,
+            "retryable": False,
+            "current_tip": error.current_tip,
+            "current_digest": error.current_digest,
+            "required_action": error.required_action,
         }
     }
 

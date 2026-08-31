@@ -154,6 +154,7 @@ from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
     StreamingSessionConflictError,
 )
+from sglang.srt.session.event_journal import SessionEventJournal
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -609,6 +610,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.list_sessions_futures: dict[
             str, asyncio.Future[ListSessionsReqOutput]
         ] = {}
+        self.session_event_journal = SessionEventJournal(
+            self.server_args.streaming_session_journal_size
+        )
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -1706,6 +1710,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.obj.rid,
                 finish_reason["observed_tip"],
                 finish_reason["observed_digest"],
+                finish_reason["lineage_generation"],
             )
 
         if (
@@ -2285,6 +2290,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            session_lineage_generations = (
+                recv_obj.session_lineage_generations
+                if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+                else None
+            )
+            if (
+                session_lineage_generations is not None
+                and session_lineage_generations[i] is not None
+            ):
+                meta_info["_session_lineage_generation"] = session_lineage_generations[
+                    i
+                ]
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
