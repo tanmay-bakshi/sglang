@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    KVComponentResidency,
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
@@ -667,15 +668,36 @@ class StreamingSession(BasePrefixCache):
         slot = self.slots.get(session_id)
         if slot is None:
             return StreamingSessionCacheSnapshot()
+        full, swa = self.inner.streaming_session_protected_residency(slot.last_node)
         if not slot.is_holding_kv:
             return StreamingSessionCacheSnapshot(
                 protected=slot.cache_protected_len,
+                full=full,
+                swa=swa,
             )
 
         allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
+        full_held = max(0, allocated - slot.cache_protected_len)
+        full_device_pages = ceil_align(full_held, self.page_size) // self.page_size
+        swa_device_pages = 0
+        if self.supports_swa():
+            swa_start = max(
+                slot.cache_protected_len,
+                slot.kv.swa_evicted_seqlen,
+            )
+            swa_held = max(0, allocated - swa_start)
+            swa_device_pages = ceil_align(swa_held, self.page_size) // self.page_size
         return StreamingSessionCacheSnapshot(
             protected=slot.cache_protected_len,
-            held_tokens=max(0, allocated - slot.cache_protected_len),
+            held_tokens=full_held,
+            full=KVComponentResidency(
+                device_pages=full.device_pages + full_device_pages,
+                host_backed_pages=full.host_backed_pages,
+            ),
+            swa=KVComponentResidency(
+                device_pages=swa.device_pages + swa_device_pages,
+                host_backed_pages=swa.host_backed_pages,
+            ),
         )
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:

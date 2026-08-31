@@ -8,6 +8,10 @@ from sglang.srt.managers.io_struct import (
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     GetSessionInfoReqOutput,
+    ListSessionsReqInput,
+    ListSessionsReqOutput,
+    SessionInventoryOutput,
+    SessionKVResidencyOutput,
     msgpack_decode,
     msgpack_encode,
 )
@@ -39,6 +43,34 @@ def _session_info_output(
         inflight=False,
         held_tokens=tip,
         last_rid=f"rid-{tip}",
+    )
+
+
+def _list_sessions_output(correlation_id: str) -> ListSessionsReqOutput:
+    """Build a deterministic inventory response.
+
+    :param correlation_id: Internal control-plane request identity.
+    :returns: Complete session-inventory IPC response.
+    """
+    return ListSessionsReqOutput(
+        correlation_id=correlation_id,
+        sessions=[
+            SessionInventoryOutput(
+                session_id="session-a",
+                lineage_generation=3,
+                tip=128,
+                lineage_digest="sha256:v1:digest-128",
+                floor=64,
+                full=SessionKVResidencyOutput(
+                    device_pages=8,
+                    host_backed_pages=4,
+                ),
+                swa=SessionKVResidencyOutput(
+                    device_pages=2,
+                    host_backed_pages=1,
+                ),
+            )
+        ],
     )
 
 
@@ -79,6 +111,19 @@ class _UnavailableSessionInfoTokenizerManager:
         raise StreamingSessionInfoUnavailableError(
             f"Session {session_id} is not a streaming session."
         )
+
+
+class _InventoryTokenizerManager:
+    """Minimal tokenizer manager for the inventory HTTP endpoint."""
+
+    engine_incarnation_id: str = "engine-incarnation-a"
+
+    async def list_sessions(self) -> ListSessionsReqOutput:
+        """Return one deterministic inventory entry.
+
+        :returns: Configured session inventory.
+        """
+        return _list_sessions_output("internal-correlation")
 
 
 class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
@@ -254,6 +299,88 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decoded_error, error)
         self.assertIs(type(decoded_error.correlation_id), str)
         self.assertIs(type(decoded_error.message), str)
+
+
+class StreamingSessionInventoryTransportTest(unittest.IsolatedAsyncioTestCase):
+    """Inventory endpoint and correlated IPC behavior."""
+
+    async def test_http_body_contains_engine_and_component_residency(self) -> None:
+        manager = _InventoryTokenizerManager()
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(types.SimpleNamespace(tokenizer_manager=manager))
+        try:
+            response = await http_server.list_sessions()
+        finally:
+            http_server.set_global_state(prior_state)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "engine_incarnation_id": "engine-incarnation-a",
+                "sessions": [
+                    {
+                        "session_id": "session-a",
+                        "lineage_generation": 3,
+                        "tip": 128,
+                        "lineage_digest": "sha256:v1:digest-128",
+                        "floor": 64,
+                        "kv_residency": {
+                            "full": {
+                                "device_pages": 8,
+                                "host_backed_pages": 4,
+                            },
+                            "swa": {
+                                "device_pages": 2,
+                                "host_backed_pages": 1,
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+    async def test_concurrent_reads_complete_their_exact_waiters(self) -> None:
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.list_sessions_futures = {}
+        manager.auto_create_handle_loop = lambda: None
+        dispatched: list[ListSessionsReqInput] = []
+        manager._dispatch_to_scheduler = dispatched.append
+
+        tasks = [asyncio.create_task(manager.list_sessions()) for _ in range(16)]
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(dispatched), len(tasks))
+        self.assertEqual(
+            len({request.correlation_id for request in dispatched}),
+            len(tasks),
+        )
+        for request in reversed(dispatched):
+            manager._handle_list_sessions_req_output(
+                _list_sessions_output(request.correlation_id)
+            )
+
+        results = await asyncio.gather(*tasks)
+        self.assertTrue(
+            all(result.sessions[0].session_id == "session-a" for result in results)
+        )
+        self.assertEqual(manager.list_sessions_futures, {})
+
+    async def test_inventory_ipc_round_trips_nested_value_domains(self) -> None:
+        request = ListSessionsReqInput(correlation_id="correlation-a")
+        output = _list_sessions_output("correlation-a")
+
+        decoded_request = msgpack_decode(msgpack_encode(request))
+        decoded_output = msgpack_decode(msgpack_encode(output))
+
+        self.assertIs(type(decoded_request), ListSessionsReqInput)
+        self.assertEqual(decoded_request, request)
+        self.assertIs(type(decoded_output), ListSessionsReqOutput)
+        self.assertEqual(decoded_output, output)
+        [session] = decoded_output.sessions
+        self.assertIs(type(session), SessionInventoryOutput)
+        self.assertIs(type(session.full), SessionKVResidencyOutput)
+        self.assertIs(type(session.swa), SessionKVResidencyOutput)
 
 
 if __name__ == "__main__":

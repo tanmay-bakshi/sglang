@@ -2210,6 +2210,58 @@ class GetSessionInfoReqOutput(BaseReq, kw_only=True):
     last_rid: str | None
 
 
+class SessionKVResidencyOutput(BaseReq, kw_only=True):
+    """Wire representation of one component's residency.
+
+    :ivar device_pages: Pages currently resident in the device KV pool.
+    :ivar host_backed_pages: Pages with a copy in the host KV pool.
+    """
+
+    device_pages: int
+    host_backed_pages: int
+
+
+class SessionInventoryOutput(BaseReq, kw_only=True):
+    """Wire representation of one open streaming session.
+
+    :ivar session_id: Public session identifier.
+    :ivar lineage_generation: Generation incremented by history rewrites.
+    :ivar tip: Absolute durable token offset.
+    :ivar lineage_digest: Canonical token-history digest.
+    :ivar floor: Earliest allowed rollback offset.
+    :ivar full: Full-attention KV residency.
+    :ivar swa: Sliding-window-attention KV residency.
+    """
+
+    session_id: str
+    lineage_generation: int
+    tip: int
+    lineage_digest: str
+    floor: int
+    full: SessionKVResidencyOutput
+    swa: SessionKVResidencyOutput
+
+
+class ListSessionsReqInput(BaseReq, kw_only=True):
+    """Scheduler inventory query.
+
+    :ivar correlation_id: Unique frontend waiter identity.
+    """
+
+    correlation_id: str
+
+
+class ListSessionsReqOutput(BaseReq, kw_only=True):
+    """Scheduler inventory response.
+
+    :ivar correlation_id: Unique frontend waiter identity.
+    :ivar sessions: Complete open streaming-session inventory.
+    """
+
+    correlation_id: str
+    sessions: list[SessionInventoryOutput]
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

@@ -18,7 +18,10 @@ from http import HTTPStatus
 from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import CloseSessionReqInput, OpenSessionReqInput
-from sglang.srt.mem_cache.base_prefix_cache import StreamingSessionCacheSnapshot
+from sglang.srt.mem_cache.base_prefix_cache import (
+    KVComponentResidency,
+    StreamingSessionCacheSnapshot,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.errors import (
@@ -487,6 +490,7 @@ class TestSessionTokenShare(CustomTestCase):
             (self.session.current_tip(), self.session.last_rid),
             (6, "r1"),
         )
+        self.assertEqual(self.session.lineage_generation, 0)
 
         truncate = self._create("truncate", [], max_new_tokens=0, truncate_to=4)
         cache = SimpleNamespace(
@@ -498,6 +502,7 @@ class TestSessionTokenShare(CustomTestCase):
             (self.session.current_tip(), self.session.last_rid),
             (4, "truncate"),
         )
+        self.assertEqual(self.session.lineage_generation, 1)
         self.session.abort_req(truncate)
         self.assertEqual(
             (self.session.current_tip(), self.session.last_rid),
@@ -710,7 +715,18 @@ class TestSessionTokenShare(CustomTestCase):
         tree_cache = SimpleNamespace(
             supports_mamba=lambda: False,
             streaming_session_cache_snapshot=lambda session_id: (
-                StreamingSessionCacheSnapshot(protected=64, held_tokens=192)
+                StreamingSessionCacheSnapshot(
+                    protected=64,
+                    held_tokens=192,
+                    full=KVComponentResidency(
+                        device_pages=12,
+                        host_backed_pages=3,
+                    ),
+                    swa=KVComponentResidency(
+                        device_pages=4,
+                        host_backed_pages=2,
+                    ),
+                )
             ),
         )
         controller = SessionController(tree_cache)
@@ -746,6 +762,20 @@ class TestSessionTokenShare(CustomTestCase):
             ),
         )
         self.assertEqual(session.last_active_time, last_active_before)
+        [inventory] = controller.list_info()
+        self.assertEqual(inventory.session_id, "info-session")
+        self.assertEqual(inventory.lineage_generation, 0)
+        self.assertEqual(inventory.tip, 256)
+        self.assertEqual(inventory.lineage_digest, session.current_digest())
+        self.assertEqual(inventory.floor, 128)
+        self.assertEqual(
+            inventory.full,
+            KVComponentResidency(device_pages=12, host_backed_pages=3),
+        )
+        self.assertEqual(
+            inventory.swa,
+            KVComponentResidency(device_pages=4, host_backed_pages=2),
+        )
         self.assertEqual(
             controller.get_info("missing"),
             type(info)(

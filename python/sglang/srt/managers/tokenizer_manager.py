@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import (
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqOutput,
     HealthCheckOutput,
+    ListSessionsReqOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
@@ -419,6 +420,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.engine_incarnation_id: str = port_args.instance_id
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
@@ -604,6 +606,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.session_info_futures: dict[
             str, asyncio.Future[GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput]
         ] = {}
+        self.list_sessions_futures: dict[
+            str, asyncio.Future[ListSessionsReqOutput]
+        ] = {}
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -774,6 +779,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_get_session_info_req_output,
                 ),
                 (GetSessionInfoReqOutput, self._handle_get_session_info_req_output),
+                (ListSessionsReqOutput, self._handle_list_sessions_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -3384,6 +3390,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if future is None:
             logger.warning(
                 "Session info response arrived after waiter cleanup: %s",
+                recv_obj.correlation_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
+
+    def _handle_list_sessions_req_output(
+        self, recv_obj: ListSessionsReqOutput
+    ) -> None:
+        """Complete the exact waiter for a concurrent inventory read.
+
+        :param recv_obj: Atomic scheduler-owned session inventory.
+        """
+        future = self.list_sessions_futures.get(recv_obj.correlation_id)
+        if future is None:
+            logger.warning(
+                "Session inventory arrived after waiter cleanup: %s",
                 recv_obj.correlation_id,
             )
             return

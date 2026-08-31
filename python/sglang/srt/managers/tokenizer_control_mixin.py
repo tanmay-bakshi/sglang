@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    ListSessionsReqInput,
+    ListSessionsReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -957,6 +959,23 @@ class TokenizerControlMixin:
             return result
         finally:
             self.session_info_futures.pop(correlation_id, None)
+
+    async def list_sessions(self: TokenizerManager) -> ListSessionsReqOutput:
+        """Read all open streaming sessions' recovery state.
+
+        :returns: Atomic scheduler-owned inventory.
+        """
+        self.auto_create_handle_loop()
+        correlation_id = uuid.uuid4().hex
+        future: asyncio.Future[ListSessionsReqOutput] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self.list_sessions_futures[correlation_id] = future
+        self._dispatch_to_scheduler(ListSessionsReqInput(correlation_id=correlation_id))
+        try:
+            return await future
+        finally:
+            self.list_sessions_futures.pop(correlation_id, None)
 
     async def close_session(
         self: TokenizerManager,

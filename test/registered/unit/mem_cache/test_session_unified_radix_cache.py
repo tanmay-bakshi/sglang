@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
+    KVComponentResidency,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -195,6 +196,18 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
 
         self.cache.release_radix_session("s1")
         self.assertEqual(self.full.session_ref(leaf), 0)
+
+    def test_streaming_residency_counts_device_and_host_pages_on_locked_path(self):
+        leaf = insert(self.cache, [1, 2, 3, 4])
+        leaf.component_data[ComponentType.FULL].host_value = torch.arange(4)
+
+        full, swa = self.cache.streaming_session_protected_residency(leaf.id)
+
+        self.assertEqual(
+            full,
+            KVComponentResidency(device_pages=4, host_backed_pages=4),
+        )
+        self.assertEqual(swa, KVComponentResidency())
 
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

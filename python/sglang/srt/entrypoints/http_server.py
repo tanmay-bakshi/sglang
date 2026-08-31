@@ -1655,6 +1655,42 @@ async def session_info(session_id: Annotated[str, Query(min_length=1)]):
     )
 
 
+@app.get("/list_sessions")
+async def list_sessions() -> ORJSONResponse:
+    """Return the engine's complete streaming-session recovery inventory.
+
+    :returns: Engine incarnation and all open streaming sessions.
+    """
+    result = await _global_state.tokenizer_manager.list_sessions()
+    return ORJSONResponse(
+        {
+            "engine_incarnation_id": (
+                _global_state.tokenizer_manager.engine_incarnation_id
+            ),
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "lineage_generation": session.lineage_generation,
+                    "tip": session.tip,
+                    "lineage_digest": session.lineage_digest,
+                    "floor": session.floor,
+                    "kv_residency": {
+                        "full": {
+                            "device_pages": session.full.device_pages,
+                            "host_backed_pages": session.full.host_backed_pages,
+                        },
+                        "swa": {
+                            "device_pages": session.swa.device_pages,
+                            "host_backed_pages": session.swa.host_backed_pages,
+                        },
+                    },
+                }
+                for session in result.sessions
+            ],
+        }
+    )
+
+
 @app.api_route("/configure_logging", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(

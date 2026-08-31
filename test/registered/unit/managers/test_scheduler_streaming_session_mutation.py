@@ -13,6 +13,10 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
+    ListSessionsReqInput,
+    ListSessionsReqOutput,
+    SessionInventoryOutput,
+    SessionKVResidencyOutput,
     SessionParams,
     TokenizedGenerateReqInput,
 )
@@ -523,6 +527,49 @@ class TestStreamingSessionTopologyAndMetrics(CustomTestCase):
 
         self.assertIsNone(Scheduler.get_session_info(scheduler, request))
         scheduler.session_controller.get_info.assert_not_called()
+
+    def test_session_inventory_is_serialized_on_unique_output_rank(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = ParallelState.trivial()
+        scheduler.session_controller = MagicMock()
+        scheduler.session_controller.list_info.return_value = [
+            SimpleNamespace(
+                session_id="session-a",
+                lineage_generation=2,
+                tip=128,
+                lineage_digest="sha256:v1:digest",
+                floor=64,
+                full=SimpleNamespace(device_pages=8, host_backed_pages=4),
+                swa=SimpleNamespace(device_pages=2, host_backed_pages=1),
+            )
+        ]
+        request = ListSessionsReqInput(correlation_id="correlation-a")
+
+        output = Scheduler.list_sessions(scheduler, request)
+
+        self.assertEqual(
+            output,
+            ListSessionsReqOutput(
+                correlation_id="correlation-a",
+                sessions=[
+                    SessionInventoryOutput(
+                        session_id="session-a",
+                        lineage_generation=2,
+                        tip=128,
+                        lineage_digest="sha256:v1:digest",
+                        floor=64,
+                        full=SessionKVResidencyOutput(
+                            device_pages=8,
+                            host_backed_pages=4,
+                        ),
+                        swa=SessionKVResidencyOutput(
+                            device_pages=2,
+                            host_backed_pages=1,
+                        ),
+                    )
+                ],
+            ),
+        )
 
 
 if __name__ == "__main__":

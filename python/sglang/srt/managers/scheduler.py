@@ -148,6 +148,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
+    ListSessionsReqInput,
+    ListSessionsReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -165,6 +167,8 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
+    SessionInventoryOutput,
+    SessionKVResidencyOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     ShutdownReq,
@@ -1669,6 +1673,7 @@ class Scheduler(
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (GetSessionInfoReqInput, self.get_session_info),
+                (ListSessionsReqInput, self.list_sessions),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -5468,6 +5473,39 @@ class Scheduler(
             inflight=info.inflight,
             held_tokens=info.held_tokens,
             last_rid=info.last_rid,
+        )
+
+    def list_sessions(
+        self, recv_req: ListSessionsReqInput
+    ) -> ListSessionsReqOutput | None:
+        """Read all streaming-session recovery state on its owning scheduler.
+
+        :param recv_req: Inventory query with a unique waiter identity.
+        :returns: Complete inventory from the designated response rank.
+        """
+        if not _is_streaming_session_output_rank(self.ps):
+            return None
+        sessions: list[SessionInventoryOutput] = [
+            SessionInventoryOutput(
+                session_id=entry.session_id,
+                lineage_generation=entry.lineage_generation,
+                tip=entry.tip,
+                lineage_digest=entry.lineage_digest,
+                floor=entry.floor,
+                full=SessionKVResidencyOutput(
+                    device_pages=entry.full.device_pages,
+                    host_backed_pages=entry.full.host_backed_pages,
+                ),
+                swa=SessionKVResidencyOutput(
+                    device_pages=entry.swa.device_pages,
+                    host_backed_pages=entry.swa.host_backed_pages,
+                ),
+            )
+            for entry in self.session_controller.list_info()
+        ]
+        return ListSessionsReqOutput(
+            correlation_id=recv_req.correlation_id,
+            sessions=sessions,
         )
 
     def _record_streaming_session_idempotency_conflict(self, req: Req) -> None:

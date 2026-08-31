@@ -114,11 +114,31 @@ class EvictResult:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class KVComponentResidency:
+    """Physical page residency for one KV component.
+
+    :ivar device_pages: Pages currently allocated in the device KV pool.
+    :ivar host_backed_pages: Pages with a copy in the host KV pool.
+    """
+
+    device_pages: int = 0
+    host_backed_pages: int = 0
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class StreamingSessionCacheSnapshot:
-    """Read-only per-session KV ownership summary."""
+    """Read-only per-session KV ownership summary.
+
+    :ivar protected: Tokens protected through shared radix-tree ownership.
+    :ivar held_tokens: Tokens held exclusively by the detached session slot.
+    :ivar full: Residency of full-attention KV pages.
+    :ivar swa: Residency of sliding-window-attention KV pages.
+    """
 
     protected: int = 0
     held_tokens: int = 0
+    full: KVComponentResidency = dataclasses.field(default_factory=KVComponentResidency)
+    swa: KVComponentResidency = dataclasses.field(default_factory=KVComponentResidency)
 
 
 @dataclasses.dataclass
@@ -482,6 +502,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         :returns: An empty snapshot for caches without streaming-session state.
         """
         return StreamingSessionCacheSnapshot()
+
+    def streaming_session_protected_residency(
+        self, node: Any
+    ) -> tuple[KVComponentResidency, KVComponentResidency]:
+        """Return component residency on a streaming session's locked tree path.
+
+        :param node: Cache-specific tree node held by the session slot.
+        :returns: Full and SWA residency, or zeros for caches without tiering.
+        """
+        return KVComponentResidency(), KVComponentResidency()
 
     def is_chunk_cache(self) -> bool:
         return False

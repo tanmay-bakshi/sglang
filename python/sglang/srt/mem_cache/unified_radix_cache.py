@@ -9,6 +9,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
+
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     InsertResult,
+    KVComponentResidency,
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
@@ -3014,6 +3016,47 @@ class UnifiedRadixCache(BasePrefixCache):
         :returns: The composed streaming-session cache snapshot.
         """
         return self.session.streaming_session_cache_snapshot(session_id)
+
+    def streaming_session_protected_residency(
+        self, node: NodeId | None
+    ) -> tuple[KVComponentResidency, KVComponentResidency]:
+        """Count device and host pages on a session's locked radix path.
+
+        :param node: Deepest locked tree node, or ``None`` for an empty path.
+        :returns: Full and SWA physical page residency.
+        """
+        if node is None:
+            return KVComponentResidency(), KVComponentResidency()
+
+        def component_residency(component_type: ComponentType) -> KVComponentResidency:
+            if component_type not in self.components:
+                return KVComponentResidency()
+
+            device_pages = 0
+            host_backed_pages = 0
+            current = self.tree_core.node_by_id(node)
+            while current is not self.tree_core.root_node:
+                component_data = current.component_data[component_type]
+                if component_data.value is not None:
+                    device_pages += (
+                        ceil_align(len(component_data.value), self.page_size)
+                        // self.page_size
+                    )
+                if component_data.host_value is not None:
+                    host_backed_pages += (
+                        ceil_align(len(component_data.host_value), self.page_size)
+                        // self.page_size
+                    )
+                current = current.parent
+            return KVComponentResidency(
+                device_pages=device_pages,
+                host_backed_pages=host_backed_pages,
+            )
+
+        return (
+            component_residency(ComponentType.FULL),
+            component_residency(ComponentType.SWA),
+        )
 
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import KVComponentResidency, MatchResult
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
@@ -46,6 +46,7 @@ class _FakeInnerCache:
         page_size,
         match_results=None,
         sliding_window_size=None,
+        protected_residency=None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
@@ -54,6 +55,11 @@ class _FakeInnerCache:
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
+        self.protected_residency = (
+            protected_residency
+            if protected_residency is not None
+            else (KVComponentResidency(), KVComponentResidency())
+        )
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -72,6 +78,9 @@ class _FakeInnerCache:
 
     def supports_swa(self):
         return self.sliding_window_size is not None
+
+    def streaming_session_protected_residency(self, node):
+        return self.protected_residency
 
     def sanity_check(self):
         return None
@@ -157,7 +166,43 @@ def test_per_session_cache_snapshot_reports_durable_slot_ownership():
 
     assert snapshot.protected == 32
     assert snapshot.held_tokens == 64
+    assert snapshot.full == KVComponentResidency(device_pages=4)
+    assert snapshot.swa == KVComponentResidency()
     assert tree_cache.streaming_session_cache_snapshot("missing").held_tokens == 0
+
+
+def test_per_session_cache_snapshot_combines_tree_and_slot_residency():
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    tree_cache = StreamingSession(
+        _FakeInnerCache(
+            _FakeReqToTokenPool(req_to_token),
+            _FakeAllocator(),
+            page_size=16,
+            sliding_window_size=64,
+            protected_residency=(
+                KVComponentResidency(device_pages=2, host_backed_pages=2),
+                KVComponentResidency(device_pages=1, host_backed_pages=1),
+            ),
+        )
+    )
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=96,
+        kv=SimpleNamespace(kv_allocated_len=96, swa_evicted_seqlen=64),
+        cache_protected_len=32,
+        last_node=17,
+    )
+
+    snapshot = tree_cache.streaming_session_cache_snapshot("session-a")
+
+    assert snapshot.full == KVComponentResidency(
+        device_pages=6,
+        host_backed_pages=2,
+    )
+    assert snapshot.swa == KVComponentResidency(
+        device_pages=3,
+        host_backed_pages=1,
+    )
 
 
 def test_held_empty_slot_remains_owned_during_resume() -> None:

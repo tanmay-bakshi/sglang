@@ -38,7 +38,11 @@ from sglang.srt.session.errors import (
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        BasePrefixCache,
+        KVComponentResidency,
+    )
+
 StreamingSessionReapCause = Literal["close", "timeout"]
 StreamingSessionReapObserver = Callable[[StreamingSessionReapCause], None]
 
@@ -86,6 +90,28 @@ class StreamingSessionInfo:
     inflight: bool
     held_tokens: int
     last_rid: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSessionInventory:
+    """Recovery inventory entry for one open streaming session.
+
+    :ivar session_id: Public session identifier.
+    :ivar lineage_generation: Generation incremented by history rewrites.
+    :ivar tip: Absolute token offset of the durable lineage tip.
+    :ivar lineage_digest: Canonical digest of the durable token history.
+    :ivar floor: Earliest token offset to which the session may roll back.
+    :ivar full: Full-attention KV page residency.
+    :ivar swa: Sliding-window-attention KV page residency.
+    """
+
+    session_id: str
+    lineage_generation: int
+    tip: int
+    lineage_digest: str
+    floor: int
+    full: KVComponentResidency
+    swa: KVComponentResidency
 
 
 class SessionReqNode:
@@ -150,6 +176,7 @@ class Session:
         self.timeout = timeout
         self.supports_mamba = supports_mamba
         self.manual_commit = manual_commit
+        self.lineage_generation: int = 0
         self.floor: int = 0
         self.last_rid: str | None = None
         self.last_active_time: float = time.monotonic()
@@ -614,8 +641,11 @@ class Session:
 
         truncate_target = req.streaming_session_truncate_to
         if truncate_target is not None:
+            rewrites_lineage = truncate_target < self.current_tip()
             tree_cache.truncate_session(self.session_id, truncate_target)
             self._truncate_token_arrays(truncate_target)
+            if rewrites_lineage:
+                self.lineage_generation += 1
             req.time_stats.increment_streaming_session_truncation()
 
         commit_target = req.streaming_session_commit_to
@@ -738,6 +768,30 @@ class SessionController:
             held_tokens=cache.held_tokens,
             last_rid=session.last_rid,
         )
+
+    def list_info(self) -> list[StreamingSessionInventory]:
+        """Return recovery inventory for every open streaming session.
+
+        :returns: Session entries ordered by identifier for stable polling.
+        """
+        inventory: list[StreamingSessionInventory] = []
+        for session_id in sorted(self.sessions):
+            session = self.sessions[session_id]
+            if not session.streaming:
+                continue
+            cache = self.tree_cache.streaming_session_cache_snapshot(session_id)
+            inventory.append(
+                StreamingSessionInventory(
+                    session_id=session_id,
+                    lineage_generation=session.lineage_generation,
+                    tip=session.current_tip(),
+                    lineage_digest=session.current_digest(),
+                    floor=session.floor,
+                    full=cache.full,
+                    swa=cache.swa,
+                )
+            )
+        return inventory
 
     def open(self, recv_req: OpenSessionReqInput) -> OpenSessionReqOutput:
         session_id = recv_req.session_id
