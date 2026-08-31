@@ -100,6 +100,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
+        req.session = None
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -779,6 +780,64 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def test_streaming_chunk_shares_prefill_budget_with_short_waiter(self):
+        """Admit a short request beside a resumed deep-session chunk."""
+        available_tokens = 100_000
+        self.mock_token_allocator.available_size.return_value = available_tokens
+        self.mock_token_allocator.full_available_size.return_value = available_tokens
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=2048,
+            waiting_queue_len=1,
+        )
+        chunked = self._create_delayer_req(40_000)
+        chunked.session = SimpleNamespace(streaming=True)
+
+        resumed = adder.add_chunked_req(chunked)
+
+        self.assertIs(resumed, chunked)
+        self.assertEqual(chunked.extend_range.length, 1024)
+        self.assertEqual(adder.rem_chunk_tokens, 1024)
+
+        short = self._create_delayer_req(16)
+        short.session = None
+        admitted = adder.add_one_req(
+            short,
+            has_chunked_req=True,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(admitted, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [chunked, short])
+
+    def test_live_chunk_does_not_create_a_second_chunk(self):
+        """Leave a second deep request queued while one chunk owns the pass."""
+        available_tokens = 100_000
+        self.mock_token_allocator.available_size.return_value = available_tokens
+        self.mock_token_allocator.full_available_size.return_value = available_tokens
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_chunk_tokens=2048,
+            waiting_queue_len=1,
+        )
+        chunked = self._create_delayer_req(40_000)
+        chunked.session = SimpleNamespace(streaming=True)
+        adder.add_chunked_req(chunked)
+        second_deep = self._create_delayer_req(40_000)
+        second_deep.session = None
+
+        admitted = adder.add_one_req(
+            second_deep,
+            has_chunked_req=True,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(admitted, AddReqResult.OTHER)
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.can_run_list, [chunked])
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)

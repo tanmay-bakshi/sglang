@@ -1023,6 +1023,8 @@ class PrefillAdder:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
+        _rem_tokens = self._cap_streaming_chunk_for_waiters(req, _rem_tokens)
+
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
         if self.prefill_delayer_single_pass is not None:
@@ -1055,6 +1057,31 @@ class PrefillAdder:
 
         # Return if chunked prefill not finished
         return req if truncated else None
+
+    def _cap_streaming_chunk_for_waiters(self, req: Req, max_tokens: int) -> int:
+        """Reserve half a prefill pass for requests waiting behind a session.
+
+        A live chunk must run on every pass to preserve its allocated state. If
+        it consumes the entire chunk budget, however, short requests cannot
+        enter prefill until a deep session has finished every chunk. Splitting
+        the budget lets complete short prefills share the batch without parking
+        the live chunk.
+
+        :param req: Chunked request resumed at the start of the prefill pass.
+        :param max_tokens: Tokens currently available to the resumed chunk.
+        :returns: Page-aligned token cap that preserves room for waiters.
+        """
+        session = req.session
+        is_streaming_session = session is not None and session.streaming
+        if (
+            not is_streaming_session
+            or self.waiting_queue_len == 0
+            or max_tokens < self.page_size * 2
+        ):
+            return max_tokens
+
+        fair_share = max_tokens // 2
+        return max(self.page_size, fair_share // self.page_size * self.page_size)
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -1394,6 +1421,9 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

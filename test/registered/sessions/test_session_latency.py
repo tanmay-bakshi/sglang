@@ -8,9 +8,10 @@ Tests:
 """
 
 import random
+import statistics
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -27,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
 
 NUM_TURNS = 150
 INPUT_LEN = 16
@@ -36,6 +37,11 @@ NUM_CONCURRENT = 8
 HEAD_TURNS = 10
 TAIL_TURNS = 10
 SAMPLE_TURNS = 8
+
+COLD_PREFILL_DEPTH = 40_000
+COLD_PREFILL_SHORT_SAMPLES = 7
+COLD_PREFILL_SHORT_INPUT_LEN = 16
+COLD_PREFILL_P50_RATIO_LIMIT = 3.0
 
 NUM_TURNS_RANDOM = 50
 RANDOM_INPUT_LEN_RANGE = (8, 64)
@@ -274,6 +280,8 @@ class TestSessionLatency(CustomTestCase):
                 "--cuda-graph-backend-prefill=disabled",
                 "--page-size",
                 "4",
+                "--chunked-prefill-size",
+                "2048",
             ],
         )
         cls.tokenizer = get_tokenizer(cls.model)
@@ -394,6 +402,155 @@ class TestSessionLatency(CustomTestCase):
                 f"session {i}: expected {NUM_TURNS_RANDOM} turns, got {len(r.turns)}",
             )
         _print_mode_table(results[0], label="random streaming session 0")
+
+    def test_chunked_cold_prefill_preserves_short_request_latency(self) -> None:
+        """Bound short-request p50 while a 40k session prefill is in flight."""
+        solo_latencies: list[float] = []
+        requests.post(self.base_url + "/flush_cache").raise_for_status()
+        for sample_idx in range(COLD_PREFILL_SHORT_SAMPLES):
+            latency, _ = self._timed_short_request(sample_idx)
+            solo_latencies.append(latency)
+
+        requests.post(self.base_url + "/flush_cache").raise_for_status()
+        deep_input_ids = _generate_input_chunks(
+            self.tokenizer,
+            num_turns=1,
+            input_len=COLD_PREFILL_DEPTH,
+            offset=0,
+        )[0]
+        open_response = requests.post(
+            self.base_url + "/open_session",
+            json={
+                "capacity_of_str_len": len(deep_input_ids) + 16,
+                "streaming": True,
+            },
+        )
+        open_response.raise_for_status()
+        session_id = open_response.json()
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=COLD_PREFILL_SHORT_SAMPLES + 1
+            ) as pool:
+                deep_future = pool.submit(
+                    self._run_deep_session_prefill,
+                    session_id,
+                    deep_input_ids,
+                )
+                self._wait_for_session_inflight(session_id, deep_future)
+                short_futures = [
+                    pool.submit(self._timed_short_request, sample_idx + 1000)
+                    for sample_idx in range(COLD_PREFILL_SHORT_SAMPLES)
+                ]
+                short_results = [future.result() for future in short_futures]
+                deep_response, deep_finished_at = deep_future.result()
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            ).raise_for_status()
+
+        concurrent_latencies = [latency for latency, _ in short_results]
+        short_finished_at = [finished_at for _, finished_at in short_results]
+        solo_p50 = statistics.median(solo_latencies)
+        concurrent_p50 = statistics.median(concurrent_latencies)
+        ratio = concurrent_p50 / solo_p50
+        print(
+            "\n  chunked_cold_prefill  "
+            f"solo_p50={solo_p50:.1f}ms  "
+            f"concurrent_p50={concurrent_p50:.1f}ms  ratio={ratio:.2f}"
+        )
+
+        self.assertGreaterEqual(
+            deep_response["meta_info"]["prompt_tokens"],
+            COLD_PREFILL_DEPTH,
+        )
+        self.assertLess(
+            min(short_finished_at),
+            deep_finished_at,
+            "a short request must finish before the deep session prefill",
+        )
+        self.assertLess(
+            ratio,
+            COLD_PREFILL_P50_RATIO_LIMIT,
+            f"short-request p50 regressed under cold prefill: {ratio:.2f}x",
+        )
+
+    def _timed_short_request(self, sample_idx: int) -> tuple[float, float]:
+        """Issue one cold short request and record latency and completion time.
+
+        :param sample_idx: Offset used to keep prompts distinct across samples.
+        :returns: Client latency in milliseconds and monotonic completion time.
+        """
+        input_ids = _generate_input_chunks(
+            self.tokenizer,
+            num_turns=1,
+            input_len=COLD_PREFILL_SHORT_INPUT_LEN,
+            offset=sample_idx,
+        )[0]
+        started_at = time.perf_counter()
+        _send_generate(
+            self.base_url,
+            {
+                "input_ids": input_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        finished_at = time.perf_counter()
+        return (finished_at - started_at) * 1000, finished_at
+
+    def _run_deep_session_prefill(
+        self,
+        session_id: str,
+        input_ids: list[int],
+    ) -> tuple[dict[str, object], float]:
+        """Prefill one deep streaming session to a durable boundary.
+
+        :param session_id: Open streaming-session identity.
+        :param input_ids: Cold token history exceeding the qualification depth.
+        :returns: Generate response and monotonic completion time.
+        """
+        response = _send_generate(
+            self.base_url,
+            {
+                "input_ids": input_ids,
+                "session_params": {"id": session_id, "rid": None},
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        return response, time.perf_counter()
+
+    def _wait_for_session_inflight(
+        self,
+        session_id: str,
+        deep_future: Future[tuple[dict[str, object], float]],
+    ) -> None:
+        """Wait until the scheduler has admitted the deep session mutation.
+
+        :param session_id: Session whose atomic state is polled.
+        :param deep_future: Concurrent deep-request future used for early failure.
+        """
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            response = requests.get(
+                self.base_url + "/session_info",
+                params={"session_id": session_id},
+            )
+            response.raise_for_status()
+            if response.json()["inflight"]:
+                return
+            if deep_future.done():
+                self.fail("deep session request finished before inflight observation")
+            time.sleep(0.01)
+        self.fail("deep session request was not admitted within 10 seconds")
 
 
 if __name__ == "__main__":
