@@ -1645,6 +1645,7 @@ async def session_info(session_id: Annotated[str, Query(min_length=1)]):
         {
             "exists": result.exists,
             "tip": result.tip,
+            "lineage_digest": result.lineage_digest,
             "floor": result.floor,
             "protected": result.protected,
             "inflight": result.inflight,
@@ -2150,6 +2151,8 @@ def _streaming_session_conflict_error_payload(
             "code": HTTPStatus.CONFLICT.value,
             "retryable": False,
             "correlation_id": error.correlation_id,
+            "observed_tip": error.observed_tip,
+            "observed_digest": error.observed_digest,
         }
     }
 

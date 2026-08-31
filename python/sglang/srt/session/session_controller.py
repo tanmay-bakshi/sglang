@@ -12,12 +12,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import time
 import uuid
 from array import array
+from collections.abc import Iterable
 from dataclasses import dataclass
 from http import HTTPStatus
+from itertools import chain
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -42,12 +46,41 @@ StreamingSessionReapObserver = Callable[[StreamingSessionReapCause], None]
 logger = logging.getLogger(__name__)
 
 
+_LINEAGE_DIGEST_DOMAIN = b"sglang.streaming-session.token-history:v1\x00"
+_LINEAGE_DIGEST_PREFIX = "sha256:v1:"
+_TOKEN_ID_STRUCT = struct.Struct(">q")
+
+
+def compute_lineage_digest(token_ids: Iterable[int]) -> str:
+    """Compute the canonical digest for a streaming-session token history.
+
+    :param token_ids: Token identifiers in absolute lineage order.
+    :returns: Versioned SHA-256 digest over canonical signed 64-bit token IDs.
+    """
+    digest = hashlib.sha256()
+    digest.update(_LINEAGE_DIGEST_DOMAIN)
+    for token_id in token_ids:
+        digest.update(_TOKEN_ID_STRUCT.pack(token_id))
+    return _LINEAGE_DIGEST_PREFIX + digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class StreamingSessionInfo:
-    """Read-only durable state of a streaming session."""
+    """Read-only durable state of a streaming session.
+
+    :ivar exists: Whether the requested session is open.
+    :ivar tip: Absolute token offset of the durable lineage tip.
+    :ivar lineage_digest: Canonical digest of the durable token history.
+    :ivar floor: Earliest token offset to which the session may roll back.
+    :ivar protected: Tokens protected through shared radix-tree ownership.
+    :ivar inflight: Whether a mutation currently owns the session.
+    :ivar held_tokens: Tokens held exclusively by the session cache slot.
+    :ivar last_rid: Request that established the latest durable boundary.
+    """
 
     exists: bool
     tip: int
+    lineage_digest: str | None
     floor: int
     protected: int
     inflight: bool
@@ -130,6 +163,7 @@ class Session:
         self.committed_unpadded_len: Optional[int] = None
         self.committed_fill_len: Optional[int] = None
         self.committed_output_len: Optional[int] = None
+        self._lineage_digest: str = compute_lineage_digest(())
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -146,6 +180,13 @@ class Session:
             return 0
         assert self.committed_output_len is not None
         return self.committed_origin_len + self.committed_output_len
+
+    def current_digest(self) -> str:
+        """Return the digest of the latest durable token history.
+
+        :returns: Versioned canonical lineage digest.
+        """
+        return self._lineage_digest
 
     @staticmethod
     def _strip_tokenized_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -304,6 +345,7 @@ class Session:
         abort_message = ""
         abort_status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST
         abort_err_type = "BadRequestError"
+        abort_error_data: dict[str, object] | None = None
         if self.streaming:
             if self._inflight:
                 abort = True
@@ -321,6 +363,28 @@ class Session:
                 )
                 abort_status_code = HTTPStatus.CONFLICT
                 abort_err_type = STREAMING_SESSION_CONFLICT_ERROR_TYPE
+                abort_error_data = {
+                    "observed_tip": current_tip,
+                    "observed_digest": self.current_digest(),
+                }
+            elif (
+                session_params.expected_digest is not None
+                and session_params.expected_digest != self.current_digest()
+            ):
+                current_tip = self.current_tip()
+                current_digest = self.current_digest()
+                abort = True
+                abort_message = (
+                    "Streaming session expected_digest conflict for session "
+                    f"{self.session_id}: expected {session_params.expected_digest}, "
+                    f"current digest is {current_digest}."
+                )
+                abort_status_code = HTTPStatus.CONFLICT
+                abort_err_type = STREAMING_SESSION_CONFLICT_ERROR_TYPE
+                abort_error_data = {
+                    "observed_tip": current_tip,
+                    "observed_digest": current_digest,
+                }
             elif session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
@@ -396,11 +460,12 @@ class Session:
             session_params.truncate_to is not None
             or session_params.commit_to is not None
             or session_params.expected_tip is not None
+            or session_params.expected_digest is not None
         ):
             abort = True
             abort_message = (
                 "Non-streaming sessions do not support truncate_to, commit_to, "
-                "or expected_tip."
+                "expected_tip, or expected_digest."
             )
         elif len(req.input_ids) == 0:
             abort = True
@@ -527,6 +592,7 @@ class Session:
                 abort_message,
                 status_code=abort_status_code,
                 err_type=abort_err_type,
+                error_data=abort_error_data,
             )
         elif self.streaming:
             # req_nodes is NOT updated here — finish_req() handles it.
@@ -577,6 +643,7 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
         self.committed_output_len = 0
+        self._lineage_digest = compute_lineage_digest(req.origin_input_ids)
         self.last_rid = req.rid
 
     def finish_req(self, req):
@@ -605,6 +672,9 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
         self.committed_output_len = finished_len
+        self._lineage_digest = compute_lineage_digest(
+            chain(req.origin_input_ids, req.output_ids[:finished_len])
+        )
 
     def abort_req(self, req: Req) -> None:
         """Release the exact request that owns the in-flight session turn.
@@ -645,6 +715,7 @@ class SessionController:
             return StreamingSessionInfo(
                 exists=False,
                 tip=0,
+                lineage_digest=None,
                 floor=0,
                 protected=0,
                 inflight=False,
@@ -660,6 +731,7 @@ class SessionController:
         return StreamingSessionInfo(
             exists=True,
             tip=session.current_tip(),
+            lineage_digest=session.current_digest(),
             floor=session.floor,
             protected=cache.protected,
             inflight=session._inflight,

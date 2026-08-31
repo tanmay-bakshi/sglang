@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
+
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -23,6 +24,8 @@ _CONFLICT_MESSAGE = (
     "Streaming session expected_tip conflict for session session-a: "
     "expected 120, current tip is 128."
 )
+_OBSERVED_DIGEST = "sha256:v1:observed"
+_OBSERVED_TIP = 128
 
 
 class _DeterministicTokenizerManager:
@@ -148,6 +151,8 @@ class StreamingSessionConflictReconstructionTest(unittest.IsolatedAsyncioTestCas
                     "message": _CONFLICT_MESSAGE,
                     "status_code": HTTPStatus.CONFLICT,
                     "err_type": STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+                    "observed_tip": _OBSERVED_TIP,
+                    "observed_digest": _OBSERVED_DIGEST,
                 }
             }
         }
@@ -157,6 +162,8 @@ class StreamingSessionConflictReconstructionTest(unittest.IsolatedAsyncioTestCas
 
         self.assertEqual(str(raised.exception), _CONFLICT_MESSAGE)
         self.assertEqual(raised.exception.correlation_id, _CORRELATION_ID)
+        self.assertEqual(raised.exception.observed_tip, _OBSERVED_TIP)
+        self.assertEqual(raised.exception.observed_digest, _OBSERVED_DIGEST)
 
     async def test_unmarked_conflict_is_not_promoted(self) -> None:
         """Leave unrelated 409 aborts on the pre-existing generic path."""
@@ -195,13 +202,20 @@ class StreamingSessionConflictHttpTest(unittest.IsolatedAsyncioTestCase):
                 "code": HTTPStatus.CONFLICT.value,
                 "retryable": False,
                 "correlation_id": _CORRELATION_ID,
+                "observed_tip": _OBSERVED_TIP,
+                "observed_digest": _OBSERVED_DIGEST,
             }
         }
 
     async def test_non_stream_conflict_returns_http_409(self) -> None:
         """Return an actual HTTP 409 and the stable public envelope."""
         response, chunks, _ = await _invoke_generate(
-            StreamingSessionConflictError(_CONFLICT_MESSAGE, _CORRELATION_ID),
+            StreamingSessionConflictError(
+                _CONFLICT_MESSAGE,
+                _CORRELATION_ID,
+                _OBSERVED_TIP,
+                _OBSERVED_DIGEST,
+            ),
             stream=False,
         )
 
@@ -215,7 +229,12 @@ class StreamingSessionConflictHttpTest(unittest.IsolatedAsyncioTestCase):
     async def test_stream_conflict_emits_only_error_then_done(self) -> None:
         """Keep HTTP 200 while emitting one 409-coded SSE event and DONE."""
         response, chunks, manager = await _invoke_generate(
-            StreamingSessionConflictError(_CONFLICT_MESSAGE, _CORRELATION_ID),
+            StreamingSessionConflictError(
+                _CONFLICT_MESSAGE,
+                _CORRELATION_ID,
+                _OBSERVED_TIP,
+                _OBSERVED_DIGEST,
+            ),
             stream=True,
         )
 

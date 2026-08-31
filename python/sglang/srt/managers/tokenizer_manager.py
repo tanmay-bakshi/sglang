@@ -1698,6 +1698,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise StreamingSessionConflictError(
                 finish_reason["message"],
                 state.obj.rid,
+                finish_reason["observed_tip"],
+                finish_reason["observed_digest"],
             )
 
         if (

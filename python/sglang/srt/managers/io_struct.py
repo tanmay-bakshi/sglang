@@ -154,6 +154,9 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Idempotency precondition for the durable streaming-session context.
     # A mismatch rejects the request without mutating the session.
     expected_tip: int | None = None
+    # Canonical token-history precondition. Unlike expected_tip, this detects a
+    # truncate-and-append lineage change that returns to the same token count.
+    expected_digest: str | None = None
 
 
 # Type definitions for multimodal input data
@@ -2199,6 +2202,7 @@ class GetSessionInfoReqOutput(BaseReq, kw_only=True):
     correlation_id: str
     exists: bool
     tip: int
+    lineage_digest: str | None
     floor: int
     protected: int
     inflight: bool

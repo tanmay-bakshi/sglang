@@ -26,7 +26,11 @@ from sglang.srt.session.errors import (
     StreamingSessionConflictError,
     StreamingSessionInfoUnavailableError,
 )
-from sglang.srt.session.session_controller import Session, SessionController
+from sglang.srt.session.session_controller import (
+    Session,
+    SessionController,
+    compute_lineage_digest,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
@@ -39,6 +43,7 @@ def _recv(
     truncate_to=None,
     commit_to=None,
     expected_tip=None,
+    expected_digest=None,
     offset=None,
     input_text=None,
 ):
@@ -58,6 +63,7 @@ def _recv(
             truncate_to=truncate_to,
             commit_to=commit_to,
             expected_tip=expected_tip,
+            expected_digest=expected_digest,
         ),
         sampling_params=sampling_params,
         lora_id=None,
@@ -91,10 +97,23 @@ class TestSessionTokenShare(CustomTestCase):
         )
 
     def test_conflict_error_preserves_request_correlation(self):
-        error = StreamingSessionConflictError("stale session", "request-rid")
+        error = StreamingSessionConflictError(
+            "stale session",
+            "request-rid",
+            17,
+            "sha256:v1:observed",
+        )
 
         self.assertEqual(str(error), "stale session")
         self.assertEqual(error.correlation_id, "request-rid")
+        self.assertEqual(error.observed_tip, 17)
+        self.assertEqual(error.observed_digest, "sha256:v1:observed")
+
+    def test_lineage_digest_has_a_frozen_canonical_encoding(self):
+        self.assertEqual(
+            compute_lineage_digest([1, 2, 3]),
+            "sha256:v1:a44c31ff28955f17bf7e2126c1183121535405592a84d9b83af68c5c0b42a05e",
+        )
 
     def test_controller_captures_recurrent_cache_capability(self):
         tree_cache = SimpleNamespace(supports_mamba=lambda: True)
@@ -119,6 +138,7 @@ class TestSessionTokenShare(CustomTestCase):
         truncate_to=None,
         commit_to=None,
         expected_tip=None,
+        expected_digest=None,
     ):
         return self.session.create_req(
             _recv(
@@ -128,6 +148,7 @@ class TestSessionTokenShare(CustomTestCase):
                 truncate_to=truncate_to,
                 commit_to=commit_to,
                 expected_tip=expected_tip,
+                expected_digest=expected_digest,
             ),
             tokenizer=None,
             vocab_size=VOCAB,
@@ -367,6 +388,13 @@ class TestSessionTokenShare(CustomTestCase):
         finish = conflict.to_finish
         self.assertEqual(finish.status_code, HTTPStatus.CONFLICT)
         self.assertEqual(finish.err_type, STREAMING_SESSION_CONFLICT_ERROR_TYPE)
+        self.assertEqual(
+            finish.error_data,
+            {
+                "observed_tip": 5,
+                "observed_digest": self.session.current_digest(),
+            },
+        )
         self.assertEqual(conflict.rid, "stale-rid")
         self.assertEqual(
             finish.message,
@@ -379,6 +407,51 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(self.session.floor, 0)
         self.assertEqual(self.session.last_rid, "r1")
         self.assertEqual(self.session.last_active_time, last_active_before)
+        self.assertFalse(self.session._inflight)
+
+    def test_expected_digest_rejects_same_length_different_lineage(self):
+        first = self._create("r1", [1, 2, 3])
+        self._decode_and_finish(first, [4, 5])
+        stale_digest = self.session.current_digest()
+
+        rewrite = self._create(
+            "rewrite",
+            [9, 4, 5],
+            max_new_tokens=0,
+            truncate_to=2,
+            expected_tip=5,
+            expected_digest=stale_digest,
+        )
+        cache = SimpleNamespace(
+            truncate_session=lambda session_id, target: None,
+            commit_session=lambda session_id, floor: None,
+        )
+        self.session.commit_prepared_req(rewrite, cache)
+        self.session.finish_req(rewrite)
+        self.assertEqual(self.session.current_tip(), 5)
+        self.assertNotEqual(self.session.current_digest(), stale_digest)
+
+        with get_parallel().override(tp_rank=0):
+            conflict = self._create(
+                "stale-lineage",
+                [6],
+                expected_tip=5,
+                expected_digest=stale_digest,
+            )
+
+        self.assertEqual(conflict.to_finish.status_code, HTTPStatus.CONFLICT)
+        self.assertEqual(
+            conflict.to_finish.err_type,
+            STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+        )
+        self.assertEqual(
+            conflict.to_finish.error_data,
+            {
+                "observed_tip": 5,
+                "observed_digest": self.session.current_digest(),
+            },
+        )
+        self.assertIn("expected_digest conflict", conflict.to_finish.message)
         self.assertFalse(self.session._inflight)
 
     def test_matching_expected_tip_tracks_only_durable_context(self):
@@ -586,6 +659,7 @@ class TestSessionTokenShare(CustomTestCase):
             {"truncate_to": 0},
             {"commit_to": 0},
             {"expected_tip": 0},
+            {"expected_digest": compute_lineage_digest(())},
         ):
             with self.subTest(riders=riders):
                 session = Session(capacity_of_str_len=0, session_id="ordinary")
@@ -663,6 +737,7 @@ class TestSessionTokenShare(CustomTestCase):
             type(info)(
                 exists=True,
                 tip=256,
+                lineage_digest=session.current_digest(),
                 floor=128,
                 protected=64,
                 inflight=True,
@@ -676,6 +751,7 @@ class TestSessionTokenShare(CustomTestCase):
             type(info)(
                 exists=False,
                 tip=0,
+                lineage_digest=None,
                 floor=0,
                 protected=0,
                 inflight=False,

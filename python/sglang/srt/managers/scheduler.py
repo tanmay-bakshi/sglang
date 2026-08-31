@@ -5462,6 +5462,7 @@ class Scheduler(
             correlation_id=recv_req.correlation_id,
             exists=info.exists,
             tip=info.tip,
+            lineage_digest=info.lineage_digest,
             floor=info.floor,
             protected=info.protected,
             inflight=info.inflight,

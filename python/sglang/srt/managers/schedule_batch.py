@@ -287,19 +287,29 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
+    def __init__(
+        self,
+        message: str | None = None,
+        status_code: HTTPStatus | int | None = None,
+        err_type: str | None = None,
+        error_data: dict[str, object] | None = None,
+    ) -> None:
         super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
+        self.error_data = error_data
 
-    def to_json(self):
-        return {
+    def to_json(self) -> dict[str, object]:
+        result = {
             "type": "abort",
             "message": self.message,
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+        if self.error_data is not None:
+            result.update(self.error_data)
+        return result
 
 
 class Modality(Enum):
@@ -1889,6 +1899,7 @@ class Req(ReqDllmMixin):
         error_msg: str,
         status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST,
         err_type: str = "BadRequestError",
+        error_data: dict[str, object] | None = None,
     ) -> None:
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
@@ -1899,7 +1910,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
+        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type, error_data)
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

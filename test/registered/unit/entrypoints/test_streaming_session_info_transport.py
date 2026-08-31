@@ -33,6 +33,7 @@ def _session_info_output(
         correlation_id=correlation_id,
         exists=True,
         tip=tip,
+        lineage_digest=f"sha256:v1:digest-{tip}",
         floor=tip,
         protected=0,
         inflight=False,
@@ -101,6 +102,7 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
             {
                 "exists": True,
                 "tip": 128,
+                "lineage_digest": "sha256:v1:digest-128",
                 "floor": 128,
                 "protected": 0,
                 "inflight": False,
@@ -219,6 +221,7 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
             correlation_id="correlation-a",
             exists=False,
             tip=0,
+            lineage_digest=None,
             floor=0,
             protected=0,
             inflight=False,
@@ -241,6 +244,7 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decoded_output, output)
         self.assertIs(type(decoded_output.exists), bool)
         self.assertIs(type(decoded_output.tip), int)
+        self.assertIsNone(decoded_output.lineage_digest)
         self.assertIs(type(decoded_output.floor), int)
         self.assertIs(type(decoded_output.protected), int)
         self.assertIs(type(decoded_output.inflight), bool)
