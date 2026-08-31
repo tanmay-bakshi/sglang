@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CloseSessionReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -43,6 +44,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    InstallSessionFencingReqInput,
+    InstallSessionFencingReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     ListSessionsReqInput,
@@ -87,7 +90,12 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import LoRARef
-from sglang.srt.session.errors import StreamingSessionInfoUnavailableError
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+    StreamingSessionInfoUnavailableError,
+    StreamingSessionStaleEpochError,
+)
+from sglang.srt.session.fencing import SessionFencingState
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
@@ -134,6 +142,7 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("install_session_fencing", InstallSessionFencingReqOutput),
 ]
 
 
@@ -910,26 +919,34 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        if obj.streaming:
-            if not self.server_args.enable_streaming_session:
-                raise ValueError(
-                    "Streaming sessions are disabled. "
-                    "Please relaunch with --enable-streaming-session."
-                )
+        async with self.session_fencing_dispatch_lock:
+            self.session_fencing_register.validate(obj.epoch)
+            if obj.streaming:
+                if not self.server_args.enable_streaming_session:
+                    raise ValueError(
+                        "Streaming sessions are disabled. "
+                        "Please relaunch with --enable-streaming-session."
+                    )
 
-        if obj.session_id is None:
-            obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
-            return None
+            if obj.session_id is None:
+                obj.session_id = uuid.uuid4().hex
+            elif obj.session_id in self.session_futures:
+                return None
 
-        future = asyncio.Future()
-        self.session_futures[obj.session_id] = future
-        self._dispatch_to_scheduler(obj)
-
-        try:
-            return await future
-        finally:
-            self.session_futures.pop(obj.session_id, None)
+            future = asyncio.Future()
+            self.session_futures[obj.session_id] = future
+            try:
+                self._dispatch_to_scheduler(obj)
+                result = await future
+                if result.error_type == STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE:
+                    raise StreamingSessionStaleEpochError(
+                        request_epoch=result.request_epoch,
+                        registered_epoch=result.registered_epoch,
+                        cluster_incarnation=result.cluster_incarnation,
+                    )
+                return result.session_id if result.success else None
+            finally:
+                self.session_futures.pop(obj.session_id, None)
 
     async def get_session_info(
         self: TokenizerManager,
@@ -982,7 +999,51 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self._async_dispatch_to_scheduler(obj)
+        async with self.session_fencing_dispatch_lock:
+            self.session_fencing_register.validate(obj.epoch)
+            correlation_id = uuid.uuid4().hex
+            obj.correlation_id = correlation_id
+            future: asyncio.Future[CloseSessionReqOutput] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self.close_session_futures[correlation_id] = future
+            try:
+                await self._async_dispatch_to_scheduler(obj)
+                result = await future
+                if result.error_type == STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE:
+                    raise StreamingSessionStaleEpochError(
+                        request_epoch=result.request_epoch,
+                        registered_epoch=result.registered_epoch,
+                        cluster_incarnation=result.cluster_incarnation,
+                    )
+            finally:
+                self.close_session_futures.pop(correlation_id, None)
+
+    async def install_session_fencing_register(
+        self: TokenizerManager,
+        obj: InstallSessionFencingReqInput,
+    ) -> SessionFencingState:
+        """Install and confirm one register value on every scheduler.
+
+        :param obj: Exact epoch and cluster incarnation pair to install.
+        :returns: Scheduler-confirmed register state mirrored by the frontend.
+        :raises RuntimeError: If scheduler groups report divergent values.
+        """
+        self.auto_create_handle_loop()
+        if obj.epoch < 0 or obj.cluster_incarnation < 0:
+            raise ValueError("Session fencing register values must be non-negative.")
+        async with self.session_fencing_dispatch_lock:
+            results = await self.install_session_fencing_communicator(obj)
+            states = {(result.epoch, result.cluster_incarnation) for result in results}
+            if len(states) != 1:
+                raise RuntimeError(
+                    f"Schedulers installed divergent fencing registers: {states}."
+                )
+            epoch, cluster_incarnation = states.pop()
+            return self.session_fencing_register.install(
+                epoch,
+                cluster_incarnation,
+            )
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

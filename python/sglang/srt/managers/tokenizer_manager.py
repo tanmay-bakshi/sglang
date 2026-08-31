@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CloseSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
@@ -152,9 +153,12 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
     StreamingSessionConflictError,
+    StreamingSessionStaleEpochError,
 )
 from sglang.srt.session.event_journal import SessionEventJournal
+from sglang.srt.session.fencing import SessionFencingRegister
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -604,6 +608,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.close_session_futures: dict[str, asyncio.Future[CloseSessionReqOutput]] = (
+            {}
+        )
         self.session_info_futures: dict[
             str, asyncio.Future[GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput]
         ] = {}
@@ -613,6 +620,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.session_event_journal = SessionEventJournal(
             self.server_args.streaming_session_journal_size
         )
+        self.session_fencing_register = SessionFencingRegister()
+        self.session_fencing_dispatch_lock = asyncio.Lock()
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -778,6 +787,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (CloseSessionReqOutput, self._handle_close_session_req_output),
                 (
                     GetSessionInfoReqErrorOutput,
                     self._handle_get_session_info_req_output,
@@ -1711,6 +1721,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 finish_reason["observed_tip"],
                 finish_reason["observed_digest"],
                 finish_reason["lineage_generation"],
+            )
+
+        if (
+            finish_reason.get("type") == "abort"
+            and finish_reason.get("status_code") == HTTPStatus.CONFLICT
+            and finish_reason.get("err_type")
+            == STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE
+        ):
+            raise StreamingSessionStaleEpochError(
+                request_epoch=finish_reason["request_epoch"],
+                registered_epoch=finish_reason["registered_epoch"],
+                cluster_incarnation=finish_reason["cluster_incarnation"],
+                lineage_generation=finish_reason["lineage_generation"],
+                observed_tip=finish_reason["observed_tip"],
             )
 
         if (
@@ -3394,7 +3418,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         if not future.done():
-            future.set_result(recv_obj.session_id if recv_obj.success else None)
+            future.set_result(recv_obj)
+
+    def _handle_close_session_req_output(
+        self,
+        recv_obj: CloseSessionReqOutput,
+    ) -> None:
+        """Complete the exact waiter for a confirmed session close.
+
+        :param recv_obj: Scheduler-owned close result.
+        """
+        future = self.close_session_futures.get(recv_obj.correlation_id)
+        if future is None:
+            logger.warning(
+                "Close session response arrived after waiter cleanup: %s",
+                recv_obj.correlation_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_get_session_info_req_output(
         self, recv_obj: GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput

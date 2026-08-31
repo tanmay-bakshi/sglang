@@ -54,7 +54,44 @@ class StreamingSessionJournalBehindError(Exception):
         self.required_action = required_action
 
 
+class StreamingSessionStaleEpochError(Exception):
+    """Reports a session mutation fenced by the installed engine epoch."""
+
+    request_epoch: int
+    registered_epoch: int
+    cluster_incarnation: int
+    lineage_generation: int
+    observed_tip: int
+
+    def __init__(
+        self,
+        request_epoch: int,
+        registered_epoch: int,
+        cluster_incarnation: int,
+        lineage_generation: int = 0,
+        observed_tip: int = 0,
+    ) -> None:
+        """Initialize a typed stale-epoch rejection.
+
+        :param request_epoch: Epoch supplied by the rejected mutation.
+        :param registered_epoch: Minimum epoch installed on the engine.
+        :param cluster_incarnation: Installed cluster incarnation identity.
+        :param lineage_generation: Current session lineage generation.
+        :param observed_tip: Current durable session tip.
+        """
+        super().__init__(
+            f"Stale session epoch {request_epoch}: engine fencing register is "
+            f"({registered_epoch}, {cluster_incarnation})."
+        )
+        self.request_epoch = request_epoch
+        self.registered_epoch = registered_epoch
+        self.cluster_incarnation = cluster_incarnation
+        self.lineage_generation = lineage_generation
+        self.observed_tip = observed_tip
+
+
 STREAMING_SESSION_CONFLICT_ERROR_TYPE = StreamingSessionConflictError.__name__
+STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE = StreamingSessionStaleEpochError.__name__
 
 
 class StreamingSessionInfoUnavailableError(ValueError):

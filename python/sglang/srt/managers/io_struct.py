@@ -157,6 +157,8 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # Canonical token-history precondition. Unlike expected_tip, this detects a
     # truncate-and-append lineage change that returns to the same token count.
     expected_digest: str | None = None
+    # Internal transport of the HTTP fencing epoch to the owning scheduler.
+    epoch: int | None = None
 
 
 # Type definitions for multimodal input data
@@ -2180,16 +2182,51 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
     dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
+class InstallSessionFencingReqInput(BaseReq, kw_only=True):
+    """Administrative installation of the session fencing register.
+
+    :ivar epoch: Minimum accepted session mutation epoch.
+    :ivar cluster_incarnation: Cluster incarnation identity to echo.
+    """
+
+    epoch: int
+    cluster_incarnation: int
+
+
+class InstallSessionFencingReqOutput(BaseReq, kw_only=True):
+    """Scheduler-confirmed session fencing register value.
+
+    :ivar epoch: Installed minimum session mutation epoch.
+    :ivar cluster_incarnation: Installed cluster incarnation identity.
+    """
+
+    epoch: int
+    cluster_incarnation: int
+
+
 class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
     manual_commit: bool = False
+    epoch: int | None = None
 
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+    epoch: int | None = None
+    correlation_id: str | None = None
+
+
+class CloseSessionReqOutput(BaseReq, kw_only=True):
+    correlation_id: str
+    success: bool
+    error_type: str | None = None
+    message: str | None = None
+    request_epoch: int = 0
+    registered_epoch: int = 0
+    cluster_incarnation: int = 0
 
 
 class GetSessionInfoReqInput(BaseReq, kw_only=True):
@@ -2269,6 +2306,11 @@ class ListSessionsReqOutput(BaseReq, kw_only=True):
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool
+    error_type: str | None = None
+    message: str | None = None
+    request_epoch: int = 0
+    registered_epoch: int = 0
+    cluster_incarnation: int = 0
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):

@@ -17,6 +17,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.session.errors import StreamingSessionInfoUnavailableError
+from sglang.srt.session.fencing import (
+    CLUSTER_INCARNATION_HEADER,
+    FENCING_EPOCH_HEADER,
+    SessionFencingRegister,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -87,6 +92,7 @@ class _SessionInfoTokenizerManager:
         """
         self.response = response
         self.requested_session_id = None
+        self.session_fencing_register = SessionFencingRegister()
 
     async def get_session_info(self, session_id: str) -> GetSessionInfoReqOutput:
         """Return the configured snapshot.
@@ -100,6 +106,8 @@ class _SessionInfoTokenizerManager:
 
 class _UnavailableSessionInfoTokenizerManager:
     """Minimal tokenizer manager that rejects a non-streaming session."""
+
+    session_fencing_register = SessionFencingRegister()
 
     async def get_session_info(self, session_id: str) -> GetSessionInfoReqOutput:
         """Reject introspection for an ordinary session.
@@ -117,6 +125,7 @@ class _InventoryTokenizerManager:
     """Minimal tokenizer manager for the inventory HTTP endpoint."""
 
     engine_incarnation_id: str = "engine-incarnation-a"
+    session_fencing_register = SessionFencingRegister()
 
     async def list_sessions(self) -> ListSessionsReqOutput:
         """Return one deterministic inventory entry.
@@ -141,6 +150,8 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
             http_server.set_global_state(prior_state)
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers[FENCING_EPOCH_HEADER], "0")
+        self.assertEqual(response.headers[CLUSTER_INCARNATION_HEADER], "0")
         self.assertEqual(manager.requested_session_id, "session-a")
         self.assertEqual(
             json.loads(response.body),
@@ -167,6 +178,8 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
             http_server.set_global_state(prior_state)
 
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.headers[FENCING_EPOCH_HEADER], "0")
+        self.assertEqual(response.headers[CLUSTER_INCARNATION_HEADER], "0")
         self.assertEqual(
             json.loads(response.body),
             {
@@ -314,6 +327,8 @@ class StreamingSessionInventoryTransportTest(unittest.IsolatedAsyncioTestCase):
             http_server.set_global_state(prior_state)
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers[FENCING_EPOCH_HEADER], "0")
+        self.assertEqual(response.headers[CLUSTER_INCARNATION_HEADER], "0")
         self.assertEqual(
             json.loads(response.body),
             {

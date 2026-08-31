@@ -15,6 +15,7 @@ from sglang.srt.session.event_journal import (
     SessionEventCursor,
     SessionEventJournal,
 )
+from sglang.srt.session.fencing import SessionFencingRegister
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -96,6 +97,7 @@ class _JournalTokenizerManager:
         :param pause_before_second: Whether the second output awaits release.
         """
         self.session_event_journal = SessionEventJournal(journal_size)
+        self.session_fencing_register = SessionFencingRegister()
         self.generate_calls = 0
         self.generation_finished = asyncio.Event()
         self.release_second = asyncio.Event() if pause_before_second else None

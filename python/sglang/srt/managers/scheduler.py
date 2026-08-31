@@ -123,6 +123,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CloseSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -146,6 +147,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    InstallSessionFencingReqInput,
+    InstallSessionFencingReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     ListSessionsReqInput,
@@ -155,6 +158,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -305,8 +309,11 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
     StreamingSessionInfoUnavailableError,
+    StreamingSessionStaleEpochError,
 )
+from sglang.srt.session.fencing import SessionFencingRegister
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -1254,6 +1261,7 @@ class Scheduler(
             else None
         )
         self.session_controller = SessionController(self.tree_cache, reap_observer)
+        self.session_fencing_register = SessionFencingRegister()
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1670,6 +1678,10 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (
+                    InstallSessionFencingReqInput,
+                    self.install_session_fencing_register,
+                ),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (GetSessionInfoReqInput, self.get_session_info),
@@ -2551,6 +2563,11 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        if session_id is not None and self._reject_stale_session_epoch(
+            recv_req,
+            session_id,
+        ):
+            return
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
             recv_req.session_id is not None and self.enable_session_radix_cache
@@ -2660,6 +2677,54 @@ class Scheduler(
             return
 
         self._enqueue_prepared_generate_request(req)
+
+    def _reject_stale_session_epoch(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+        session_id: str,
+    ) -> bool:
+        """Emit a typed pre-mutation rejection for a stale session epoch.
+
+        :param recv_req: Tokenized session mutation request.
+        :param session_id: Target session identity.
+        :returns: Whether the request was rejected.
+        """
+        session = self.session_controller.get(session_id)
+        lineage_generation = session.lineage_generation if session is not None else 0
+        observed_tip = session.current_tip() if session is not None else 0
+        assert recv_req.session_params is not None
+        try:
+            self.session_fencing_register.validate(
+                recv_req.session_params.epoch,
+                lineage_generation=lineage_generation,
+                observed_tip=observed_tip,
+            )
+        except StreamingSessionStaleEpochError as error:
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+            )
+            req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(
+                str(error),
+                status_code=HTTPStatus.CONFLICT,
+                err_type=STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+                error_data={
+                    "request_epoch": error.request_epoch,
+                    "registered_epoch": error.registered_epoch,
+                    "cluster_incarnation": error.cluster_incarnation,
+                    "lineage_generation": error.lineage_generation,
+                    "observed_tip": error.observed_tip,
+                },
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return True
+        return False
 
     def _finish_empty_streaming_session_mutation(self, req: Req) -> None:
         """Finish a mutation whose post-operation context has no model input.
@@ -5429,7 +5494,41 @@ class Scheduler(
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
         return ExpertDistributionReqOutput()
 
+    def install_session_fencing_register(
+        self,
+        recv_req: InstallSessionFencingReqInput,
+    ) -> InstallSessionFencingReqOutput | None:
+        """Install an exact register pair before later scheduler messages run.
+
+        :param recv_req: Administrative register installation.
+        :returns: Confirmed value from the designated response rank.
+        """
+        state = self.session_fencing_register.install(
+            recv_req.epoch,
+            recv_req.cluster_incarnation,
+        )
+        if not _is_streaming_session_output_rank(self.ps):
+            return None
+        return InstallSessionFencingReqOutput(
+            epoch=state.epoch,
+            cluster_incarnation=state.cluster_incarnation,
+        )
+
     def open_session(self, recv_req: OpenSessionReqInput):
+        try:
+            self.session_fencing_register.validate(recv_req.epoch)
+        except StreamingSessionStaleEpochError as error:
+            if not _is_streaming_session_output_rank(self.ps):
+                return None
+            return OpenSessionReqOutput(
+                session_id=recv_req.session_id,
+                success=False,
+                error_type=STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+                message=str(error),
+                request_epoch=error.request_epoch,
+                registered_epoch=error.registered_epoch,
+                cluster_incarnation=error.cluster_incarnation,
+            )
         output = self.session_controller.open(recv_req)
         if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
@@ -5437,7 +5536,25 @@ class Scheduler(
             return output
         return None
 
-    def close_session(self, recv_req: CloseSessionReqInput):
+    def close_session(
+        self,
+        recv_req: CloseSessionReqInput,
+    ) -> CloseSessionReqOutput | None:
+        correlation_id = recv_req.correlation_id or ""
+        try:
+            self.session_fencing_register.validate(recv_req.epoch)
+        except StreamingSessionStaleEpochError as error:
+            if not _is_streaming_session_output_rank(self.ps):
+                return None
+            return CloseSessionReqOutput(
+                correlation_id=correlation_id,
+                success=False,
+                error_type=STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+                message=str(error),
+                request_epoch=error.request_epoch,
+                registered_epoch=error.registered_epoch,
+                cluster_incarnation=error.cluster_incarnation,
+            )
         if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
         if (
@@ -5445,6 +5562,12 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+        if not _is_streaming_session_output_rank(self.ps):
+            return None
+        return CloseSessionReqOutput(
+            correlation_id=correlation_id,
+            success=True,
+        )
 
     def get_session_info(
         self, recv_req: GetSessionInfoReqInput

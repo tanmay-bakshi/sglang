@@ -129,6 +129,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    InstallSessionFencingReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -171,8 +172,10 @@ from sglang.srt.session.errors import (
     StreamingSessionConflictError,
     StreamingSessionInfoUnavailableError,
     StreamingSessionJournalBehindError,
+    StreamingSessionStaleEpochError,
 )
 from sglang.srt.session.event_journal import JournalBehindError
+from sglang.srt.session.fencing import FENCING_EPOCH_HEADER
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -913,6 +916,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    session_request = obj.session_params is not None
+    if session_request:
+        try:
+            assert obj.session_params is not None
+            obj.session_params["epoch"] = _session_request_epoch(request)
+        except ValueError as error:
+            return _session_fencing_response(_create_error_response(error))
     if obj.stream:
         session_stream = _streaming_session_coordinates(obj)
         if session_stream is not None:
@@ -982,15 +992,59 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return orjson_response(ret)
+            response = orjson_response(ret)
+            return _session_fencing_response(response) if session_request else response
         except StreamingSessionConflictError as error:
-            return ORJSONResponse(
+            response = ORJSONResponse(
                 content=_streaming_session_conflict_error_payload(error),
                 status_code=HTTPStatus.CONFLICT,
             )
+            return _session_fencing_response(response) if session_request else response
+        except StreamingSessionStaleEpochError as error:
+            return _session_fencing_response(
+                ORJSONResponse(
+                    content=_streaming_session_stale_epoch_payload(error),
+                    status_code=HTTPStatus.CONFLICT,
+                )
+            )
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
-            return _create_error_response(e)
+            response = _create_error_response(e)
+            return _session_fencing_response(response) if session_request else response
+
+
+def _session_request_epoch(request: Request) -> int | None:
+    """Parse the optional session fencing epoch header.
+
+    :param request: Incoming native session request.
+    :returns: Non-negative epoch, or ``None`` when the header is absent.
+    :raises ValueError: If the header is not a non-negative integer.
+    """
+    raw_epoch = request.headers.get(FENCING_EPOCH_HEADER)
+    if raw_epoch is None:
+        return None
+    try:
+        epoch = int(raw_epoch)
+    except ValueError as error:
+        raise ValueError(
+            f"{FENCING_EPOCH_HEADER} must be a non-negative integer."
+        ) from error
+    if epoch < 0:
+        raise ValueError(f"{FENCING_EPOCH_HEADER} must be a non-negative integer.")
+    return epoch
+
+
+def _session_fencing_response(response: Response) -> Response:
+    """Echo the frontend's confirmed fencing register on a session response.
+
+    :param response: Native session API response.
+    :returns: The same response with current register headers.
+    """
+    headers = (
+        _global_state.tokenizer_manager.session_fencing_register.state.response_headers()
+    )
+    response.headers.update(headers)
+    return response
 
 
 def _streaming_session_coordinates(
@@ -1049,19 +1103,23 @@ async def _generate_streaming_session_request(
                 current_tip=info.tip,
                 current_digest=info.lineage_digest,
             )
-            return ORJSONResponse(
-                content=_streaming_session_journal_behind_payload(error),
-                status_code=HTTPStatus.CONFLICT,
+            return _session_fencing_response(
+                ORJSONResponse(
+                    content=_streaming_session_journal_behind_payload(error),
+                    status_code=HTTPStatus.CONFLICT,
+                )
             )
-        return StreamingResponse(
-            journal.stream(subscription),
-            media_type="text/event-stream",
+        return _session_fencing_response(
+            StreamingResponse(
+                journal.stream(subscription),
+                media_type="text/event-stream",
+            )
         )
 
     try:
         subscription = journal.begin_stream(session_id, request_id)
     except ValueError as error:
-        return _create_error_response(error)
+        return _session_fencing_response(_create_error_response(error))
 
     async def produce() -> None:
         lineage_generation: int | None = None
@@ -1108,6 +1166,19 @@ async def _generate_streaming_session_request(
                 current_offset,
                 b"data: "
                 + dumps_json(_streaming_session_conflict_error_payload(error))
+                + b"\n\n",
+            )
+        except StreamingSessionStaleEpochError as error:
+            lineage_generation = error.lineage_generation
+            current_offset = error.observed_tip
+            await journal.append(
+                session_id,
+                request_id,
+                lineage_generation,
+                current_offset,
+                current_offset,
+                b"data: "
+                + dumps_json(_streaming_session_stale_epoch_payload(error))
                 + b"\n\n",
             )
         except HTTPException as error:
@@ -1172,9 +1243,11 @@ async def _generate_streaming_session_request(
 
     producer = asyncio.create_task(produce())
     journal.set_producer(session_id, request_id, producer)
-    return StreamingResponse(
-        journal.stream(subscription),
-        media_type="text/event-stream",
+    return _session_fencing_response(
+        StreamingResponse(
+            journal.stream(subscription),
+            media_type="text/event-stream",
+        )
     )
 
 
@@ -1838,24 +1911,62 @@ async def unload_lora_adapter(
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
     try:
+        obj.epoch = _session_request_epoch(request)
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
         if session_id is None:
-            raise Exception(
+            raise RuntimeError(
                 "Failed to open the session. Check if a session with the same id is still open."
             )
-        return session_id
-    except Exception as e:
-        return _create_error_response(e)
+        return _session_fencing_response(ORJSONResponse(session_id))
+    except StreamingSessionStaleEpochError as error:
+        return _session_fencing_response(
+            ORJSONResponse(
+                content=_streaming_session_stale_epoch_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
+        )
+    except (RuntimeError, ValueError) as error:
+        return _session_fencing_response(_create_error_response(error))
 
 
 @app.api_route("/close_session", methods=["GET", "POST"])
 async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
+        obj.epoch = _session_request_epoch(request)
         await _global_state.tokenizer_manager.close_session(obj, request)
-        return Response(status_code=200)
-    except Exception as e:
-        return _create_error_response(e)
+        return _session_fencing_response(Response(status_code=200))
+    except StreamingSessionStaleEpochError as error:
+        return _session_fencing_response(
+            ORJSONResponse(
+                content=_streaming_session_stale_epoch_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
+        )
+    except ValueError as error:
+        return _session_fencing_response(_create_error_response(error))
+
+
+@app.post("/install_session_fencing_register")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def install_session_fencing_register(
+    obj: Annotated[InstallSessionFencingReqInput, Body()],
+) -> ORJSONResponse:
+    """Install the scheduler-authoritative session fencing register."""
+    try:
+        state = await _global_state.tokenizer_manager.install_session_fencing_register(
+            obj
+        )
+    except ValueError as error:
+        return _session_fencing_response(_create_error_response(error))
+    return _session_fencing_response(
+        ORJSONResponse(
+            {
+                "epoch": state.epoch,
+                "cluster_incarnation": state.cluster_incarnation,
+            }
+        )
+    )
 
 
 @app.get("/session_info")
@@ -1864,18 +1975,20 @@ async def session_info(session_id: Annotated[str, Query(min_length=1)]):
     try:
         result = await _global_state.tokenizer_manager.get_session_info(session_id)
     except StreamingSessionInfoUnavailableError as error:
-        return _create_error_response(error)
-    return ORJSONResponse(
-        {
-            "exists": result.exists,
-            "tip": result.tip,
-            "lineage_digest": result.lineage_digest,
-            "floor": result.floor,
-            "protected": result.protected,
-            "inflight": result.inflight,
-            "held_tokens": result.held_tokens,
-            "last_rid": result.last_rid,
-        }
+        return _session_fencing_response(_create_error_response(error))
+    return _session_fencing_response(
+        ORJSONResponse(
+            {
+                "exists": result.exists,
+                "tip": result.tip,
+                "lineage_digest": result.lineage_digest,
+                "floor": result.floor,
+                "protected": result.protected,
+                "inflight": result.inflight,
+                "held_tokens": result.held_tokens,
+                "last_rid": result.last_rid,
+            }
+        )
     )
 
 
@@ -1886,32 +1999,34 @@ async def list_sessions() -> ORJSONResponse:
     :returns: Engine incarnation and all open streaming sessions.
     """
     result = await _global_state.tokenizer_manager.list_sessions()
-    return ORJSONResponse(
-        {
-            "engine_incarnation_id": (
-                _global_state.tokenizer_manager.engine_incarnation_id
-            ),
-            "sessions": [
-                {
-                    "session_id": session.session_id,
-                    "lineage_generation": session.lineage_generation,
-                    "tip": session.tip,
-                    "lineage_digest": session.lineage_digest,
-                    "floor": session.floor,
-                    "kv_residency": {
-                        "full": {
-                            "device_pages": session.full.device_pages,
-                            "host_backed_pages": session.full.host_backed_pages,
+    return _session_fencing_response(
+        ORJSONResponse(
+            {
+                "engine_incarnation_id": (
+                    _global_state.tokenizer_manager.engine_incarnation_id
+                ),
+                "sessions": [
+                    {
+                        "session_id": session.session_id,
+                        "lineage_generation": session.lineage_generation,
+                        "tip": session.tip,
+                        "lineage_digest": session.lineage_digest,
+                        "floor": session.floor,
+                        "kv_residency": {
+                            "full": {
+                                "device_pages": session.full.device_pages,
+                                "host_backed_pages": session.full.host_backed_pages,
+                            },
+                            "swa": {
+                                "device_pages": session.swa.device_pages,
+                                "host_backed_pages": session.swa.host_backed_pages,
+                            },
                         },
-                        "swa": {
-                            "device_pages": session.swa.device_pages,
-                            "host_backed_pages": session.swa.host_backed_pages,
-                        },
-                    },
-                }
-                for session in result.sessions
-            ],
-        }
+                    }
+                    for session in result.sessions
+                ],
+            }
+        )
     )
 
 
@@ -2434,6 +2549,27 @@ def _streaming_session_journal_behind_payload(
             "current_tip": error.current_tip,
             "current_digest": error.current_digest,
             "required_action": error.required_action,
+        }
+    }
+
+
+def _streaming_session_stale_epoch_payload(
+    error: StreamingSessionStaleEpochError,
+) -> dict[str, dict[str, object]]:
+    """Build the stable session fencing rejection envelope.
+
+    :param error: Typed stale-epoch rejection with the installed register.
+    :returns: Public stale-epoch payload shared by JSON and SSE transports.
+    """
+    return {
+        "error": {
+            "message": str(error),
+            "type": "stale_epoch",
+            "code": HTTPStatus.CONFLICT.value,
+            "retryable": False,
+            "request_epoch": error.request_epoch,
+            "registered_epoch": error.registered_epoch,
+            "cluster_incarnation": error.cluster_incarnation,
         }
     }
 

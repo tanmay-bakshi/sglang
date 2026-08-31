@@ -11,10 +11,12 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     ListSessionsReqInput,
     ListSessionsReqOutput,
+    OpenSessionReqInput,
     SessionInventoryOutput,
     SessionKVResidencyOutput,
     SessionParams,
@@ -27,7 +29,11 @@ from sglang.srt.managers.scheduler import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.errors import StreamingSessionInfoUnavailableError
+from sglang.srt.session.errors import (
+    STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+    StreamingSessionInfoUnavailableError,
+)
+from sglang.srt.session.fencing import SessionFencingRegister
 from sglang.srt.session.session_controller import Session
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -40,6 +46,7 @@ def _tokenized_request(
     max_new_tokens: int = 1,
     truncate_to: int | None = None,
     commit_to: int | None = None,
+    epoch: int | None = None,
 ) -> TokenizedGenerateReqInput:
     """Build one real scheduler input for a streaming-session turn.
 
@@ -48,6 +55,7 @@ def _tokenized_request(
     :param max_new_tokens: Decode limit.
     :param truncate_to: Optional durable rollback target.
     :param commit_to: Optional rollback floor.
+    :param epoch: Optional session fencing epoch.
     :returns: Canonical tokenized scheduler input.
     """
     return TokenizedGenerateReqInput(
@@ -67,8 +75,125 @@ def _tokenized_request(
             id="session",
             truncate_to=truncate_to,
             commit_to=commit_to,
+            epoch=epoch,
         ),
     )
+
+
+class TestStreamingSessionEpochFencing(CustomTestCase):
+    """Scheduler-owned rejection before session mutation."""
+
+    def test_stale_epoch_is_typed_and_does_not_enter_session_controller(self) -> None:
+        """Build only an output request when the installed fence rejects."""
+        session = SimpleNamespace(
+            lineage_generation=4,
+            current_tip=MagicMock(return_value=128),
+            create_req=MagicMock(),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.session_controller = SimpleNamespace(
+            get=MagicMock(return_value=session)
+        )
+        scheduler.session_fencing_register = SessionFencingRegister()
+        scheduler.session_fencing_register.install(7, 19)
+        scheduler.model_config = SimpleNamespace(vocab_size=1024)
+        scheduler.tokenizer = None
+        scheduler.init_req_max_new_tokens = MagicMock()
+        queued: list[object] = []
+        scheduler._add_request_to_queue = queued.append
+        request = _tokenized_request("stale", [1], epoch=6)
+
+        with get_parallel().override(tp_rank=0):
+            rejected = Scheduler._reject_stale_session_epoch(
+                scheduler,
+                request,
+                "session",
+            )
+
+        self.assertTrue(rejected)
+        self.assertEqual(len(queued), 1)
+        [output_request] = queued
+        self.assertIsInstance(output_request.to_finish, FINISH_ABORT)
+        self.assertEqual(
+            output_request.to_finish.err_type,
+            STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+        )
+        self.assertEqual(
+            output_request.to_finish.error_data,
+            {
+                "request_epoch": 6,
+                "registered_epoch": 7,
+                "cluster_incarnation": 19,
+                "lineage_generation": 4,
+                "observed_tip": 128,
+            },
+        )
+        session.create_req.assert_not_called()
+
+    def test_higher_epoch_passes_without_advancing_scheduler_register(self) -> None:
+        """Leave equal-or-higher requests for normal session routing."""
+        session = SimpleNamespace(
+            lineage_generation=4,
+            current_tip=MagicMock(return_value=128),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.session_controller = SimpleNamespace(
+            get=MagicMock(return_value=session)
+        )
+        scheduler.session_fencing_register = SessionFencingRegister()
+        installed = scheduler.session_fencing_register.install(7, 19)
+
+        rejected = Scheduler._reject_stale_session_epoch(
+            scheduler,
+            _tokenized_request("current", [1], epoch=8),
+            "session",
+        )
+
+        self.assertFalse(rejected)
+        self.assertEqual(scheduler.session_fencing_register.state, installed)
+
+    def test_stale_open_and_close_do_not_touch_session_or_cache_state(self) -> None:
+        """Fence lifecycle mutations before controller and radix-cache calls."""
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = ParallelState.trivial(dp_rank=0, dp_size=1)
+        scheduler.session_fencing_register = SessionFencingRegister()
+        scheduler.session_fencing_register.install(7, 19)
+        scheduler.session_controller = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.enable_session_radix_cache = True
+
+        open_output = Scheduler.open_session(
+            scheduler,
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="session",
+                streaming=True,
+                epoch=6,
+            ),
+        )
+        close_output = Scheduler.close_session(
+            scheduler,
+            CloseSessionReqInput(
+                session_id="session",
+                epoch=6,
+                correlation_id="close-correlation",
+            ),
+        )
+
+        self.assertFalse(open_output.success)
+        self.assertEqual(
+            open_output.error_type,
+            STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+        )
+        self.assertFalse(close_output.success)
+        self.assertEqual(
+            close_output.error_type,
+            STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+        )
+        scheduler.session_controller.open.assert_not_called()
+        scheduler.session_controller.close.assert_not_called()
+        scheduler.tree_cache.open_radix_session.assert_not_called()
+        scheduler.tree_cache.release_radix_session.assert_not_called()
 
 
 class TestEmptyStreamingSessionMutation(CustomTestCase):
