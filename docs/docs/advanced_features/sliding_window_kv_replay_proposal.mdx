@@ -1,0 +1,109 @@
+---
+title: "Proposal: Replay Sliding-Window KV on HiCache Reload"
+metatags:
+    description: "Design proposal for omitting sliding-window KV from HiCache pages and rebuilding the final attention window during reload."
+---
+
+<Note>
+Status: design proposal only. Implementation requires design-owner approval.
+</Note>
+
+## Decision requested
+
+Approve a prototype in which HiCache persists and reloads the ten full-attention
+target layers, but omits the fifty sliding-window target layers and reconstructs
+their final window of at most 1,024 tokens on the GPU. Keep every DFlash sidecar
+in the first version.
+
+This is structurally feasible, but it is not a pure latency optimization. It
+buys host capacity and transfer traffic. With replay serialized after H2D, it
+increases isolated reload latency. The prototype should proceed only if host
+capacity is the governing objective and if an overlapped replay pipeline can
+pass token-identity tests.
+
+## Measured economics
+
+For one TP rank at a 28,032-token prefix:
+
+| Payload | Current bytes | Proposed bytes |
+| --- | ---: | ---: |
+| Ten full-attention target layers | 1,148,190,720 | 1,148,190,720 |
+| Fifty target SWA layers, final 1,024-token window | 419,430,400 | 0 |
+| DFlash state | 287,047,680 | 287,047,680 |
+| **Total** | **1,854,668,800** | **1,435,238,400** |
+
+The proposal removes 419,430,400 bytes per rank, 22.61% of the current entry.
+If the host budget can be reassigned between pools, that is approximately
+1.29 times as many equivalent prefixes. The current host pools are separately
+allocated, so omitting SWA bytes alone does not create that capacity. Pool
+sizing must return the retired SWA budget to the full and draft pools.
+
+At the measured 51.04 GB/s H2D rate, the omitted bytes save about 8.2 ms per
+rank. A measured 1,024-token replay costs about 30 ms. Serialized execution
+therefore changes the transfer-plus-replay component from about 36.3 ms to
+58.1 ms, a roughly 21.8 ms regression. The latency case depends on overlapping
+most of replay with the full-KV and DFlash transfer; without that overlap, the
+proposal is a capacity optimization only.
+
+## Reload architecture
+
+The radix match must distinguish an intentionally omitted SWA payload from a
+corrupt or incomplete component hit. A successful match would produce a
+materialization plan with two parts: load all full-attention and retained draft
+state, then replay the final `min(prefix_length, 1024)` tokens to populate SWA.
+The request cannot become runnable until both parts complete on every TP rank.
+
+Replay is only partially materialized, not partially computed. Hidden states
+flow through all sixty transformer layers in order. At each full-attention
+layer, attention reads the already loaded full-prefix KV and must not allocate,
+append, or duplicate full KV. At each sliding-window layer, replay allocates
+SWA slots and writes K/V for the final window. This requires a forward mode
+whose cache-write policy is explicit per layer. Reusing ordinary extend mode
+would risk overwriting loaded full KV and publishing an inconsistent prefix.
+
+`UnifiedRadixCache` would carry the materialization plan through match and
+load-back instead of treating absent SWA host transfers as a shorter usable
+prefix. `SWAComponent` would allocate the replay slots, rebuild `full_to_swa`
+for the corresponding full-KV locations, and publish its device frontier only
+after replay succeeds. Accounting must charge those allocations while replay
+is pending and release them on cancellation or a failed TP vote. The radix
+node also needs an explicit policy bit indicating that missing SWA host values
+are intentional, so ordinary integrity checks remain strict.
+
+## Draft state and page boundaries
+
+The first version retains DFlash. Its full-cache sidecar already derives host
+indices from the target full pool, so it can ride the retained transfer. Target
+replay must suppress DFlash materialization hooks for this span or prove that
+rewriting the loaded draft state is bit-equivalent. Reconstructing DFlash later
+is a separate proposal because it requires the target hidden-state taps and
+has its own numerical and lifecycle invariants.
+
+`HybridPoolAssembler` must keep registering the retained sidecar, while
+`DFlashWorkerV2` needs an explicit replay mode that does not rewrite it.
+
+A draft model with a `DRAFT_SWA` sidecar is harder: that sidecar currently
+derives indices from the target SWA pool. Removing the source allocation would
+invalidate its addressing. Such a configuration must either give draft SWA an
+independent host allocation or remain ineligible. Keeping an otherwise unused
+target SWA pool merely as an index anchor would erase much of the capacity win.
+
+Transfer and replay cuts remain page-floored. Replay begins at
+`floor(max(0, prefix_length - 1024), page_size)` and uses the exact logical
+token count, which also covers any final partial page. No partial host page is
+published. This needs a hard correctness gate: on the production FP4 plus
+DFlash stack, ordinary token replay has already diverged from an undisturbed
+decode session under greedy sampling. A dedicated replay mode must demonstrate
+a 64-token token-identical continuation for aligned and unaligned frontiers
+before this design can be enabled.
+
+## Recommendation
+
+Approve only a guarded prototype with the following exit criteria: strict
+full/SWA/draft accounting on every TP rank, exact continuation identity,
+cancellation cleanup, and a measured overlap timeline showing whether the
+30 ms replay is hidden. If identity requires a private tail channel or if
+replay remains serialized, do not ship it. Retaining the current all-layer
+transfer is simpler and faster for isolated reloads; the proposed design earns
+its complexity only when the 22.61% host-capacity gain materially improves the
+production hit rate.
