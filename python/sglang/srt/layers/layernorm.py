@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Optional, Tuple, Union
 
@@ -44,6 +45,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -61,8 +63,6 @@ if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             import flashinfer.norm
-
-            from sglang.srt.utils.custom_op import register_custom_op
 
             def _layernorm_fake_impl(
                 input: torch.Tensor,
@@ -168,6 +168,85 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_flashinfer_add_rmsnorm_fp4quant() -> Callable[
+    ..., tuple[torch.Tensor, torch.Tensor]
+]:
+    """Resolve the FlashInfer NVFP4 norm kernel when its server flag is used.
+
+    :returns: FlashInfer's fused residual-add, RMSNorm, and FP4 quantizer.
+    """
+    from flashinfer.norm import add_rmsnorm_fp4quant
+
+    return add_rmsnorm_fp4quant
+
+
+def _flashinfer_add_rmsnorm_fp4quant_fake(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe the fused kernel outputs to ``torch.compile``.
+
+    :param input_tensor: Input activation added to the residual.
+    :param residual: Residual activation updated by the real kernel.
+    :param weight: RMSNorm weight.
+    :param global_scale: ModelOpt activation scale.
+    :param eps: RMSNorm epsilon.
+    :returns: Fake packed-FP4 values and swizzled E4M3 scales.
+    """
+    del residual, weight, global_scale, eps
+    num_rows, hidden_size = input_tensor.shape
+    packed_fp4 = input_tensor.new_empty(
+        (num_rows, hidden_size // 2), dtype=torch.float4_e2m1fn_x2
+    )
+    num_m_tiles = (num_rows + 127) // 128
+    num_k_tiles = (hidden_size // 16 + 3) // 4
+    scales = input_tensor.new_empty(
+        (num_m_tiles * num_k_tiles * 512,), dtype=torch.float8_e4m3fn
+    )
+    return packed_fp4, scales
+
+
+def _flashinfer_add_rmsnorm_fp4quant_impl(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call FlashInfer's fused kernel behind an opaque Torch operator.
+
+    :param input_tensor: Input activation added to the residual.
+    :param residual: Residual activation updated in place.
+    :param weight: RMSNorm weight.
+    :param global_scale: ModelOpt activation scale with shape ``(1,)``.
+    :param eps: RMSNorm epsilon.
+    :returns: Packed-FP4 values and swizzled E4M3 scales.
+    """
+    add_rmsnorm_fp4quant = _get_flashinfer_add_rmsnorm_fp4quant()
+    return add_rmsnorm_fp4quant(
+        input_tensor,
+        residual,
+        weight,
+        global_scale=global_scale,
+        eps=eps,
+        block_size=16,
+        scale_format="e4m3",
+        is_sf_swizzled_layout=True,
+    )
+
+
+_flashinfer_add_rmsnorm_fp4quant = register_custom_op(
+    _flashinfer_add_rmsnorm_fp4quant_impl,
+    op_name="flashinfer_add_rmsnorm_fp4quant",
+    mutates_args=["residual"],
+    fake_impl=_flashinfer_add_rmsnorm_fp4quant_fake,
+)
 
 
 if _is_npu:
@@ -969,6 +1048,44 @@ class RMSNorm(BaseFusedOp):
         if needs_reshape:
             out = out.reshape(original_shape)
         return out, scale, orig_dtype
+
+    def forward_with_nvfp4_quant_fusion(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Fuse residual addition, RMSNorm, and NVFP4 input quantization.
+
+        The quantized activation uses FlashInfer's swizzled 128x4 E4M3 scale
+        layout and can be consumed directly by ModelOpt blockscaled GEMMs.
+        The residual is updated in place, matching :meth:`forward_cuda`.
+
+        :param x: Input activation added to the residual.
+        :param residual: Residual activation updated in place.
+        :param global_scale: ModelOpt activation scale used by FP4 quantization.
+        :returns: A prequantized ``(packed_fp4, scales)`` input and the updated
+            residual.
+        :raises ValueError: If the inputs do not have the supported shape.
+        """
+        if x.dim() != 2 or residual.dim() != 2:
+            raise ValueError("Fused add-RMSNorm-FP4 quantization requires 2D inputs")
+        if x.shape != residual.shape:
+            raise ValueError("Input and residual shapes must match")
+
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if not residual.is_contiguous():
+            residual = residual.contiguous()
+
+        packed_fp4, scales = _flashinfer_add_rmsnorm_fp4quant(
+            x,
+            residual,
+            self.weight.data,
+            global_scale=global_scale.reshape(1),
+            eps=self.variance_epsilon,
+        )
+        return (packed_fp4.view(torch.uint8), scales), residual
 
 
 class LayerNorm(BaseFusedOp):

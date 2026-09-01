@@ -1976,6 +1976,11 @@ class ServerArgs:
         "Enable fused GeGLU and NVFP4 quantization for Gemma 4 target-verify batches with at least 16 tokens.",
         NS("exec.kernel"),
     ] = False
+    enable_flashinfer_add_rmsnorm_fp4_quant: A[
+        bool,
+        "Enable FlashInfer fused residual addition, RMS normalization, and NVFP4 quantization for eligible Gemma 4 MLP inputs.",
+        NS("exec.kernel"),
+    ] = False
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",

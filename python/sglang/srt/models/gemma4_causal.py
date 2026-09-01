@@ -116,6 +116,7 @@ class Gemma4MLP(Gemma3MLP):
     """Gemma 4 dense MLP with fused NVFP4 down-projection inputs."""
 
     _enable_fused_geglu_verify: bool
+    _use_fused_add_rmsnorm_fp4_quant: bool
     _use_fused_geglu_fp4: bool
 
     def __init__(
@@ -152,8 +153,18 @@ class Gemma4MLP(Gemma3MLP):
         self._enable_fused_geglu_verify = (
             get_exec().kernel.enable_gemma4_nvfp4_geglu_verify
         )
+        gate_up_quant_method = self.gate_up_proj.quant_method
+        self._use_fused_add_rmsnorm_fp4_quant = (
+            get_exec().kernel.enable_flashinfer_add_rmsnorm_fp4_quant
+            and is_sm100_supported()
+            and isinstance(gate_up_quant_method, ModelOptFp4LinearMethod)
+            and not gate_up_quant_method.quant_config.is_awq
+            and not get_fp4_gemm_runner_backend().is_marlin()
+        )
         if self._use_fused_geglu_fp4:
             self.down_proj._accepts_prequantized_fp4 = True
+        if self._use_fused_add_rmsnorm_fp4_quant:
+            self.gate_up_proj._accepts_prequantized_fp4 = True
 
     def forward(
         self,
@@ -855,14 +866,21 @@ class Gemma4DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if self.enable_moe_block:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            # Also need raw (unfused) residual for router and pre_ff_norm_2
+        if self.mlp._use_fused_add_rmsnorm_fp4_quant:
+            hidden_states, residual = (
+                self.pre_feedforward_layernorm.forward_with_nvfp4_quant_fusion(
+                    hidden_states,
+                    residual,
+                    self.mlp.gate_up_proj.input_scale_inv,
+                )
+            )
+        else:
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
-            # For MoE: router and pre_ff_norm_2 need the unfused residual
-            # (which is now updated to post_attn_out + old_residual)
+
+        if self.enable_moe_block:
+            # The router and second feed-forward norm consume the updated BF16 residual.
             moe_input = residual
 
             # Dense MLP branch
@@ -902,10 +920,6 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
             hidden_states = self.mlp(hidden_states, forward_batch)
 
         if (
