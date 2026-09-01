@@ -1971,6 +1971,11 @@ class ServerArgs:
         "Enable fused qk normalization and rope rotary embedding.",
         NS("exec.kernel"),
     ] = False
+    enable_gemma4_nvfp4_geglu_verify: A[
+        bool,
+        "Enable fused GeGLU and NVFP4 quantization for Gemma 4 target-verify batches with at least 16 tokens.",
+        NS("exec.kernel"),
+    ] = False
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",

@@ -59,7 +59,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -75,6 +79,30 @@ from sglang.srt.utils.common import is_sm100_supported
 logger = logging.getLogger(__name__)
 
 
+_MIN_FUSED_GEGLU_VERIFY_TOKENS = 16
+
+
+def _should_use_fused_geglu_fp4(
+    forward_mode: ForwardMode,
+    num_tokens: int,
+    enable_verify: bool,
+) -> bool:
+    """Return whether this forward mode should fuse GeGLU and FP4 quantization.
+
+    :param forward_mode: Current model-forward mode.
+    :param num_tokens: Number of activation rows in the forward.
+    :param enable_verify: Whether the target-verify extension is enabled.
+    :returns: Whether the fused kernel is eligible for this forward.
+    """
+    if forward_mode.is_extend_without_speculative():
+        return True
+    return (
+        enable_verify
+        and forward_mode.is_target_verify()
+        and num_tokens >= _MIN_FUSED_GEGLU_VERIFY_TOKENS
+    )
+
+
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
@@ -85,7 +113,10 @@ Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
 
 
 class Gemma4MLP(Gemma3MLP):
-    """Gemma 4 dense MLP with a prefill-only fused NVFP4 down-projection input."""
+    """Gemma 4 dense MLP with fused NVFP4 down-projection inputs."""
+
+    _enable_fused_geglu_verify: bool
+    _use_fused_geglu_fp4: bool
 
     def __init__(
         self,
@@ -118,6 +149,9 @@ class Gemma4MLP(Gemma3MLP):
             and not down_quant_method.quant_config.is_awq
             and not get_fp4_gemm_runner_backend().is_marlin()
         )
+        self._enable_fused_geglu_verify = (
+            get_exec().kernel.enable_gemma4_nvfp4_geglu_verify
+        )
         if self._use_fused_geglu_fp4:
             self.down_proj._accepts_prequantized_fp4 = True
 
@@ -126,7 +160,7 @@ class Gemma4MLP(Gemma3MLP):
         x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch | None = None,
     ) -> torch.Tensor:
-        """Run the dense MLP, fusing GeGLU and FP4 quantization in prefill.
+        """Run the dense MLP with eligible GeGLU and FP4 quantization fused.
 
         :param x: BF16 or prequantized FP4 MLP input.
         :param forward_batch: Current model-forward metadata.
@@ -136,7 +170,11 @@ class Gemma4MLP(Gemma3MLP):
         use_fused = (
             self._use_fused_geglu_fp4
             and forward_batch is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            and _should_use_fused_geglu_fp4(
+                forward_batch.forward_mode,
+                gate_up.shape[0],
+                self._enable_fused_geglu_verify,
+            )
         )
         if use_fused:
             down_input = gelu_tanh_and_mul_fp4_quant(
