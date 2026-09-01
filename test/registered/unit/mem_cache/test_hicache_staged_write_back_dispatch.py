@@ -282,6 +282,121 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             [0, 1],
         )
 
+    def test_l2_transfer_bulk_loads_complete_pool(self):
+        host_pool = mock.Mock()
+        host_pool.load_to_device_all_layer.return_value = True
+        transfer = L2Transfer(
+            host_pool=host_pool,
+            device_pool=mock.sentinel.device_pool,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            layer_mapper={1: 0, 3: 1}.get,
+            bulk_h2d=True,
+        )
+        completed_layers: list[int] = []
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            L2TransferEngine("kernel").submit_host_to_device(
+                [transfer],
+                layer_num=4,
+                on_layer_done=completed_layers.append,
+            )
+
+        host_pool.load_to_device_all_layer.assert_called_once_with(
+            mock.sentinel.device_pool,
+            transfer.host_indices,
+            transfer.device_indices,
+            [0, 1],
+            "kernel",
+            is_draft=False,
+        )
+        host_pool.load_to_device_per_layer.assert_not_called()
+        self.assertEqual(completed_layers, [0, 1, 2, 3])
+
+    def test_l2_transfer_falls_back_when_bulk_load_declines(self):
+        host_pool = mock.Mock()
+        host_pool.load_to_device_all_layer.return_value = False
+        transfer = L2Transfer(
+            host_pool=host_pool,
+            device_pool=mock.sentinel.device_pool,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+            layer_mapper={1: 0, 3: 1}.get,
+            bulk_h2d=True,
+        )
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            L2TransferEngine("kernel").submit_host_to_device([transfer], layer_num=4)
+
+        self.assertEqual(
+            [
+                call.args[3]
+                for call in host_pool.load_to_device_per_layer.call_args_list
+            ],
+            [0, 1],
+        )
+
+    def test_mha_bulk_load_uses_all_layer_jit(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.supports_bulk_h2d = True
+        host.layout = "page_first"
+        host.layout_dim = 64
+        host.token_stride_size = 16
+        host.element_dim = 8
+        host.dtype = torch.bfloat16
+        host.layer_num = 2
+        host.k_data_ptrs = mock.sentinel.host_k_ptrs
+        host.v_data_ptrs = mock.sentinel.host_v_ptrs
+        device_pool = _device_pool_stub(
+            layer_num=2,
+            k_data_ptrs=mock.sentinel.device_k_ptrs,
+            v_data_ptrs=mock.sentinel.device_v_ptrs,
+        )
+        host_indices = _indices(0, 2)
+        device_indices = _indices(2, 4)
+
+        with mock.patch(
+            f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_all_layer"
+        ) as transfer:
+            submitted = host.load_to_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                [0, 1],
+                "kernel",
+            )
+
+        self.assertTrue(submitted)
+        transfer.assert_called_once_with(
+            k_ptr_dst=mock.sentinel.device_k_ptrs,
+            v_ptr_dst=mock.sentinel.device_v_ptrs,
+            indices_dst=device_indices,
+            k_ptr_src=mock.sentinel.host_k_ptrs,
+            v_ptr_src=mock.sentinel.host_v_ptrs,
+            indices_src=host_indices,
+            kv_cache_src_stride_bytes=64,
+            kv_cache_dst_stride_bytes=16,
+            element_size=16,
+        )
+
+    def test_mha_bulk_load_rejects_partial_layer_plan(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.supports_bulk_h2d = True
+        host.layer_num = 2
+        device_pool = _device_pool_stub(layer_num=2)
+
+        with mock.patch(
+            f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_all_layer"
+        ) as transfer:
+            submitted = host.load_to_device_all_layer(
+                device_pool,
+                _indices(0, 2),
+                _indices(2, 4),
+                [0],
+                "kernel",
+            )
+
+        self.assertFalse(submitted)
+        transfer.assert_not_called()
+
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
         host_pool = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)

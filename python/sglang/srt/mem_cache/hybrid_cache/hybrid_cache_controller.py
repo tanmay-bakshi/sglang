@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     count_pool_hits,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, supports_bulk_h2d
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -398,6 +398,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=host_indices,
                     device_indices=device_indices,
                     layer_mapper=anchor.layer_mapper,
+                    bulk_h2d=supports_bulk_h2d(anchor.host_pool),
                 )
             )
         for pool_transfer in pool_transfers or []:
@@ -414,6 +415,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
                     layer_mapper=entry.layer_mapper,
+                    bulk_h2d=supports_bulk_h2d(entry.host_pool),
                 )
             )
         return transfers
@@ -457,6 +459,7 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=target_transfer.device_indices,
                         layer_mapper=draft_layer_mapper,
                         is_draft=True,
+                        bulk_h2d=target_transfer.bulk_h2d,
                     )
                 )
         return transfers

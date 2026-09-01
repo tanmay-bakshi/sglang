@@ -6,10 +6,23 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def supports_bulk_h2d(host_pool: Any) -> bool:
+    """Return whether a concrete host pool supports bulk device loading.
+
+    :param host_pool: Candidate host-pool implementation.
+    :returns: Whether the pool advertises the bulk H2D contract.
+    """
+    return (
+        isinstance(host_pool, HostKVCache)
+        and host_pool.supports_bulk_h2d is True
+    )
 
 
 @cache
@@ -38,6 +51,7 @@ class L2Transfer(NamedTuple):
     device_indices: torch.Tensor
     layer_mapper: Optional[Callable[[int], Optional[int]]] = None
     is_draft: bool = False
+    bulk_h2d: bool = False
 
 
 class TransferCompletion(NamedTuple):
@@ -85,18 +99,37 @@ class L2TransferEngine:
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
-            for layer_id in range(layer_num):
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
+            bulk_transfer_indices: set[int] = set()
+            for transfer_index, transfer in enumerate(transfers):
+                if not transfer.bulk_h2d:
+                    continue
+                local_layer_ids = [
+                    local_layer_id
+                    for layer_id in range(layer_num)
+                    if (
+                        local_layer_id := self._local_layer_id(
+                            transfer, primary, layer_id
+                        )
                     )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
+                    is not None
+                ]
+                if transfer.host_pool.load_to_device_all_layer(
+                    transfer.device_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                    local_layer_ids,
+                    self.io_backend,
+                    is_draft=transfer.is_draft,
+                ):
+                    bulk_transfer_indices.add(transfer_index)
+            for layer_id in range(layer_num):
+                for transfer_index, transfer in enumerate(transfers):
+                    if transfer_index in bulk_transfer_indices:
+                        continue
+                    local_layer_id = self._local_layer_id(
+                        transfer, primary, layer_id
+                    )
+                    if local_layer_id is None:
                         continue
                     transfer.host_pool.load_to_device_per_layer(
                         transfer.device_pool,
@@ -111,6 +144,34 @@ class L2TransferEngine:
             ack_finish.record()
             self._record_stream(transfers, self.host_to_device_stream)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
+
+    @staticmethod
+    def _local_layer_id(
+        transfer: L2Transfer,
+        primary: L2Transfer | None,
+        layer_id: int,
+    ) -> int | None:
+        """Map a logical layer into one transfer's local pool.
+
+        :param transfer: Transfer whose layer mapping is being evaluated.
+        :param primary: Anchor transfer in the submitted plan.
+        :param layer_id: Logical model layer.
+        :returns: Local layer, or ``None`` when the transfer skips it.
+        """
+        local_layer_id = (
+            transfer.layer_mapper(layer_id)
+            if transfer.layer_mapper is not None
+            else layer_id
+        )
+        if local_layer_id is None:
+            return None
+        if (
+            transfer is not primary
+            and transfer.layer_mapper is None
+            and layer_id >= transfer.host_pool.layer_num
+        ):
+            return None
+        return local_layer_id
 
     @staticmethod
     def _start_event(start_event):

@@ -105,6 +105,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
+        self.supports_bulk_h2d = (
+            self.can_use_jit
+            and self.layout in ("layer_first", "page_first")
+            and device_pool.head_dim == device_pool.v_head_dim
+            and len(self.mtp_draft_device_pools) == 0
+        )
 
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
@@ -373,6 +379,53 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def load_to_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_ids: list[int],
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> bool:
+        """Load a complete symmetric MHA pool with one JIT launch.
+
+        :param device_pool: Device pool receiving the cache values.
+        :param host_indices: Source indices in the host pool.
+        :param device_indices: Destination indices in the device pool.
+        :param layer_ids: Local layers selected by the logical transfer plan.
+        :param io_backend: Configured HiCache transfer backend.
+        :param is_draft: Whether this is a packed draft-layer transfer.
+        :returns: Whether the transfer was submitted in bulk.
+        """
+        if not self.supports_bulk_h2d or io_backend != "kernel" or is_draft:
+            return False
+        if self._is_device_layer_sharded(device_pool):
+            return False
+        if layer_ids != list(range(device_pool.layer_num)):
+            return False
+        if self.layer_num != device_pool.layer_num:
+            return False
+
+        src_stride_bytes = (
+            self.layout_dim
+            if self.layout == "page_first"
+            else self.token_stride_size
+        )
+        jit_transfer_hicache_all_layer(
+            k_ptr_dst=device_pool.k_data_ptrs,
+            v_ptr_dst=device_pool.v_data_ptrs,
+            indices_dst=device_indices,
+            k_ptr_src=self.k_data_ptrs,
+            v_ptr_src=self.v_data_ptrs,
+            indices_src=host_indices,
+            kv_cache_src_stride_bytes=src_stride_bytes,
+            kv_cache_dst_stride_bytes=self.token_stride_size,
+            element_size=self.element_dim * self.dtype.itemsize,
+        )
+        return True
 
     def _resolve_device_transfer_buffers(self, device_pool):
         if self.mtp_draft_device_pools:

@@ -40,7 +40,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer import (
+    L2Transfer,
+    L2TransferEngine,
+    supports_bulk_h2d,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -902,6 +906,7 @@ class HiCacheController:
                 device_pool=self.mem_pool_device,
                 host_indices=host_indices,
                 device_indices=device_indices,
+                bulk_h2d=supports_bulk_h2d(self.mem_pool_host),
             )
         ]
         return transfers

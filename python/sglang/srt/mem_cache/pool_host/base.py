@@ -113,6 +113,7 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    supports_bulk_h2d = False
 
     def __init__(
         self,
@@ -286,6 +287,28 @@ class HostKVCache(abc.ABC):
         Load KV data from the host memory pool to the device memory pool for a specific layer.
         """
         raise NotImplementedError()
+
+    def load_to_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_ids: list[int],
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> bool:
+        """Try to load a complete pool with one all-layer transfer.
+
+        :param device_pool: Device pool receiving the cache values.
+        :param host_indices: Source indices in the host pool.
+        :param device_indices: Destination indices in the device pool.
+        :param layer_ids: Local layers selected by the logical transfer plan.
+        :param io_backend: Configured HiCache transfer backend.
+        :param is_draft: Whether this is a packed draft-layer transfer.
+        :returns: Whether the transfer was submitted in bulk.
+        """
+        return False
 
     @abc.abstractmethod
     def backup_from_device_all_layer(
