@@ -911,6 +911,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             cache.commit_streaming_session_demotion("session"),
             exact_tokens,
         )
+        cache.sanity_check()
         state = cache.session.demoted["session"]
         self.assertEqual(state.swa_evicted_seqlen, page_size)
         self.assertEqual(allocator.full_available_size(), full_available_baseline)

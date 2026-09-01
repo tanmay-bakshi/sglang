@@ -2676,20 +2676,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Host locks remove protected aux states from the host LRU.
+                # Every remaining host-only state must be tracked there.
                 host_lru = self.host_lru_lists[ct]
-                s3_ids = {
+                evictable_host_ids = {
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
+                    and n.component_data[ct].host_lock_ref == 0
                 }
                 host_lru_ids = set(host_lru.cache.keys())
-                if s3_ids != host_lru_ids:
+                if evictable_host_ids != host_lru_ids:
                     E(
                         f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"+tree={evictable_host_ids - host_lru_ids}, "
+                        f"+lru={host_lru_ids - evictable_host_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids
