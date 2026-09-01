@@ -371,10 +371,10 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
 
 
 class TestEmptyStreamingSessionMutation(CustomTestCase):
-    """Exercise the scheduler's no-forward completion path."""
+    """Exercise streaming-session completion without model ownership."""
 
-    def test_finishes_without_queueing_or_model_resources(self):
-        """A zero-context mutation completes without owning model resources."""
+    def test_finishes_bare_noop_without_queueing_or_model_resources(self) -> None:
+        """A bare empty append completes without owning model resources."""
         finished = False
 
         def update_finish_state() -> None:
@@ -387,6 +387,8 @@ class TestEmptyStreamingSessionMutation(CustomTestCase):
         req = SimpleNamespace(
             session=session,
             sampling_params=SimpleNamespace(max_new_tokens=0),
+            origin_input_ids=[1, 2, 3],
+            streaming_session_preburst_mutation=False,
             req_pool_idx=None,
             is_holding_kv=False,
             kv=ReqKvInfo(),
@@ -398,7 +400,7 @@ class TestEmptyStreamingSessionMutation(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.output_streamer = MagicMock()
 
-        Scheduler._finish_empty_streaming_session_mutation(scheduler, req)
+        Scheduler._finish_streaming_session_without_forward(scheduler, req)
 
         self.assertTrue(finished)
         session.finish_req.assert_called_once_with(req)
@@ -408,6 +410,79 @@ class TestEmptyStreamingSessionMutation(CustomTestCase):
         time_stats.set_forward_entry_time.assert_called_once_with(timestamp)
         time_stats.set_prefill_finished_time.assert_called_once_with(timestamp)
         time_stats.set_completion_time.assert_called_once_with(timestamp)
+
+    def test_no_forward_predicate_preserves_zero_context_mutations(self) -> None:
+        req = SimpleNamespace(
+            session=SimpleNamespace(streaming=True),
+            sampling_params=SimpleNamespace(max_new_tokens=0),
+            origin_input_ids=[],
+            streaming_session_preburst_mutation=True,
+        )
+
+        self.assertTrue(
+            Scheduler._can_finish_streaming_session_without_forward(req)
+        )
+
+    def test_no_forward_predicate_rejects_real_model_work(self) -> None:
+        for max_new_tokens, preburst_mutation in ((1, False), (0, True)):
+            with self.subTest(
+                max_new_tokens=max_new_tokens,
+                preburst_mutation=preburst_mutation,
+            ):
+                req = SimpleNamespace(
+                    session=SimpleNamespace(streaming=True),
+                    sampling_params=SimpleNamespace(
+                        max_new_tokens=max_new_tokens
+                    ),
+                    origin_input_ids=[1, 2, 3],
+                    streaming_session_preburst_mutation=preburst_mutation,
+                )
+
+                self.assertFalse(
+                    Scheduler._can_finish_streaming_session_without_forward(req)
+                )
+
+    def test_bare_noop_preserves_cache_and_subsequent_continuation(self) -> None:
+        session = Session(
+            capacity_of_str_len=0,
+            session_id="session",
+            streaming=True,
+        )
+        seeded = session.create_req(
+            _tokenized_request("seed", [1, 2, 3], max_new_tokens=0),
+            tokenizer=None,
+            vocab_size=1024,
+        )
+        session.finish_req(seeded)
+        empty = session.create_req(
+            _tokenized_request("empty", [], max_new_tokens=0),
+            tokenizer=None,
+            vocab_size=1024,
+        )
+        empty.sampling_params.normalize(tokenizer=None)
+        tree_cache = MagicMock()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.output_streamer = MagicMock()
+
+        self.assertEqual(list(empty.origin_input_ids), [1, 2, 3])
+        self.assertFalse(empty.streaming_session_preburst_mutation)
+        self.assertTrue(
+            Scheduler._can_finish_streaming_session_without_forward(empty)
+        )
+
+        session.commit_prepared_req(empty, tree_cache)
+        Scheduler._finish_streaming_session_without_forward(scheduler, empty)
+
+        self.assertEqual(tree_cache.mock_calls, [])
+        self.assertEqual(session.current_tip(), 3)
+        self.assertEqual(session.last_rid, "empty")
+        continuation = session.create_req(
+            _tokenized_request("continuation", [4]),
+            tokenizer=None,
+            vocab_size=1024,
+        )
+        self.assertEqual(list(continuation.origin_input_ids), [1, 2, 3, 4])
+        session.abort_req(continuation)
 
 
 class TestStreamingSessionAdmission(CustomTestCase):

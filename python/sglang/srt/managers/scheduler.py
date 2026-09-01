@@ -2706,15 +2706,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if (
-            req.session is not None
-            and req.session.streaming
-            and len(req.origin_input_ids) == 0
-        ):
+        if self._can_finish_streaming_session_without_forward(req):
             if not self._set_or_validate_priority(req):
                 return
             req.session.commit_prepared_req(req, self.tree_cache)
-            self._finish_empty_streaming_session_mutation(req)
+            self._finish_streaming_session_without_forward(req)
             return
 
         self._enqueue_prepared_generate_request(req)
@@ -2767,13 +2763,31 @@ class Scheduler(
             return True
         return False
 
-    def _finish_empty_streaming_session_mutation(self, req: Req) -> None:
-        """Finish a mutation whose post-operation context has no model input.
+    @staticmethod
+    def _can_finish_streaming_session_without_forward(req: Req) -> bool:
+        """Return whether one prepared session turn has no model work.
 
-        :param req: Prepared streaming-session request with an empty context.
+        :param req: Validated request before scheduler admission.
+        :returns: Whether the turn can finish without cache or model ownership.
         """
-        assert req.session is not None and req.session.streaming
-        assert req.sampling_params.max_new_tokens == 0
+        if req.session is None or not req.session.streaming:
+            return False
+        if req.sampling_params.max_new_tokens != 0:
+            return False
+        return (
+            len(req.origin_input_ids) == 0
+            or not req.streaming_session_preburst_mutation
+        )
+
+    def _finish_streaming_session_without_forward(self, req: Req) -> None:
+        """Finish a validated session turn without cache or model ownership.
+
+        This covers mutations producing an empty context and bare empty appends
+        requesting zero generated tokens.
+
+        :param req: Prepared streaming-session request with no model work.
+        """
+        assert self._can_finish_streaming_session_without_forward(req)
         assert not req.is_holding_kv and req.kv.is_released
 
         now = time.perf_counter()
