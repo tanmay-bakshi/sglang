@@ -153,11 +153,11 @@ def free_mapped_swa_slots(
     full_slots = req_to_token_pool.req_to_token[req_pool_idx, start:end]
     kv_cache = token_to_kv_pool_allocator.get_kvcache()
     swa_slots = kv_cache.translate_loc_from_full_to_swa(full_slots)
-    if not bool((swa_slots > 0).all()):
-        raise AssertionError(
-            "Streaming-session SWA release crossed positions without live mappings: "
-            f"{start=} {end=}"
-        )
+    torch._assert_async(
+        (swa_slots > 0).all(),
+        "Streaming-session SWA release crossed positions without live mappings: "
+        f"{start=} {end=}",
+    )
     token_to_kv_pool_allocator.free_swa(full_slots)
 
 
@@ -175,13 +175,9 @@ def free_swa_out_of_window_slots(
     if not req.is_holding_kv or req.kv.is_released:
         return
 
-    streaming_session_floor = getattr(req, "streaming_session_floor", None)
+    streaming_session_floor = req.streaming_session_floor
     if streaming_session_floor is not None:
-        tree_protected_len = getattr(
-            req,
-            "streaming_session_tree_protected_len",
-            None,
-        )
+        tree_protected_len = req.streaming_session_tree_protected_len
         if tree_protected_len is None:
             tree_protected_len = req.cache_protected_len
         new_swa_evicted_seqlen, physical_free_start = (
