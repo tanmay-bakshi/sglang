@@ -222,7 +222,9 @@ class SWAComponent(TreeComponent):
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
                     return True
                 return False
-            state["len"] += len(node.key)
+            state["len"] += self.tree_core.component_logical_length(
+                node, ct, host=cd.value is None
+            )
             return state["len"] >= sliding_window_size
 
         return validator
@@ -250,8 +252,11 @@ class SWAComponent(TreeComponent):
                 # worth of pages, cap swa_host_hit at sliding_window_size
                 # here so the scheduler budget matches the actual device-pool
                 # consumption.
-                swa_host_hit += len(cd.host_value)
-                n_swa += len(cd.host_value)
+                logical_len = self.tree_core.component_logical_length(
+                    node, ct, host=True
+                )
+                swa_host_hit += logical_len
+                n_swa += logical_len
             else:
                 break
             node = node.parent
@@ -633,7 +638,9 @@ class SWAComponent(TreeComponent):
                 comp.host_lock_ref = ref + 1
             else:
                 comp.lock_ref = ref + 1
-            swa_lock_size += len(value)
+            swa_lock_size += self.tree_core.component_logical_length(
+                cur, ct, host=lock_host
+            )
             if swa_lock_size >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
                     comp.metadata[uuid_key] = next_component_uuid()
@@ -853,12 +860,14 @@ class SWAComponent(TreeComponent):
                 assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
-                    n_swa += len(cd.value)
+                    n_swa += self.tree_core.component_logical_length(
+                        cur, ct, host=False
+                    )
                 else:
                     # host only, collect it
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
-                    n_swa += len(cd.host_value)
+                    n_swa += self.tree_core.component_logical_length(cur, ct, host=True)
                 cur = cur.parent
 
             if not backed_up:
@@ -939,15 +948,21 @@ class SWAComponent(TreeComponent):
                 n = self.tree_core.node_by_id(nid)
                 cd_n = n.component_data[ct]
                 cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
-                n_tokens = len(cd_n.host_value)
-                swa_chunk = device_indices[offset : offset + n_tokens].clone()
+                physical_tokens = len(cd_n.host_value)
+                logical_tokens = self.tree_core.component_logical_length(
+                    n, ct, host=True
+                )
+                swa_chunk = device_indices[offset : offset + logical_tokens].clone()
                 self.tree_core.set_component_device_value(
                     n.id, self.component_type, swa_chunk
                 )
-                assert cd_full_n.value is not None and len(cd_full_n.value) == n_tokens
+                assert (
+                    cd_full_n.value is not None
+                    and len(cd_full_n.value) == logical_tokens
+                )
                 full_chunks.append(cd_full_n.value)
                 swa_chunks.append(swa_chunk)
-                offset += n_tokens
+                offset += physical_tokens
             assert offset == len(xfer.host_indices)
             # rebuild the mapping for the loaded SWA chunk, defer to orchestrator level
             if full_chunks:

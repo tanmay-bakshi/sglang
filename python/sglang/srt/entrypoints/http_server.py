@@ -122,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DemoteSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
@@ -2026,6 +2027,48 @@ async def list_sessions() -> ORJSONResponse:
                     for session in result.sessions
                 ],
             }
+        )
+    )
+
+
+@app.post("/demote_session")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def demote_session(
+    obj: Annotated[DemoteSessionReqInput, Body()], request: Request
+) -> ORJSONResponse:
+    """Move one idle streaming session's reusable KV to the host tier.
+
+    :param obj: Typed session-demotion request.
+    :param request: Incoming HTTP request carrying the fencing epoch.
+    :returns: Transaction result and the session's durable lineage coordinates.
+    """
+    try:
+        obj.epoch = _session_request_epoch(request)
+        result = await _global_state.tokenizer_manager.demote_session(obj, request)
+    except StreamingSessionStaleEpochError as error:
+        return _session_fencing_response(
+            ORJSONResponse(
+                content=_streaming_session_stale_epoch_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
+        )
+    except ValueError as error:
+        return _session_fencing_response(_create_error_response(error))
+
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.CONFLICT
+    return _session_fencing_response(
+        ORJSONResponse(
+            {
+                "session_id": result.session_id,
+                "success": result.success,
+                "tip": result.tip,
+                "lineage_digest": result.lineage_digest,
+                "lineage_generation": result.lineage_generation,
+                "host_backed_tokens": result.host_backed_tokens,
+                "error_type": result.error_type,
+                "message": result.message,
+            },
+            status_code=status_code,
         )
     )
 

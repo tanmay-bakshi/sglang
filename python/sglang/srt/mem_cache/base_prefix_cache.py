@@ -77,6 +77,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    trigger_backup: bool = True
 
 
 @dataclasses.dataclass
@@ -204,6 +205,7 @@ class LoadBackResult:
     :ivar queued_any_component: Whether an asynchronous component transfer was queued.
     :ivar full_tokens: Number of full-KV tokens restored by this operation.
     :ivar swa_tokens: Number of sliding-window tokens restored by this operation.
+    :ivar cache_protected_len: Exact restored prefix still owned by the radix tree.
     """
 
     new_full_device_indices: torch.Tensor
@@ -211,6 +213,7 @@ class LoadBackResult:
     queued_any_component: bool
     full_tokens: int
     swa_tokens: int
+    cache_protected_len: int | None = None
 
 
 class MatchResult(NamedTuple):
@@ -465,6 +468,88 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_streaming_session(self) -> bool:
         return False
+
+    def supports_streaming_session_demotion(self) -> bool:
+        """Return whether streaming sessions can become host-resident.
+
+        :returns: Whether transactional host demotion is available.
+        """
+        return False
+
+    def is_streaming_session_demoted(self, session_id: str) -> bool:
+        """Return whether one streaming session is host-resident.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Whether the session has a durable host frontier.
+        """
+        return False
+
+    def prepare_streaming_session_demotion(
+        self,
+        session_id: str,
+        token_ids: Sequence[int],
+        extra_key: str | None,
+        cache_salt: str | None,
+        priority: int,
+    ) -> int | None:
+        """Privately stage one session's host copy before a distributed vote.
+
+        :param session_id: Session identifier to stage.
+        :param token_ids: Complete committed token lineage.
+        :param extra_key: Radix cache classification key.
+        :param cache_salt: Radix cache namespace salt.
+        :param priority: Eviction priority inherited from the session.
+        :returns: Exact staged token count, or ``None`` on rejection.
+        """
+        return None
+
+    def discard_streaming_session_demotion(self, session_id: str) -> None:
+        """Discard one private host stage after a failed distributed vote.
+
+        :param session_id: Session identifier whose stage must be discarded.
+        """
+        return None
+
+    def commit_streaming_session_demotion(self, session_id: str) -> int:
+        """Publish one unanimously prepared host stage.
+
+        :param session_id: Session identifier whose stage must be committed.
+        :returns: Exact host-backed token count.
+        """
+        raise NotImplementedError()
+
+    def clear_radix_session_refs(self, session_id: str) -> int:
+        """Release cache coverage without closing the session generation.
+
+        :param session_id: Session identifier whose coverage must be released.
+        :returns: Number of component frontier tags removed.
+        """
+        return 0
+
+    def retire_streaming_session_private_path(self, session_id: str, node: Any) -> None:
+        """Retire one session-private exact suffix path.
+
+        :param session_id: Session identifier that owns the private path.
+        :param node: Exact host frontier, or an ordinary radix frontier.
+        """
+        return None
+
+    def streaming_session_private_parent(self, node: Any) -> Any | None:
+        """Return the ordinary radix parent of a private session path.
+
+        :param node: Exact host frontier, or an ordinary aligned frontier.
+        :returns: The ordinary parent, or ``None`` without a private suffix.
+        """
+        return None
+
+    def adopt_streaming_session_private_path(self, session_id: str, node: Any) -> int:
+        """Transfer a restored private suffix to a detached session slot.
+
+        :param session_id: Session identifier that owns the private path.
+        :param node: Exact restored frontier.
+        :returns: Logical private-suffix length, or zero without one.
+        """
+        return 0
 
     def release_session(self, session_id: str) -> None:
         pass

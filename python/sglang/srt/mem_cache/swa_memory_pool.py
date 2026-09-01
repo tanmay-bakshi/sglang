@@ -265,6 +265,9 @@ class SWAKVPool(BaseSWAKVPool):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
+        # A page-granular load also writes unused tail slots. Fence before a
+        # forward can extend a restored partial page through those same slots.
+        self._wait_for_layer(layer.layer_id)
         # loc_info bundles the full loc and the pre-translated SWA loc.
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
@@ -301,6 +304,7 @@ class SWAKVPool(BaseSWAKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        self._wait_for_layer(layer.layer_id)
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
         pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool

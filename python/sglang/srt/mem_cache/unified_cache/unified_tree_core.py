@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
+    RebuildFullToSWAMapping,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -90,6 +91,7 @@ logger = logging.getLogger(__name__)
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
 # the TP consistency check can still all_reduce [digest, -digest] in int64.
 _RECLAIM_DIGEST_MASK = (1 << 42) - 1
+_SESSION_PRIVATE_EDGE = object()
 
 
 class StorageBackupSpec(NamedTuple):
@@ -135,6 +137,11 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # A private edge preserves one streaming session's numerical KV
+        # realization. A partial-page node keeps its exact logical key while
+        # each attached pool value owns one complete physical page.
+        self.private_session_id: str | None = None
+        self.private_physical_length: int | None = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -151,6 +158,16 @@ class UnifiedTreeNode:
             self.parent is not None
             and self.component_data[ComponentType.FULL].value is None
         )
+
+    @property
+    def is_session_private(self) -> bool:
+        """Return whether this node belongs to one streaming session."""
+        return self.private_session_id is not None
+
+    @property
+    def is_session_fringe(self) -> bool:
+        """Return whether this node is an exact partial-page fringe."""
+        return self.private_physical_length is not None
 
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
@@ -495,6 +512,62 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    @staticmethod
+    def _session_private_edge(session_id: str) -> tuple[object, str]:
+        return (_SESSION_PRIVATE_EDGE, session_id)
+
+    def _child_edge_key(self, node: UnifiedTreeNode) -> Any:
+        if node.private_session_id is not None:
+            return self._session_private_edge(node.private_session_id)
+        assert node.key is not None
+        return node.key.child_key(self.page_size)
+
+    def component_logical_length(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        *,
+        host: bool,
+    ) -> int:
+        """Return logical tokens represented by one component allocation.
+
+        :param node: Tree node carrying the component value.
+        :param component_type: Component whose allocation is inspected.
+        :param host: Whether to inspect the host rather than device allocation.
+        :returns: Exact logical token count.
+        """
+        component_data = node.component_data[component_type]
+        value = component_data.host_value if host else component_data.value
+        if value is None:
+            return 0
+        if node.is_session_fringe:
+            assert node.key is not None
+            return len(node.key)
+        return len(value)
+
+    def is_session_private(self, node_id: NodeId) -> bool:
+        """Return whether a node belongs to one streaming session."""
+        return self.node_by_id(node_id).is_session_private
+
+    def streaming_session_private_parent(self, node_id: NodeId) -> NodeId:
+        """Return the ordinary radix parent of a private session path."""
+        node = self.node_by_id(node_id)
+        assert node.is_session_private
+        while node.is_session_private:
+            assert node.parent is not None
+            node = node.parent
+        return node.id
+
+    def streaming_session_private_length(self, node_id: NodeId) -> int:
+        """Return the logical token count on a private session path."""
+        node = self.node_by_id(node_id)
+        private_length = 0
+        while node.is_session_private:
+            assert node.key is not None and node.parent is not None
+            private_length += len(node.key)
+            node = node.parent
+        return private_length
+
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
@@ -643,8 +716,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if len(key) == 0:
             return self._empty_match_result
-        key = key.page_aligned(self.page_size)
-        if len(key) == 0:
+        exact_key = key
+        aligned_key = key.page_aligned(self.page_size)
+        session_id = self._streaming_session_id(params)
+        if len(aligned_key) == 0 and session_id is None:
             return self._empty_match_result
 
         (
@@ -654,7 +729,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(
+            aligned_key,
+            exact_key=exact_key,
+            session_id=session_id,
+        )
         return self._match_post_processor(
             params,
             value,
@@ -665,7 +744,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    @staticmethod
+    def _streaming_session_id(params: MatchPrefixParams) -> str | None:
+        req = params.req
+        if req is None or req.session is None or not req.session.streaming:
+            return None
+        return req.session.session_id
+
+    def _matching_session_private_child(
+        self,
+        parent: UnifiedTreeNode,
+        exact_key: RadixKey,
+        session_id: str | None,
+        prefix_len: int,
+    ) -> UnifiedTreeNode | None:
+        if session_id is None:
+            return None
+        child = parent.children.get(self._session_private_edge(session_id))
+        if child is None:
+            return None
+        child_len = len(child.key)
+        child_end = prefix_len + child_len
+        if child_end > len(exact_key):
+            return None
+        suffix = exact_key[prefix_len:child_end]
+        if child.key.match(suffix) != child_len:
+            return None
+        return child
+
+    def _match_prefix_helper(
+        self,
+        key: RadixKey,
+        *,
+        exact_key: RadixKey | None = None,
+        session_id: str | None = None,
+    ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -678,7 +791,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        child_key = key.child_key(self.page_size) if len(key) > 0 else None
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -719,6 +832,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
+        def _accept_session_private_path() -> bool:
+            nonlocal node
+            nonlocal best_match_node
+            nonlocal best_match_device_node, best_match_device_value_len
+            nonlocal full_kv_hit_length
+            if exact_key is None:
+                return False
+            accepted = False
+            while True:
+                child = self._matching_session_private_child(
+                    node,
+                    exact_key,
+                    session_id,
+                    full_kv_hit_length,
+                )
+                if child is None:
+                    return accepted
+                full_value = child.component_data[BASE_COMPONENT_TYPE].value
+                if full_value is not None:
+                    value.append(full_value)
+                full_kv_hit_length += len(child.key)
+                node = child
+                _update_best_if_valid(node)
+                accepted = True
+
+        if _accept_session_private_path():
+            return (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+                full_kv_hit_length,
+                action,
+            )
+
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
@@ -740,6 +888,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
+            if _accept_session_private_path():
+                break
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -786,6 +936,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_indices = torch.cat(value[:best_match_device_value_len])
         else:
             device_indices = self._empty_match_result.device_indices
+        cache_protected_len = None
+        if best_match_node.is_session_private:
+            cache_protected_len = full_kv_hit_length
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=best_match_device_node,
@@ -793,6 +946,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            cache_protected_len=cache_protected_len,
         )
 
         for component in self.components:
@@ -998,7 +1152,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKV([value_slice[dup_start:consumed_from]])
                 )
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        if state.params.trigger_backup and self._inc_hit_count_and_check(
+            node, state.params.chunked
+        ):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1046,9 +1202,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if not state.params.trigger_backup:
+            return False
         if state.is_new_leaf:
             return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+                state.target_node,
+                state.params.chunked,
             )
 
         node = state.target_node
@@ -1078,6 +1237,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> tuple[UnifiedTreeNode, Optional[CacheAction | ComponentAction]]:
+        if child.is_session_private:
+            raise AssertionError(
+                "Session-private paths must be created at their physical boundaries."
+            )
         new_node = self._new_node(priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -1149,6 +1312,132 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.kv_events.record_store(new_node)
         return new_node
 
+    def add_streaming_session_private_node(
+        self,
+        parent_id: NodeId,
+        session_id: str,
+        key: RadixKey,
+        priority: int,
+        *,
+        is_fringe: bool,
+    ) -> NodeId:
+        """Attach one node preserving a session's exact KV realization.
+
+        :param parent_id: Ordinary radix anchor or preceding private node.
+        :param session_id: Sole session allowed to match the node.
+        :param key: Exact token identity represented by the node.
+        :param priority: Session eviction priority.
+        :param is_fringe: Whether the node owns one physical partial page.
+        :returns: Newly attached private node identifier.
+        """
+        if len(key) <= 0:
+            raise ValueError("A streaming-session private node cannot be empty.")
+        if is_fringe:
+            if len(key) >= self.page_size:
+                raise ValueError("A streaming-session fringe must be one partial page.")
+        elif len(key) % self.page_size != 0:
+            raise ValueError(
+                "A streaming-session aligned private node must contain whole pages."
+            )
+        parent = self.node_by_id(parent_id)
+        if (
+            parent.private_session_id is not None
+            and parent.private_session_id != session_id
+        ):
+            raise RuntimeError(
+                f"Session {session_id} cannot extend private path owned by "
+                f"{parent.private_session_id}."
+            )
+        edge = self._session_private_edge(session_id)
+        if edge in parent.children:
+            raise RuntimeError(f"Session {session_id} already has a private child.")
+        node = self._new_node(priority=priority)
+        node.parent = parent
+        node.key = key
+        node.private_session_id = session_id
+        if is_fringe:
+            node.private_physical_length = self.page_size
+        parent.children[edge] = node
+        self._update_evictable_leaf_sets(node)
+        self._update_evictable_leaf_sets(parent)
+        return node.id
+
+    def _streaming_session_private_nodes(
+        self, session_id: str, node_id: NodeId
+    ) -> list[UnifiedTreeNode]:
+        """Return one private path in root order, excluding its ordinary anchor."""
+        node = self.node_by_id(node_id)
+        nodes: list[UnifiedTreeNode] = []
+        while node.is_session_private:
+            if node.private_session_id != session_id:
+                raise RuntimeError(
+                    f"Session {session_id} cannot own private node {node.id} "
+                    f"belonging to {node.private_session_id}."
+                )
+            nodes.append(node)
+            assert node.parent is not None
+            node = node.parent
+        nodes.reverse()
+        return nodes
+
+    def _detach_streaming_session_private_path(
+        self, session_id: str, node_id: NodeId
+    ) -> DemoteResult:
+        """Release and unregister every node on one private session path."""
+        result = DemoteResult()
+        nodes = self._streaming_session_private_nodes(session_id, node_id)
+        if len(nodes) == 0:
+            return result
+        for node in nodes:
+            if any(
+                component_data.lock_ref > 0 or component_data.host_lock_ref > 0
+                for component_data in node.component_data
+            ):
+                raise RuntimeError(f"Session-private node {node.id} is still locked.")
+        for node in reversed(nodes):
+            if len(node.children) > 0:
+                raise RuntimeError(
+                    f"Session-private node {node.id} still has attached children."
+                )
+            for component in self.components:
+                if component.node_has_component_data(node, target=EvictLayer.DEVICE):
+                    self._evict_component_and_detach_lru(
+                        node,
+                        component,
+                        target=EvictLayer.DEVICE,
+                        tracker=result.tracker,
+                        device_frees=result.device_frees,
+                        host_frees=result.host_frees,
+                    )
+                if component.node_has_component_data(node, target=EvictLayer.HOST):
+                    self._evict_component_and_detach_lru(
+                        node,
+                        component,
+                        target=EvictLayer.HOST,
+                        tracker=result.tracker,
+                        device_frees=result.device_frees,
+                        host_frees=result.host_frees,
+                    )
+            parent = node.parent
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            self._remove_leaf_from_parent(node)
+            assert parent is not None
+            self._update_evictable_leaf_sets(parent)
+        return result
+
+    def adopt_streaming_session_private_path(
+        self, session_id: str, node_id: NodeId
+    ) -> DemoteResult:
+        """Transfer a restored private path out of tree ownership."""
+        return self._detach_streaming_session_private_path(session_id, node_id)
+
+    def retire_streaming_session_private_path(
+        self, session_id: str, node_id: NodeId
+    ) -> DemoteResult:
+        """Release one host-resident private path after session ownership ends."""
+        return self._detach_streaming_session_private_path(session_id, node_id)
+
     def _unevict_node_on_insert(
         self, node: UnifiedTreeNode, fresh_value: torch.Tensor
     ) -> None:
@@ -1193,6 +1482,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[BASE_COMPONENT_TYPE]
         return (
             node is not self.root_node
+            and not node.is_session_private
             and cd.value is not None
             and cd.host_value is not None
             and node.write_through_pending_id is None
@@ -1619,7 +1909,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
-        key = node.key.child_key(self.page_size)
+        key = self._child_edge_key(node)
         v = node.parent.children.pop(key, None)
         assert v == node
         # Deleted nodes must not linger in duplicate tracking as ghosts.
@@ -2018,6 +2308,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         assert not cache_actions  # BACKUP_HOST emits no actions
 
+    def _partial_page_device_chunks_by_node(
+        self,
+        transfer: PoolTransfer,
+        component_type: ComponentType,
+    ) -> dict[NodeId, torch.Tensor]:
+        """Return physical device pages loaded for exact partial-page nodes.
+
+        :param transfer: Completed host-to-device pool transfer.
+        :param component_type: Tree component represented by the transfer.
+        :returns: Physical device chunks keyed by fringe node identifier.
+        """
+        if transfer.device_indices is None:
+            return {}
+        chunks: dict[NodeId, torch.Tensor] = {}
+        offset = 0
+        for node_id in transfer.nodes_to_load or ():
+            node = self.node_by_id(node_id)
+            host_value = node.component_data[component_type].host_value
+            if host_value is None:
+                raise AssertionError(
+                    f"Load-back node {node_id} has no {component_type} host value."
+                )
+            physical_len = len(host_value)
+            if node.is_session_fringe:
+                chunks[node_id] = transfer.device_indices[
+                    offset : offset + physical_len
+                ]
+            offset += physical_len
+        if offset != len(transfer.device_indices):
+            raise AssertionError(
+                f"Load-back {component_type} transfer length mismatch: "
+                f"{offset=} device_slots={len(transfer.device_indices)}"
+            )
+        return chunks
+
     def commit_load_back(
         self,
         node_id: NodeId,
@@ -2041,6 +2366,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
                 pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
+        fringe_full_chunks = self._partial_page_device_chunks_by_node(
+            kv_xfer, BASE_COMPONENT_TYPE
+        )
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
             CacheTransferPhase.LOAD_BACK,
@@ -2048,13 +2376,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=cache_actions,
         )
         for nid in kv_xfer.nodes_to_load or ():
-            self.kv_events.record_store(self.node_by_id(nid), medium=StorageMedium.GPU)
+            loaded_node = self.node_by_id(nid)
+            if not loaded_node.is_session_private:
+                self.kv_events.record_store(loaded_node, medium=StorageMedium.GPU)
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,
                 CacheTransferPhase.LOAD_BACK,
                 xfers,
                 cache_actions=cache_actions,
+            )
+        full_mapping_chunks: list[torch.Tensor] = []
+        swa_mapping_chunks: list[torch.Tensor] = []
+        for transfer in comp_xfers.get(ComponentType.SWA, ()):
+            for fringe_id, swa_chunk in self._partial_page_device_chunks_by_node(
+                transfer, ComponentType.SWA
+            ).items():
+                full_chunk = fringe_full_chunks.get(fringe_id)
+                if full_chunk is None:
+                    continue
+                if len(full_chunk) != len(swa_chunk):
+                    raise AssertionError(
+                        f"Fringe {fringe_id} Full/SWA page sizes disagree."
+                    )
+                full_mapping_chunks.append(full_chunk)
+                swa_mapping_chunks.append(swa_chunk)
+        if len(full_mapping_chunks) > 0:
+            cache_actions.append(
+                RebuildFullToSWAMapping(full_mapping_chunks, swa_mapping_chunks)
             )
         self._update_evictable_leaf_sets(node)
         return cache_actions
@@ -2091,6 +2440,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
+            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+
+    def finish_synchronous_backup(self, node_id: NodeId) -> None:
+        """Publish bookkeeping for a host copy completed before tree attachment."""
+        node = self.node_by_id(node_id)
+        self._update_duplicate_tracking(node)
+        self._update_evictable_leaf_sets(node)
+        if node.parent is not None:
+            self._update_evictable_leaf_sets(node.parent)
+        if not node.is_session_private:
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(
@@ -2148,12 +2507,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             E("[Root] root has a parent pointer")
         # Parent ↔ child bidirectional consistency
         for node in all_nodes:
-            for child in node.children.values():
+            for edge, child in node.children.items():
                 if child.parent is not node:
                     pid = child.parent.id if child.parent else None
                     E(f"[Tree] child {child.id} parent={pid}, expected {node.id}")
                 if child.key is None:
                     E(f"[Tree] node {child.id} has no key")
+                    continue
+                if edge != self._child_edge_key(child):
+                    E(f"[Tree] child {child.id} is registered on the wrong edge")
+                if node.is_session_private and (
+                    not child.is_session_private
+                    or child.private_session_id != node.private_session_id
+                ):
+                    E(
+                        f"[Tree] private node {node.id} has non-lineage child "
+                        f"{child.id}"
+                    )
 
         # ── PART 2: Per-node state machine and leaf qualification ──
         expected_dev_leaves: set[UnifiedTreeNode] = set()
@@ -2166,6 +2536,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             nid = node.id
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
+
+            if node.is_session_private:
+                if node.is_session_fringe:
+                    if len(node.key) >= self.page_size:
+                        E(f"node {nid} fringe key spans a complete page")
+                    if len(node.children) > 0:
+                        E(f"node {nid} fringe has descendants")
+                    for ct in self.component_types:
+                        host_value = node.component_data[ct].host_value
+                        if host_value is not None and len(host_value) != self.page_size:
+                            E(
+                                f"node {nid} {ct} fringe host length="
+                                f"{len(host_value)}, expected {self.page_size}"
+                            )
+                elif len(node.key) % self.page_size != 0:
+                    E(f"node {nid} private aligned key is not page-aligned")
 
             # Full is the tree backbone, so aux data requires Full data.
             for ct in self.component_types:

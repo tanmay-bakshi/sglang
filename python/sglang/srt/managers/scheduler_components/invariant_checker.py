@@ -256,16 +256,19 @@ class SchedulerInvariantChecker:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
+                physical_cache_protected_len = req.cache_protected_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+                    physical_cache_protected_len = ceil_align(
+                        req.cache_protected_len, self.page_size
+                    )
 
-                full_uncached += max(0, allocated_len - req.cache_protected_len)
+                full_uncached += max(0, allocated_len - physical_cache_protected_len)
                 if self.is_hybrid_swa:
                     swa_uncached += max(
                         0,
                         allocated_len
-                        - max(req.cache_protected_len, req.kv.swa_evicted_seqlen),
+                        - max(physical_cache_protected_len, req.kv.swa_evicted_seqlen),
                     )
 
                 if req.beam_group is not None:

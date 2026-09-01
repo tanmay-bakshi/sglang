@@ -15,11 +15,13 @@
 
 import dataclasses
 import faulthandler
+import hashlib
 import logging
 import os
 import signal
 import sys
 import time
+import traceback
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -126,6 +128,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DemoteSessionReqInput,
+    DemoteSessionReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -309,12 +313,17 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    STREAMING_SESSION_DEMOTION_ERROR_TYPE,
     STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+    StreamingSessionDemotionError,
     StreamingSessionInfoUnavailableError,
     StreamingSessionStaleEpochError,
 )
 from sglang.srt.session.fencing import SessionFencingRegister
-from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.session_controller import (
+    SessionController,
+    StreamingSessionDemotionContext,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
@@ -427,6 +436,37 @@ def _is_streaming_session_output_rank(ps: ParallelState) -> bool:
         and ps.attn_tp_rank == 0
         and ps.attn_cp_rank == 0
     )
+
+
+def _streaming_session_demotion_identity(
+    context: StreamingSessionDemotionContext | None,
+) -> int:
+    """Return a stable TP-vote identity for lineage and cache namespace.
+
+    :param context: Rank-local validated demotion context.
+    :returns: Non-negative signed-int64-safe identity, or zero without context.
+    """
+    if context is None:
+        return 0
+    digest = hashlib.sha256()
+    fields: tuple[str | int | None, ...] = (
+        context.session_id,
+        context.tip,
+        context.lineage_digest,
+        context.lineage_generation,
+        context.extra_key,
+        context.cache_salt,
+    )
+    for field in fields:
+        if field is None:
+            encoded = b""
+            digest.update(b"n")
+        else:
+            encoded = str(field).encode("utf-8")
+            digest.update(b"v")
+        digest.update(len(encoded).to_bytes(8, byteorder="big"))
+        digest.update(encoded)
+    return int.from_bytes(digest.digest()[:8], byteorder="big") & ((1 << 62) - 1)
 
 
 def _accumulate_decode_moment(
@@ -1686,6 +1726,7 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (GetSessionInfoReqInput, self.get_session_info),
                 (ListSessionsReqInput, self.list_sessions),
+                (DemoteSessionReqInput, self.demote_session),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -5629,6 +5670,148 @@ class Scheduler(
         return ListSessionsReqOutput(
             correlation_id=recv_req.correlation_id,
             sessions=sessions,
+        )
+
+    def demote_session(
+        self, recv_req: DemoteSessionReqInput
+    ) -> DemoteSessionReqOutput | None:
+        """Stage, vote, and atomically publish one host-resident session.
+
+        :param recv_req: Fenced administrative demotion request.
+        :returns: Transaction result from the designated response rank.
+        """
+        correlation_id = recv_req.correlation_id or ""
+        session = self.session_controller.get(recv_req.session_id)
+        tip = 0
+        lineage_digest: str | None = None
+        lineage_generation = 0
+        if session is not None and session.streaming:
+            tip = session.current_tip()
+            lineage_digest = session.current_digest()
+            lineage_generation = session.lineage_generation
+
+        local_error_type: str | None = None
+        local_error_message: str | None = None
+        stale_error: StreamingSessionStaleEpochError | None = None
+        context: StreamingSessionDemotionContext | None = None
+        try:
+            self.session_fencing_register.validate(
+                recv_req.epoch,
+                lineage_generation=lineage_generation,
+                observed_tip=tip,
+            )
+            context = self.session_controller.demotion_context(recv_req.session_id)
+        except StreamingSessionStaleEpochError as error:
+            stale_error = error
+            local_error_type = STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE
+            local_error_message = str(error)
+        except StreamingSessionDemotionError as error:
+            local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
+            local_error_message = str(error)
+
+        mode = 0
+        host_backed_tokens = 0
+        staged = False
+        if context is not None and context.already_demoted:
+            mode = 1
+            host_backed_tokens = self.tree_cache.streaming_session_cache_snapshot(
+                recv_req.session_id
+            ).protected
+        elif context is not None:
+            try:
+                prepared_tokens = self.tree_cache.prepare_streaming_session_demotion(
+                    recv_req.session_id,
+                    context.token_ids,
+                    context.extra_key,
+                    context.cache_salt,
+                    context.priority,
+                )
+                if prepared_tokens is not None:
+                    mode = 2
+                    host_backed_tokens = prepared_tokens
+                    staged = True
+                else:
+                    local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
+                    local_error_message = (
+                        "Session KV has no committed frontier or the host tier "
+                        "could not reserve the transaction."
+                    )
+            except Exception:
+                logger.error(
+                    "Session demotion staging failed on this rank:\n%s",
+                    traceback.format_exc(),
+                )
+                local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
+                local_error_message = "Session host staging failed on this rank."
+
+        identity = _streaming_session_demotion_identity(context)
+        vote = torch.tensor(
+            [
+                int(local_error_type is None),
+                mode,
+                -mode,
+                host_backed_tokens,
+                -host_backed_tokens,
+                identity,
+                -identity,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        if self.ps.tp_size > 1:
+            torch.distributed.all_reduce(
+                vote,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+        vote_values = [int(value) for value in vote.tolist()]
+        unanimous = (
+            vote_values[0] == 1
+            and vote_values[1] == -vote_values[2]
+            and vote_values[3] == -vote_values[4]
+            and vote_values[5] == -vote_values[6]
+        )
+        if not unanimous:
+            if staged:
+                self.tree_cache.discard_streaming_session_demotion(recv_req.session_id)
+            if local_error_type is None:
+                local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
+                local_error_message = (
+                    "Session demotion did not prepare identically on every "
+                    "tensor-parallel rank."
+                )
+        elif mode == 2:
+            host_backed_tokens = self.tree_cache.commit_streaming_session_demotion(
+                recv_req.session_id
+            )
+
+        if not _is_streaming_session_output_rank(self.ps):
+            return None
+        request_epoch = 0 if recv_req.epoch is None else recv_req.epoch
+        registered = self.session_fencing_register.state
+        return DemoteSessionReqOutput(
+            correlation_id=correlation_id,
+            session_id=recv_req.session_id,
+            success=unanimous,
+            tip=tip,
+            lineage_digest=lineage_digest,
+            lineage_generation=lineage_generation,
+            host_backed_tokens=host_backed_tokens if unanimous else 0,
+            error_type=None if unanimous else local_error_type,
+            message=None if unanimous else local_error_message,
+            request_epoch=(
+                stale_error.request_epoch if stale_error is not None else request_epoch
+            ),
+            registered_epoch=(
+                stale_error.registered_epoch
+                if stale_error is not None
+                else registered.epoch
+            ),
+            cluster_incarnation=(
+                stale_error.cluster_incarnation
+                if stale_error is not None
+                else registered.cluster_incarnation
+            ),
         )
 
     def _record_streaming_session_idempotency_conflict(self, req: Req) -> None:

@@ -2303,6 +2303,50 @@ class ListSessionsReqOutput(BaseReq, kw_only=True):
     sessions: list[SessionInventoryOutput]
 
 
+class DemoteSessionReqInput(BaseReq, kw_only=True):
+    """Administrative request to move one open streaming session to host KV.
+
+    :ivar session_id: Public session identifier.
+    :ivar epoch: Optional fencing epoch supplied by the caller.
+    :ivar correlation_id: Internal frontend waiter identity.
+    """
+
+    session_id: str
+    epoch: int | None = None
+    correlation_id: str | None = None
+
+
+class DemoteSessionReqOutput(BaseReq, kw_only=True):
+    """Tensor-parallel transaction result for one session demotion.
+
+    :ivar correlation_id: Internal frontend waiter identity.
+    :ivar session_id: Public session identifier.
+    :ivar success: Whether every tensor-parallel rank committed.
+    :ivar tip: Absolute durable token offset observed by the scheduler.
+    :ivar lineage_digest: Canonical digest of the durable token history.
+    :ivar lineage_generation: Generation incremented by history rewrites.
+    :ivar host_backed_tokens: Exact token count published to the host tier.
+    :ivar error_type: Stable typed failure category.
+    :ivar message: Human-readable failure detail.
+    :ivar request_epoch: Effective epoch carried by the request.
+    :ivar registered_epoch: Scheduler fencing epoch at rejection time.
+    :ivar cluster_incarnation: Scheduler fencing incarnation at rejection time.
+    """
+
+    correlation_id: str
+    session_id: str
+    success: bool
+    tip: int
+    lineage_digest: str | None
+    lineage_generation: int
+    host_backed_tokens: int = 0
+    error_type: str | None = None
+    message: str | None = None
+    request_epoch: int = 0
+    registered_epoch: int = 0
+    cluster_incarnation: int = 0
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

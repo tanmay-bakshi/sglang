@@ -22,6 +22,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
     CloseSessionReqOutput,
+    DemoteSessionReqInput,
+    DemoteSessionReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -993,6 +995,41 @@ class TokenizerControlMixin:
             return await future
         finally:
             self.list_sessions_futures.pop(correlation_id, None)
+
+    async def demote_session(
+        self: TokenizerManager,
+        obj: DemoteSessionReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> DemoteSessionReqOutput:
+        """Run one fenced, tensor-parallel streaming-session demotion.
+
+        :param obj: Typed administrative demotion request.
+        :param request: Originating HTTP request, when present.
+        :returns: Scheduler-owned transactional result.
+        """
+        self.auto_create_handle_loop()
+        async with self.session_fencing_dispatch_lock:
+            self.session_fencing_register.validate(obj.epoch)
+            correlation_id = uuid.uuid4().hex
+            obj.correlation_id = correlation_id
+            future: asyncio.Future[DemoteSessionReqOutput] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self.demote_session_futures[correlation_id] = future
+            try:
+                await self._async_dispatch_to_scheduler(obj)
+                result = await future
+                if result.error_type == STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE:
+                    raise StreamingSessionStaleEpochError(
+                        request_epoch=result.request_epoch,
+                        registered_epoch=result.registered_epoch,
+                        cluster_incarnation=result.cluster_incarnation,
+                        lineage_generation=result.lineage_generation,
+                        observed_tip=result.tip,
+                    )
+                return result
+            finally:
+                self.demote_session_futures.pop(correlation_id, None)
 
     async def close_session(
         self: TokenizerManager,

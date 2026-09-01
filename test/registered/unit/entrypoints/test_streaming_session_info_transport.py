@@ -5,6 +5,8 @@ import unittest
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import (
+    DemoteSessionReqInput,
+    DemoteSessionReqOutput,
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     GetSessionInfoReqOutput,
@@ -133,6 +135,36 @@ class _InventoryTokenizerManager:
         :returns: Configured session inventory.
         """
         return _list_sessions_output("internal-correlation")
+
+
+class _DemotionTokenizerManager:
+    """Minimal tokenizer manager for the demotion HTTP endpoint."""
+
+    response: DemoteSessionReqOutput
+    requested: DemoteSessionReqInput | None
+
+    def __init__(self, response: DemoteSessionReqOutput) -> None:
+        """Initialize the deterministic manager.
+
+        :param response: Transaction result returned by every request.
+        """
+        self.response = response
+        self.requested = None
+        self.session_fencing_register = SessionFencingRegister()
+
+    async def demote_session(
+        self,
+        obj: DemoteSessionReqInput,
+        request: object,
+    ) -> DemoteSessionReqOutput:
+        """Return the configured transaction result.
+
+        :param obj: Typed public request.
+        :param request: Originating HTTP request.
+        :returns: Configured scheduler response.
+        """
+        self.requested = obj
+        return self.response
 
 
 class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
@@ -312,6 +344,186 @@ class StreamingSessionInfoTransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decoded_error, error)
         self.assertIs(type(decoded_error.correlation_id), str)
         self.assertIs(type(decoded_error.message), str)
+
+
+class StreamingSessionDemotionTransportTest(unittest.IsolatedAsyncioTestCase):
+    """Typed correlated transport for the administrative demotion operation."""
+
+    async def test_http_success_exposes_lineage_and_forwards_epoch(self) -> None:
+        output = DemoteSessionReqOutput(
+            correlation_id="internal-correlation",
+            session_id="session-a",
+            success=True,
+            tip=129,
+            lineage_digest="sha256:v1:digest-129",
+            lineage_generation=3,
+            host_backed_tokens=129,
+        )
+        manager = _DemotionTokenizerManager(output)
+        manager.session_fencing_register.install(7, 19)
+        request = types.SimpleNamespace(headers={FENCING_EPOCH_HEADER: "7"})
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(types.SimpleNamespace(tokenizer_manager=manager))
+        try:
+            response = await http_server.demote_session(
+                DemoteSessionReqInput(session_id="session-a"),
+                request,
+            )
+        finally:
+            http_server.set_global_state(prior_state)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers[FENCING_EPOCH_HEADER], "7")
+        self.assertEqual(response.headers[CLUSTER_INCARNATION_HEADER], "19")
+        self.assertIsNotNone(manager.requested)
+        self.assertEqual(manager.requested.epoch, 7)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "session_id": "session-a",
+                "success": True,
+                "tip": 129,
+                "lineage_digest": "sha256:v1:digest-129",
+                "lineage_generation": 3,
+                "host_backed_tokens": 129,
+                "error_type": None,
+                "message": None,
+            },
+        )
+
+    async def test_http_rejection_is_a_typed_conflict(self) -> None:
+        output = DemoteSessionReqOutput(
+            correlation_id="internal-correlation",
+            session_id="session-a",
+            success=False,
+            tip=129,
+            lineage_digest="sha256:v1:digest-129",
+            lineage_generation=3,
+            error_type="StreamingSessionDemotionError",
+            message="host tier full",
+        )
+        manager = _DemotionTokenizerManager(output)
+        request = types.SimpleNamespace(headers={})
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(types.SimpleNamespace(tokenizer_manager=manager))
+        try:
+            response = await http_server.demote_session(
+                DemoteSessionReqInput(session_id="session-a"),
+                request,
+            )
+        finally:
+            http_server.set_global_state(prior_state)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "session_id": "session-a",
+                "success": False,
+                "tip": 129,
+                "lineage_digest": "sha256:v1:digest-129",
+                "lineage_generation": 3,
+                "host_backed_tokens": 0,
+                "error_type": "StreamingSessionDemotionError",
+                "message": "host tier full",
+            },
+        )
+
+    async def test_http_invalid_epoch_is_rejected_before_dispatch(self) -> None:
+        output = DemoteSessionReqOutput(
+            correlation_id="internal-correlation",
+            session_id="session-a",
+            success=True,
+            tip=129,
+            lineage_digest="sha256:v1:digest-129",
+            lineage_generation=3,
+        )
+        manager = _DemotionTokenizerManager(output)
+        request = types.SimpleNamespace(headers={FENCING_EPOCH_HEADER: "invalid"})
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(types.SimpleNamespace(tokenizer_manager=manager))
+        try:
+            response = await http_server.demote_session(
+                DemoteSessionReqInput(session_id="session-a"),
+                request,
+            )
+        finally:
+            http_server.set_global_state(prior_state)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(manager.requested)
+
+    async def test_waiter_completes_with_exact_scheduler_result(self) -> None:
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.demote_session_futures = {}
+        manager.session_fencing_register = SessionFencingRegister()
+        manager.session_fencing_dispatch_lock = asyncio.Lock()
+        manager.auto_create_handle_loop = lambda: None
+        dispatched: list[DemoteSessionReqInput] = []
+
+        async def dispatch(request: DemoteSessionReqInput) -> None:
+            dispatched.append(request)
+
+        manager._async_dispatch_to_scheduler = dispatch
+        task = asyncio.create_task(
+            manager.demote_session(DemoteSessionReqInput(session_id="session-a"))
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(len(dispatched), 1)
+        correlation_id = dispatched[0].correlation_id
+        self.assertIsNotNone(correlation_id)
+
+        manager._handle_demote_session_req_output(
+            DemoteSessionReqOutput(
+                correlation_id=correlation_id,
+                session_id="session-a",
+                success=True,
+                tip=128,
+                lineage_digest="sha256:v1:digest-128",
+                lineage_generation=3,
+                host_backed_tokens=128,
+            )
+        )
+
+        result = await task
+        self.assertTrue(result.success)
+        self.assertEqual(result.tip, 128)
+        self.assertEqual(result.lineage_digest, "sha256:v1:digest-128")
+        self.assertEqual(result.lineage_generation, 3)
+        self.assertEqual(result.host_backed_tokens, 128)
+        self.assertEqual(manager.demote_session_futures, {})
+
+    async def test_ipc_round_trip_preserves_typed_error_fields(self) -> None:
+        request = DemoteSessionReqInput(
+            session_id="session-a",
+            epoch=7,
+            correlation_id="correlation-a",
+        )
+        output = DemoteSessionReqOutput(
+            correlation_id="correlation-a",
+            session_id="session-a",
+            success=False,
+            tip=128,
+            lineage_digest="sha256:v1:digest-128",
+            lineage_generation=3,
+            error_type="StreamingSessionDemotionError",
+            message="host tier full",
+            request_epoch=7,
+            registered_epoch=7,
+            cluster_incarnation=19,
+        )
+
+        decoded_request = msgpack_decode(msgpack_encode(request))
+        decoded_output = msgpack_decode(msgpack_encode(output))
+
+        self.assertIs(type(decoded_request), DemoteSessionReqInput)
+        self.assertEqual(decoded_request, request)
+        self.assertIs(type(decoded_output), DemoteSessionReqOutput)
+        self.assertEqual(decoded_output, output)
+        self.assertIs(type(decoded_output.success), bool)
+        self.assertIs(type(decoded_output.tip), int)
+        self.assertIs(type(decoded_output.lineage_digest), str)
+        self.assertIs(type(decoded_output.error_type), str)
 
 
 class StreamingSessionInventoryTransportTest(unittest.IsolatedAsyncioTestCase):

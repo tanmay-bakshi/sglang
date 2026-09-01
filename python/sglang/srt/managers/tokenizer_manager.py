@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DemoteSessionReqOutput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FreezeGCReq,
@@ -614,8 +615,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.session_info_futures: dict[
             str, asyncio.Future[GetSessionInfoReqOutput | GetSessionInfoReqErrorOutput]
         ] = {}
-        self.list_sessions_futures: dict[
-            str, asyncio.Future[ListSessionsReqOutput]
+        self.list_sessions_futures: dict[str, asyncio.Future[ListSessionsReqOutput]] = (
+            {}
+        )
+        self.demote_session_futures: dict[
+            str, asyncio.Future[DemoteSessionReqOutput]
         ] = {}
         self.session_event_journal = SessionEventJournal(
             self.server_args.streaming_session_journal_size
@@ -794,6 +798,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 (GetSessionInfoReqOutput, self._handle_get_session_info_req_output),
                 (ListSessionsReqOutput, self._handle_list_sessions_req_output),
+                (DemoteSessionReqOutput, self._handle_demote_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -2223,6 +2228,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             already terminalized this generation.
         :returns: Deferred disconnect cleanup.
         """
+
         # Abort the request if the client is disconnected.
         async def abort_request() -> None:
             if terminal_completion is not None and terminal_completion.is_set():
@@ -3455,9 +3461,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not future.done():
             future.set_result(recv_obj)
 
-    def _handle_list_sessions_req_output(
-        self, recv_obj: ListSessionsReqOutput
-    ) -> None:
+    def _handle_list_sessions_req_output(self, recv_obj: ListSessionsReqOutput) -> None:
         """Complete the exact waiter for a concurrent inventory read.
 
         :param recv_obj: Atomic scheduler-owned session inventory.
@@ -3466,6 +3470,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if future is None:
             logger.warning(
                 "Session inventory arrived after waiter cleanup: %s",
+                recv_obj.correlation_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
+
+    def _handle_demote_session_req_output(
+        self, recv_obj: DemoteSessionReqOutput
+    ) -> None:
+        """Complete the exact waiter for a session-demotion transaction.
+
+        :param recv_obj: Scheduler-owned transaction result.
+        """
+        future = self.demote_session_futures.get(recv_obj.correlation_id)
+        if future is None:
+            logger.warning(
+                "Session demotion response arrived after waiter cleanup: %s",
                 recv_obj.correlation_id,
             )
             return

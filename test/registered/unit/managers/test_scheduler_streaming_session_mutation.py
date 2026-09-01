@@ -1,7 +1,8 @@
 import unittest
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -12,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    DemoteSessionReqInput,
     GetSessionInfoReqErrorOutput,
     GetSessionInfoReqInput,
     ListSessionsReqInput,
@@ -25,6 +27,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import (
     Scheduler,
+    _streaming_session_demotion_identity,
     _validate_streaming_session_topology,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -34,7 +37,10 @@ from sglang.srt.session.errors import (
     StreamingSessionInfoUnavailableError,
 )
 from sglang.srt.session.fencing import SessionFencingRegister
-from sglang.srt.session.session_controller import Session
+from sglang.srt.session.session_controller import (
+    Session,
+    StreamingSessionDemotionContext,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -194,6 +200,174 @@ class TestStreamingSessionEpochFencing(CustomTestCase):
         scheduler.session_controller.close.assert_not_called()
         scheduler.tree_cache.open_radix_session.assert_not_called()
         scheduler.tree_cache.release_radix_session.assert_not_called()
+
+
+class TestStreamingSessionDemotionTransaction(CustomTestCase):
+    """Exercise staging, TP voting, and commit boundaries."""
+
+    @staticmethod
+    def _scheduler(tp_size: int = 1) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ps = SimpleNamespace(
+            pp_rank=0,
+            tp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            tp_size=tp_size,
+        )
+        scheduler.tp_cpu_group = object()
+        scheduler.session_fencing_register = SessionFencingRegister()
+        session = SimpleNamespace(
+            streaming=True,
+            current_tip=MagicMock(return_value=129),
+            current_digest=MagicMock(return_value="sha256:v1:digest"),
+            lineage_generation=3,
+        )
+        context = StreamingSessionDemotionContext(
+            session_id="session",
+            token_ids=array("q", range(129)),
+            extra_key=None,
+            cache_salt=None,
+            priority=0,
+            tip=129,
+            lineage_digest="sha256:v1:digest",
+            lineage_generation=3,
+            already_demoted=False,
+        )
+        scheduler.session_controller = SimpleNamespace(
+            get=MagicMock(return_value=session),
+            demotion_context=MagicMock(return_value=context),
+        )
+        scheduler.tree_cache = MagicMock()
+        scheduler.tree_cache.prepare_streaming_session_demotion.return_value = 129
+        scheduler.tree_cache.commit_streaming_session_demotion.return_value = 129
+        return scheduler
+
+    def test_unanimous_stage_commits_once(self) -> None:
+        scheduler = self._scheduler()
+
+        output = Scheduler.demote_session(
+            scheduler,
+            DemoteSessionReqInput(
+                session_id="session",
+                correlation_id="correlation",
+            ),
+        )
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.tip, 129)
+        self.assertEqual(output.lineage_digest, "sha256:v1:digest")
+        self.assertEqual(output.lineage_generation, 3)
+        self.assertEqual(output.host_backed_tokens, 129)
+        scheduler.tree_cache.commit_streaming_session_demotion.assert_called_once_with(
+            "session"
+        )
+        scheduler.tree_cache.discard_streaming_session_demotion.assert_not_called()
+
+    def test_partial_stage_discards_without_committing(self) -> None:
+        scheduler = self._scheduler(tp_size=2)
+
+        def reject_vote(vote, **kwargs) -> None:
+            vote[0] = 0
+
+        with patch("torch.distributed.all_reduce", side_effect=reject_vote):
+            output = Scheduler.demote_session(
+                scheduler,
+                DemoteSessionReqInput(
+                    session_id="session",
+                    correlation_id="correlation",
+                ),
+            )
+
+        self.assertFalse(output.success)
+        scheduler.tree_cache.discard_streaming_session_demotion.assert_called_once_with(
+            "session"
+        )
+        scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
+
+    def test_lineage_or_namespace_vote_divergence_discards_stage(self) -> None:
+        scheduler = self._scheduler(tp_size=2)
+
+        def diverge_identity(vote, **kwargs) -> None:
+            vote[5] -= 1
+
+        with patch("torch.distributed.all_reduce", side_effect=diverge_identity):
+            output = Scheduler.demote_session(
+                scheduler,
+                DemoteSessionReqInput(
+                    session_id="session",
+                    correlation_id="correlation",
+                ),
+            )
+
+        self.assertFalse(output.success)
+        scheduler.tree_cache.discard_streaming_session_demotion.assert_called_once_with(
+            "session"
+        )
+        scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
+
+    def test_vote_identity_binds_lineage_and_cache_namespace(self) -> None:
+        context = self._scheduler().session_controller.demotion_context.return_value
+        identity = _streaming_session_demotion_identity(context)
+
+        variants = (
+            replace(context, lineage_digest="sha256:v1:other"),
+            replace(context, lineage_generation=context.lineage_generation + 1),
+            replace(context, extra_key="adapter-b"),
+            replace(context, cache_salt="tenant-b"),
+        )
+
+        self.assertTrue(
+            all(
+                _streaming_session_demotion_identity(variant) != identity
+                for variant in variants
+            )
+        )
+
+    def test_already_demoted_session_is_idempotent(self) -> None:
+        scheduler = self._scheduler()
+        scheduler.session_controller.demotion_context.return_value = replace(
+            scheduler.session_controller.demotion_context.return_value,
+            already_demoted=True,
+        )
+        scheduler.tree_cache.streaming_session_cache_snapshot.return_value = (
+            SimpleNamespace(protected=128)
+        )
+
+        output = Scheduler.demote_session(
+            scheduler,
+            DemoteSessionReqInput(
+                session_id="session",
+                correlation_id="correlation",
+            ),
+        )
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.host_backed_tokens, 128)
+        scheduler.tree_cache.prepare_streaming_session_demotion.assert_not_called()
+        scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
+
+    def test_stale_epoch_never_stages_or_commits(self) -> None:
+        scheduler = self._scheduler()
+        scheduler.session_fencing_register.install(7, 19)
+
+        output = Scheduler.demote_session(
+            scheduler,
+            DemoteSessionReqInput(
+                session_id="session",
+                epoch=6,
+                correlation_id="correlation",
+            ),
+        )
+
+        self.assertFalse(output.success)
+        self.assertEqual(
+            output.error_type,
+            STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+        )
+        scheduler.session_controller.demotion_context.assert_not_called()
+        scheduler.tree_cache.prepare_streaming_session_demotion.assert_not_called()
+        scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
 
 
 class TestEmptyStreamingSessionMutation(CustomTestCase):

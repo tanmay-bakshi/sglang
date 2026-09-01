@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -57,7 +58,7 @@ class SessionSlot:
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
     cache_protected_len: int = 0
-    tree_protected_len: int = 0
+    tree_protected_len: int = -1
     swa_uuid_for_lock: Optional[str] = None
     # components the first req skipped locking on last_node, so release dec
     # releases only what it took (may share the node with another req).
@@ -75,6 +76,10 @@ class SessionSlot:
     # the request row and must advance with an off-request SWA reconciliation.
     c4_state_alloc_offset: int = 0
     c128_state_alloc_offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.tree_protected_len < 0:
+            self.tree_protected_len = self.cache_protected_len
 
     @property
     def is_holding_kv(self) -> bool:
@@ -147,6 +152,20 @@ class SessionSlot:
         # must remain intact for idempotent restoration.
 
 
+@dataclass(frozen=True, slots=True)
+class DemotedSessionState:
+    """Host-resident radix frontier retained for an open streaming session.
+
+    :ivar last_node: Radix node anchoring the reusable host prefix.
+    :ivar cache_protected_len: Exact number of host-backed tokens.
+    :ivar host_lock_params: Component lock coordinates required for release.
+    """
+
+    last_node: Any
+    cache_protected_len: int
+    host_lock_params: DecLockRefParams
+
+
 def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
@@ -164,6 +183,7 @@ class StreamingSession(BasePrefixCache):
     def __init__(self, inner: BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
+        self.demoted: dict[str, DemotedSessionState] = {}
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -215,6 +235,14 @@ class StreamingSession(BasePrefixCache):
     def any_holding_kv(self) -> bool:
         return any(s.is_holding_kv for s in self.slots.values())
 
+    def is_demoted(self, session_id: str) -> bool:
+        """Return whether one session currently owns a host frontier.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Whether the session is host-resident.
+        """
+        return session_id in self.demoted
+
     # -- Try-handle entries for composition (see class docstring) --
 
     def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
@@ -254,6 +282,7 @@ class StreamingSession(BasePrefixCache):
 
     def reset(self):
         self.slots.clear()
+        self.demoted.clear()
         self.inner.reset()
 
     # -- Streaming entries: contract with embedded composers (e.g.
@@ -371,6 +400,7 @@ class StreamingSession(BasePrefixCache):
                     self._free_tail(slot, req, rollback_len)
                     slot.save_from_req(req, is_first=True)
                     slot.kv_committed_len = rollback_len
+                    self._release_demoted_state(session_id)
                     req.session.abort_req(req)
                     req.time_stats.increment_streaming_session_abort_with_slot_preserved()
                     return True
@@ -455,6 +485,7 @@ class StreamingSession(BasePrefixCache):
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
         self._reconcile_slot_swa(slot)
+        self._release_demoted_state(session_id)
 
         return True
 
@@ -474,7 +505,10 @@ class StreamingSession(BasePrefixCache):
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
-        if req.session.session_id in self.slots:
+        # A reloaded demoted session has no slot until it finishes. Keep its
+        # private suffix out of ordinary radix publication until adoption.
+        session_id = req.session.session_id
+        if session_id in self.slots or session_id in self.demoted:
             return True
         return False
 
@@ -519,15 +553,65 @@ class StreamingSession(BasePrefixCache):
     # -- Session lifecycle --
 
     def release_session(self, session_id: str) -> None:
+        slot = self.slots.get(session_id)
+        self._release_demoted_state(session_id, retire_private_path=slot is None)
         slot = self.slots.pop(session_id, None)
-        if slot is None:
-            return
-        protected_len = slot.cache_protected_len
+        if slot is not None:
+            self._release_slot_resources(
+                session_id,
+                slot,
+                free_start=slot.tree_protected_len,
+            )
+
+    def transition_to_demoted(
+        self,
+        session_id: str,
+        last_node: Any,
+        cache_protected_len: int,
+        tree_prefix_len: int,
+        host_lock_params: DecLockRefParams,
+    ) -> None:
+        """Replace a detached device slot with its host-resident tree frontier.
+
+        :param session_id: Session identifier to transition.
+        :param last_node: Published radix frontier.
+        :param cache_protected_len: Exact host-backed token count.
+        :param tree_prefix_len: Page-aligned prefix already owned by the ordinary
+            radix tree.
+        :param host_lock_params: Component lock coordinates required for release.
+        """
+        slot = self.slots.pop(session_id)
+        assert session_id not in self.demoted
+        assert tree_prefix_len % self.page_size == 0
+        assert tree_prefix_len <= cache_protected_len
+        assert cache_protected_len <= slot.kv_committed_len
+        self.demoted[session_id] = DemotedSessionState(
+            last_node=last_node,
+            cache_protected_len=cache_protected_len,
+            host_lock_params=host_lock_params,
+        )
+        self._release_slot_resources(
+            session_id,
+            slot,
+            free_start=tree_prefix_len,
+        )
+
+    def _release_slot_resources(
+        self,
+        session_id: str,
+        slot: SessionSlot,
+        *,
+        free_start: int,
+    ) -> None:
+        """Release one detached request row and the device KV it still owns.
+
+        :param session_id: Session identifier used for lifecycle logging.
+        :param slot: Detached slot whose ownership must be retired.
+        :param free_start: First device slot not transferred to radix ownership.
+        """
         lock_node = slot.last_node
         tokens_freed = (
-            max(0, slot.kv.kv_allocated_len - protected_len)
-            if slot.is_holding_kv
-            else 0
+            max(0, slot.kv.kv_allocated_len - free_start) if slot.is_holding_kv else 0
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
@@ -541,9 +625,10 @@ class StreamingSession(BasePrefixCache):
                     skip_lock_node_ids=slot.skip_lock_node_ids,
                 ),
             )
+            self.inner.retire_streaming_session_private_path(session_id, lock_node)
 
         if slot.is_holding_kv:
-            start = protected_len
+            start = free_start
             end = slot.kv.kv_allocated_len
             if start < end:
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -553,6 +638,49 @@ class StreamingSession(BasePrefixCache):
             self.req_to_token_pool.release_detached_request_slot(slot.req_pool_idx)
 
         self._free_slot_mamba(slot)
+
+    def _release_demoted_state(
+        self, session_id: str, *, retire_private_path: bool = False
+    ) -> None:
+        """Release one session's host lock and radix coverage.
+
+        :param session_id: Session identifier whose host ownership must end.
+        :param retire_private_path: Whether no device slot inherits the suffix.
+        """
+        state = self.demoted.pop(session_id, None)
+        if state is None:
+            return
+        self.inner.dec_host_lock_ref(state.last_node, state.host_lock_params)
+        self.inner.clear_radix_session_refs(session_id)
+        if retire_private_path:
+            self.inner.retire_streaming_session_private_path(
+                session_id, state.last_node
+            )
+            return
+        slot = self.slots.get(session_id)
+        private_parent = self.inner.streaming_session_private_parent(state.last_node)
+        replacement_lock: IncLockRefResult | None = None
+        if slot is not None and private_parent is not None:
+            replacement_lock = self.inner.inc_lock_ref(private_parent)
+            self.inner.dec_lock_ref(
+                state.last_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
+                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                ),
+            )
+        private_len = self.inner.adopt_streaming_session_private_path(
+            session_id, state.last_node
+        )
+        if slot is not None and private_len > 0:
+            if private_parent is None or replacement_lock is None:
+                raise AssertionError(
+                    "A restored private suffix has no ordinary lock frontier."
+                )
+            slot.last_node = private_parent
+            slot.swa_uuid_for_lock = replacement_lock.swa_uuid_for_lock
+            slot.skip_lock_node_ids = replacement_lock.skip_lock_node_ids
+            slot.tree_protected_len = state.cache_protected_len - private_len
 
     def truncate_session(self, session_id: str, target: int) -> None:
         """Trim a session slot to an already-validated logical token index."""
@@ -654,7 +782,7 @@ class StreamingSession(BasePrefixCache):
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
-                total += max(0, allocated - slot.cache_protected_len)
+                total += max(0, allocated - slot.tree_protected_len)
         return total
 
     def streaming_session_cache_snapshot(
@@ -667,7 +795,17 @@ class StreamingSession(BasePrefixCache):
         """
         slot = self.slots.get(session_id)
         if slot is None:
-            return StreamingSessionCacheSnapshot()
+            demoted = self.demoted.get(session_id)
+            if demoted is None:
+                return StreamingSessionCacheSnapshot()
+            full, swa = self.inner.streaming_session_protected_residency(
+                demoted.last_node
+            )
+            return StreamingSessionCacheSnapshot(
+                protected=demoted.cache_protected_len,
+                full=full,
+                swa=swa,
+            )
         full, swa = self.inner.streaming_session_protected_residency(slot.last_node)
         if not slot.is_holding_kv:
             return StreamingSessionCacheSnapshot(
@@ -677,16 +815,16 @@ class StreamingSession(BasePrefixCache):
             )
 
         allocated = ceil_align(slot.kv.kv_allocated_len, self.page_size)
-        full_held = max(0, allocated - slot.cache_protected_len)
-        full_device_pages = ceil_align(full_held, self.page_size) // self.page_size
+        full_held = max(0, allocated - slot.tree_protected_len)
+        full_device_pages = full_held // self.page_size
         swa_device_pages = 0
         if self.supports_swa():
             swa_start = max(
-                slot.cache_protected_len,
+                slot.tree_protected_len,
                 slot.kv.swa_evicted_seqlen,
             )
             swa_held = max(0, allocated - swa_start)
-            swa_device_pages = ceil_align(swa_held, self.page_size) // self.page_size
+            swa_device_pages = swa_held // self.page_size
         return StreamingSessionCacheSnapshot(
             protected=slot.cache_protected_len,
             held_tokens=full_held,
@@ -716,7 +854,7 @@ class StreamingSession(BasePrefixCache):
                 total += max(
                     0,
                     allocated
-                    - max(slot.cache_protected_len, slot.kv.swa_evicted_seqlen),
+                    - max(slot.tree_protected_len, slot.kv.swa_evicted_seqlen),
                 )
         return total
 
@@ -855,6 +993,94 @@ class StreamingSession(BasePrefixCache):
     def supports_streaming_session(self) -> bool:
         return True
 
+    def supports_streaming_session_demotion(self) -> bool:
+        """Return whether the composed cache supports host demotion.
+
+        :returns: Whether transactional host demotion is available.
+        """
+        return self.inner.supports_streaming_session_demotion()
+
+    def is_streaming_session_demoted(self, session_id: str) -> bool:
+        """Return whether one session owns a host frontier.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Whether the session is host-resident.
+        """
+        return self.is_demoted(session_id)
+
+    def prepare_streaming_session_demotion(
+        self,
+        session_id: str,
+        token_ids: Sequence[int],
+        extra_key: str | None,
+        cache_salt: str | None,
+        priority: int,
+    ) -> int | None:
+        """Delegate private host staging to the composed cache.
+
+        :param session_id: Session identifier to stage.
+        :param token_ids: Complete committed token lineage.
+        :param extra_key: Radix cache classification key.
+        :param cache_salt: Radix cache namespace salt.
+        :param priority: Eviction priority inherited from the session.
+        :returns: Exact staged token count, or ``None`` on rejection.
+        """
+        return self.inner.prepare_streaming_session_demotion(
+            session_id,
+            token_ids,
+            extra_key,
+            cache_salt,
+            priority,
+        )
+
+    def discard_streaming_session_demotion(self, session_id: str) -> None:
+        """Delegate private-stage discard to the composed cache.
+
+        :param session_id: Session identifier whose stage must be discarded.
+        """
+        self.inner.discard_streaming_session_demotion(session_id)
+
+    def commit_streaming_session_demotion(self, session_id: str) -> int:
+        """Delegate unanimous host-stage publication to the composed cache.
+
+        :param session_id: Session identifier whose stage must be committed.
+        :returns: Exact host-backed token count.
+        """
+        return self.inner.commit_streaming_session_demotion(session_id)
+
+    def clear_radix_session_refs(self, session_id: str) -> int:
+        """Release tagged cache coverage without closing the generation.
+
+        :param session_id: Session identifier whose coverage must be released.
+        :returns: Number of component frontier tags removed.
+        """
+        return self.inner.clear_radix_session_refs(session_id)
+
+    def retire_streaming_session_private_path(self, session_id: str, node: Any) -> None:
+        """Delegate retirement of one private exact suffix.
+
+        :param session_id: Session identifier that owns the private suffix.
+        :param node: Exact host frontier, or an ordinary radix frontier.
+        """
+        self.inner.retire_streaming_session_private_path(session_id, node)
+
+    def streaming_session_private_parent(self, node: Any) -> Any | None:
+        """Delegate resolution of a private suffix's ordinary parent.
+
+        :param node: Exact host frontier, or an ordinary aligned frontier.
+        :returns: The ordinary parent, or ``None`` without a private suffix.
+        """
+        return self.inner.streaming_session_private_parent(node)
+
+    def adopt_streaming_session_private_path(self, session_id: str, node: Any) -> int:
+        """Delegate restored private-suffix ownership to the device slot.
+
+        :param session_id: Session identifier that owns the private suffix.
+        :param node: Exact restored frontier.
+        :returns: Logical private-suffix length, or zero without one.
+        """
+        return self.inner.adopt_streaming_session_private_path(session_id, node)
+
     def is_chunk_cache(self):
         return self.inner.is_chunk_cache()
 
@@ -868,10 +1094,6 @@ class StreamingSession(BasePrefixCache):
         return self.inner.init_metrics_collector()
 
     def sanity_check(self):
-        # Skip inner sanity check when sessions hold tree locks, because
-        # the check asserts all nodes are unlocked during idle.
-        if self.any_holding_kv():
-            return
         self.inner.sanity_check()
 
     # Forward attribute access for cache-specific methods (e.g.

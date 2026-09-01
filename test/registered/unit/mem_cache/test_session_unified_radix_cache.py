@@ -14,8 +14,10 @@ import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     InsertParams,
+    InsertResult,
     KVComponentResidency,
     MatchPrefixParams,
 )
@@ -208,6 +210,52 @@ class TestSessionUnifiedRadixCache(CustomTestCase):
             KVComponentResidency(device_pages=4, host_backed_pages=4),
         )
         self.assertEqual(swa, KVComponentResidency())
+
+    def test_first_streaming_prefix_defers_host_backup_until_demotion(self) -> None:
+        token_ids = array("q", [1, 2, 3, 4])
+        req_pool_idx = self.cache.req_to_token_pool.alloc_rows(1)[0]
+        indices = self.cache.token_to_kv_pool_allocator.alloc(len(token_ids))
+        self.assertIsNotNone(indices)
+        self.cache.req_to_token_pool.write(
+            (req_pool_idx, slice(0, len(token_ids))), indices
+        )
+
+        def get_fill_ids() -> array:
+            return token_ids
+
+        req = SimpleNamespace(
+            session=SimpleNamespace(streaming=True, session_id="session"),
+            get_fill_ids=get_fill_ids,
+            req_pool_idx=req_pool_idx,
+            cache_protected_len=0,
+            priority=None,
+            extra_key="streaming-prefix",
+            cache_salt=None,
+            last_node=self.cache.tree_core.root_node.id,
+            swa_uuid_for_lock=None,
+            swa_prefix_lock_released=False,
+            skip_lock_node_ids={},
+        )
+        captured: list[InsertParams] = []
+        original_insert = self.cache.insert
+
+        def capture_insert(params: InsertParams) -> InsertResult:
+            captured.append(params)
+            return original_insert(params)
+
+        self.cache.insert = capture_insert
+        try:
+            self.cache.cache_unfinished_req(req)
+        finally:
+            self.cache.insert = original_insert
+
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0].trigger_backup)
+        self.cache.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(skip_lock_node_ids=req.skip_lock_node_ids),
+        )
+        self.cache.req_to_token_pool.free_rows([req_pool_idx])
 
     def test_reopen_rejects_stale_generation(self):
         leaf = insert(self.cache, [1, 2, 3, 4])

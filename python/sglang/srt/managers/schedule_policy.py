@@ -1364,7 +1364,11 @@ class PrefillAdder:
                     ]
                 )
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                req.cache_protected_len = (
+                    prefix_len
+                    if load_back_result.cache_protected_len is None
+                    else load_back_result.cache_protected_len
+                )
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

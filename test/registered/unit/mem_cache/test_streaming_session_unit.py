@@ -4,10 +4,20 @@ import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
-from sglang.srt.mem_cache.base_prefix_cache import KVComponentResidency, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    IncLockRefResult,
+    KVComponentResidency,
+    MatchResult,
+)
 from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.session.streaming_session import (
+    DemotedSessionState,
+    SessionSlot,
+    StreamingSession,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -47,6 +57,8 @@ class _FakeInnerCache:
         match_results=None,
         sliding_window_size=None,
         protected_residency=None,
+        private_parent=None,
+        private_len=0,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
@@ -55,6 +67,14 @@ class _FakeInnerCache:
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
+        self.dec_host_lock_ref_calls = []
+        self.cleared_session_refs = []
+        self.retired_private_paths = []
+        self.adopted_private_paths = []
+        self.inc_lock_ref_calls = []
+        self.sanity_checks = 0
+        self.private_parent = private_parent
+        self.private_len = private_len
         self.protected_residency = (
             protected_residency
             if protected_residency is not None
@@ -73,6 +93,30 @@ class _FakeInnerCache:
         self.dec_lock_ref_calls.append(node)
         self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
 
+    def inc_lock_ref(self, node):
+        self.inc_lock_ref_calls.append(node)
+        return IncLockRefResult(
+            swa_uuid_for_lock=23,
+            skip_lock_node_ids={ComponentType.SWA: {9}},
+        )
+
+    def dec_host_lock_ref(self, node, params):
+        self.dec_host_lock_ref_calls.append((node, params))
+
+    def clear_radix_session_refs(self, session_id: str) -> int:
+        self.cleared_session_refs.append(session_id)
+        return 1
+
+    def retire_streaming_session_private_path(self, session_id: str, node) -> None:
+        self.retired_private_paths.append((session_id, node))
+
+    def streaming_session_private_parent(self, node):
+        return self.private_parent
+
+    def adopt_streaming_session_private_path(self, session_id: str, node) -> int:
+        self.adopted_private_paths.append((session_id, node))
+        return self.private_len
+
     def supports_mamba(self):
         return False
 
@@ -83,6 +127,7 @@ class _FakeInnerCache:
         return self.protected_residency
 
     def sanity_check(self):
+        self.sanity_checks += 1
         return None
 
 
@@ -203,6 +248,129 @@ def test_per_session_cache_snapshot_combines_tree_and_slot_residency():
         device_pages=3,
         host_backed_pages=1,
     )
+
+
+def test_demoted_snapshot_and_close_release_only_session_ownership() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    inner = _FakeInnerCache(
+        _FakeReqToTokenPool(req_to_token),
+        _FakeAllocator(),
+        page_size=16,
+        protected_residency=(
+            KVComponentResidency(device_pages=0, host_backed_pages=6),
+            KVComponentResidency(device_pages=0, host_backed_pages=4),
+        ),
+    )
+    tree_cache = StreamingSession(inner)
+    lock_params = DecLockRefParams(swa_uuid_for_host_lock=17)
+    tree_cache.demoted["session-a"] = DemotedSessionState(
+        last_node=41,
+        cache_protected_len=96,
+        host_lock_params=lock_params,
+    )
+    tree_cache.slots["active-session"] = SessionSlot(req_pool_idx=0)
+
+    snapshot = tree_cache.streaming_session_cache_snapshot("session-a")
+
+    assert snapshot.protected == 96
+    assert snapshot.held_tokens == 0
+    assert snapshot.full == KVComponentResidency(host_backed_pages=6)
+    assert snapshot.swa == KVComponentResidency(host_backed_pages=4)
+
+    tree_cache.sanity_check()
+    assert inner.sanity_checks == 1
+
+    tree_cache.release_session("session-a")
+
+    assert not tree_cache.is_demoted("session-a")
+    assert inner.dec_host_lock_ref_calls == [(41, lock_params)]
+    assert inner.cleared_session_refs == ["session-a"]
+    assert inner.retired_private_paths == [("session-a", 41)]
+
+
+def test_restored_private_suffix_reanchors_tree_lock_and_becomes_slot_owned() -> None:
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=page_size,
+        private_parent=41,
+        private_len=17,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=80,
+        kv=SimpleNamespace(kv_allocated_len=80, swa_evicted_seqlen=0),
+        last_node=42,
+        cache_protected_len=65,
+        tree_protected_len=65,
+        swa_uuid_for_lock=17,
+        skip_lock_node_ids={ComponentType.FULL: {7}},
+    )
+    host_lock_params = DecLockRefParams(swa_uuid_for_host_lock=19)
+    tree_cache.demoted["session-a"] = DemotedSessionState(
+        last_node=42,
+        cache_protected_len=65,
+        host_lock_params=host_lock_params,
+    )
+
+    tree_cache._release_demoted_state("session-a")
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.last_node == 41
+    assert slot.cache_protected_len == 65
+    assert slot.tree_protected_len == 48
+    assert slot.swa_uuid_for_lock == 23
+    assert slot.skip_lock_node_ids == {ComponentType.SWA: {9}}
+    assert inner.dec_host_lock_ref_calls == [(42, host_lock_params)]
+    assert inner.cleared_session_refs == ["session-a"]
+    assert inner.inc_lock_ref_calls == [41]
+    assert inner.dec_lock_ref_calls == [42]
+    assert inner.dec_lock_ref_params == [
+        DecLockRefParams(
+            swa_uuid_for_lock=17,
+            skip_lock_node_ids={ComponentType.FULL: {7}},
+        )
+    ]
+    assert inner.adopted_private_paths == [("session-a", 42)]
+    snapshot = tree_cache.streaming_session_cache_snapshot("session-a")
+    assert snapshot.protected == 65
+    assert snapshot.held_tokens == 32
+    assert snapshot.full.device_pages == 2
+    assert tree_cache.session_held_tokens() == 32
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [42, 41]
+    assert inner.retired_private_paths == [("session-a", 41)]
+    assert req_to_token_pool.free_slots == [0]
+    assert allocator.freed[0].tolist() == list(range(48, 80))
+
+
+def test_demoted_reload_skips_ordinary_radix_insertion_until_adoption() -> None:
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    inner = _FakeInnerCache(
+        _FakeReqToTokenPool(req_to_token),
+        _FakeAllocator(),
+        page_size=16,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.demoted["session-a"] = DemotedSessionState(
+        last_node=42,
+        cache_protected_len=65,
+        host_lock_params=DecLockRefParams(),
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=80)
+
+    handled = tree_cache.try_cache_unfinished_req(req)
+
+    assert handled
+    assert tree_cache.is_demoted("session-a")
+    assert "session-a" not in tree_cache.slots
 
 
 def test_held_empty_slot_remains_owned_during_resume() -> None:
@@ -827,6 +995,33 @@ def test_streaming_floor_preserves_radix_owned_rollback_window():
 
     assert req.kv.swa_evicted_seqlen == 1_024
     assert allocator.freed_swa == []
+
+
+def test_streaming_exact_fringe_preserves_its_physical_swa_page() -> None:
+    req_to_token = torch.arange(512, dtype=torch.int32).reshape(2, 256)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    req = SimpleNamespace(
+        is_holding_kv=True,
+        req_pool_idx=0,
+        cache_protected_len=65,
+        swa_evict_floor=0,
+        streaming_session_floor=256,
+        kv=ReqKvInfo(kv_allocated_len=256, swa_evicted_seqlen=0),
+    )
+
+    free_swa_out_of_window_slots(
+        req,
+        256,
+        sliding_window_size=64,
+        page_size=16,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+    )
+
+    assert req.kv.swa_evicted_seqlen == 192
+    assert len(allocator.freed_swa) == 1
+    assert allocator.freed_swa[0].tolist() == list(range(80, 192))
 
 
 def test_streaming_floor_rejects_unpersisted_forced_evict_prefix():

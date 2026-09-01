@@ -35,6 +35,7 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         pool = object.__new__(SWAKVPool)
         # layer 0 -> full pool, layer 1 -> swa pool
         pool.layers_mapping = {0: (0, False), 1: (0, True)}
+        pool.layer_transfer_counter = None
         recorded = {}
 
         def _swa_set(layer, loc, k, v, k_scale, v_scale, layer_id_override):
@@ -46,6 +47,35 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         pool.swa_kv_pool = SimpleNamespace(set_kv_buffer=_swa_set)
         pool.full_kv_pool = SimpleNamespace(set_kv_buffer=_full_set)
         return pool, recorded
+
+    def test_waits_for_layer_load_before_writing(self) -> None:
+        pool, _ = self._pool_and_record()
+        events: list[str] = []
+
+        def wait_for_layer(layer_id: int) -> None:
+            events.append("wait")
+
+        def write_kv(
+            layer: None,
+            loc: torch.Tensor,
+            cache_k: torch.Tensor | None,
+            cache_v: torch.Tensor | None,
+            k_scale: float,
+            v_scale: float,
+            layer_id_override: int,
+        ) -> None:
+            events.append("write")
+
+        pool._wait_for_layer = wait_for_layer
+        pool.swa_kv_pool = SimpleNamespace(set_kv_buffer=write_kv)
+        pool.set_kv_buffer(
+            SimpleNamespace(layer_id=1),
+            KVWriteLoc(torch.tensor([3, 4]), torch.tensor([7, 8])),
+            None,
+            None,
+        )
+
+        self.assertEqual(events, ["wait", "write"])
 
     def test_swa_layer_uses_swa_loc_directly(self):
         pool, recorded = self._pool_and_record()
@@ -89,6 +119,7 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
     def test_composed_mla_pools_route_local_layer_ids(self):
         pool = object.__new__(SWAKVPool)
         pool.layers_mapping = {7: (1, False), 8: (2, True)}
+        pool.layer_transfer_counter = None
         recorded = {}
 
         def make_mla_pool(name):

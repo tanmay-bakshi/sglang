@@ -78,6 +78,41 @@ class UnifiedSessionRefTracker:
             leaf = component.resolve_session_leaf(req, last_node)
             component.register_session_leaf(session_id, leaf)
 
+    def register_streaming_session_frontier(
+        self, session_id: str, node_id: int
+    ) -> None:
+        """Tag a host-resident streaming-session frontier in every component.
+
+        :param session_id: Open streaming-session identifier.
+        :param node_id: Exact host-backed radix frontier.
+        :raises RuntimeError: If the session has no open radix generation.
+        """
+        if not self.enable_session_radix_cache:
+            return
+        if (
+            session_id in self._closed_session_ids
+            or session_id not in self._session_generations
+        ):
+            raise RuntimeError(
+                f"Streaming session {session_id} has no open radix generation."
+            )
+
+        node = self.tree_core.node_by_id(node_id)
+        for component in self.components:
+            leaf = component.resolve_session_frontier(node)
+            component.register_session_leaf(session_id, leaf)
+
+    def clear_session_refs(self, session_id: str) -> int:
+        """Release component coverage without closing the radix generation.
+
+        :param session_id: Session identifier whose coverage must be released.
+        :returns: Number of component frontier tags removed.
+        """
+        indexed = 0
+        for component in self.components:
+            indexed += component.release_session(session_id)
+        return indexed
+
     def _remember_closed_session(self, session_id: str) -> None:
         self._closed_session_ids[session_id] = None
         self._closed_session_ids.move_to_end(session_id)
@@ -106,9 +141,7 @@ class UnifiedSessionRefTracker:
         self._remember_closed_session(session_id)
         self._session_generations.pop(session_id, None)
 
-        indexed = 0
-        for component in self.components:
-            indexed += component.release_session(session_id)
+        indexed = self.clear_session_refs(session_id)
 
         logger.info(
             "release_session %s: indexed %d component leaves",

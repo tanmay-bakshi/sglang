@@ -96,3 +96,10 @@ STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE = StreamingSessionStaleEpochError.__nam
 
 class StreamingSessionInfoUnavailableError(ValueError):
     """Reports introspection of an existing non-streaming session."""
+
+
+class StreamingSessionDemotionError(ValueError):
+    """Reports a session state that cannot enter the host-resident transaction."""
+
+
+STREAMING_SESSION_DEMOTION_ERROR_TYPE = StreamingSessionDemotionError.__name__

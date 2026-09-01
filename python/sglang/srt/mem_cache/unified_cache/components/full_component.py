@@ -127,7 +127,9 @@ class FullComponent(TreeComponent):
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
-                kv_host_hit += len(full_host)
+                kv_host_hit += self.tree_core.component_logical_length(
+                    node, ct, host=True
+                )
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(
@@ -415,11 +417,12 @@ class FullComponent(TreeComponent):
             for nid in xfer.nodes_to_load or []:
                 n = self.tree_core.node_by_id(nid)
                 cd = n.component_data[ct]
-                n_len = len(cd.host_value)
-                cd.value = device_indices[offset : offset + n_len].clone()
-                offset += n_len
+                physical_len = len(cd.host_value)
+                logical_len = self.tree_core.component_logical_length(n, ct, host=True)
+                cd.value = device_indices[offset : offset + logical_len].clone()
+                offset += physical_len
                 # Full uses leaf sets, not LRU
-                self.tree_core.component_evictable_size_[ct] += n_len
+                self.tree_core.component_evictable_size_[ct] += logical_len
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)

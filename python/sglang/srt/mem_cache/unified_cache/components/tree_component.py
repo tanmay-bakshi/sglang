@@ -169,6 +169,16 @@ class TreeComponent(ABC):
     ) -> Optional[UnifiedTreeNode]:
         return self._find_reusable_session_leaf(last_node)
 
+    def resolve_session_frontier(
+        self, node: Optional[UnifiedTreeNode]
+    ) -> Optional[UnifiedTreeNode]:
+        """Resolve reusable component state at an explicit radix frontier.
+
+        :param node: Full-KV radix frontier.
+        :returns: Nearest reusable frontier for this component.
+        """
+        return self._find_reusable_session_leaf(node)
+
     def _mark_session_leaf(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         self._session_leaves[session_id].add(leaf)
         cd = leaf.component_data[self.component_type]

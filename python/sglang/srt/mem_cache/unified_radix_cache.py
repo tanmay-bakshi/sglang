@@ -4,7 +4,9 @@ import atexit
 import logging
 import threading
 import time
+from array import array
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -170,6 +172,30 @@ class _QueuedLoadBackResult:
     swa_tokens: int
 
 
+@dataclass(frozen=True)
+class _PendingStreamingSessionDemotion:
+    """Privately staged host copy awaiting the tensor-parallel commit vote.
+
+    :ivar key: Exact radix identity for the staged prefix.
+    :ivar aligned_len: Complete-page length of the exact staged prefix.
+    :ivar device_indices: Device slots copied into the private host stage.
+    :ivar backup: Privately owned target, SWA, and draft host slots.
+    :ivar tree_prefix_node: Existing ordinary radix frontier anchoring the suffix.
+    :ivar tree_prefix_len: Prefix already owned by the ordinary radix tree.
+    :ivar swa_window_start: First staged token retaining SWA device state.
+    :ivar priority: Eviction priority inherited from the session request.
+    """
+
+    key: RadixKey
+    aligned_len: int
+    device_indices: torch.Tensor
+    backup: RetractionBackup
+    tree_prefix_node: NodeId
+    tree_prefix_len: int
+    swa_window_start: int
+    priority: int
+
+
 class _OngoingPrefetch(NamedTuple):
     """Tracks an in-flight storage→host prefetch operation."""
 
@@ -250,6 +276,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Dispatch methods below pre-check conditions so the session's
         # internal fall-through to self.inner.xxx never fires -- no recursion.
         self.session = StreamingSession(inner=self)
+        self._pending_streaming_session_demotions: dict[
+            str, _PendingStreamingSessionDemotion
+        ] = {}
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -383,6 +412,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reset Controller.
         self.session.slots.clear()
+        self.session.demoted.clear()
+        self._pending_streaming_session_demotions.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
@@ -965,11 +996,16 @@ class UnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # components prepare insert data + return effective cache_len
+        is_streaming = req.session is not None and req.session.streaming
+        # A first-turn streaming insert runs before speculative decoding has
+        # finished materializing its draft KV. The session lock keeps the
+        # device prefix alive; explicit demotion publishes one coherent
+        # target/draft snapshot after the request is idle.
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            trigger_backup=not is_streaming,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1193,28 +1229,28 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         return torch.cat([indices, tail])
 
-    def _retraction_device_transfers(
-        self, req: Req
-    ) -> tuple[torch.Tensor, list[PoolTransfer]]:
-        num_tokens = req.seqlen - 1
-        full_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :num_tokens
-        ].to(torch.int64)
-        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
+    def _device_transfers_from_indices(
+        self,
+        full_indices: torch.Tensor,
+        num_tokens: int,
+    ) -> list[PoolTransfer]:
+        """Build auxiliary transfer descriptors for one full-KV index span.
 
+        :param full_indices: Full-attention device slots in lineage order.
+        :param num_tokens: Logical token count represented by the slots.
+        :returns: SWA and draft sidecar transfer descriptors.
+        """
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
         if self.supports_swa():
             kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
             assert self.sliding_window_size is not None
             window_start = max(0, num_tokens - self.sliding_window_size)
             window_start = window_start // self.page_size * self.page_size
-            window_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, window_start:num_tokens
-            ].to(torch.int64)
+            window_indices = full_indices[window_start:num_tokens]
             swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
             assert bool(
                 (swa_indices > 0).all()
-            ), f"unmapped SWA window positions for request {req.rid}"
+            ), "unmapped SWA window positions in host-backup span"
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
@@ -1237,18 +1273,37 @@ class UnifiedRadixCache(BasePrefixCache):
                 component_transfers,
             )
         )
-        return full_indices, extra_transfers
+        return extra_transfers
+
+    def _retraction_device_transfers(
+        self, req: Req
+    ) -> tuple[torch.Tensor, list[PoolTransfer]]:
+        num_tokens = req.seqlen - 1
+        full_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :num_tokens
+        ].to(torch.int64)
+        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
+        return full_indices, self._device_transfers_from_indices(
+            full_indices,
+            num_tokens,
+        )
 
     def _reclaim_retraction_host(self, num_tokens: int) -> int:
         if self.disable:
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
-        """Back up device KV to the host pool; None when it cannot fit after reclaim."""
-        assert req.seqlen > 1
+    def _stage_retraction_backup(
+        self,
+        device_indices: torch.Tensor,
+        extra_transfers: list[PoolTransfer],
+    ) -> RetractionBackup | None:
+        """Copy one complete transfer set into privately owned host slots.
 
-        device_indices, extra_transfers = self._retraction_device_transfers(req)
+        :param device_indices: Full-attention device slots to copy.
+        :param extra_transfers: Auxiliary pool transfers sharing the transaction.
+        :returns: Private host stage, or ``None`` when capacity cannot be reserved.
+        """
         host_indices = self.host_pool_group.alloc(len(device_indices))
         if host_indices is None:
             self._reclaim_retraction_host(len(device_indices))
@@ -1290,6 +1345,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.retraction_discard(backup)
             raise
         return backup
+
+    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+        """Back up device KV to the host pool; None when it cannot fit after reclaim."""
+        assert req.seqlen > 1
+
+        device_indices, extra_transfers = self._retraction_device_transfers(req)
+        return self._stage_retraction_backup(device_indices, extra_transfers)
 
     def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
@@ -1571,6 +1633,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_xfer.device_indices = device_indices
         full_tokens = _queued_transfer_token_count(kv_xfer)
+        logical_full_tokens = sum(
+            self.tree_core.component_logical_length(
+                self.tree_core.node_by_id(loaded_node_id),
+                ComponentType.FULL,
+                host=True,
+            )
+            for loaded_node_id in kv_xfer.nodes_to_load or ()
+        )
         swa_tokens = sum(
             _queued_transfer_token_count(xfer)
             for xfer in comp_xfers.get(ComponentType.SWA, ())
@@ -1590,7 +1660,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return _QueuedLoadBackResult(
-            new_full_device_indices=device_indices,
+            new_full_device_indices=device_indices[:logical_full_tokens],
             full_tokens=full_tokens,
             swa_tokens=swa_tokens,
         )
@@ -2859,6 +2929,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     queued_any_component=True,
                     full_tokens=load_result.full_tokens,
                     swa_tokens=load_result.swa_tokens,
+                    cache_protected_len=(
+                        len(params.req.prefix_indices)
+                        + len(load_result.new_full_device_indices)
+                    ),
                 )
 
         return LoadBackResult(
@@ -2985,13 +3059,399 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
 
+    def clear_radix_session_refs(self, session_id: str) -> int:
+        """Release tagged cache coverage while keeping the generation open.
+
+        :param session_id: Session identifier whose coverage must be released.
+        :returns: Number of component frontier tags removed.
+        """
+        return self.session_refs.clear_session_refs(session_id)
+
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:
         return True
 
+    def supports_streaming_session_demotion(self) -> bool:
+        """Return whether this cache can publish durable host-resident sessions.
+
+        :returns: Whether transactional host demotion is available.
+        """
+        return (
+            not self.disable
+            and self.enable_session_radix_cache
+            and self.host_memory_mode == "cache"
+            and self.buffer_pipeline is None
+            and self.supports_retraction_backup()
+        )
+
+    def is_streaming_session_demoted(self, session_id: str) -> bool:
+        """Return whether one streaming session owns a host frontier.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Whether the session is host-resident.
+        """
+        return self.session.is_demoted(session_id)
+
+    def prepare_streaming_session_demotion(
+        self,
+        session_id: str,
+        token_ids: Sequence[int],
+        extra_key: str | None,
+        cache_salt: str | None,
+        priority: int,
+    ) -> int | None:
+        """Stage a session's exact KV privately in the host pools.
+
+        The slot's existing tree prefix retains ordinary radix identity. Every
+        detached suffix page is published on a session-private path, and a
+        trailing partial page owns one physical host page with its exact length.
+
+        :param session_id: Session identifier to stage.
+        :param token_ids: Complete committed token lineage.
+        :param extra_key: Radix cache classification key.
+        :param cache_salt: Radix cache namespace salt.
+        :param priority: Eviction priority inherited from the session.
+        :returns: Exact staged token count, or ``None`` on rejection.
+        """
+        if not self.supports_streaming_session_demotion():
+            return None
+        if session_id in self._pending_streaming_session_demotions:
+            raise RuntimeError(f"Session {session_id} already has a staged demotion.")
+        if self.session.is_demoted(session_id):
+            raise RuntimeError(f"Session {session_id} is already host-resident.")
+
+        slot = self.session.slots.get(session_id)
+        if slot is None or not slot.is_holding_kv:
+            return None
+
+        key = RadixKey(
+            array("q", token_ids),
+            extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=cache_salt,
+        )
+        key = key[: min(len(key), slot.kv_committed_len)]
+        exact_len = len(key)
+        aligned_len = exact_len // self.page_size * self.page_size
+        physical_len = ceil_align(exact_len, self.page_size)
+        if exact_len == 0 or slot.cache_protected_len > exact_len:
+            return None
+        tree_prefix_len = slot.tree_protected_len
+        if (
+            tree_prefix_len < 0
+            or tree_prefix_len % self.page_size != 0
+            or tree_prefix_len > aligned_len
+            or tree_prefix_len > slot.cache_protected_len
+        ):
+            raise AssertionError(
+                "Streaming-session tree frontier is inconsistent with demotion: "
+                f"{tree_prefix_len=} {slot.cache_protected_len=} {aligned_len=}"
+            )
+        tree_prefix_node = (
+            self.tree_core.root_node.id if slot.last_node is None else slot.last_node
+        )
+        tree_nodes = self._streaming_session_path(
+            tree_prefix_node,
+            tree_prefix_len,
+        )
+        offset = 0
+        for node in tree_nodes:
+            node_len = len(node.key)
+            if node.key.match(key[offset : offset + node_len]) != node_len:
+                raise AssertionError(
+                    f"Session {session_id} lineage does not match its tree frontier."
+                )
+            offset += node_len
+
+        logical_device_indices = self.req_to_token_pool.req_to_token[
+            slot.req_pool_idx, :exact_len
+        ].to(dtype=torch.int64, copy=True)
+        device_indices = self._pad_retraction_indices(
+            logical_device_indices, self.page_size
+        )
+        assert len(device_indices) == physical_len
+        extra_transfers = self._device_transfers_from_indices(
+            device_indices,
+            exact_len,
+        )
+        swa_window_start = 0
+        if self.supports_swa():
+            assert self.sliding_window_size is not None
+            swa_window_start = max(0, exact_len - self.sliding_window_size)
+            swa_window_start = swa_window_start // self.page_size * self.page_size
+
+        backup = self._stage_retraction_backup(device_indices, extra_transfers)
+        if backup is None:
+            return None
+        self._pending_streaming_session_demotions[session_id] = (
+            _PendingStreamingSessionDemotion(
+                key=key,
+                aligned_len=aligned_len,
+                device_indices=device_indices,
+                backup=backup,
+                tree_prefix_node=tree_prefix_node,
+                tree_prefix_len=tree_prefix_len,
+                swa_window_start=swa_window_start,
+                priority=priority,
+            )
+        )
+        return exact_len
+
+    def discard_streaming_session_demotion(self, session_id: str) -> None:
+        """Discard a private stage after any tensor-parallel rank votes no.
+
+        :param session_id: Session identifier whose stage must be discarded.
+        """
+        pending = self._pending_streaming_session_demotions.pop(session_id, None)
+        if pending is not None:
+            self.retraction_discard(pending.backup)
+
+    def commit_streaming_session_demotion(self, session_id: str) -> int:
+        """Publish a unanimously staged session and retire its device slot.
+
+        :param session_id: Session identifier whose stage must be committed.
+        :returns: Exact host-backed token count.
+        """
+        pending = self._pending_streaming_session_demotions.pop(session_id)
+        last_node = pending.tree_prefix_node
+        private_boundaries = [pending.tree_prefix_len]
+        if pending.tree_prefix_len < pending.swa_window_start < pending.aligned_len:
+            private_boundaries.append(pending.swa_window_start)
+        private_boundaries.append(pending.aligned_len)
+        for start, end in pairwise(private_boundaries):
+            if start == end:
+                continue
+            last_node = self.tree_core.add_streaming_session_private_node(
+                last_node,
+                session_id,
+                pending.key[start:end],
+                pending.priority,
+                is_fringe=False,
+            )
+        if pending.aligned_len < len(pending.key):
+            fringe_key = pending.key[pending.aligned_len :]
+            last_node = self.tree_core.add_streaming_session_private_node(
+                last_node,
+                session_id,
+                fringe_key,
+                pending.priority,
+                is_fringe=True,
+            )
+
+        self._commit_streaming_session_host_path(
+            last_node,
+            pending.backup,
+            logical_len=len(pending.key),
+        )
+        host_lock_params = self.inc_host_lock_ref(last_node).to_dec_params()
+        self.session_refs.register_streaming_session_frontier(session_id, last_node)
+        self.session.transition_to_demoted(
+            session_id,
+            last_node,
+            len(pending.key),
+            pending.tree_prefix_len,
+            host_lock_params,
+        )
+        self._demote_streaming_session_tree_path(pending.tree_prefix_node)
+        return len(pending.key)
+
+    def _streaming_session_path(
+        self,
+        last_node: NodeId,
+        expected_len: int,
+    ) -> list[UnifiedTreeNode]:
+        """Return the exact root-to-frontier node path for a staged prefix.
+
+        :param last_node: Radix frontier anchoring the staged prefix.
+        :param expected_len: Required logical length of the complete path.
+        :returns: Non-root nodes in root-to-frontier order.
+        :raises AssertionError: If the frontier does not span the staged prefix.
+        """
+        nodes: list[UnifiedTreeNode] = []
+        node = self.tree_core.node_by_id(last_node)
+        while node is not self.tree_core.root_node:
+            nodes.append(node)
+            node = node.parent
+        nodes.reverse()
+        path_len = sum(len(node.key) for node in nodes)
+        if path_len != expected_len:
+            raise AssertionError(
+                "Session demotion frontier length mismatch: "
+                f"{path_len=} {expected_len=}"
+            )
+        return nodes
+
+    def _commit_streaming_session_host_path(
+        self,
+        last_node: NodeId,
+        backup: RetractionBackup,
+        *,
+        logical_len: int | None = None,
+    ) -> None:
+        """Attach staged full and SWA slots to the integrated radix path.
+
+        :param last_node: Radix frontier anchoring the staged prefix.
+        :param backup: Private host stage to publish.
+        :param logical_len: Exact token count when a physical fringe is present.
+        """
+        expected_len = len(backup.host_indices) if logical_len is None else logical_len
+        nodes = self._streaming_session_path(last_node, expected_len)
+        full_frees: list[torch.Tensor] = []
+        offset = 0
+        for node in nodes:
+            logical_node_len = len(node.key)
+            physical_node_len = (
+                logical_node_len
+                if node.private_physical_length is None
+                else node.private_physical_length
+            )
+            host_slice = backup.host_indices[offset : offset + physical_node_len]
+            full_data = node.component_data[ComponentType.FULL]
+            if full_data.host_value is None:
+                self.tree_core.commit_backup(node.id, host_slice, {})
+                self.tree_core.finish_synchronous_backup(node.id)
+            else:
+                full_frees.append(host_slice)
+            offset += physical_node_len
+        if offset != len(backup.host_indices):
+            raise AssertionError(
+                "Session demotion full host allocation does not match its path: "
+                f"{offset=} host_slots={len(backup.host_indices)}"
+            )
+        for host_indices in full_frees:
+            self.host_pool_group.free(host_indices, pool=PoolName.KV)
+
+        independent = [
+            transfer
+            for transfer in backup.pool_transfers or []
+            if transfer.indices_from_pool is None
+        ]
+        unsupported = [
+            transfer.name for transfer in independent if transfer.name != PoolName.SWA
+        ]
+        if len(unsupported) > 0:
+            raise AssertionError(
+                f"Unsupported independently allocated demotion pools: {unsupported}"
+            )
+        swa_transfers = [
+            transfer for transfer in independent if transfer.name == PoolName.SWA
+        ]
+        if len(swa_transfers) == 0:
+            return
+        if len(swa_transfers) != 1 or swa_transfers[0].host_indices is None:
+            raise AssertionError("Session demotion requires one resolved SWA transfer.")
+
+        transfer = swa_transfers[0]
+        remaining = len(transfer.host_indices)
+        swa_frees: list[torch.Tensor] = []
+        for node in reversed(nodes):
+            if remaining == 0:
+                break
+            logical_node_len = len(node.key)
+            physical_node_len = (
+                logical_node_len
+                if node.private_physical_length is None
+                else node.private_physical_length
+            )
+            if logical_node_len > remaining:
+                if node.is_session_private:
+                    raise AssertionError(
+                        "Private demotion node crosses the SWA window boundary."
+                    )
+                _, split_action = self.tree_core._split_node(
+                    node.key,
+                    node,
+                    logical_node_len - remaining,
+                )
+                if split_action is not None:
+                    self._apply_cache_action(split_action)
+                logical_node_len = len(node.key)
+                physical_node_len = logical_node_len
+                assert logical_node_len == remaining
+            host_slice = transfer.host_indices[
+                remaining - physical_node_len : remaining
+            ]
+            swa_data = node.component_data[ComponentType.SWA]
+            if swa_data.host_value is None:
+                self.tree_core.commit_backup(
+                    node.id,
+                    backup.host_indices[:0],
+                    {ComponentType.SWA: [replace(transfer, host_indices=host_slice)]},
+                )
+            else:
+                swa_frees.append(host_slice)
+            remaining -= physical_node_len
+        if remaining != 0:
+            raise AssertionError(
+                f"SWA demotion path is short by {remaining} host slots."
+            )
+        for host_indices in swa_frees:
+            self.host_pool_group.free(host_indices, pool=PoolName.SWA)
+
+    def _demote_streaming_session_tree_path(self, last_node: NodeId) -> None:
+        """Demote the unlocked ordinary prefix while preserving shared branches.
+
+        :param last_node: Ordinary host-backed frontier to demote toward the root.
+        """
+        node = self.tree_core.node_by_id(last_node)
+        while node is not self.tree_core.root_node:
+            parent = node.parent
+            if node.evicted:
+                node = parent
+                continue
+            if not self.tree_core._is_device_leaf(node):
+                break
+            if not node.backuped:
+                raise AssertionError(
+                    f"Session demotion node {node.id} has no published host copy."
+                )
+            result = self.tree_core.demote(node.id)
+            self._free_values(result.device_frees, result.host_frees)
+            node = parent
+
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
+
+    def streaming_session_private_parent(self, node: NodeId) -> NodeId | None:
+        """Return the ordinary radix parent of a session-private suffix.
+
+        :param node: Exact host frontier, or an ordinary aligned frontier.
+        :returns: The ordinary parent, or ``None`` without a private suffix.
+        """
+        if not self.tree_core.is_session_private(node):
+            return None
+        return self.tree_core.streaming_session_private_parent(node)
+
+    def retire_streaming_session_private_path(
+        self, session_id: str, node: NodeId
+    ) -> None:
+        """Detach a private exact suffix after session ownership ends.
+
+        :param session_id: Session identifier that owns the private suffix.
+        :param node: Exact host frontier, or an ordinary radix frontier.
+        """
+        result = self.tree_core.retire_streaming_session_private_path(session_id, node)
+        self._free_values(result.device_frees, result.host_frees)
+
+    def adopt_streaming_session_private_path(
+        self, session_id: str, node: NodeId
+    ) -> int:
+        """Transfer a restored private suffix to detached-slot ownership.
+
+        :param session_id: Session identifier that owns the private suffix.
+        :param node: Exact restored frontier.
+        :returns: Logical private-suffix length, or zero without one.
+        """
+        if not self.tree_core.is_session_private(node):
+            return 0
+        private_len = self.tree_core.streaming_session_private_length(node)
+        result = self.tree_core.adopt_streaming_session_private_path(session_id, node)
+        # The detached request slot inherits every restored device allocation.
+        # Only the redundant host copies leave ownership during adoption.
+        result.device_frees.clear()
+        self._free_values(result.device_frees, result.host_frees)
+        return private_len
 
     def truncate_session(self, session_id: str, target: int) -> None:
         self.session.truncate_session(session_id, target)
@@ -3131,12 +3591,6 @@ class UnifiedRadixCache(BasePrefixCache):
         TODO(hzh): This method has relatively high latency; simplify the
         check logic once the tree implementation stabilizes.
         """
-        # Skip when streaming sessions hold tree locks: the check asserts
-        # all nodes are unlocked during idle, which streaming sessions break
-        # by design (they hold a first-turn lock across turns).
-        if self.session.any_holding_kv():
-            return
-
         # Pass ongoing ops as lightweight (id, node_id) pairs so the tree core
         # can resolve + validate them without reaching into Controller state.
         if self.buffer_pipeline is not None:

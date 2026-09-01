@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionDemotionError,
     StreamingSessionInfoUnavailableError,
 )
 from sglang.srt.utils.common import log_info_on_rank0
@@ -112,6 +113,32 @@ class StreamingSessionInventory:
     floor: int
     full: KVComponentResidency
     swa: KVComponentResidency
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSessionDemotionContext:
+    """Immutable inputs and recovery coordinates for one demotion transaction.
+
+    :ivar session_id: Public session identifier.
+    :ivar token_ids: Complete committed token lineage.
+    :ivar extra_key: Radix cache classification key.
+    :ivar cache_salt: Radix cache namespace salt.
+    :ivar priority: Cache eviction priority inherited from the last request.
+    :ivar tip: Absolute durable token offset.
+    :ivar lineage_digest: Canonical digest of the durable token history.
+    :ivar lineage_generation: Generation incremented by history rewrites.
+    :ivar already_demoted: Whether the transaction has already committed.
+    """
+
+    session_id: str
+    token_ids: array
+    extra_key: str | None
+    cache_salt: str | None
+    priority: int
+    tip: int
+    lineage_digest: str
+    lineage_generation: int
+    already_demoted: bool
 
 
 class SessionReqNode:
@@ -214,6 +241,17 @@ class Session:
         :returns: Versioned canonical lineage digest.
         """
         return self._lineage_digest
+
+    def committed_token_ids(self) -> array:
+        """Return a private copy of the complete durable token lineage.
+
+        :returns: Committed token identifiers in absolute lineage order.
+        """
+        if len(self.req_nodes) == 0:
+            return array("q")
+        [last_req_node] = self.req_nodes.values()
+        token_ids, _ = self._committed_token_arrays(last_req_node.req)
+        return token_ids
 
     @staticmethod
     def _strip_tokenized_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
@@ -794,6 +832,52 @@ class SessionController:
                 )
             )
         return inventory
+
+    def demotion_context(self, session_id: str) -> StreamingSessionDemotionContext:
+        """Validate and freeze the inputs for a streaming-session demotion.
+
+        :param session_id: Session identifier to demote.
+        :returns: Immutable cache identity and recovery coordinates.
+        :raises StreamingSessionDemotionError: If the session cannot be demoted.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise StreamingSessionDemotionError(f"Session {session_id} does not exist.")
+        if not session.streaming:
+            raise StreamingSessionDemotionError(
+                f"Session {session_id} is not a streaming session."
+            )
+        if session._inflight:
+            raise StreamingSessionDemotionError(
+                f"Session {session_id} has an active request."
+            )
+        if not self.tree_cache.supports_streaming_session_demotion():
+            raise StreamingSessionDemotionError(
+                "Session demotion requires UnifiedRadixCache with cache-mode HiCache "
+                "and session radix references enabled."
+            )
+        if len(session.req_nodes) != 1:
+            raise StreamingSessionDemotionError(
+                f"Session {session_id} has no committed KV frontier."
+            )
+
+        [last_req_node] = session.req_nodes.values()
+        last_req = last_req_node.req
+        if not last_req.finished():
+            raise StreamingSessionDemotionError(
+                f"Session {session_id} has an unfinished request."
+            )
+        return StreamingSessionDemotionContext(
+            session_id=session_id,
+            token_ids=session.committed_token_ids(),
+            extra_key=last_req.extra_key,
+            cache_salt=last_req.cache_salt,
+            priority=0 if last_req.priority is None else last_req.priority,
+            tip=session.current_tip(),
+            lineage_digest=session.current_digest(),
+            lineage_generation=session.lineage_generation,
+            already_demoted=self.tree_cache.is_streaming_session_demoted(session_id),
+        )
 
     def open(self, recv_req: OpenSessionReqInput) -> OpenSessionReqOutput:
         session_id = recv_req.session_id

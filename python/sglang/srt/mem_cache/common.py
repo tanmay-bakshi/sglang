@@ -87,7 +87,8 @@ def streaming_session_swa_eviction_plan(
 
     :param current_watermark: Current logical SWA eviction watermark.
     :param pre_len: Request length used by ordinary SWA eviction.
-    :param cache_protected_len: Prefix whose physical KV is radix-owned.
+    :param cache_protected_len: Exact protected prefix whose physical pages must
+        remain live.
     :param sliding_window_size: Model sliding-attention window.
     :param page_size: KV cache page size.
     :param streaming_session_floor: Durable rollback floor for the session.
@@ -100,15 +101,15 @@ def streaming_session_swa_eviction_plan(
     assert cache_protected_len >= 0
     assert streaming_session_floor >= 0
     assert forced_evict_floor >= 0
+    physical_cache_protected_len = ceil_align(cache_protected_len, page_size)
     if page_size > 1:
         assert current_watermark % page_size == 0
-        assert cache_protected_len % page_size == 0
 
     if page_size > 1 and forced_evict_floor > 0:
         forced_evict_floor = -(-forced_evict_floor // page_size) * page_size
     # The forced prefix remains physically live but is not persisted on a
     # detached slot, so accepting it would corrupt the next turn's frontier.
-    if forced_evict_floor > cache_protected_len:
+    if forced_evict_floor > physical_cache_protected_len:
         raise RuntimeError(
             "Streaming sessions do not support prefill-aware SWA eviction floors."
         )
@@ -123,7 +124,7 @@ def streaming_session_swa_eviction_plan(
     logical_watermark = max(current_watermark, threshold)
     physical_free_start = max(
         current_watermark,
-        cache_protected_len,
+        physical_cache_protected_len,
         forced_evict_floor,
     )
     if page_size > 1:

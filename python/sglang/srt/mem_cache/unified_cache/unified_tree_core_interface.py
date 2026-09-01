@@ -409,6 +409,33 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def add_streaming_session_private_node(
+        self,
+        parent_id: NodeId,
+        session_id: str,
+        key: RadixKey,
+        priority: int,
+        *,
+        is_fringe: bool,
+    ) -> NodeId:
+        """Attach one exact, session-private suffix node."""
+        ...
+
+    @abstractmethod
+    def retire_streaming_session_private_path(
+        self, session_id: str, node_id: NodeId
+    ) -> DemoteResult:
+        """Release and detach one complete private suffix path."""
+        ...
+
+    @abstractmethod
+    def adopt_streaming_session_private_path(
+        self, session_id: str, node_id: NodeId
+    ) -> DemoteResult:
+        """Transfer one restored private suffix to session-slot ownership."""
+        ...
+
+    @abstractmethod
     def build_backup_spec(
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
