@@ -998,6 +998,7 @@ def test_active_swa_eviction_is_clamped_by_streaming_floor():
         cache_protected_len=0,
         swa_evict_floor=0,
         streaming_session_floor=80,
+        streaming_session_tree_protected_len=0,
         kv=ReqKvInfo(kv_allocated_len=112, swa_evicted_seqlen=0),
     )
 
@@ -1024,6 +1025,7 @@ def test_held_empty_request_skips_swa_eviction_before_allocation() -> None:
         cache_protected_len=0,
         swa_evict_floor=0,
         streaming_session_floor=80,
+        streaming_session_tree_protected_len=None,
         kv=ReqKvInfo(),
     )
 
@@ -1050,6 +1052,7 @@ def test_streaming_floor_preserves_radix_owned_rollback_window():
         cache_protected_len=2_048,
         swa_evict_floor=0,
         streaming_session_floor=2_048,
+        streaming_session_tree_protected_len=2_048,
         kv=ReqKvInfo(kv_allocated_len=4_608, swa_evicted_seqlen=0),
     )
 
@@ -1076,6 +1079,7 @@ def test_streaming_exact_fringe_preserves_its_physical_swa_page() -> None:
         cache_protected_len=65,
         swa_evict_floor=0,
         streaming_session_floor=256,
+        streaming_session_tree_protected_len=65,
         kv=ReqKvInfo(kv_allocated_len=256, swa_evicted_seqlen=0),
     )
 
@@ -1103,6 +1107,7 @@ def test_streaming_floor_rejects_unpersisted_forced_evict_prefix():
         cache_protected_len=64,
         swa_evict_floor=96,
         streaming_session_floor=256,
+        streaming_session_tree_protected_len=64,
         kv=ReqKvInfo(kv_allocated_len=256, swa_evicted_seqlen=32),
     )
 
@@ -1239,6 +1244,7 @@ def test_non_session_swa_eviction_keeps_existing_frontier():
         cache_protected_len=0,
         swa_evict_floor=0,
         streaming_session_floor=None,
+        streaming_session_tree_protected_len=None,
         kv=ReqKvInfo(kv_allocated_len=112, swa_evicted_seqlen=0),
     )
 
