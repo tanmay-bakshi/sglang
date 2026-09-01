@@ -76,7 +76,7 @@ def streaming_session_swa_eviction_plan(
     current_watermark: int,
     pre_len: int,
     *,
-    cache_protected_len: int,
+    tree_protected_len: int,
     sliding_window_size: int,
     page_size: int,
     streaming_session_floor: int,
@@ -87,8 +87,8 @@ def streaming_session_swa_eviction_plan(
 
     :param current_watermark: Current logical SWA eviction watermark.
     :param pre_len: Request length used by ordinary SWA eviction.
-    :param cache_protected_len: Exact protected prefix whose physical pages must
-        remain live.
+    :param tree_protected_len: Prefix whose physical pages remain owned by the
+        radix tree.
     :param sliding_window_size: Model sliding-attention window.
     :param page_size: KV cache page size.
     :param streaming_session_floor: Durable rollback floor for the session.
@@ -98,10 +98,10 @@ def streaming_session_swa_eviction_plan(
     """
     assert current_watermark >= 0
     assert pre_len >= 0
-    assert cache_protected_len >= 0
+    assert tree_protected_len >= 0
     assert streaming_session_floor >= 0
     assert forced_evict_floor >= 0
-    physical_cache_protected_len = ceil_align(cache_protected_len, page_size)
+    physical_tree_protected_len = ceil_align(tree_protected_len, page_size)
     if page_size > 1:
         assert current_watermark % page_size == 0
 
@@ -109,7 +109,7 @@ def streaming_session_swa_eviction_plan(
         forced_evict_floor = -(-forced_evict_floor // page_size) * page_size
     # The forced prefix remains physically live but is not persisted on a
     # detached slot, so accepting it would corrupt the next turn's frontier.
-    if forced_evict_floor > physical_cache_protected_len:
+    if forced_evict_floor > physical_tree_protected_len:
         raise RuntimeError(
             "Streaming sessions do not support prefill-aware SWA eviction floors."
         )
@@ -124,13 +124,41 @@ def streaming_session_swa_eviction_plan(
     logical_watermark = max(current_watermark, threshold)
     physical_free_start = max(
         current_watermark,
-        physical_cache_protected_len,
+        physical_tree_protected_len,
         forced_evict_floor,
     )
     if page_size > 1:
         assert logical_watermark % page_size == 0
         assert physical_free_start % page_size == 0
     return logical_watermark, physical_free_start
+
+
+def free_mapped_swa_slots(
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    req_pool_idx: int,
+    start: int,
+    end: int,
+) -> None:
+    """Release a physical SWA range only when every full slot has a mapping.
+
+    :param req_to_token_pool: Request-to-full-slot mapping.
+    :param token_to_kv_pool_allocator: Hybrid allocator owning the SWA mappings.
+    :param req_pool_idx: Detached or active request row.
+    :param start: Inclusive page-aligned token position.
+    :param end: Exclusive page-aligned token position.
+    """
+    if end <= start:
+        return
+    full_slots = req_to_token_pool.req_to_token[req_pool_idx, start:end]
+    kv_cache = token_to_kv_pool_allocator.get_kvcache()
+    swa_slots = kv_cache.translate_loc_from_full_to_swa(full_slots)
+    if not bool((swa_slots > 0).all()):
+        raise AssertionError(
+            "Streaming-session SWA release crossed positions without live mappings: "
+            f"{start=} {end=}"
+        )
+    token_to_kv_pool_allocator.free_swa(full_slots)
 
 
 def free_swa_out_of_window_slots(
@@ -149,11 +177,18 @@ def free_swa_out_of_window_slots(
 
     streaming_session_floor = getattr(req, "streaming_session_floor", None)
     if streaming_session_floor is not None:
+        tree_protected_len = getattr(
+            req,
+            "streaming_session_tree_protected_len",
+            None,
+        )
+        if tree_protected_len is None:
+            tree_protected_len = req.cache_protected_len
         new_swa_evicted_seqlen, physical_free_start = (
             streaming_session_swa_eviction_plan(
                 req.kv.swa_evicted_seqlen,
                 pre_len,
-                cache_protected_len=req.cache_protected_len,
+                tree_protected_len=tree_protected_len,
                 sliding_window_size=sliding_window_size,
                 page_size=page_size,
                 streaming_session_floor=streaming_session_floor,
@@ -162,11 +197,13 @@ def free_swa_out_of_window_slots(
             )
         )
         if new_swa_evicted_seqlen > physical_free_start:
-            free_slots = req_to_token_pool.req_to_token[
+            free_mapped_swa_slots(
+                req_to_token_pool,
+                token_to_kv_pool_allocator,
                 req.req_pool_idx,
-                physical_free_start:new_swa_evicted_seqlen,
-            ]
-            token_to_kv_pool_allocator.free_swa(free_slots)
+                physical_free_start,
+                new_swa_evicted_seqlen,
+            )
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
         return
 

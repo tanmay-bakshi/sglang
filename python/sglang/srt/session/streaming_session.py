@@ -23,7 +23,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     StreamingSessionCacheSnapshot,
 )
-from sglang.srt.mem_cache.common import streaming_session_swa_eviction_plan
+from sglang.srt.mem_cache.common import (
+    free_mapped_swa_slots,
+    streaming_session_swa_eviction_plan,
+)
 from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
@@ -134,6 +137,7 @@ class SessionSlot:
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
         req.streaming_session_floor = self.streaming_session_floor
+        req.streaming_session_tree_protected_len = self.tree_protected_len
         req.skip_lock_node_ids = self.skip_lock_node_ids
 
         req.mamba_pool_idx = self.mamba_pool_idx
@@ -158,11 +162,13 @@ class DemotedSessionState:
 
     :ivar last_node: Radix node anchoring the reusable host prefix.
     :ivar cache_protected_len: Exact number of host-backed tokens.
+    :ivar swa_evicted_seqlen: First restored token with live SWA device state.
     :ivar host_lock_params: Component lock coordinates required for release.
     """
 
     last_node: Any
     cache_protected_len: int
+    swa_evicted_seqlen: int
     host_lock_params: DecLockRefParams
 
 
@@ -242,6 +248,31 @@ class StreamingSession(BasePrefixCache):
         :returns: Whether the session is host-resident.
         """
         return session_id in self.demoted
+
+    def restore_demoted_request_state(self, req: Req | None, matched_len: int) -> None:
+        """Restore physical ownership cursors for one host-resident match.
+
+        :param req: Request receiving a demoted session prefix.
+        :param matched_len: Exact full-KV prefix accepted by the cache.
+        """
+        if req is None or not _is_streaming(req):
+            return
+        state = self.demoted.get(req.session.session_id)
+        if state is None:
+            return
+        if matched_len != state.cache_protected_len:
+            raise AssertionError(
+                "A demoted streaming session did not restore its exact frontier: "
+                f"{matched_len=} expected={state.cache_protected_len}"
+            )
+        current_watermark = req.kv.swa_evicted_seqlen
+        if current_watermark not in (0, state.swa_evicted_seqlen):
+            raise AssertionError(
+                "A demoted streaming request already has an unrelated SWA "
+                f"watermark: {current_watermark=}"
+            )
+        req.kv.swa_evicted_seqlen = state.swa_evicted_seqlen
+        req.streaming_session_tree_protected_len = state.cache_protected_len
 
     # -- Try-handle entries for composition (see class docstring) --
 
@@ -484,8 +515,8 @@ class StreamingSession(BasePrefixCache):
         # verify by ~1, which would short-change inheritance). Clamp to allocated
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
-        self._reconcile_slot_swa(slot)
-        self._release_demoted_state(session_id)
+        if not self._release_demoted_state(session_id):
+            self._reconcile_slot_swa(slot)
 
         return True
 
@@ -569,6 +600,7 @@ class StreamingSession(BasePrefixCache):
         last_node: Any,
         cache_protected_len: int,
         tree_prefix_len: int,
+        swa_evicted_seqlen: int,
         host_lock_params: DecLockRefParams,
     ) -> None:
         """Replace a detached device slot with its host-resident tree frontier.
@@ -578,6 +610,8 @@ class StreamingSession(BasePrefixCache):
         :param cache_protected_len: Exact host-backed token count.
         :param tree_prefix_len: Page-aligned prefix already owned by the ordinary
             radix tree.
+        :param swa_evicted_seqlen: First token retained in the restored SWA
+            window.
         :param host_lock_params: Component lock coordinates required for release.
         """
         slot = self.slots.pop(session_id)
@@ -585,9 +619,12 @@ class StreamingSession(BasePrefixCache):
         assert tree_prefix_len % self.page_size == 0
         assert tree_prefix_len <= cache_protected_len
         assert cache_protected_len <= slot.kv_committed_len
+        assert swa_evicted_seqlen % self.page_size == 0
+        assert swa_evicted_seqlen <= cache_protected_len
         self.demoted[session_id] = DemotedSessionState(
             last_node=last_node,
             cache_protected_len=cache_protected_len,
+            swa_evicted_seqlen=swa_evicted_seqlen,
             host_lock_params=host_lock_params,
         )
         self._release_slot_resources(
@@ -641,22 +678,23 @@ class StreamingSession(BasePrefixCache):
 
     def _release_demoted_state(
         self, session_id: str, *, retire_private_path: bool = False
-    ) -> None:
+    ) -> bool:
         """Release one session's host lock and radix coverage.
 
         :param session_id: Session identifier whose host ownership must end.
         :param retire_private_path: Whether no device slot inherits the suffix.
+        :returns: Whether a demoted state was released.
         """
         state = self.demoted.pop(session_id, None)
         if state is None:
-            return
+            return False
         self.inner.dec_host_lock_ref(state.last_node, state.host_lock_params)
         self.inner.clear_radix_session_refs(session_id)
         if retire_private_path:
             self.inner.retire_streaming_session_private_path(
                 session_id, state.last_node
             )
-            return
+            return True
         slot = self.slots.get(session_id)
         private_parent = self.inner.streaming_session_private_parent(state.last_node)
         replacement_lock: IncLockRefResult | None = None
@@ -681,6 +719,46 @@ class StreamingSession(BasePrefixCache):
             slot.swa_uuid_for_lock = replacement_lock.swa_uuid_for_lock
             slot.skip_lock_node_ids = replacement_lock.skip_lock_node_ids
             slot.tree_protected_len = state.cache_protected_len - private_len
+        if slot is not None:
+            self._reconcile_adopted_swa(slot, state)
+            self._reconcile_slot_swa(slot)
+        return True
+
+    def _reconcile_adopted_swa(
+        self,
+        slot: SessionSlot,
+        state: DemotedSessionState,
+    ) -> None:
+        """Release restored SWA pages skipped while the private path was locked.
+
+        :param slot: Device slot inheriting the private suffix.
+        :param state: Host-resident ownership state being adopted.
+        """
+        if not slot.is_holding_kv or not self.supports_swa():
+            return
+        restored_watermark = state.swa_evicted_seqlen
+        logical_watermark = slot.kv.swa_evicted_seqlen
+        if logical_watermark < restored_watermark:
+            raise AssertionError(
+                "Restored SWA watermark regressed during private-path adoption: "
+                f"{logical_watermark=} {restored_watermark=}"
+            )
+        private_end = ceil_align(state.cache_protected_len, self.page_size)
+        tree_end = ceil_align(slot.tree_protected_len, self.page_size)
+        if tree_end > private_end:
+            raise AssertionError(
+                "Post-adoption tree ownership exceeds the restored private prefix: "
+                f"{tree_end=} {private_end=}"
+            )
+        free_start = max(restored_watermark, tree_end)
+        free_end = min(logical_watermark, private_end)
+        free_mapped_swa_slots(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            slot.req_pool_idx,
+            free_start,
+            free_end,
+        )
 
     def truncate_session(self, session_id: str, target: int) -> None:
         """Trim a session slot to an already-validated logical token index."""
@@ -750,7 +828,7 @@ class StreamingSession(BasePrefixCache):
         new_watermark, physical_free_start = streaming_session_swa_eviction_plan(
             slot.kv.swa_evicted_seqlen,
             slot.kv_committed_len,
-            cache_protected_len=slot.cache_protected_len,
+            tree_protected_len=slot.tree_protected_len,
             sliding_window_size=self.sliding_window_size,
             page_size=self.page_size,
             streaming_session_floor=slot.streaming_session_floor,
@@ -759,10 +837,13 @@ class StreamingSession(BasePrefixCache):
             return
 
         if new_watermark > physical_free_start:
-            free_slots = self.req_to_token_pool.req_to_token[
-                slot.req_pool_idx, physical_free_start:new_watermark
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            free_mapped_swa_slots(
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                slot.req_pool_idx,
+                physical_free_start,
+                new_watermark,
+            )
         slot.kv.swa_evicted_seqlen = new_watermark
 
     def release_radix_session(self, session_id: str) -> None:

@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import RetractionBackup, retraction_backup
+from sglang.srt.mem_cache.common import (
+    RetractionBackup,
+    free_swa_out_of_window_slots,
+    retraction_backup,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -346,6 +350,16 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         env.cache.open_radix_session(session_id)
         return req, source_indices
 
+    @staticmethod
+    def _streaming_match_req(session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            session=SimpleNamespace(
+                streaming=True,
+                session_id=session_id,
+            ),
+            kv=ReqKvInfo(),
+        )
+
     def test_backup_declined_when_host_pool_too_small(self):
         # A backup-only host pool is deliberately smaller than the device pool,
         # so a large enough request cannot be preserved.
@@ -537,12 +551,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                         extra_key="namespace",
                         cache_salt="tenant",
                     ),
-                    req=SimpleNamespace(
-                        session=SimpleNamespace(
-                            streaming=True,
-                            session_id=session_id,
-                        )
-                    ),
+                    req=self._streaming_match_req(session_id),
                 )
             )
 
@@ -683,12 +692,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             return cache.match_prefix(
                 MatchPrefixParams(
                     key=key,
-                    req=SimpleNamespace(
-                        session=SimpleNamespace(
-                            streaming=True,
-                            session_id=session_id,
-                        )
-                    ),
+                    req=self._streaming_match_req(session_id),
                 )
             )
 
@@ -830,12 +834,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                     extra_key="namespace",
                     cache_salt="tenant",
                 ),
-                req=SimpleNamespace(
-                    session=SimpleNamespace(
-                        streaming=True,
-                        session_id="session",
-                    )
-                ),
+                req=self._streaming_match_req("session"),
             )
         )
         load_req = SimpleNamespace(
@@ -876,6 +875,188 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache.release_radix_session("session")
         cache.release_session("session")
         cache.sanity_check()
+
+    def test_streaming_session_swa_adoption_balances_real_allocator(self) -> None:
+        page_size = 64
+        exact_tokens = page_size * 2 + 1
+        below_transition = page_size * 3 - 1
+        transition = page_size * 3
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        allocator = env.allocator
+        full_available_baseline = allocator.full_available_size()
+        swa_available_baseline = allocator.swa_available_size()
+        request_available_baseline = env.req_to_token_pool.available_size()
+        host_available_baseline = cache.host_pool_group.available_size()
+
+        self._admit_streaming_session(env, "session", exact_tokens)
+        token_ids = array("q", range(exact_tokens + 1))
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                "session",
+                token_ids,
+                extra_key="namespace",
+                cache_salt="tenant",
+                priority=0,
+            ),
+            exact_tokens,
+        )
+        self.assertEqual(
+            cache.commit_streaming_session_demotion("session"),
+            exact_tokens,
+        )
+        state = cache.session.demoted["session"]
+        self.assertEqual(state.swa_evicted_seqlen, page_size)
+        self.assertEqual(allocator.full_available_size(), full_available_baseline)
+        self.assertEqual(allocator.swa_available_size(), swa_available_baseline)
+        self.assertEqual(
+            env.req_to_token_pool.available_size(), request_available_baseline
+        )
+
+        match_req = self._streaming_match_req("session")
+        owner_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    extra_key="namespace",
+                    cache_salt="tenant",
+                ),
+                req=match_req,
+            )
+        )
+        self.assertEqual(owner_match.full_kv_hit_length, exact_tokens)
+        self.assertEqual(match_req.kv.swa_evicted_seqlen, page_size)
+        self.assertEqual(
+            match_req.streaming_session_tree_protected_len,
+            exact_tokens,
+        )
+        match_req.last_node = owner_match.last_device_node
+        match_req.prefix_indices = owner_match.device_indices
+        match_req.swa_host_hit_length = owner_match.swa_host_hit_length
+        match_req.mamba_host_hit_length = 0
+        match_req.mamba_pool_idx = None
+        load_result = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=owner_match.best_match_node,
+                host_hit_length=owner_match.host_hit_length,
+                req=match_req,
+            )
+        )
+        cache.ready_to_load_host_cache()
+        ack = cache.cache_controller.ack_load_queue[0]
+        ack.finish_event.synchronize()
+        cache.loading_check(finish_count=1)
+
+        restored_req = SimpleNamespace(rid="restored", req_pool_idx=None)
+        self.assertIsNotNone(env.req_to_token_pool.alloc([restored_req]))
+        restored_indices = load_result.new_full_device_indices
+        fringe_page = restored_indices[-1] + torch.arange(
+            page_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        env.req_to_token_pool.write(
+            (restored_req.req_pool_idx, slice(0, exact_tokens)),
+            restored_indices,
+        )
+        env.req_to_token_pool.write(
+            (restored_req.req_pool_idx, slice(exact_tokens, transition)),
+            fringe_page[1:],
+        )
+        match_req.req_pool_idx = restored_req.req_pool_idx
+        match_req.is_holding_kv = True
+        match_req.cache_protected_len = exact_tokens
+        match_req.swa_evict_floor = 0
+        match_req.streaming_session_floor = transition
+        match_req.kv.kv_allocated_len = transition
+        swa_available_after_restore = allocator.swa_available_size()
+
+        for pre_len, expected_watermark in (
+            (below_transition, page_size),
+            (transition, page_size * 2),
+        ):
+            free_swa_out_of_window_slots(
+                match_req,
+                pre_len,
+                sliding_window_size=page_size,
+                page_size=page_size,
+                req_to_token_pool=env.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+            )
+            self.assertEqual(
+                match_req.kv.swa_evicted_seqlen,
+                expected_watermark,
+            )
+            self.assertEqual(
+                allocator.swa_available_size(),
+                swa_available_after_restore,
+            )
+
+        restored_lock = cache.inc_lock_ref(state.last_node)
+        cache.session.slots["session"] = SessionSlot(
+            req_pool_idx=restored_req.req_pool_idx,
+            kv_committed_len=transition,
+            kv=match_req.kv,
+            streaming_session_floor=transition,
+            last_node=state.last_node,
+            cache_protected_len=exact_tokens,
+            tree_protected_len=exact_tokens,
+            swa_uuid_for_lock=restored_lock.swa_uuid_for_lock,
+            skip_lock_node_ids=restored_lock.skip_lock_node_ids,
+        )
+
+        self.assertTrue(cache.session._release_demoted_state("session"))
+
+        slot = cache.session.slots["session"]
+        self.assertEqual(slot.tree_protected_len, 0)
+        self.assertEqual(slot.kv.swa_evicted_seqlen, page_size * 2)
+        full_consumption = (
+            full_available_baseline - allocator.full_available_size()
+        )
+        swa_consumption = swa_available_baseline - allocator.swa_available_size()
+        self.assertEqual(cache.session.session_held_tokens(), full_consumption)
+        self.assertEqual(cache.session.session_held_swa_tokens(), swa_consumption)
+        self.assertEqual(swa_consumption, page_size)
+        released_full_slots = env.req_to_token_pool.req_to_token[
+            slot.req_pool_idx, page_size : page_size * 2
+        ]
+        retained_full_slots = env.req_to_token_pool.req_to_token[
+            slot.req_pool_idx, page_size * 2 : transition
+        ]
+        self.assertTrue(
+            bool(
+                (
+                    allocator.translate_loc_from_full_to_swa(released_full_slots)
+                    == 0
+                ).all()
+            )
+        )
+        self.assertTrue(
+            bool(
+                (
+                    allocator.translate_loc_from_full_to_swa(retained_full_slots)
+                    > 0
+                ).all()
+            )
+        )
+
+        cache.release_radix_session("session")
+        cache.release_session("session")
+        cache.sanity_check()
+        self.assertEqual(allocator.full_available_size(), full_available_baseline)
+        self.assertEqual(allocator.swa_available_size(), swa_available_baseline)
+        self.assertEqual(
+            env.req_to_token_pool.available_size(), request_available_baseline
+        )
+        self.assertEqual(
+            cache.host_pool_group.available_size(), host_available_baseline
+        )
 
     def test_streaming_session_failed_vote_discards_private_stage(self) -> None:
         env = self._build_cache(

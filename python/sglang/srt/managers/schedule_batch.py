@@ -924,6 +924,9 @@ class Req(ReqDllmMixin):
         # None distinguishes ordinary requests from a streaming session whose
         # valid rollback floor is token zero.
         self.streaming_session_floor: int | None = None
+        # Physical radix ownership can be shorter than the exact reusable
+        # prefix after a restored private suffix is adopted by the session.
+        self.streaming_session_tree_protected_len: int | None = None
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds

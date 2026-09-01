@@ -34,6 +34,14 @@ class _FakeAllocator:
     def free_swa(self, free_index: torch.Tensor):
         self.freed_swa.append(free_index.clone())
 
+    def get_kvcache(self) -> "_FakeAllocator":
+        return self
+
+    def translate_loc_from_full_to_swa(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return kv_indices + 1
+
 
 class _FakeReqToTokenPool:
     def __init__(self, req_to_token: torch.Tensor) -> None:
@@ -266,6 +274,7 @@ def test_demoted_snapshot_and_close_release_only_session_ownership() -> None:
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=41,
         cache_protected_len=96,
+        swa_evicted_seqlen=0,
         host_lock_params=lock_params,
     )
     tree_cache.slots["active-session"] = SessionSlot(req_pool_idx=0)
@@ -315,6 +324,7 @@ def test_restored_private_suffix_reanchors_tree_lock_and_becomes_slot_owned() ->
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=42,
         cache_protected_len=65,
+        swa_evicted_seqlen=0,
         host_lock_params=host_lock_params,
     )
 
@@ -351,6 +361,64 @@ def test_restored_private_suffix_reanchors_tree_lock_and_becomes_slot_owned() ->
     assert allocator.freed[0].tolist() == list(range(48, 80))
 
 
+@pytest.mark.parametrize(
+    ("committed_len", "logical_watermark", "expected_freed"),
+    [
+        (79, 32, []),
+        (80, 48, list(range(32, 48))),
+    ],
+)
+def test_demoted_swa_adoption_reconciles_restored_private_ownership(
+    committed_len: int,
+    logical_watermark: int,
+    expected_freed: list[int],
+) -> None:
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=page_size,
+        sliding_window_size=32,
+        private_parent=41,
+        private_len=49,
+    )
+    tree_cache = StreamingSession(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=committed_len,
+        kv=SimpleNamespace(
+            kv_allocated_len=80,
+            swa_evicted_seqlen=logical_watermark,
+        ),
+        streaming_session_floor=committed_len,
+        last_node=42,
+        cache_protected_len=65,
+        tree_protected_len=65,
+        swa_uuid_for_lock=17,
+    )
+    tree_cache.demoted["session-a"] = DemotedSessionState(
+        last_node=42,
+        cache_protected_len=65,
+        swa_evicted_seqlen=32,
+        host_lock_params=DecLockRefParams(swa_uuid_for_host_lock=19),
+    )
+
+    assert tree_cache._release_demoted_state("session-a")
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.tree_protected_len == 16
+    assert slot.kv.swa_evicted_seqlen == logical_watermark
+    assert [
+        index
+        for freed in allocator.freed_swa
+        for index in freed.tolist()
+    ] == expected_freed
+    assert tree_cache.session_held_swa_tokens() == 80 - logical_watermark
+
+
 def test_demoted_reload_skips_ordinary_radix_insertion_until_adoption() -> None:
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     inner = _FakeInnerCache(
@@ -362,6 +430,7 @@ def test_demoted_reload_skips_ordinary_radix_insertion_until_adoption() -> None:
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=42,
         cache_protected_len=65,
+        swa_evicted_seqlen=0,
         host_lock_params=DecLockRefParams(),
     )
     req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=80)

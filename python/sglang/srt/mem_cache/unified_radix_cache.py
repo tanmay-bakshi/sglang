@@ -587,6 +587,9 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        self.session.restore_demoted_request_state(
+            params.req, result.full_kv_hit_length
+        )
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -3251,6 +3254,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_node,
             len(pending.key),
             pending.tree_prefix_len,
+            pending.swa_window_start,
             host_lock_params,
         )
         self._demote_streaming_session_tree_path(pending.tree_prefix_node)
