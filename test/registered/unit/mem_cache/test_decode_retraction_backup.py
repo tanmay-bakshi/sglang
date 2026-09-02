@@ -1282,6 +1282,80 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache.release_session("a")
         cache.sanity_check()
 
+    def test_device_pressure_keeps_a_demoted_path_out_of_the_host_lru(self) -> None:
+        """Evicting a shared prefix's window pages must not expose locked host pages (E3 F17)."""
+        page_size = 64
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        tip = 2 * page_size
+        prefix_req, prefix_indices = self._admit_req(env, page_size)
+        self._seed_pool(env.target_pool, prefix_indices, base=5000)
+        prefix_key = RadixKey(
+            array("q", range(page_size + 1)),
+            extra_key="namespace",
+            cache_salt="tenant",
+            is_bigram=True,
+        )
+        planted = cache.insert(
+            InsertParams(key=prefix_key, value=prefix_indices, trigger_backup=True)
+        )
+        env.req_to_token_pool.free(prefix_req)
+        prefix_node = planted.last_device_node
+        cache.writing_check(write_back=True)
+
+        req, tail_indices = self._admit_streaming_session(env, "a", page_size)
+        row = req.req_pool_idx
+        env.req_to_token_pool.write((row, slice(0, page_size)), prefix_indices)
+        env.req_to_token_pool.write((row, slice(page_size, tip)), tail_indices)
+        lock = cache.inc_lock_ref(prefix_node)
+        slot = cache.session.slots["a"]
+        slot.last_node = prefix_node
+        slot.cache_protected_len = page_size
+        slot.tree_protected_len = page_size
+        slot.kv_committed_len = tip
+        slot.kv = ReqKvInfo(kv_allocated_len=tip)
+        slot.swa_uuid_for_lock = lock.swa_uuid_for_lock
+        slot.skip_lock_node_ids = lock.skip_lock_node_ids
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                "a",
+                array("q", range(tip + 1)),
+                extra_key="namespace",
+                cache_salt="tenant",
+                priority=0,
+            ),
+            tip,
+        )
+        self.assertEqual(cache.commit_streaming_session_demotion("a"), tip)
+        cache.sanity_check()
+
+        def locked_host_lru_nodes() -> list[int]:
+            lru = cache.tree_core.host_lru_lists[ComponentType.SWA]
+            return sorted(
+                node.id
+                for node in lru.cache.values()
+                if node.component_data[ComponentType.SWA].host_lock_ref > 0
+                or node.is_session_private
+            )
+
+        self.assertEqual(locked_host_lru_nodes(), [], self._dump_tree(cache))
+        evicted = cache.evict(EvictParams(num_tokens=page_size, swa_num_tokens=page_size))
+        cache.sanity_check()
+        self.assertEqual(
+            locked_host_lru_nodes(),
+            [],
+            f"evicted={evicted}\n" + self._dump_tree(cache),
+        )
+        cache.release_radix_session("a")
+        cache.release_session("a")
+        cache.sanity_check()
+
     def test_streaming_session_demotion_publishes_exact_private_fringe(self) -> None:
         page_size = 64
         exact_tokens = page_size + 1
