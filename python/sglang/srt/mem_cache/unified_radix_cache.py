@@ -4139,14 +4139,28 @@ class UnifiedRadixCache(BasePrefixCache):
             "free_set_digest": self._free_set_digest(free_pages),
         }
 
-    def _unique_host_locked_pages(self) -> dict[str, int]:
-        """Count the physical host pages demoted sessions keep locked, once each.
+    @staticmethod
+    def _session_keeps_host_value(node: "UnifiedTreeNode", component_type: ComponentType) -> bool:
+        """Return whether a demoted session's path keeps one node's host copy.
 
-        A demoted session's host lock walks its whole root path for full
-        attention. For the sliding window it skips nodes whose window state
-        was a tombstone when the lock was taken: those host copies lie outside
-        the session's window, stay evictable, and are not the session's to
-        keep, so they are not counted here.
+        Full-attention host copies leave the tree leaf-first, so a session's
+        host lock on its frontier keeps every full-attention host copy above
+        it. Sliding-window host copies leave through their own LRU, and the
+        session's window-span lock skips nodes whose window state was a
+        tombstone when it was taken: those copies lie outside the session's
+        window and stay evictable, so only locked window nodes count.
+
+        :param node: Node on the session's root path.
+        :param component_type: Component whose host copy is examined.
+        :returns: Whether the session keeps the node's host copy resident.
+        """
+        data = node.component_data[component_type]
+        if data.host_value is None:
+            return False
+        return component_type == ComponentType.FULL or data.host_lock_ref > 0
+
+    def _unique_host_locked_pages(self) -> dict[str, int]:
+        """Count the physical host pages demoted sessions keep, once each.
 
         :returns: Page counts for the Full and SWA components.
         """
@@ -4161,9 +4175,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 for component_type, pages in locked.items():
                     if component_type not in self.components:
                         continue
-                    data = node.component_data[component_type]
-                    if data.host_value is not None and data.host_lock_ref > 0:
-                        pages.update(int(index) // page for index in data.host_value.tolist())
+                    if self._session_keeps_host_value(node, component_type):
+                        host_value = node.component_data[component_type].host_value
+                        pages.update(int(index) // page for index in host_value.tolist())
                 node = node.parent
         return {
             "full": len(locked[ComponentType.FULL]),
@@ -4171,10 +4185,10 @@ class UnifiedRadixCache(BasePrefixCache):
         }
 
     def _host_locked_path_pages(self, node_id: NodeId) -> dict[str, int]:
-        """Count the host pages one demoted session's host lock holds on its path.
+        """Count the host pages one demoted session keeps on its root path.
 
         :param node_id: The session's host-resident frontier.
-        :returns: Locked host pages for the Full and SWA components.
+        :returns: Kept host pages for the Full and SWA components.
         """
         page = self.page_size
         counts = {ComponentType.FULL: 0, ComponentType.SWA: 0}
@@ -4183,9 +4197,9 @@ class UnifiedRadixCache(BasePrefixCache):
             for component_type in counts:
                 if component_type not in self.components:
                     continue
-                data = node.component_data[component_type]
-                if data.host_value is not None and data.host_lock_ref > 0:
-                    counts[component_type] += ceil_align(len(data.host_value), page) // page
+                if self._session_keeps_host_value(node, component_type):
+                    host_value = node.component_data[component_type].host_value
+                    counts[component_type] += ceil_align(len(host_value), page) // page
             node = node.parent
         return {"full": counts[ComponentType.FULL], "swa": counts[ComponentType.SWA]}
 
