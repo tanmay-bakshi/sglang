@@ -142,39 +142,6 @@ class StreamingSessionCacheSnapshot:
     full: KVComponentResidency = dataclasses.field(default_factory=KVComponentResidency)
     swa: KVComponentResidency = dataclasses.field(default_factory=KVComponentResidency)
 
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class SessionReloadPlan:
-    """Allocation-free plan for restoring one host-resident session.
-
-    :ivar session_id: Session whose private host snapshot is authoritative.
-    :ivar source_node: Exact session-private host frontier.
-    :ivar tree_node: Deepest ordinary radix frontier retained by the session.
-    :ivar reuse_len: Exact logical prefix available to the request.
-    :ivar tree_protected_len: Logical prefix represented by ordinary tree nodes.
-    :ivar swa_evicted_seqlen: First token retained in the SWA window.
-    """
-
-    session_id: str
-    source_node: Any
-    tree_node: Any
-    reuse_len: int
-    tree_protected_len: int
-    swa_evicted_seqlen: int
-
-    def __post_init__(self) -> None:
-        if self.reuse_len <= 0:
-            raise ValueError("A session reload plan must expose a non-empty prefix.")
-        if not 0 <= self.tree_protected_len <= self.reuse_len:
-            raise ValueError(
-                "Session reload tree ownership must lie within the reusable prefix."
-            )
-        if not 0 <= self.swa_evicted_seqlen <= self.reuse_len:
-            raise ValueError(
-                "Session reload SWA watermark must lie within the reusable prefix."
-            )
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class HostLockRange:
     """Root-relative tree interval protected by one host lock.
@@ -359,7 +326,6 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
-    session_reload_plan: SessionReloadPlan | None = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -382,7 +348,6 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
-        session_reload_plan=None,
     )
 
 

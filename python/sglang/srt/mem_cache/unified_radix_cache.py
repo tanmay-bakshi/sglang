@@ -712,10 +712,10 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        session_reload_plan = self.session.restore_demoted_request_state(
+        self.session.restore_demoted_request_state(
             params.req, result.full_kv_hit_length
         )
-        return result._replace(session_reload_plan=session_reload_plan)
+        return result
 
     def is_chunk_cache(self) -> bool:
         return self.disable
