@@ -2535,7 +2535,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_range.length
+            assert seq_len - pre_len == req.extend_range.length, (
+                "Extend range disagrees with the request prefix: "
+                f"{seq_len=} {pre_len=} extend_range={req.extend_range} "
+                f"host_hit_length={req.host_hit_length} "
+                f"cache_protected_len={req.cache_protected_len} "
+                f"session_reload_plan={req.session_reload_plan} rid={req.rid}"
+            )
 
             req.extend_batch_idx += 1
 
