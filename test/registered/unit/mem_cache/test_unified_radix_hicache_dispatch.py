@@ -35,7 +35,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     register_stack_strategy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    _OngoingLoadBack,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -306,9 +309,10 @@ class TestUnifiedLoadBackCompletion(unittest.TestCase):
                     )
                 ],
             ),
-            ongoing_load_back={node_id: (object(), object(), object())},
+            ongoing_load_back={node_id: _OngoingLoadBack(node_id, object(), object())},
             dec_lock_ref=MagicMock(),
             dec_host_lock_ref=MagicMock(),
+            validate_host_lock_ref=MagicMock(),
             buffer_pipeline=None,
             metrics_collector=None,
             pp_rank=0,

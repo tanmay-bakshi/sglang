@@ -727,18 +727,27 @@ class StreamingSession(BasePrefixCache):
     def _release_demoted_state(self, session_id: str) -> bool:
         """Release one session's host lock and radix coverage.
 
+        With a detached slot present the private suffix is adopted: the slot
+        inherits every restored device page and moves its tree lock from the
+        private frontier to the ordinary parent. Without a slot the suffix is
+        retired from the tree. Either way the session's own host lock is the
+        only owner allowed on the path; any other lifecycle owner, or a device
+        lock that is not the inheriting slot's, is a typed refusal.
+
         :param session_id: Session identifier whose host ownership must end.
         :returns: Whether a demoted state was released.
+        :raises StreamingSessionBusyError: If another owner still holds the path.
         """
         state = self.demoted.get(session_id)
         if state is None:
             return False
+        slot = self.slots.get(session_id)
         try:
             self.inner.validate_streaming_session_private_path_detach(
                 session_id,
                 state.last_node,
                 state.host_lock_params,
-                allow_device_locks=False,
+                allow_device_locks=slot is not None,
             )
         except RuntimeError as error:
             raise StreamingSessionBusyError(
@@ -746,10 +755,75 @@ class StreamingSession(BasePrefixCache):
             ) from error
 
         self.inner.dec_host_lock_ref(state.last_node, state.host_lock_params)
-        self.inner.retire_streaming_session_private_path(session_id, state.last_node)
         self.inner.clear_radix_session_refs(session_id)
+        if slot is None:
+            self.inner.retire_streaming_session_private_path(session_id, state.last_node)
+            del self.demoted[session_id]
+            return True
+
+        private_parent = self.inner.streaming_session_private_parent(state.last_node)
+        replacement_lock: IncLockRefResult | None = None
+        if private_parent is not None:
+            replacement_lock = self.inner.inc_lock_ref(private_parent)
+            self.inner.dec_lock_ref(
+                state.last_node,
+                DecLockRefParams(
+                    swa_uuid_for_lock=slot.swa_uuid_for_lock,
+                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                ),
+            )
+        private_len = self.inner.adopt_streaming_session_private_path(
+            session_id, state.last_node
+        )
+        if private_len > 0:
+            if private_parent is None or replacement_lock is None:
+                raise AssertionError(
+                    "A restored private suffix has no ordinary lock frontier."
+                )
+            slot.last_node = private_parent
+            slot.swa_uuid_for_lock = replacement_lock.swa_uuid_for_lock
+            slot.skip_lock_node_ids = replacement_lock.skip_lock_node_ids
+            slot.tree_protected_len = state.cache_protected_len - private_len
         del self.demoted[session_id]
+        self._reconcile_adopted_swa(slot, state)
+        self._reconcile_slot_swa(slot)
         return True
+
+    def _reconcile_adopted_swa(
+        self,
+        slot: SessionSlot,
+        state: DemotedSessionState,
+    ) -> None:
+        """Release restored SWA pages skipped while the private path was locked.
+
+        :param slot: Device slot inheriting the private suffix.
+        :param state: Host-resident ownership state being adopted.
+        """
+        if not slot.is_holding_kv or not self.supports_swa():
+            return
+        restored_watermark = state.swa_evicted_seqlen
+        logical_watermark = slot.kv.swa_evicted_seqlen
+        if logical_watermark < restored_watermark:
+            raise AssertionError(
+                "Restored SWA watermark regressed during private-path adoption: "
+                f"{logical_watermark=} {restored_watermark=}"
+            )
+        private_end = ceil_align(state.cache_protected_len, self.page_size)
+        tree_end = ceil_align(slot.tree_protected_len, self.page_size)
+        if tree_end > private_end:
+            raise AssertionError(
+                "Post-adoption tree ownership exceeds the restored private prefix: "
+                f"{tree_end=} {private_end=}"
+            )
+        free_start = max(restored_watermark, tree_end)
+        free_end = min(logical_watermark, private_end)
+        free_mapped_swa_slots(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            slot.req_pool_idx,
+            free_start,
+            free_end,
+        )
 
     def truncate_session(self, session_id: str, target: int) -> None:
         """Trim a session slot to an already-validated logical token index."""
