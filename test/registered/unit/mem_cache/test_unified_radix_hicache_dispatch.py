@@ -457,6 +457,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
         kv_transfer = PoolTransfer(
             name=PoolName.KV,
             host_indices=torch.arange(full_physical_tokens, dtype=torch.int64),
+            nodes_to_load=[cls._BEST_NODE] if full_physical_tokens > 0 else [],
         )
         swa_transfer: PoolTransfer | None = None
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
@@ -474,6 +475,8 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
         )
         tree_core.commit_load_back.return_value = []
         tree_core.is_full_device_evicted.return_value = full_physical_tokens > 0
+        # A synthetic node with no fringe: its logical length is its physical one.
+        tree_core.component_logical_length.return_value = full_physical_tokens
         tree_core.empty_match_result = SimpleNamespace(
             device_indices=torch.empty((0,), dtype=torch.int64)
         )

@@ -108,6 +108,8 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         origin_input_ids=token_ids,
         output_ids=[],
         cache_protected_len=cache_protected_len,
+        streaming_session_floor=None,
+        streaming_session_tree_protected_len=None,
         kv=ReqKvInfo(
             kv_allocated_len=len(token_ids),
             swa_evicted_seqlen=0,

@@ -76,6 +76,9 @@ class _StubFullComponent(TreeComponent):
     def _recede_session_coverage(self, session_id, leaf, fallback) -> None:
         pass
 
+    def _session_coverage_nodes(self, leaf) -> tuple:
+        return ()
+
 
 class _StubMambaComponent(_StubFullComponent):
     component_type = ComponentType.MAMBA
