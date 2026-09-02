@@ -2933,6 +2933,21 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
+        if injection_enabled() and len(self.ongoing_load_back) > 0:
+            _, _, waiting_session = self._session_load_back()
+            pause_point(
+                "reload_loading_collective_peer_wait",
+                self._pause_point_rank(),
+                {
+                    **self._lifecycle_lineage_fields(waiting_session),
+                    "local_ready_count": int(load_acks),
+                    "sync_tensor": [int(value) for value in ready_counts.tolist()],
+                    "reclaim_digest": str(int(digest)),
+                    "ongoing_load_ids": [
+                        str(value) for value in sorted(self.ongoing_load_back)
+                    ],
+                },
+            )
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
@@ -3020,21 +3035,6 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            if injection_enabled() and len(self.ongoing_load_back) > 0:
-                _, _, waiting_session = self._session_load_back()
-                pause_point(
-                    "reload_loading_collective_peer_wait",
-                    self._pause_point_rank(),
-                    {
-                        **self._lifecycle_lineage_fields(waiting_session),
-                        "local_ready_count": int(finish_count),
-                        "sync_tensor": [int(value) for value in sync_tensor.tolist()],
-                        "reclaim_digest": str(int(digest)),
-                        "ongoing_load_ids": [
-                            str(value) for value in sorted(self.ongoing_load_back)
-                        ],
-                    },
-                )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
             assert (
