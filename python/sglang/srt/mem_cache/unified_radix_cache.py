@@ -4182,17 +4182,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return [token for key in keys for token in key]
 
     def _ordinary_prefix_records(self) -> list[dict[str, Any]]:
-        """Describe every tree prefix two or more streaming sessions reference.
+        """Describe every ordinary tree prefix a streaming session references.
 
         A live session references the ordinary radix path its slot protects
-        (``slot.last_node``); a demoted session references the path above its
-        host-resident frontier (``demoted.last_node``). A component on which a
-        live slot skipped its lock (tombstoned state) holds no reference. A
-        shared prefix is the deepest node whose root path is referenced by the
-        same set of sessions; its digest is the canonical JSON digest of the
-        prefix tokens, which is what a harness computes from its fixture.
+        (``slot.last_node``); a demoted session references the ordinary path
+        above its private host-resident nodes (``demoted.last_node``). Private
+        nodes are never ordinary prefixes and carry no reference. A component
+        on which a live slot skipped its lock (tombstoned state) holds no
+        reference. A record names the deepest ordinary node whose root path is
+        referenced by the same set of sessions; its digest is the canonical
+        JSON digest of the prefix tokens, which is what a harness computes
+        from its fixture.
 
-        :returns: One record per maximal shared prefix on this rank.
+        :returns: One record per maximal referenced ordinary prefix on this rank.
         """
         component_names = (
             (ComponentType.FULL, "full"),
@@ -4207,6 +4209,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ) -> None:
             node = self.tree_core.node_by_id(node_id)
             while node is not self.tree_core.root_node:
+                if node.is_session_private():
+                    node = node.parent
+                    continue
                 entry = references.setdefault(node.id, {"full": set(), "swa": set()})
                 for component_type, name in component_names:
                     if component_type not in self.components:
@@ -4225,7 +4230,7 @@ class UnifiedRadixCache(BasePrefixCache):
         records: list[dict[str, Any]] = []
         for node_id, by_component in references.items():
             shared = by_component["full"] | by_component["swa"]
-            if len(shared) < 2:
+            if len(shared) == 0:
                 continue
             node = self.tree_core.node_by_id(node_id)
             if any(
