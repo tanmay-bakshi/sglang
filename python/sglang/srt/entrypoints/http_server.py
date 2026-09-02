@@ -2045,6 +2045,7 @@ async def demote_session(
     """
     try:
         obj.epoch = _session_request_epoch(request)
+        obj.qualification_operation_id = request.headers.get("X-PhaseC-Operation-Id")
         result = await _global_state.tokenizer_manager.demote_session(obj, request)
     except StreamingSessionStaleEpochError as error:
         return _session_fencing_response(

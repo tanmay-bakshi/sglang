@@ -2309,11 +2309,14 @@ class DemoteSessionReqInput(BaseReq, kw_only=True):
     :ivar session_id: Public session identifier.
     :ivar epoch: Optional fencing epoch supplied by the caller.
     :ivar correlation_id: Internal frontend waiter identity.
+    :ivar qualification_operation_id: Optional identity a qualification harness
+        supplied to correlate this demotion with a racing operation.
     """
 
     session_id: str
     epoch: int | None = None
     correlation_id: str | None = None
+    qualification_operation_id: str | None = None
 
 
 class DemoteSessionReqOutput(BaseReq, kw_only=True):

@@ -149,6 +149,32 @@ def pause_point(point: str, tp_rank: int, state: dict[str, Any]) -> None:
     )
 
 
+def emit_scheduler_interval(
+    tp_rank: int, rid: str, entered_ns: int, exited_ns: int
+) -> None:
+    """Log one scheduler critical-section interval for a qualification race.
+
+    :param tp_rank: This scheduler's tensor-parallel rank.
+    :param rid: Operation identity the harness raced.
+    :param entered_ns: Monotonic entry time of the critical section.
+    :param exited_ns: Monotonic exit time of the critical section.
+    """
+    if _injection_dir is None:
+        return
+    payload = {
+        "tp_rank": tp_rank,
+        "rid": rid,
+        "phase": "session_lifecycle_critical_section",
+        "entered_monotonic_ns": entered_ns,
+        "exited_monotonic_ns": exited_ns,
+        "pid": os.getpid(),
+    }
+    logger.info(
+        "PHASEC_SCHEDULER_INTERVAL %s",
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )
+
+
 def take_idle_evidence_request(tp_rank: int) -> str | None:
     """Return a pending evidence tag this rank has not answered yet.
 

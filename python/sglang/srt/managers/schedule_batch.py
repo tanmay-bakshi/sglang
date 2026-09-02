@@ -928,6 +928,9 @@ class Req(ReqDllmMixin):
         # Physical radix ownership can be shorter than the exact reusable
         # prefix after a restored private suffix is adopted by the session.
         self.streaming_session_tree_protected_len: int | None = None
+        # Monotonic scheduler entry time while a qualification harness measures
+        # this session request's critical section; cleared once emitted.
+        self.qualification_entered_ns: int | None = None
         # Host-resident session matches remain allocation-free through admission.
         # The accepted batch materializes this plan before constructing its
         # request-row mapping.

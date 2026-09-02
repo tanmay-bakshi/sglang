@@ -103,6 +103,7 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.lifecycle_pause_point import (
     emit_idle_evidence,
+    emit_scheduler_interval,
     pause_point,
     take_idle_evidence_request,
 )
@@ -2624,6 +2625,7 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ) -> None:
+        entered_ns = time.monotonic_ns()
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -2686,6 +2688,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
+            req.qualification_entered_ns = entered_ns
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
@@ -4077,6 +4080,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        self._emit_qualification_intervals(new_batch)
         return new_batch, running_batch
 
     def _can_schedule_lora_req(
@@ -5789,7 +5793,40 @@ class Scheduler(
             sessions=sessions,
         )
 
+    def _emit_qualification_intervals(self, batch: ScheduleBatch) -> None:
+        """Close the critical section of every session request first admitted here.
+
+        :param batch: Prefill batch whose requests have matched and, where
+            needed, started their reload.
+        """
+        for req in batch.reqs:
+            entered_ns = req.qualification_entered_ns
+            if entered_ns is None:
+                continue
+            req.qualification_entered_ns = None
+            emit_scheduler_interval(
+                self.ps.tp_rank, req.rid, entered_ns, time.monotonic_ns()
+            )
+
     def demote_session(
+        self, recv_req: DemoteSessionReqInput
+    ) -> DemoteSessionReqOutput | None:
+        """Run one demotion transaction, timing it for qualification races.
+
+        :param recv_req: Fenced administrative demotion request.
+        :returns: Transaction result from the designated response rank.
+        """
+        entered_ns = time.monotonic_ns()
+        try:
+            return self._demote_session_transaction(recv_req)
+        finally:
+            operation_id = recv_req.qualification_operation_id
+            if operation_id is not None:
+                emit_scheduler_interval(
+                    self.ps.tp_rank, operation_id, entered_ns, time.monotonic_ns()
+                )
+
+    def _demote_session_transaction(
         self, recv_req: DemoteSessionReqInput
     ) -> DemoteSessionReqOutput | None:
         """Stage, vote, and atomically publish one host-resident session.
