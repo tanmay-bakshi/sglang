@@ -5917,8 +5917,8 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
-                    "lineage_digest": context.lineage_digest,
-                    "lineage_generation": context.lineage_generation,
+                    "lineage_digest": lineage_digest,
+                    "lineage_generation": lineage_generation,
                     "staged": staged,
                     "mode": mode,
                     "host_backed_tokens": host_backed_tokens,
@@ -5952,8 +5952,8 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
-                    "lineage_digest": context.lineage_digest,
-                    "lineage_generation": context.lineage_generation,
+                    "lineage_digest": lineage_digest,
+                    "lineage_generation": lineage_generation,
                     "local_vote": [int(value) for value in vote.tolist()],
                     "mode": mode,
                     "local_error_type": local_error_type,
@@ -5984,8 +5984,8 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
-                    "lineage_digest": context.lineage_digest,
-                    "lineage_generation": context.lineage_generation,
+                    "lineage_digest": lineage_digest,
+                    "lineage_generation": lineage_generation,
                     "unanimous": unanimous,
                     "reduced_vote": vote_values,
                     "mode": mode,
@@ -6028,8 +6028,8 @@ class Scheduler(
                     self.ps.tp_rank,
                     {
                         "session_id": recv_req.session_id,
-                        "lineage_digest": context.lineage_digest,
-                        "lineage_generation": context.lineage_generation,
+                        "lineage_digest": lineage_digest,
+                        "lineage_generation": lineage_generation,
                         "host_backed_tokens": host_backed_tokens,
                         "pending_stage_present": recv_req.session_id
                         in self.tree_cache.pending_streaming_session_demotion_ids(),
