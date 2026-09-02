@@ -101,6 +101,11 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
+from sglang.srt.lifecycle_pause_point import (
+    emit_idle_evidence,
+    pause_point,
+    take_idle_evidence_request,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -4763,6 +4768,7 @@ class Scheduler(
 
         # tree cache sanity check
         self.invariant_checker._check_tree_cache()
+        self._maybe_emit_idle_evidence()
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -4782,6 +4788,36 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+
+    def _maybe_emit_idle_evidence(self) -> None:
+        """Answer a harness evidence request with this rank's ownership state.
+
+        The ordinary checkers have already run for this idle pass; this recomputes
+        their verdicts into the record so the harness compares numbers, not a
+        summary boolean the hook chose.
+        """
+        tag = take_idle_evidence_request(self.ps.tp_rank)
+        if tag is None:
+            return
+        has_leak, _ = self.invariant_checker._check_all_pools(
+            self.pool_stats_observer.get_pool_stats(),
+        )
+        try:
+            self.tree_cache.sanity_check()
+            tree_sanity = "green"
+        except AssertionError as error:
+            tree_sanity = "red: " + str(error).splitlines()[0]
+        record = self.tree_cache.idle_ownership_evidence(
+            inventory=self.session_controller.list_info(),
+            full_total_tokens=self.invariant_checker.full_tokens_per_layer,
+            swa_total_tokens=self.invariant_checker.swa_tokens_per_layer,
+            session_held_full_tokens=self.pool_stats_observer.session_held_full_tokens(),
+            session_held_swa_tokens=self.pool_stats_observer.session_held_swa_tokens(),
+            session_held_req_count=self.pool_stats_observer.session_held_req_count(),
+        )
+        record["pool_invariant_green"] = not has_leak
+        record["tree_sanity"] = tree_sanity
+        emit_idle_evidence(tag, self.ps.tp_rank, record)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -5825,6 +5861,18 @@ class Scheduler(
                 local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
                 local_error_message = "Session host staging failed on this rank."
 
+        pause_point(
+            "demote_after_stage_before_vote",
+            self.ps.tp_rank,
+            {
+                "session_id": recv_req.session_id,
+                "staged": staged,
+                "mode": mode,
+                "host_backed_tokens": host_backed_tokens,
+                "local_error_type": local_error_type,
+                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+            },
+        )
         identity = _streaming_session_demotion_identity(context)
         vote = torch.tensor(
             [
@@ -5839,6 +5887,17 @@ class Scheduler(
             dtype=torch.int64,
             device="cpu",
         )
+        pause_point(
+            "demote_vote_collective_peer_wait",
+            self.ps.tp_rank,
+            {
+                "session_id": recv_req.session_id,
+                "vote": [int(value) for value in vote.tolist()],
+                "mode": mode,
+                "local_error_type": local_error_type,
+                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+            },
+        )
         if self.ps.tp_size > 1:
             _streaming_session_all_reduce(
                 vote,
@@ -5850,6 +5909,21 @@ class Scheduler(
             and vote_values[1] == -vote_values[2]
             and vote_values[3] == -vote_values[4]
             and vote_values[5] == -vote_values[6]
+        )
+        pause_point(
+            "demote_after_vote_before_commit",
+            self.ps.tp_rank,
+            {
+                "session_id": recv_req.session_id,
+                "unanimous": unanimous,
+                "vote_values": vote_values,
+                "mode": mode,
+                "staged": staged,
+                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                "already_demoted": self.tree_cache.is_streaming_session_demoted(
+                    recv_req.session_id
+                ),
+            },
         )
         if not unanimous:
             if staged:
@@ -5875,6 +5949,19 @@ class Scheduler(
                 )
                 raise
 
+            pause_point(
+                "demote_after_commit_before_ack",
+                self.ps.tp_rank,
+                {
+                    "session_id": recv_req.session_id,
+                    "host_backed_tokens": host_backed_tokens,
+                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "demoted": self.tree_cache.is_streaming_session_demoted(
+                        recv_req.session_id
+                    ),
+                    "output_rank": _is_streaming_session_output_rank(self.ps),
+                },
+            )
             committed = torch.tensor(
                 [
                     host_backed_tokens,

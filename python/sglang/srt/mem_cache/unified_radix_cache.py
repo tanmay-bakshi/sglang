@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import threading
 import time
@@ -14,6 +15,9 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.lifecycle_pause_point import pause_point
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -94,6 +98,7 @@ from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
+    from sglang.srt.session.session_controller import StreamingSessionInventory
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1471,6 +1476,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.cache_controller._l2_transfers(
                     write_host, write_device, write_pools
                 )
+            )
+            pause_point(
+                "demote_d2h_inflight",
+                self._pause_point_rank(),
+                {
+                    "device_tokens": int(len(device_indices)),
+                    "host_tokens": int(len(host_indices)),
+                    "extra_pools": [str(transfer.name) for transfer in resolved or []],
+                    "finish_event_done": bool(completion.finish_event.query()),
+                },
             )
             completion.finish_event.synchronize()
         except Exception:
@@ -2997,6 +3012,16 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
+            if len(self.ongoing_load_back) > 0:
+                pause_point(
+                    "reload_loading_collective_peer_wait",
+                    self._pause_point_rank(),
+                    {
+                        "local_ready_count": int(finish_count),
+                        "reclaim_digest": int(digest),
+                        "ongoing_load_ids": sorted(self.ongoing_load_back),
+                    },
+                )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
             assert (
@@ -3006,6 +3031,15 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue[0]
             ack.finish_event.synchronize()
+            pause_point(
+                "reload_after_transfer_before_finish",
+                self._pause_point_rank(),
+                {
+                    "ack_ids": [int(ack_id) for ack_id in ack.node_ids],
+                    "ongoing_load_ids": sorted(self.ongoing_load_back),
+                    "finish_event_done": True,
+                },
+            )
 
             seen_ack_ids: set[int] = set()
             for ack_id in ack.node_ids:
@@ -3212,9 +3246,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
-        if self.cache_controller is not None:
-            return self.cache_controller.start_loading()
-        return 0
+        if self.cache_controller is None:
+            return 0
+        consumer_index = self.cache_controller.start_loading()
+        if consumer_index >= 0 and not self.is_load_back_event_done(consumer_index):
+            pause_point(
+                "reload_h2d_inflight",
+                self._pause_point_rank(),
+                {
+                    "consumer_index": int(consumer_index),
+                    "ongoing_load_ids": sorted(self.ongoing_load_back),
+                    "finish_event_done": False,
+                },
+            )
+        return consumer_index
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
@@ -3843,6 +3888,282 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_mamba_slots(active_pool_idxs)
+
+    def _pause_point_rank(self) -> int:
+        """Return this cache's tensor-parallel rank for lifecycle pause points.
+
+        :returns: The rank within the TP cache group, or 0 without one.
+        """
+        if self.tp_group is None or not torch.distributed.is_initialized():
+            return 0
+        return torch.distributed.get_rank(group=self.tp_group)
+
+    def pending_streaming_session_demotion_ids(self) -> list[str]:
+        """Return the sessions with a staged but unpublished demotion.
+
+        :returns: Session identifiers in sorted order.
+        """
+        return sorted(self._pending_streaming_session_demotions)
+
+    @staticmethod
+    def _free_set_digest(indices: torch.Tensor) -> str:
+        """Digest one allocator's free set independently of its order.
+
+        :param indices: Free slot or page identifiers.
+        :returns: Hex digest of the sorted identifiers.
+        """
+        ordered, _ = torch.sort(indices.detach().to("cpu", torch.int64))
+        return hashlib.sha256(ordered.numpy().tobytes()).hexdigest()
+
+    def _device_pool_evidence(
+        self,
+        *,
+        allocator: BaseTokenToKVPoolAllocator,
+        total_tokens: int,
+        evictable_tokens: int,
+        protected_tokens: int,
+        session_held_tokens: int,
+    ) -> dict[str, Any]:
+        """Describe one device pool's complete ownership equation in pages.
+
+        :param allocator: Concrete paged allocator owning the pool.
+        :param total_tokens: Pool capacity in tokens.
+        :param evictable_tokens: Tree-owned evictable tokens.
+        :param protected_tokens: Tree-owned protected tokens.
+        :param session_held_tokens: Tokens held by detached session slots.
+        :returns: Page-denominated pool record.
+        """
+        if allocator.free_pages is None or allocator.release_pages is None:
+            raise AssertionError("Idle evidence requires a paged device allocator.")
+        page = self.page_size
+        free = torch.cat((allocator.free_pages, allocator.release_pages))
+        total = total_tokens // page
+        available = allocator.available_size() // page
+        return {
+            "unit": "pages",
+            "page_size_tokens": page,
+            "total_size": total,
+            "available_size": available,
+            "held_size": total - available,
+            "evictable_size": evictable_tokens // page,
+            "protected_size": protected_tokens // page,
+            "session_held_size": session_held_tokens // page,
+            "transient_held_size": 0,
+            "free_set_count": int(free.numel()),
+            "free_set_digest": self._free_set_digest(free),
+        }
+
+    def _host_pool_evidence(
+        self,
+        pool_name: PoolName,
+        component_type: ComponentType,
+        session_held_pages: int,
+    ) -> dict[str, Any]:
+        """Describe one host pool's complete ownership equation in pages.
+
+        :param pool_name: Host pool to describe.
+        :param component_type: Tree component the pool backs.
+        :param session_held_pages: Physical pages locked by demoted sessions.
+        :returns: Page-denominated pool record.
+        """
+        host_pool = self.host_pool_group.get_entry(pool_name).host_pool
+        page = host_pool.page_size
+        free = torch.cat((host_pool.free_slots, *host_pool.release_slots))
+        total = host_pool.logical_size // page
+        available = host_pool.available_size() // page
+        held = total - available
+        evictable = 0
+        for node in self.tree_core.host_lru_lists[component_type].cache.values():
+            host_value = node.component_data[component_type].host_value
+            if host_value is not None:
+                evictable += ceil_align(len(host_value), page) // page
+        return {
+            "unit": "pages",
+            "page_size_tokens": page,
+            "total_size": total,
+            "available_size": available,
+            "held_size": held,
+            "evictable_size": evictable,
+            "protected_size": held - session_held_pages - evictable,
+            "session_held_size": session_held_pages,
+            "transient_held_size": 0,
+            "free_set_count": int(free.numel()),
+            "free_set_digest": self._free_set_digest(free),
+        }
+
+    def _unique_host_locked_pages(self) -> dict[str, int]:
+        """Count the physical host pages locked by demoted sessions, once each.
+
+        :returns: Page counts for the Full and SWA components.
+        """
+        page = self.page_size
+        locked: dict[ComponentType, set[int]] = {
+            ComponentType.FULL: set(),
+            ComponentType.SWA: set(),
+        }
+        for state in self.session.demoted.values():
+            node = self.tree_core.node_by_id(state.last_node)
+            while node is not self.tree_core.root_node:
+                for component_type, pages in locked.items():
+                    if component_type not in self.components:
+                        continue
+                    component_data = node.component_data[component_type]
+                    if component_data.host_lock_ref > 0 and component_data.host_value is not None:
+                        pages.update(
+                            int(index) // page
+                            for index in component_data.host_value.tolist()
+                        )
+                node = node.parent
+        return {
+            "full": len(locked[ComponentType.FULL]),
+            "swa": len(locked[ComponentType.SWA]),
+        }
+
+    def _session_ownership_records(
+        self, inventory: "Sequence[StreamingSessionInventory]"
+    ) -> list[dict[str, Any]]:
+        """Describe each open session's exact stable ownership on this rank.
+
+        Sessions without committed KV are omitted: they own nothing to verify.
+
+        :param inventory: The session controller's current inventory.
+        :returns: One record per session holding device or host KV.
+        """
+        page = self.page_size
+        pending = set(self._pending_streaming_session_demotions)
+        records: list[dict[str, Any]] = []
+        for entry in inventory:
+            if entry.tip <= 0:
+                continue
+            session_id = entry.session_id
+            slot = self.session.slots.get(session_id)
+            demoted = self.session.demoted.get(session_id)
+            exclusive = {"full": 0, "swa": 0}
+            host_locked = {"full": 0, "swa": 0}
+            ongoing: list[str] = []
+            if demoted is not None:
+                state = "host"
+                slot_id = None
+                full, swa = self.streaming_session_protected_residency(demoted.last_node)
+                host_locked = {"full": full.host_backed_pages, "swa": swa.host_backed_pages}
+                ongoing = [
+                    str(ack_id)
+                    for ack_id, load_back in sorted(self.ongoing_load_back.items())
+                    if load_back.node_id == demoted.last_node
+                ]
+            elif slot is not None and slot.is_holding_kv:
+                state = "device"
+                slot_id = slot.req_pool_idx
+                allocated = ceil_align(slot.kv.kv_allocated_len, page)
+                exclusive["full"] = max(0, allocated - slot.tree_protected_len) // page
+                if self.supports_swa():
+                    swa_start = max(slot.tree_protected_len, slot.kv.swa_evicted_seqlen)
+                    exclusive["swa"] = max(0, allocated - swa_start) // page
+            else:
+                continue
+            generation = self.session_refs.radix_generation(session_id)
+            records.append(
+                {
+                    "session_id": session_id,
+                    "tip": entry.tip,
+                    "floor": entry.floor,
+                    "lineage_digest": entry.lineage_digest,
+                    "lineage_generation": entry.lineage_generation,
+                    "slot_id": slot_id,
+                    "radix_tag": f"{session_id}:g{generation}",
+                    "state": state,
+                    "kv_residency": {
+                        "full": {
+                            "device_pages": entry.full.device_pages,
+                            "host_backed_pages": entry.full.host_backed_pages,
+                        },
+                        "swa": {
+                            "device_pages": entry.swa.device_pages,
+                            "host_backed_pages": entry.swa.host_backed_pages,
+                        },
+                    },
+                    "exclusive_device_pages": exclusive,
+                    "host_locked_pages": host_locked,
+                    "pending_demotion_ids": [session_id] if session_id in pending else [],
+                    "ongoing_load_back_ids": ongoing,
+                }
+            )
+        return records
+
+    def idle_ownership_evidence(
+        self,
+        *,
+        inventory: "Sequence[StreamingSessionInventory]",
+        full_total_tokens: int,
+        swa_total_tokens: int,
+        session_held_full_tokens: int,
+        session_held_swa_tokens: int,
+        session_held_req_count: int,
+    ) -> dict[str, Any]:
+        """Assemble this rank's complete idle ownership evidence.
+
+        :param inventory: The session controller's current inventory.
+        :param full_total_tokens: Full-attention device pool capacity in tokens.
+        :param swa_total_tokens: Sliding-window device pool capacity in tokens.
+        :param session_held_full_tokens: Full tokens held by detached slots.
+        :param session_held_swa_tokens: SWA tokens held by detached slots.
+        :param session_held_req_count: Request rows held by detached slots.
+        :returns: Pool, tree, and session ownership evidence.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        if not isinstance(allocator, SWATokenToKVPoolAllocator):
+            raise AssertionError("Idle evidence requires the hybrid SWA allocator.")
+        unique_host_locked = self._unique_host_locked_pages()
+        request_total = self.req_to_token_pool.size
+        request_available = self.req_to_token_pool.available_size()
+        request_free = torch.tensor(
+            sorted(self.req_to_token_pool.free_slots), dtype=torch.int64
+        )
+        return {
+            "device_pools": {
+                "full": self._device_pool_evidence(
+                    allocator=allocator.full_attn_allocator,
+                    total_tokens=full_total_tokens,
+                    evictable_tokens=self.tree_core.full_evictable_size(),
+                    protected_tokens=self.tree_core.full_protected_size(),
+                    session_held_tokens=session_held_full_tokens,
+                ),
+                "swa": self._device_pool_evidence(
+                    allocator=allocator.swa_attn_allocator,
+                    total_tokens=swa_total_tokens,
+                    evictable_tokens=self.tree_core.swa_evictable_size(),
+                    protected_tokens=self.tree_core.swa_protected_size(),
+                    session_held_tokens=session_held_swa_tokens,
+                ),
+            },
+            "host_pools": {
+                "full": self._host_pool_evidence(
+                    PoolName.KV, ComponentType.FULL, unique_host_locked["full"]
+                ),
+                "swa": self._host_pool_evidence(
+                    PoolName.SWA, ComponentType.SWA, unique_host_locked["swa"]
+                ),
+            },
+            "request_pool": {
+                "unit": "slots",
+                "total_size": request_total,
+                "available_size": request_available,
+                "held_size": request_total - request_available,
+                "session_held_size": session_held_req_count,
+                "transient_held_size": request_total
+                - request_available
+                - session_held_req_count,
+                "free_set_count": int(request_free.numel()),
+                "free_set_digest": self._free_set_digest(request_free),
+            },
+            "unique_host_locked_pages": unique_host_locked,
+            "sessions": self._session_ownership_records(inventory),
+            "pending_streaming_session_demotions": self.pending_streaming_session_demotion_ids(),
+            "ongoing_load_back": [
+                {"ack_id": int(ack_id), "node_id": int(load_back.node_id)}
+                for ack_id, load_back in sorted(self.ongoing_load_back.items())
+            ],
+        }
 
     def streaming_session_cache_snapshot(
         self, session_id: str

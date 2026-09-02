@@ -125,6 +125,14 @@ class UnifiedSessionRefTracker:
         self._session_generations[session_id] = self._session_incarnation_counter
         return self._session_incarnation_counter
 
+    def radix_generation(self, session_id: str) -> int | None:
+        """Return a session's open radix generation without opening one.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The open generation, or ``None`` when the session has none.
+        """
+        return self._session_generations.get(session_id)
+
     def ensure_session_generation(self, session_id: str) -> int:
         generation = self._session_generations.get(session_id)
         if generation is None:
