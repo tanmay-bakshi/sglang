@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -4167,6 +4168,86 @@ class UnifiedRadixCache(BasePrefixCache):
             "swa": len(locked[ComponentType.SWA]),
         }
 
+    def _path_tokens(self, node: "UnifiedTreeNode") -> list[int]:
+        """Return the token ids from the root to one node, in order.
+
+        :param node: Tree node ending the prefix.
+        :returns: Token ids of the prefix the node completes.
+        """
+        keys: list[list[int]] = []
+        while node is not self.tree_core.root_node:
+            keys.append([int(token) for token in node.key.raw_token_ids()])
+            node = node.parent
+        keys.reverse()
+        return [token for key in keys for token in key]
+
+    def _ordinary_prefix_records(self) -> list[dict[str, Any]]:
+        """Describe every tree prefix two or more sessions reference.
+
+        A shared prefix is the deepest node whose root path is registered by
+        the same set of sessions in some component; its digest is the canonical
+        JSON digest of the prefix tokens, which is what a harness computes from
+        its fixture.
+
+        :returns: One record per maximal shared prefix on this rank.
+        """
+        references: dict[int, dict[str, set[str]]] = {}
+        for component_type, component in self.components.items():
+            name = "full" if component_type == ComponentType.FULL else "swa"
+            for session_id, leaves in component.session_leaves().items():
+                for leaf in leaves:
+                    node = leaf
+                    while node is not self.tree_core.root_node:
+                        entry = references.setdefault(node.id, {"full": set(), "swa": set()})
+                        entry[name].add(session_id)
+                        node = node.parent
+        records: list[dict[str, Any]] = []
+        for node_id, by_component in references.items():
+            shared = by_component["full"] | by_component["swa"]
+            if len(shared) < 2:
+                continue
+            node = self.tree_core.node_by_id(node_id)
+            if any(
+                (references.get(child.id, {}).get("full", set())
+                 | references.get(child.id, {}).get("swa", set()))
+                == shared
+                for child in node.children.values()
+            ):
+                continue
+            tokens = self._path_tokens(node)
+            digest = hashlib.sha256(
+                json.dumps(tokens, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            full, swa = self.streaming_session_protected_residency(node_id)
+            if full.device_pages > 0:
+                state = "device"
+            elif full.host_backed_pages > 0:
+                state = "host"
+            else:
+                state = "absent"
+            records.append(
+                {
+                    "prefix_digest": digest,
+                    "state": state,
+                    "kv_residency": {
+                        "full": {
+                            "device_pages": full.device_pages,
+                            "host_backed_pages": full.host_backed_pages,
+                        },
+                        "swa": {
+                            "device_pages": swa.device_pages,
+                            "host_backed_pages": swa.host_backed_pages,
+                        },
+                    },
+                    "session_refs": {
+                        "full": sorted(by_component["full"]),
+                        "swa": sorted(by_component["swa"]),
+                    },
+                }
+            )
+        records.sort(key=lambda record: record["prefix_digest"])
+        return records
+
     def _session_ownership_records(
         self, inventory: "Sequence[StreamingSessionInventory]"
     ) -> list[dict[str, Any]]:
@@ -4306,6 +4387,7 @@ class UnifiedRadixCache(BasePrefixCache):
             },
             "unique_host_locked_pages": unique_host_locked,
             "sessions": self._session_ownership_records(inventory),
+            "ordinary_prefixes": self._ordinary_prefix_records(),
             "pending_streaming_session_demotions": self.pending_streaming_session_demotion_ids(),
             "ongoing_load_back": [
                 {"ack_id": int(ack_id), "node_id": int(load_back.node_id)}

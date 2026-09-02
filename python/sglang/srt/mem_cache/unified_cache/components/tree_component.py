@@ -128,6 +128,13 @@ class TreeComponent(ABC):
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
 
+    def session_leaves(self) -> dict[str, set[UnifiedTreeNode]]:
+        """Return each session's registered frontier nodes, for evidence only.
+
+        :returns: Session id to frontier nodes; callers must not mutate it.
+        """
+        return self._session_leaves
+
     def session_ref(self, node: UnifiedTreeNode) -> int:
         return node.component_data[self.component_type].session_ref
 
