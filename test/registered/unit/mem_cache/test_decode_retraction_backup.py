@@ -1,3 +1,5 @@
+import hashlib
+import json
 import unittest
 from array import array
 from dataclasses import dataclass
@@ -40,6 +42,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.session.errors import StreamingSessionBusyError
+from sglang.srt.session.session_controller import StreamingSessionInventory
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
@@ -1080,6 +1083,140 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache.sanity_check()
         self.assertEqual(cache.evict_host(self.num_tokens), 0)
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
+
+    def test_idle_evidence_reports_every_referenced_ordinary_prefix(self) -> None:
+        """Walk live slots and demoted frontiers, never private nodes, into prefix records."""
+        page_size = 64
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        prefix_req, prefix_indices = self._admit_req(env, page_size)
+        self._seed_pool(env.target_pool, prefix_indices, base=5000)
+        prefix_key = RadixKey(
+            array("q", range(page_size + 1)),
+            extra_key="namespace",
+            cache_salt="tenant",
+            is_bigram=True,
+        )
+        planted = cache.insert(
+            InsertParams(key=prefix_key, value=prefix_indices, trigger_backup=False)
+        )
+        env.req_to_token_pool.free(prefix_req)
+        prefix_node = planted.last_device_node
+        self.assertIsNotNone(prefix_node)
+        prefix_tokens = [
+            int(token)
+            for token in cache.tree_core.node_by_id(prefix_node).key.raw_token_ids()
+        ]
+        expected_digest = hashlib.sha256(
+            json.dumps(prefix_tokens, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+        tip = 2 * page_size
+        for session_id in ("a", "b"):
+            req, tail_indices = self._admit_streaming_session(env, session_id, page_size)
+            row = req.req_pool_idx
+            env.req_to_token_pool.write((row, slice(0, page_size)), prefix_indices)
+            env.req_to_token_pool.write((row, slice(page_size, tip)), tail_indices)
+            lock = cache.inc_lock_ref(prefix_node)
+            slot = cache.session.slots[session_id]
+            slot.last_node = prefix_node
+            slot.cache_protected_len = page_size
+            slot.tree_protected_len = page_size
+            slot.kv_committed_len = tip
+            slot.kv = ReqKvInfo(kv_allocated_len=tip)
+            slot.swa_uuid_for_lock = lock.swa_uuid_for_lock
+            slot.skip_lock_node_ids = lock.skip_lock_node_ids
+
+        def inventory() -> list[StreamingSessionInventory]:
+            entries: list[StreamingSessionInventory] = []
+            for session_id in ("a", "b"):
+                if session_id not in cache.session.slots and not (
+                    cache.is_streaming_session_demoted(session_id)
+                ):
+                    continue
+                snapshot = cache.streaming_session_cache_snapshot(session_id)
+                entries.append(
+                    StreamingSessionInventory(
+                        session_id=session_id,
+                        lineage_generation=0,
+                        tip=tip,
+                        lineage_digest=f"sha256:v1:{session_id}",
+                        floor=tip,
+                        full=snapshot.full,
+                        swa=snapshot.swa,
+                    )
+                )
+            return entries
+
+        def evidence() -> dict:
+            return cache.idle_ownership_evidence(
+                inventory=inventory(),
+                full_total_tokens=max(self.pool_size, page_size * 4),
+                swa_total_tokens=max(self.pool_size, page_size * 4),
+                session_held_full_tokens=cache.session.session_held_full_tokens(),
+                session_held_swa_tokens=cache.session.session_held_swa_tokens(),
+                session_held_req_count=cache.session.session_held_req_count(),
+            )
+
+        live = evidence()
+        self.assertEqual(
+            live["ordinary_prefixes"],
+            [
+                {
+                    "prefix_digest": expected_digest,
+                    "state": "device",
+                    "kv_residency": {
+                        "full": {"device_pages": 1, "host_backed_pages": 0},
+                        "swa": {"device_pages": 1, "host_backed_pages": 0},
+                    },
+                    "session_refs": {"full": ["a", "b"], "swa": ["a", "b"]},
+                }
+            ],
+        )
+        self.assertEqual(
+            {entry["session_id"]: entry["exclusive_device_pages"] for entry in live["sessions"]},
+            {"a": {"full": 1, "swa": 1}, "b": {"full": 1, "swa": 1}},
+        )
+
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                "a",
+                array("q", range(tip + 1)),
+                extra_key="namespace",
+                cache_salt="tenant",
+                priority=0,
+            ),
+            tip,
+        )
+        self.assertEqual(cache.commit_streaming_session_demotion("a"), tip)
+        demoted = evidence()
+        self.assertEqual(len(demoted["ordinary_prefixes"]), 1)
+        record = demoted["ordinary_prefixes"][0]
+        self.assertEqual(record["prefix_digest"], expected_digest)
+        self.assertEqual(record["state"], "device")
+        self.assertEqual(record["session_refs"], {"full": ["a", "b"], "swa": ["a", "b"]})
+        states = {entry["session_id"]: entry["state"] for entry in demoted["sessions"]}
+        self.assertEqual(states, {"a": "host", "b": "device"})
+
+        cache.release_radix_session("b")
+        cache.release_session("b")
+        alone = evidence()
+        self.assertEqual(
+            [prefix["session_refs"] for prefix in alone["ordinary_prefixes"]],
+            [{"full": ["a"], "swa": ["a"]}],
+        )
+        cache.release_radix_session("a")
+        cache.release_session("a")
+        self.assertEqual(evidence()["ordinary_prefixes"], [])
+        cache.sanity_check()
 
     def test_streaming_session_demotion_publishes_exact_private_fringe(self) -> None:
         page_size = 64
