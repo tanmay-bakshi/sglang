@@ -12,6 +12,8 @@ from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.session.errors import (
+    STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
+    StreamingSessionNamespaceError,
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
     StreamingSessionConflictError,
 )
@@ -27,6 +29,10 @@ _CONFLICT_MESSAGE = (
 _OBSERVED_DIGEST = "sha256:v1:observed"
 _OBSERVED_TIP = 128
 _LINEAGE_GENERATION = 4
+_NAMESPACE_MESSAGE = (
+    "Session demoted-session is host-resident under cache namespace "
+    "extra_key='seeded' cache_salt=None; resume it under that namespace."
+)
 
 
 class _DeterministicTokenizerManager:
@@ -334,6 +340,98 @@ class StreamingSessionConflictHttpTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(manager.terminal_completion.is_set())
         finally:
             http_server.set_global_state(prior_state)
+
+
+class StreamingSessionNamespaceReconstructionTest(unittest.IsolatedAsyncioTestCase):
+    """Tokenizer-manager reconstruction for the typed namespace refusal."""
+
+    async def test_typed_namespace_refusal_reconstructs_both_namespaces(self) -> None:
+        """Reconstruct the seeded and requested namespaces from the finish reason."""
+        manager = TokenizerManager.__new__(TokenizerManager)
+        state = types.SimpleNamespace(
+            obj=GenerateReqInput(input_ids=[1], rid=_CORRELATION_ID)
+        )
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "message": _NAMESPACE_MESSAGE,
+                    "status_code": HTTPStatus.CONFLICT,
+                    "err_type": STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
+                    "seeded_extra_key": "seeded",
+                    "seeded_cache_salt": None,
+                    "request_extra_key": "other",
+                    "request_cache_salt": "salt",
+                }
+            }
+        }
+
+        with self.assertRaises(StreamingSessionNamespaceError) as raised:
+            await manager._handle_abort_finish_reason(out, state, is_stream=False)
+
+        self.assertEqual(str(raised.exception), _NAMESPACE_MESSAGE)
+        self.assertEqual(raised.exception.seeded_extra_key, "seeded")
+        self.assertIsNone(raised.exception.seeded_cache_salt)
+        self.assertEqual(raised.exception.request_extra_key, "other")
+        self.assertEqual(raised.exception.request_cache_salt, "salt")
+
+
+class StreamingSessionNamespaceHttpTest(unittest.IsolatedAsyncioTestCase):
+    """Native JSON and SSE namespace-refusal envelope behavior."""
+
+    def _error(self) -> StreamingSessionNamespaceError:
+        """Build the typed refusal the tokenizer manager raises.
+
+        :returns: Namespace refusal with both namespaces.
+        """
+        return StreamingSessionNamespaceError(
+            _NAMESPACE_MESSAGE,
+            seeded_extra_key="seeded",
+            seeded_cache_salt=None,
+            request_extra_key="other",
+            request_cache_salt="salt",
+        )
+
+    def _expected_payload(self) -> dict[str, dict[str, object]]:
+        """Build the frozen public namespace payload.
+
+        :returns: Expected payload shared by both transports.
+        """
+        return {
+            "error": {
+                "message": _NAMESPACE_MESSAGE,
+                "type": "streaming_session_namespace",
+                "code": HTTPStatus.CONFLICT.value,
+                "retryable": False,
+                "seeded_extra_key": "seeded",
+                "seeded_cache_salt": None,
+                "request_extra_key": "other",
+                "request_cache_salt": "salt",
+            }
+        }
+
+    async def test_non_stream_namespace_refusal_returns_http_409(self) -> None:
+        """Return an actual HTTP 409 and the stable public envelope."""
+        response, chunks, _ = await _invoke_generate(self._error(), stream=False)
+
+        self.assertEqual(response.status_code, HTTPStatus.CONFLICT)
+        self.assertEqual(
+            response.body,
+            http_server.dumps_json(self._expected_payload()),
+        )
+        self.assertEqual(chunks, [])
+
+    async def test_stream_namespace_refusal_emits_only_error_then_done(self) -> None:
+        """Keep HTTP 200 while emitting one 409-coded SSE event and DONE."""
+        response, chunks, manager = await _invoke_generate(self._error(), stream=True)
+
+        expected_event = (
+            b"data: " + http_server.dumps_json(self._expected_payload()) + b"\n\n"
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertEqual(chunks, [expected_event, b"data: [DONE]\n\n"])
+        self.assertIsNotNone(manager.terminal_completion)
+        self.assertTrue(manager.terminal_completion.is_set())
 
 
 class StreamingDisconnectAbortGuardTest(unittest.IsolatedAsyncioTestCase):

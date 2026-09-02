@@ -113,6 +113,34 @@ class StreamingSessionNamespaceError(RuntimeError):
 
     status_code: int = 409
 
+    seeded_extra_key: str | None
+    seeded_cache_salt: str | None
+    request_extra_key: str | None
+    request_cache_salt: str | None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        seeded_extra_key: str | None,
+        seeded_cache_salt: str | None,
+        request_extra_key: str | None,
+        request_cache_salt: str | None,
+    ) -> None:
+        """Build the refusal with the seeded and requested namespaces.
+
+        :param message: Human-readable refusal.
+        :param seeded_extra_key: Extra key the session was demoted under.
+        :param seeded_cache_salt: Cache salt the session was demoted under.
+        :param request_extra_key: Extra key the resume carried.
+        :param request_cache_salt: Cache salt the resume carried.
+        """
+        super().__init__(message)
+        self.seeded_extra_key = seeded_extra_key
+        self.seeded_cache_salt = seeded_cache_salt
+        self.request_extra_key = request_extra_key
+        self.request_cache_salt = request_cache_salt
+
 
 STREAMING_SESSION_DEMOTION_ERROR_TYPE = StreamingSessionDemotionError.__name__
 STREAMING_SESSION_BUSY_ERROR_TYPE = StreamingSessionBusyError.__name__

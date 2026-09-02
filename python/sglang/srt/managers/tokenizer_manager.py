@@ -154,8 +154,10 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
     STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
     StreamingSessionConflictError,
+    StreamingSessionNamespaceError,
     StreamingSessionStaleEpochError,
 )
 from sglang.srt.session.event_journal import SessionEventJournal
@@ -1740,6 +1742,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 cluster_incarnation=finish_reason["cluster_incarnation"],
                 lineage_generation=finish_reason["lineage_generation"],
                 observed_tip=finish_reason["observed_tip"],
+            )
+
+        if (
+            finish_reason.get("type") == "abort"
+            and finish_reason.get("status_code") == HTTPStatus.CONFLICT
+            and finish_reason.get("err_type") == STREAMING_SESSION_NAMESPACE_ERROR_TYPE
+        ):
+            raise StreamingSessionNamespaceError(
+                finish_reason["message"],
+                seeded_extra_key=finish_reason["seeded_extra_key"],
+                seeded_cache_salt=finish_reason["seeded_cache_salt"],
+                request_extra_key=finish_reason["request_extra_key"],
+                request_cache_salt=finish_reason["request_cache_salt"],
             )
 
         if (

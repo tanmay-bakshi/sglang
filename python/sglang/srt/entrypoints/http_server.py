@@ -172,6 +172,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.errors import (
     StreamingSessionBusyError,
     StreamingSessionConflictError,
+    StreamingSessionNamespaceError,
     StreamingSessionInfoUnavailableError,
     StreamingSessionJournalBehindError,
     StreamingSessionStaleEpochError,
@@ -957,6 +958,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     + dumps_json(_streaming_session_conflict_error_payload(error))
                     + b"\n\n"
                 )
+            except StreamingSessionNamespaceError as error:
+                terminal_completion.set()
+                yield (
+                    b"data: "
+                    + dumps_json(_streaming_session_namespace_payload(error))
+                    + b"\n\n"
+                )
             except HTTPException:
                 terminal_completion.set()
                 raise
@@ -1009,6 +1017,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     status_code=HTTPStatus.CONFLICT,
                 )
             )
+        except StreamingSessionNamespaceError as error:
+            response = ORJSONResponse(
+                content=_streaming_session_namespace_payload(error),
+                status_code=HTTPStatus.CONFLICT,
+            )
+            return _session_fencing_response(response) if session_request else response
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             response = _create_error_response(e)
@@ -1181,6 +1195,23 @@ async def _generate_streaming_session_request(
                 current_offset,
                 b"data: "
                 + dumps_json(_streaming_session_stale_epoch_payload(error))
+                + b"\n\n",
+            )
+        except StreamingSessionNamespaceError as error:
+            lineage_generation, current_offset = await _resolve_session_cursor(
+                manager,
+                session_id,
+                lineage_generation,
+                current_offset,
+            )
+            await journal.append(
+                session_id,
+                request_id,
+                lineage_generation,
+                current_offset,
+                current_offset,
+                b"data: "
+                + dumps_json(_streaming_session_namespace_payload(error))
                 + b"\n\n",
             )
         except HTTPException as error:
@@ -2593,6 +2624,28 @@ def _streaming_session_journal_behind_payload(
             "current_tip": error.current_tip,
             "current_digest": error.current_digest,
             "required_action": error.required_action,
+        }
+    }
+
+
+def _streaming_session_namespace_payload(
+    error: StreamingSessionNamespaceError,
+) -> dict[str, dict[str, object]]:
+    """Build the stable namespace-mismatch rejection envelope.
+
+    :param error: Typed refusal carrying the seeded and requested namespaces.
+    :returns: Public payload shared by JSON and SSE transports.
+    """
+    return {
+        "error": {
+            "message": str(error),
+            "type": "streaming_session_namespace",
+            "code": HTTPStatus.CONFLICT.value,
+            "retryable": False,
+            "seeded_extra_key": error.seeded_extra_key,
+            "seeded_cache_salt": error.seeded_cache_salt,
+            "request_extra_key": error.request_extra_key,
+            "request_cache_salt": error.request_cache_salt,
         }
     }
 
