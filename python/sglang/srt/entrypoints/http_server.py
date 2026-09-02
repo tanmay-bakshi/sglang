@@ -1967,6 +1967,7 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
     """Close the session."""
     try:
         obj.epoch = _session_request_epoch(request)
+        obj.qualification_operation_id = request.headers.get("X-PhaseC-Operation-Id")
         await _global_state.tokenizer_manager.close_session(obj, request)
         return _session_fencing_response(Response(status_code=200))
     except StreamingSessionStaleEpochError as error:

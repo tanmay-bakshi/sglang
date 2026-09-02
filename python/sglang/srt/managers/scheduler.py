@@ -5701,6 +5701,25 @@ class Scheduler(
         self,
         recv_req: CloseSessionReqInput,
     ) -> CloseSessionReqOutput | None:
+        """Close one session, timing it for qualification races.
+
+        :param recv_req: Fenced close request.
+        :returns: Close result from the designated response rank.
+        """
+        entered_ns = time.monotonic_ns()
+        try:
+            return self._close_session_transaction(recv_req)
+        finally:
+            operation_id = recv_req.qualification_operation_id
+            if operation_id is not None:
+                emit_scheduler_interval(
+                    self.ps.tp_rank, operation_id, entered_ns, time.monotonic_ns()
+                )
+
+    def _close_session_transaction(
+        self,
+        recv_req: CloseSessionReqInput,
+    ) -> CloseSessionReqOutput | None:
         correlation_id = recv_req.correlation_id or ""
         try:
             self.session_fencing_register.validate(recv_req.epoch)
