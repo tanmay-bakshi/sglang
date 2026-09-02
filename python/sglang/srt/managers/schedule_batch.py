@@ -108,6 +108,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchPrefixParams,
+    SessionReloadPlan,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -927,6 +928,10 @@ class Req(ReqDllmMixin):
         # Physical radix ownership can be shorter than the exact reusable
         # prefix after a restored private suffix is adopted by the session.
         self.streaming_session_tree_protected_len: int | None = None
+        # Host-resident session matches remain allocation-free through admission.
+        # The accepted batch materializes this plan before constructing its
+        # request-row mapping.
+        self.session_reload_plan: SessionReloadPlan | None = None
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds

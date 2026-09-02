@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from array import array
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.fail_stop_collective import FailStopCollective
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -21,6 +22,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    HostLockOwner,
+    HostLockOwnerKind,
     IncLockRefResult,
     InitLoadBackParams,
     InsertParams,
@@ -29,6 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
+    SessionReloadPlan,
     StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
@@ -105,12 +109,22 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
+HICACHE_COLLECTIVE_TIMEOUT_SECONDS = 30.0
+_HICACHE_COLLECTIVE = FailStopCollective(
+    timeout_seconds=HICACHE_COLLECTIVE_TIMEOUT_SECONDS
+)
+
 # Metric label per component, matching the host pool names used by
 # hicache_backup_tokens_total and the host occupancy gauges.
 _COMPONENT_POOL_LABEL = {
     ComponentType.FULL: PoolName.KV.value,
     ComponentType.SWA: PoolName.SWA.value,
     ComponentType.MAMBA: PoolName.MAMBA.value,
+}
+
+_COMPONENT_HOST_POOL = {
+    ComponentType.SWA: PoolName.SWA,
+    ComponentType.MAMBA: PoolName.MAMBA,
 }
 
 
@@ -196,6 +210,173 @@ class _PendingStreamingSessionDemotion:
     priority: int
 
 
+@dataclass(frozen=True)
+class _SessionReloadSpan:
+    """One component span participating in a session reload.
+
+    :ivar node_id: Tree node carrying the source component state.
+    :ivar component_type: Full or SWA component represented by the span.
+    :ivar logical_length: Tokens exposed to the request or tree.
+    :ivar physical_length: Source and destination slots copied by the transfer.
+    :ivar device_indices: Existing settled device value, if already resident.
+    :ivar host_indices: Authoritative host source, if a transfer is required.
+    :ivar session_private: Whether the destination remains request-owned.
+    """
+
+    node_id: NodeId
+    component_type: ComponentType
+    logical_length: int
+    physical_length: int
+    device_indices: torch.Tensor | None
+    host_indices: torch.Tensor | None
+    session_private: bool
+
+    def __post_init__(self) -> None:
+        if self.logical_length <= 0 or self.physical_length < self.logical_length:
+            raise ValueError("A reload span must describe a non-empty physical range.")
+        if (self.device_indices is None) == (self.host_indices is None):
+            raise ValueError("A reload span must have exactly one resident source.")
+        source = (
+            self.device_indices
+            if self.device_indices is not None
+            else self.host_indices
+        )
+        assert source is not None
+        if len(source) != self.physical_length:
+            raise ValueError("Reload span source length disagrees with its footprint.")
+
+
+@dataclass(frozen=True)
+class _SessionReloadSpec:
+    """Stable component partition for one accepted session reload.
+
+    :ivar plan: Match-time session identity and ownership boundaries.
+    :ivar full_spans: Complete Full-KV lineage in root-to-frontier order.
+    :ivar swa_spans: Retained SWA window in root-to-frontier order.
+    :ivar full_transfer: Concatenated host-only Full-KV source.
+    :ivar component_transfers: Concatenated host-only auxiliary sources.
+    """
+
+    plan: SessionReloadPlan
+    full_spans: tuple[_SessionReloadSpan, ...]
+    swa_spans: tuple[_SessionReloadSpan, ...]
+    full_transfer: PoolTransfer
+    component_transfers: dict[ComponentType, list[PoolTransfer]]
+
+
+@dataclass
+class _HostStageSlice:
+    """One consumed range from a staged host allocation."""
+
+    indices: torch.Tensor
+    tree_owned: bool = False
+
+
+@dataclass
+class _HostStageAllocation:
+    """Resumable ownership cursor for one independently allocated host pool."""
+
+    pool: PoolName
+    indices: torch.Tensor
+    cursor: int = 0
+    consumed: list[_HostStageSlice] = field(default_factory=list)
+    released: bool = False
+
+    def take(self, length: int) -> _HostStageSlice:
+        """Consume the next exact range while retaining stage ownership."""
+        if length <= 0 or self.cursor + length > len(self.indices):
+            raise AssertionError(
+                f"Invalid {self.pool} stage consumption: {self.cursor=} "
+                f"{length=} capacity={len(self.indices)}"
+            )
+        stage_slice = _HostStageSlice(
+            indices=self.indices[self.cursor : self.cursor + length]
+        )
+        self.cursor += length
+        self.consumed.append(stage_slice)
+        return stage_slice
+
+    def stage_owned_indices(self) -> torch.Tensor:
+        """Return every slot still owned by the stage in allocation order."""
+        parts = [item.indices for item in self.consumed if not item.tree_owned]
+        if self.cursor < len(self.indices):
+            parts.append(self.indices[self.cursor :])
+        if len(parts) == 0:
+            return self.indices[:0]
+        return torch.cat(parts)
+
+
+@dataclass
+class _HostStageLedger:
+    """Exact ownership ledger while a demotion stage is attached to the tree."""
+
+    allocations: dict[PoolName, _HostStageAllocation]
+
+    @classmethod
+    def from_backup(cls, backup: RetractionBackup) -> _HostStageLedger:
+        """Build one ledger from independently allocated backup pools."""
+        if backup.host_indices is None:
+            raise AssertionError("Host-pool demotion requires Full host indices.")
+        allocations = {
+            PoolName.KV: _HostStageAllocation(PoolName.KV, backup.host_indices)
+        }
+        for transfer in backup.pool_transfers or ():
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            if transfer.name in allocations:
+                raise AssertionError(
+                    f"Demotion stage has multiple {transfer.name} allocations."
+                )
+            allocations[transfer.name] = _HostStageAllocation(
+                transfer.name, transfer.host_indices
+            )
+        return cls(allocations=allocations)
+
+    def take(self, pool: PoolName, length: int) -> _HostStageSlice:
+        """Consume one range from an independently allocated pool."""
+        allocation = self.allocations.get(pool)
+        if allocation is None:
+            raise AssertionError(f"Demotion stage has no {pool} allocation.")
+        return allocation.take(length)
+
+    def assert_fully_consumed(self) -> None:
+        """Require every staged allocation to have an explicit disposition."""
+        incomplete = {
+            pool: len(allocation.indices) - allocation.cursor
+            for pool, allocation in self.allocations.items()
+            if allocation.cursor != len(allocation.indices)
+        }
+        if len(incomplete) > 0:
+            raise AssertionError(f"Demotion stage has unplanned slots: {incomplete}.")
+
+    def release_stage_owned(self, host_pool_group) -> None:
+        """Release every slot not transferred to tree ownership exactly once."""
+        for allocation in self.allocations.values():
+            if allocation.released:
+                continue
+            indices = allocation.stage_owned_indices()
+            if len(indices) > 0:
+                host_pool_group.free(indices, pool=allocation.pool)
+            allocation.released = True
+
+
+@dataclass(frozen=True)
+class _HostPathAttachment:
+    """Tree component value whose ownership came from one staged slice."""
+
+    node_id: NodeId
+    component_type: ComponentType
+    stage_slice: _HostStageSlice
+
+
+@dataclass
+class _StreamingSessionHostPathTransaction:
+    """Rollback ledger for staged host-path publication."""
+
+    ledger: _HostStageLedger
+    attachments: list[_HostPathAttachment] = field(default_factory=list)
+
+
 class _OngoingPrefetch(NamedTuple):
     """Tracks an in-flight storage→host prefetch operation."""
 
@@ -203,7 +384,7 @@ class _OngoingPrefetch(NamedTuple):
     prefetch_key: RadixKey
     host_indices: torch.Tensor
     operation: PrefetchOperation
-    anchor_lock_params: DecLockRefParams
+    anchor_lock_params: DecLockRefParams | None
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
@@ -344,6 +525,53 @@ class UnifiedRadixCache(BasePrefixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _fail_stop_all_reduce_attn_groups(
+        self,
+        tensor: torch.Tensor,
+        op: torch.distributed.ReduceOp,
+        *,
+        operation: str,
+    ) -> None:
+        """Run bounded attention-group consensus without changing its topology."""
+        reduced = False
+        for group_name, group in (
+            ("attention-context", self.attn_cp_group),
+            ("attention-tensor", self.attn_tp_group),
+        ):
+            if group is None or torch.distributed.get_world_size(group=group) <= 1:
+                continue
+            _HICACHE_COLLECTIVE.all_reduce(
+                tensor,
+                operation=f"{operation}:{group_name}",
+                op=op,
+                group=group,
+            )
+            reduced = True
+        if reduced or self.tp_world_size <= 1:
+            return
+        _HICACHE_COLLECTIVE.all_reduce(
+            tensor,
+            operation=f"{operation}:tensor-parallel",
+            op=op,
+            group=self.tp_group,
+        )
+
+    def _fail_stop_all_reduce(
+        self,
+        data: torch.Tensor,
+        tp_reduce_op: torch.distributed.ReduceOp,
+        *,
+        operation: str,
+    ) -> None:
+        """Run bounded TP consensus and preserve the established PP relay."""
+        if self.pp_rank == 0:
+            self._fail_stop_all_reduce_attn_groups(
+                data,
+                tp_reduce_op,
+                operation=operation,
+            )
+        self._pp_sync(data)
 
     def _barrier_attn_groups(self):
         waited = False
@@ -587,10 +815,10 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        self.session.restore_demoted_request_state(
+        session_reload_plan = self.session.restore_demoted_request_state(
             params.req, result.full_kv_hit_length
         )
-        return result
+        return result._replace(session_reload_plan=session_reload_plan)
 
     def is_chunk_cache(self) -> bool:
         return self.disable
@@ -882,8 +1110,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return IncLockRefResult()
         return self.tree_core.inc_host_lock_ref(node_id)
 
+    def validate_host_lock_ref(
+        self,
+        node_id: NodeId,
+        params: DecLockRefParams,
+    ) -> None:
+        if self.disable:
+            return
+        self.tree_core.validate_host_lock_ref(node_id, params)
+
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
@@ -1535,32 +1772,217 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
 
         host_anchor_params = self.inc_host_lock_ref(node_id).to_dec_params()
-
-        # Lock the path before building transfers (the aux build can evict).
-        result = self.inc_lock_ref(node_id)
-        ancestor_lock_params = result.to_dec_params()
-
-        # Let each component pre-allocate per-request state for the load-back;
-        # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
-        }
+        ancestor_lock_params: DecLockRefParams | None = None
+        preps: dict[ComponentType, PrepareLoadBackResult] = {}
         load_result: _QueuedLoadBackResult | None = None
         try:
+            # Lock the path before building transfers (the aux build can evict).
+            result = self.inc_lock_ref(node_id)
+            ancestor_lock_params = result.to_dec_params()
+            for component in self._components_tuple:
+                preps[component.component_type] = component.prepare_load_back(
+                    node_id,
+                    req=req,
+                )
             load_result = self._load_back_transfers(
                 node_id=node_id,
                 mem_quota=mem_quota,
                 req=req,
                 result=result,
-                ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
             )
             return load_result
         finally:
-            success = load_result is not None
-            for comp in self._components_tuple:
-                comp.finalize_load_back(req, preps[comp.component_type], success)
+            try:
+                if ancestor_lock_params is not None:
+                    self.dec_lock_ref(node_id, ancestor_lock_params)
+            finally:
+                try:
+                    if load_result is None:
+                        self.dec_host_lock_ref(node_id, host_anchor_params)
+                finally:
+                    success = load_result is not None
+                    for component in self._components_tuple:
+                        prep = preps.get(component.component_type)
+                        if prep is not None:
+                            component.finalize_load_back(req, prep, success)
+
+    def _build_session_reload_spec(
+        self,
+        plan: SessionReloadPlan,
+    ) -> _SessionReloadSpec:
+        """Partition a demoted session into settled and transferable spans.
+
+        The returned descriptor is allocation-free. Private destinations never
+        become radix-tree device values; ordinary host-only destinations are
+        eligible for publication only after their transfer ACK.
+
+        :param plan: Match-time session reload identity and ownership boundary.
+        :returns: Stable Full/SWA source partition for transfer preparation.
+        """
+
+        if self.supports_mamba():
+            raise AssertionError("Streaming-session demotion does not support Mamba.")
+
+        state = self.session.demoted.get(plan.session_id)
+        if state is None:
+            raise RuntimeError(f"Session {plan.session_id} is no longer demoted.")
+        if (
+            state.last_node != plan.source_node
+            or state.cache_protected_len != plan.reuse_len
+            or state.tree_protected_len != plan.tree_protected_len
+            or state.swa_evicted_seqlen != plan.swa_evicted_seqlen
+        ):
+            raise RuntimeError(
+                f"Session {plan.session_id} reload plan is stale relative to its owner."
+            )
+
+        nodes = self._streaming_session_path(plan.source_node, plan.reuse_len)
+        full_spans: list[_SessionReloadSpan] = []
+        swa_spans: list[_SessionReloadSpan] = []
+        offset = 0
+        ordinary_end = 0
+        saw_private = False
+        for node in nodes:
+            node_start = offset
+            node_end = node_start + len(node.key)
+            offset = node_end
+            if node.is_session_private:
+                saw_private = True
+                if node.private_session_id != plan.session_id:
+                    raise AssertionError(
+                        f"Reload path contains private node {node.id} owned by "
+                        f"{node.private_session_id!r}."
+                    )
+                if node_start < plan.tree_protected_len:
+                    raise AssertionError(
+                        "Session-private reload span overlaps ordinary tree ownership."
+                    )
+            elif saw_private:
+                raise AssertionError("An ordinary node follows a private reload span.")
+            elif node_end > plan.tree_protected_len:
+                raise AssertionError(
+                    "Ordinary reload path extends beyond its declared tree frontier."
+                )
+            else:
+                ordinary_end = node_end
+
+            full_data = node.component_data[ComponentType.FULL]
+            full_device = full_data.value
+            full_host = full_data.host_value
+            if node.is_session_private and full_device is not None:
+                raise AssertionError(
+                    f"Demoted private node {node.id} unexpectedly has device Full KV."
+                )
+            if full_device is not None:
+                full_host = None
+                full_physical_length = len(full_device)
+            elif full_host is not None:
+                full_physical_length = len(full_host)
+            else:
+                raise AssertionError(
+                    f"Reload node {node.id} has neither Full device nor host state."
+                )
+            full_spans.append(
+                _SessionReloadSpan(
+                    node_id=node.id,
+                    component_type=ComponentType.FULL,
+                    logical_length=len(node.key),
+                    physical_length=full_physical_length,
+                    device_indices=full_device,
+                    host_indices=full_host,
+                    session_private=node.is_session_private,
+                )
+            )
+
+            if not self.supports_swa() or node_end <= plan.swa_evicted_seqlen:
+                continue
+            if node_start < plan.swa_evicted_seqlen:
+                raise AssertionError(
+                    "SWA reload watermark cuts through a tree node; demotion must split "
+                    "that boundary before publication."
+                )
+            swa_data = node.component_data[ComponentType.SWA]
+            swa_device = swa_data.value
+            swa_host = swa_data.host_value
+            if node.is_session_private and swa_device is not None:
+                raise AssertionError(
+                    f"Demoted private node {node.id} unexpectedly has device SWA KV."
+                )
+            if swa_device is not None:
+                swa_host = None
+                swa_physical_length = len(swa_device)
+                swa_logical_length = self.tree_core.component_logical_length(
+                    node, ComponentType.SWA, host=False
+                )
+            elif swa_host is not None:
+                swa_physical_length = len(swa_host)
+                swa_logical_length = self.tree_core.component_logical_length(
+                    node, ComponentType.SWA, host=True
+                )
+            else:
+                raise AssertionError(
+                    f"Reload node {node.id} has neither SWA device nor host state."
+                )
+            if swa_logical_length != len(node.key):
+                raise AssertionError(
+                    f"SWA reload node {node.id} spans {swa_logical_length} logical "
+                    f"tokens for a {len(node.key)}-token tree range."
+                )
+            swa_spans.append(
+                _SessionReloadSpan(
+                    node_id=node.id,
+                    component_type=ComponentType.SWA,
+                    logical_length=swa_logical_length,
+                    physical_length=swa_physical_length,
+                    device_indices=swa_device,
+                    host_indices=swa_host,
+                    session_private=node.is_session_private,
+                )
+            )
+
+        if offset != plan.reuse_len:
+            raise AssertionError(
+                f"Session reload path ends at {offset}, expected {plan.reuse_len}."
+            )
+        if ordinary_end != plan.tree_protected_len:
+            raise AssertionError(
+                "Session reload ordinary frontier disagrees with its declared length: "
+                f"{ordinary_end=} expected={plan.tree_protected_len}."
+            )
+
+        full_host_spans = [span for span in full_spans if span.host_indices is not None]
+        full_host_indices = (
+            torch.cat([span.host_indices for span in full_host_spans])
+            if len(full_host_spans) > 0
+            else torch.empty((0,), dtype=torch.int64, device="cpu")
+        )
+        full_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=full_host_indices,
+            nodes_to_load=[span.node_id for span in full_host_spans],
+        )
+
+        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
+        swa_host_spans = [span for span in swa_spans if span.host_indices is not None]
+        if len(swa_host_spans) > 0:
+            component_transfers[ComponentType.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.cat(
+                        [span.host_indices for span in swa_host_spans]
+                    ),
+                    nodes_to_load=[span.node_id for span in swa_host_spans],
+                )
+            ]
+
+        return _SessionReloadSpec(
+            plan=plan,
+            full_spans=tuple(full_spans),
+            swa_spans=tuple(swa_spans),
+            full_transfer=full_transfer,
+            component_transfers=component_transfers,
+        )
 
     def _load_back_transfers(
         self,
@@ -1569,7 +1991,6 @@ class UnifiedRadixCache(BasePrefixCache):
         mem_quota: int | None,
         req: Req | None,
         result: IncLockRefResult,
-        ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
     ) -> _QueuedLoadBackResult | None:
         """Allocate and commit controller-owned component transfers.
@@ -1578,7 +1999,6 @@ class UnifiedRadixCache(BasePrefixCache):
         :param mem_quota: Maximum additional full-KV allocation, if constrained.
         :param req: Request receiving per-request component state.
         :param result: Device-tree lock acquisition result.
-        :param ancestor_lock_params: Device-tree lease release parameters.
         :param host_anchor_params: Host-tree lease release parameters.
         :returns: Metadata for the queued component payload, or ``None`` on failure.
         """
@@ -1597,8 +2017,6 @@ class UnifiedRadixCache(BasePrefixCache):
             for xfer in aux_xfers
         )
         if not has_component_payload:
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return None
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
@@ -1609,8 +2027,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return None
 
         avail = self._component_available_size(ComponentType.FULL)
@@ -1618,8 +2034,6 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             self.evict_for_alloc(EvictParams(num_tokens=needed))
             if self._component_available_size(ComponentType.FULL) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
                 return None
 
         # Load H→D
@@ -1629,9 +2043,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return None
 
         kv_xfer.device_indices = device_indices
@@ -1656,17 +2068,17 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
 
+        queued_result = _QueuedLoadBackResult(
+            new_full_device_indices=device_indices[:logical_full_tokens],
+            full_tokens=full_tokens,
+            swa_tokens=swa_tokens,
+        )
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
-
-        return _QueuedLoadBackResult(
-            new_full_device_indices=device_indices[:logical_full_tokens],
-            full_tokens=full_tokens,
-            swa_tokens=swa_tokens,
-        )
+        return queued_result
 
     def _build_sidecar_transfers(
         self,
@@ -1739,17 +2151,21 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
-        operation_id = self.cache_controller.write_storage(
-            spec.host_value,
-            spec.token_ids,
-            spec.hash_value,
-            spec.prefix_keys,
-            extra_pools=aux_xfers or None,
-        )
-        self.ongoing_backup[operation_id] = (
-            node_id,
-            self.inc_host_lock_ref(node_id).to_dec_params(),
-        )
+        lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
+        registered = False
+        try:
+            operation_id = self.cache_controller.write_storage(
+                spec.host_value,
+                spec.token_ids,
+                spec.hash_value,
+                spec.prefix_keys,
+                extra_pools=aux_xfers or None,
+            )
+            self.ongoing_backup[operation_id] = (node_id, lock_params)
+            registered = True
+        finally:
+            if not registered:
+                self.dec_host_lock_ref(node_id, lock_params)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -1869,79 +2285,99 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        alloc_failed = False
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
-            # Pre-allocate the component's prefetch host buffer so the build stays pure.
-            prep = self.components[ct].prepare_prefetch(
-                last_host_node_id, prefetch_tokens=len(prefetch_key)
-            )
-            if prep.alloc_failed:
-                alloc_failed = True
-                break
-            if prep.host_indices is None:
-                continue
-            transfers = self.tree_core.build_hicache_transfers(
-                ct,
-                last_host_node_id,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                last_hash=last_hash,
-                host_indices=prep.host_indices,
-            )
-            if transfers:
-                comp_xfers[ct] = transfers
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
-        )
-        if alloc_failed:
-            # The whole storage fetch is forfeited over one aux staging
-            # alloc (e.g. a single SWA window) — count it, or write-burst
-            # starvation of the aux pool reads as generic hit-rate loss.
-            if (
-                self.enable_storage_metrics
-                and self.storage_metrics_collector is not None
-            ):
-                self.storage_metrics_collector.log_prefetch_aux_alloc_failed_tokens(
-                    len(prefetch_key)
+        prefetch_registered = False
+        prepared_component_buffers: list[PoolTransfer] = []
+        try:
+            comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+            alloc_failed = False
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE:
+                    continue
+                # Pre-allocate the component's prefetch host buffer so the build stays pure.
+                prep = self.components[ct].prepare_prefetch(
+                    last_host_node_id, prefetch_tokens=len(prefetch_key)
                 )
-            self.cache_controller.append_host_mem_release(
-                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+                if prep.alloc_failed:
+                    alloc_failed = True
+                    break
+                if prep.host_indices is None:
+                    continue
+                pool_name = _COMPONENT_HOST_POOL.get(ct)
+                if pool_name is None:
+                    raise AssertionError(
+                        f"Component {ct} allocated an unsupported prefetch buffer."
+                    )
+                prepared_component_buffers.append(
+                    PoolTransfer(name=pool_name, host_indices=prep.host_indices)
+                )
+                transfers = self.tree_core.build_hicache_transfers(
+                    ct,
+                    last_host_node_id,
+                    CacheTransferPhase.PREFETCH,
+                    token_ids=prefetch_key.token_ids,
+                    prefetch_tokens=len(prefetch_key),
+                    last_hash=last_hash,
+                    host_indices=prep.host_indices,
+                )
+                if not transfers:
+                    raise AssertionError(
+                        f"Component {ct} allocated a prefetch buffer without a transfer."
+                    )
+                comp_xfers[ct] = transfers
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
+            sidecar_xfers = self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
             )
-            if anchor_lock_params is not None:
-                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
-            # Forfeited over transient staging pressure; retryable.
-            self._storage_prefetch_missed_rids.add(req_id)
-            return
+            if alloc_failed:
+                # The whole storage fetch is forfeited over one aux staging
+                # alloc (e.g. a single SWA window) — count it, or write-burst
+                # starvation of the aux pool reads as generic hit-rate loss.
+                if (
+                    self.enable_storage_metrics
+                    and self.storage_metrics_collector is not None
+                ):
+                    self.storage_metrics_collector.log_prefetch_aux_alloc_failed_tokens(
+                        len(prefetch_key)
+                    )
+                # Forfeited over transient staging pressure; retryable.
+                self._storage_prefetch_missed_rids.add(req_id)
+                return
 
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-        operation = self.cache_controller.prefetch(
-            req_id,
-            prefetch_key,
-            last_hash,
-            prefix_keys,
-            extra_pools=aux_xfers or None,
-        )
-        stats["issued"] += 1
-        # Snapshots for the L3 miss accounting at the query outcome (the
-        # hit/revoke drains): requested span and total prompt length.
-        operation.stats_requested_tokens = prefetch_length
-        operation.stats_total_tokens = prefetch_length + len(
-            matched_prefix_tokens or []
-        )
-        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
-            last_host_node_id,
-            prefetch_key,
-            None,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        )
+            aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+            aux_xfers.extend(sidecar_xfers)
+            operation = self.cache_controller.prefetch(
+                req_id,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                extra_pools=aux_xfers or None,
+            )
+            self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+                last_host_node_id,
+                prefetch_key,
+                None,
+                operation,
+                anchor_lock_params,
+                comp_xfers,
+            )
+            prefetch_registered = True
+            stats["issued"] += 1
+            # Snapshots for the L3 miss accounting at the query outcome (the
+            # hit/revoke drains): requested span and total prompt length.
+            operation.stats_requested_tokens = prefetch_length
+            operation.stats_total_tokens = prefetch_length + len(
+                matched_prefix_tokens or []
+            )
+        finally:
+            if not prefetch_registered:
+                try:
+                    if len(prepared_component_buffers) > 0:
+                        self.cache_controller.append_host_mem_release(
+                            extra_pools=prepared_component_buffers,
+                        )
+                finally:
+                    if anchor_lock_params is not None:
+                        self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         if buffer_mode:
             self.buffer_pipeline.set_prefix_ctx(
                 req_id,
@@ -2327,7 +2763,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return len(prefetch_key)
 
     def revoke_pending_prefetch(self, req_id: str) -> None:
-        info = self.ongoing_prefetch.pop(req_id, None)
+        info = self.ongoing_prefetch.get(req_id)
         if info is None:
             return
         (
@@ -2338,6 +2774,9 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        if anchor_lock_params is not None:
+            self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+        del self.ongoing_prefetch[req_id]
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(req_id)
@@ -2346,8 +2785,6 @@ class UnifiedRadixCache(BasePrefixCache):
         cc.append_host_mem_release(
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
         )
-        if anchor_lock_params is not None:
-            self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -2388,6 +2825,19 @@ class UnifiedRadixCache(BasePrefixCache):
                     # All TP/PP ranks must consume the same number of elements.
                     item = q.get()
                     yield item
+
+        def _peek_queue(q: Queue[T]) -> T:
+            """Return the FIFO head without consuming its retry trigger."""
+            with q.mutex:
+                if len(q.queue) == 0:
+                    raise RuntimeError("A synchronized storage queue became empty.")
+                return q.queue[0]
+
+        def _commit_queue_head(q: Queue[T], expected: T) -> None:
+            """Consume a previously inspected FIFO head after its state commits."""
+            committed = q.get()
+            if committed is not expected:
+                raise RuntimeError("A storage queue changed while committing its head.")
 
         buffer_mode = self.host_memory_mode == "buffer_only"
 
@@ -2522,16 +2972,27 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _drain_backup():
             drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
+            while n_backup is None or drained < n_backup:
+                if n_backup is None and cc.ack_backup_queue.empty():
+                    break
+                operation = _peek_queue(cc.ack_backup_queue)
+                entry = None
+                if not buffer_mode:
+                    entry = self.ongoing_backup.get(operation.id)
+                    if entry is not None:
+                        node_id, lock_params = entry
+                        self.validate_host_lock_ref(node_id, lock_params)
+
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
-                else:
-                    entry = self.ongoing_backup.pop(operation.id, None)
-                    if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
+                elif entry is not None:
+                    node_id, lock_params = entry
+                    self.dec_host_lock_ref(node_id, lock_params)
+                    del self.ongoing_backup[operation.id]
+
+                _commit_queue_head(cc.ack_backup_queue, operation)
+                drained += 1
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -2821,26 +3282,58 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            self._fail_stop_all_reduce(
+                sync_tensor,
+                torch.distributed.ReduceOp.MIN,
+                operation="hicache-load-completion-consensus",
+            )
             finish_count = int(sync_tensor[0].item())
             assert (
                 sync_tensor[1].item() == -sync_tensor[2].item()
             ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
-            ack = cc.ack_load_queue.pop(0)
+            ack = cc.ack_load_queue[0]
             ack.finish_event.synchronize()
+
+            seen_ack_ids: set[int] = set()
+            for ack_id in ack.node_ids:
+                if ack_id in seen_ack_ids:
+                    raise RuntimeError(f"Load-back ACK repeats operation {ack_id}.")
+                seen_ack_ids.add(ack_id)
+                if (
+                    self.buffer_pipeline is not None
+                    and self.buffer_pipeline.owns_load_back_ack(ack_id)
+                ):
+                    continue
+                load_back = self.ongoing_load_back.get(ack_id)
+                if load_back is None:
+                    raise RuntimeError(
+                        f"Load-back ACK names unknown operation {ack_id}."
+                    )
+                self.validate_host_lock_ref(
+                    load_back.node_id,
+                    load_back.host_lock_params,
+                )
+
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
                     continue
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+                node, lock_params, host_lock_params = self.ongoing_load_back[ack_id]
+                # Finalize the idempotent tree marks before consuming either
+                # ownership receipt. A later release failure can still retry
+                # from the queued ACK without rebuilding published state.
+                self.tree_core.finish_load_back(node)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
-                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
-                self.tree_core.finish_load_back(node)
+                del self.ongoing_load_back[ack_id]
+
+            committed_ack = cc.ack_load_queue.pop(0)
+            if committed_ack is not ack:
+                raise RuntimeError("Load-back ACK queue changed during commit.")
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -3216,48 +3709,94 @@ class UnifiedRadixCache(BasePrefixCache):
         :param session_id: Session identifier whose stage must be committed.
         :returns: Exact host-backed token count.
         """
-        pending = self._pending_streaming_session_demotions.pop(session_id)
+        pending = self._pending_streaming_session_demotions[session_id]
         last_node = pending.tree_prefix_node
-        private_boundaries = [pending.tree_prefix_len]
-        if pending.tree_prefix_len < pending.swa_window_start < pending.aligned_len:
-            private_boundaries.append(pending.swa_window_start)
-        private_boundaries.append(pending.aligned_len)
-        for start, end in pairwise(private_boundaries):
-            if start == end:
-                continue
-            last_node = self.tree_core.add_streaming_session_private_node(
-                last_node,
-                session_id,
-                pending.key[start:end],
-                pending.priority,
-                is_fringe=False,
-            )
-        if pending.aligned_len < len(pending.key):
-            fringe_key = pending.key[pending.aligned_len :]
-            last_node = self.tree_core.add_streaming_session_private_node(
-                last_node,
-                session_id,
-                fringe_key,
-                pending.priority,
-                is_fringe=True,
-            )
+        host_lock_params: DecLockRefParams | None = None
+        host_path_transaction: _StreamingSessionHostPathTransaction | None = None
+        committed = False
+        source_retirement_started = False
+        try:
+            if pending.swa_window_start < pending.tree_prefix_len:
+                self._split_streaming_session_path_at(
+                    pending.tree_prefix_node,
+                    pending.tree_prefix_len,
+                    pending.swa_window_start,
+                )
+            private_boundaries = [pending.tree_prefix_len]
+            if pending.tree_prefix_len < pending.swa_window_start < pending.aligned_len:
+                private_boundaries.append(pending.swa_window_start)
+            private_boundaries.append(pending.aligned_len)
+            for start, end in pairwise(private_boundaries):
+                if start == end:
+                    continue
+                last_node = self.tree_core.add_streaming_session_private_node(
+                    last_node,
+                    session_id,
+                    pending.key[start:end],
+                    pending.priority,
+                    is_fringe=False,
+                )
+            if pending.aligned_len < len(pending.key):
+                fringe_key = pending.key[pending.aligned_len :]
+                last_node = self.tree_core.add_streaming_session_private_node(
+                    last_node,
+                    session_id,
+                    fringe_key,
+                    pending.priority,
+                    is_fringe=True,
+                )
 
-        self._commit_streaming_session_host_path(
-            last_node,
-            pending.backup,
-            logical_len=len(pending.key),
-        )
-        host_lock_params = self.inc_host_lock_ref(last_node).to_dec_params()
-        self.session_refs.register_streaming_session_frontier(session_id, last_node)
-        self.session.transition_to_demoted(
-            session_id,
-            last_node,
-            len(pending.key),
-            pending.tree_prefix_len,
-            pending.swa_window_start,
-            host_lock_params,
-        )
-        self._demote_streaming_session_tree_path(pending.tree_prefix_node)
+            host_path_transaction = _StreamingSessionHostPathTransaction(
+                ledger=_HostStageLedger.from_backup(pending.backup)
+            )
+            self._commit_streaming_session_host_path(
+                last_node,
+                pending.backup,
+                host_path_transaction,
+                logical_len=len(pending.key),
+                swa_window_start=pending.swa_window_start,
+            )
+            host_lock_params = self.inc_host_lock_ref(last_node).to_dec_params()
+            self.session_refs.register_streaming_session_frontier(
+                session_id,
+                last_node,
+            )
+            source_retirement_started = True
+            self.session.transition_to_demoted(
+                session_id,
+                last_node,
+                len(pending.key),
+                pending.tree_prefix_len,
+                pending.swa_window_start,
+                host_lock_params,
+            )
+            self._demote_streaming_session_tree_path(pending.tree_prefix_node)
+            host_path_transaction.ledger.release_stage_owned(self.host_pool_group)
+            committed = True
+        finally:
+            published = committed or self.session.is_demoted(session_id)
+            if published:
+                self._pending_streaming_session_demotions.pop(session_id, None)
+            elif source_retirement_started:
+                # Source retirement is deliberately the final local phase. An
+                # exception here is indeterminate and must be handled by the
+                # post-commit TP fail-stop fence; rollback could resurrect pages
+                # that one allocator has already released.
+                pass
+            else:
+                self.clear_radix_session_refs(session_id)
+                if host_lock_params is not None:
+                    self.dec_host_lock_ref(last_node, host_lock_params)
+                if host_path_transaction is not None:
+                    self._rollback_streaming_session_host_path(
+                        host_path_transaction
+                    )
+                else:
+                    self.retraction_discard(pending.backup)
+                if self.tree_core.is_session_private(last_node):
+                    self.retire_streaming_session_private_path(session_id, last_node)
+                self._pending_streaming_session_demotions.pop(session_id, None)
+
         return len(pending.key)
 
     def _streaming_session_path(
@@ -3286,23 +3825,65 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return nodes
 
+    def _split_streaming_session_path_at(
+        self,
+        last_node: NodeId,
+        path_len: int,
+        boundary: int,
+    ) -> None:
+        """Ensure one root-relative boundary falls between ordinary nodes.
+
+        A split is a representation-only change and deliberately survives a
+        later transaction rollback. Performing it before host ownership moves
+        keeps every staged slice bound to one stable node.
+
+        :param last_node: Ordinary radix frontier to inspect.
+        :param path_len: Exact logical length represented by the frontier.
+        :param boundary: Root-relative token boundary to materialize.
+        """
+        if boundary <= 0 or boundary >= path_len:
+            return
+        offset = 0
+        for node in self._streaming_session_path(last_node, path_len):
+            node_end = offset + len(node.key)
+            if boundary == offset or boundary == node_end:
+                return
+            if offset < boundary < node_end:
+                _, action = self.tree_core._split_node(
+                    node.key,
+                    node,
+                    boundary - offset,
+                )
+                if action is not None:
+                    self._apply_cache_action(action)
+                return
+            offset = node_end
+        raise AssertionError(
+            f"Session path boundary {boundary} lies outside a {path_len}-token path."
+        )
+
     def _commit_streaming_session_host_path(
         self,
         last_node: NodeId,
         backup: RetractionBackup,
+        transaction: _StreamingSessionHostPathTransaction,
         *,
         logical_len: int | None = None,
-    ) -> None:
+        swa_window_start: int = 0,
+    ) -> _StreamingSessionHostPathTransaction:
         """Attach staged full and SWA slots to the integrated radix path.
 
         :param last_node: Radix frontier anchoring the staged prefix.
         :param backup: Private host stage to publish.
+        :param transaction: Caller-owned stage-consumption and rollback ledger.
         :param logical_len: Exact token count when a physical fringe is present.
+        :param swa_window_start: First logical token represented by staged SWA.
+        :returns: Exact ownership ledger for commit or rollback.
         """
+        if backup.host_indices is None:
+            raise AssertionError("Session demotion has no staged Full host indices.")
         expected_len = len(backup.host_indices) if logical_len is None else logical_len
         nodes = self._streaming_session_path(last_node, expected_len)
-        full_frees: list[torch.Tensor] = []
-        offset = 0
         for node in nodes:
             logical_node_len = len(node.key)
             physical_node_len = (
@@ -3310,21 +3891,26 @@ class UnifiedRadixCache(BasePrefixCache):
                 if node.private_physical_length is None
                 else node.private_physical_length
             )
-            host_slice = backup.host_indices[offset : offset + physical_node_len]
+            stage_slice = transaction.ledger.take(
+                PoolName.KV, physical_node_len
+            )
             full_data = node.component_data[ComponentType.FULL]
             if full_data.host_value is None:
-                self.tree_core.commit_backup(node.id, host_slice, {})
+                self.tree_core.commit_backup(node.id, stage_slice.indices, {})
+                attached = node.component_data[ComponentType.FULL].host_value
+                if attached is None or not torch.equal(attached, stage_slice.indices):
+                    raise AssertionError(
+                        f"Full host publication on node {node.id} lost its stage."
+                    )
+                stage_slice.tree_owned = True
+                transaction.attachments.append(
+                    _HostPathAttachment(
+                        node_id=node.id,
+                        component_type=ComponentType.FULL,
+                        stage_slice=stage_slice,
+                    )
+                )
                 self.tree_core.finish_synchronous_backup(node.id)
-            else:
-                full_frees.append(host_slice)
-            offset += physical_node_len
-        if offset != len(backup.host_indices):
-            raise AssertionError(
-                "Session demotion full host allocation does not match its path: "
-                f"{offset=} host_slots={len(backup.host_indices)}"
-            )
-        for host_indices in full_frees:
-            self.host_pool_group.free(host_indices, pool=PoolName.KV)
 
         independent = [
             transfer
@@ -3342,56 +3928,92 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer for transfer in independent if transfer.name == PoolName.SWA
         ]
         if len(swa_transfers) == 0:
-            return
+            transaction.ledger.assert_fully_consumed()
+            return transaction
         if len(swa_transfers) != 1 or swa_transfers[0].host_indices is None:
             raise AssertionError("Session demotion requires one resolved SWA transfer.")
 
-        transfer = swa_transfers[0]
-        remaining = len(transfer.host_indices)
-        swa_frees: list[torch.Tensor] = []
-        for node in reversed(nodes):
-            if remaining == 0:
-                break
+        selected_nodes: list[UnifiedTreeNode] = []
+        offset = 0
+        for node in nodes:
+            node_end = offset + len(node.key)
+            if node_end > swa_window_start:
+                if offset < swa_window_start:
+                    raise AssertionError(
+                        "SWA demotion boundary cuts through an unsplit tree node."
+                    )
+                selected_nodes.append(node)
+            offset = node_end
+
+        for node in selected_nodes:
             logical_node_len = len(node.key)
             physical_node_len = (
                 logical_node_len
                 if node.private_physical_length is None
                 else node.private_physical_length
             )
-            if logical_node_len > remaining:
-                if node.is_session_private:
-                    raise AssertionError(
-                        "Private demotion node crosses the SWA window boundary."
-                    )
-                _, split_action = self.tree_core._split_node(
-                    node.key,
-                    node,
-                    logical_node_len - remaining,
-                )
-                if split_action is not None:
-                    self._apply_cache_action(split_action)
-                logical_node_len = len(node.key)
-                physical_node_len = logical_node_len
-                assert logical_node_len == remaining
-            host_slice = transfer.host_indices[
-                remaining - physical_node_len : remaining
-            ]
+            stage_slice = transaction.ledger.take(
+                PoolName.SWA, physical_node_len
+            )
             swa_data = node.component_data[ComponentType.SWA]
             if swa_data.host_value is None:
                 self.tree_core.commit_backup(
                     node.id,
                     backup.host_indices[:0],
-                    {ComponentType.SWA: [replace(transfer, host_indices=host_slice)]},
+                    {
+                        ComponentType.SWA: [
+                            replace(
+                                swa_transfers[0],
+                                host_indices=stage_slice.indices,
+                            )
+                        ]
+                    },
                 )
+                attached = node.component_data[ComponentType.SWA].host_value
+                if attached is None or not torch.equal(attached, stage_slice.indices):
+                    raise AssertionError(
+                        f"SWA host publication on node {node.id} lost its stage."
+                    )
+                stage_slice.tree_owned = True
+                transaction.attachments.append(
+                    _HostPathAttachment(
+                        node_id=node.id,
+                        component_type=ComponentType.SWA,
+                        stage_slice=stage_slice,
+                    )
+                )
+
+        transaction.ledger.assert_fully_consumed()
+        return transaction
+
+    def _rollback_streaming_session_host_path(
+        self,
+        transaction: _StreamingSessionHostPathTransaction,
+    ) -> None:
+        """Detach every staged attachment and release the remaining stage."""
+        for attachment in reversed(transaction.attachments):
+            node = self.tree_core.node_by_id(attachment.node_id)
+            component_data = node.component_data[attachment.component_type]
+            attached = component_data.host_value
+            if attached is None or not torch.equal(
+                attached, attachment.stage_slice.indices
+            ):
+                raise AssertionError(
+                    f"Rollback lost {attachment.component_type} host ownership on "
+                    f"node {attachment.node_id}."
+                )
+            component_data.host_value = None
+            attachment.stage_slice.tree_owned = False
+            if attachment.component_type == ComponentType.FULL:
+                self.tree_core._update_duplicate_tracking(node)
+                self.tree_core._update_evictable_leaf_sets(node)
+                if node.parent is not None:
+                    self.tree_core._update_evictable_leaf_sets(node.parent)
             else:
-                swa_frees.append(host_slice)
-            remaining -= physical_node_len
-        if remaining != 0:
-            raise AssertionError(
-                f"SWA demotion path is short by {remaining} host slots."
-            )
-        for host_indices in swa_frees:
-            self.host_pool_group.free(host_indices, pool=PoolName.SWA)
+                self.tree_core._reconcile_auxiliary_host_lru(
+                    node, attachment.component_type
+                )
+        transaction.ledger.release_stage_owned(self.host_pool_group)
 
     def _demote_streaming_session_tree_path(self, last_node: NodeId) -> None:
         """Demote the unlocked ordinary prefix while preserving shared branches.
@@ -3437,6 +4059,28 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         result = self.tree_core.retire_streaming_session_private_path(session_id, node)
         self._free_values(result.device_frees, result.host_frees)
+
+    def validate_streaming_session_private_path_detach(
+        self,
+        session_id: str,
+        node: NodeId,
+        owner_params: DecLockRefParams,
+        *,
+        allow_device_locks: bool,
+    ) -> None:
+        """Validate private-path detachment before releasing its owner.
+
+        :param session_id: Session that owns the private suffix.
+        :param node: Exact private frontier.
+        :param owner_params: Demoted session's host-lock receipt.
+        :param allow_device_locks: Whether request-owned locks remain temporarily.
+        """
+        self.tree_core.validate_streaming_session_private_path_detach(
+            session_id,
+            node,
+            owner_params,
+            allow_device_locks=allow_device_locks,
+        )
 
     def adopt_streaming_session_private_path(
         self, session_id: str, node: NodeId
@@ -3609,7 +4253,49 @@ class UnifiedRadixCache(BasePrefixCache):
         ongoing_load_back = [
             (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
         ]
-        self.tree_core.sanity_check(ongoing_write_through, ongoing_load_back)
+        host_lock_owners = [
+            HostLockOwner(
+                kind=HostLockOwnerKind.LOAD_BACK,
+                owner_id=operation_id,
+                anchor_node_id=load_back.node_id,
+                lock_params=load_back.host_lock_params,
+            )
+            for operation_id, load_back in self.ongoing_load_back.items()
+        ]
+        host_lock_owners.extend(
+            HostLockOwner(
+                kind=HostLockOwnerKind.STORAGE_BACKUP,
+                owner_id=operation_id,
+                anchor_node_id=node_id,
+                lock_params=lock_params,
+            )
+            for operation_id, (node_id, lock_params) in self.ongoing_backup.items()
+        )
+        host_lock_owners.extend(
+            HostLockOwner(
+                kind=HostLockOwnerKind.PREFETCH,
+                owner_id=request_id,
+                anchor_node_id=prefetch.anchor_node_id,
+                lock_params=prefetch.anchor_lock_params,
+            )
+            for request_id, prefetch in self.ongoing_prefetch.items()
+            if prefetch.anchor_lock_params is not None
+        )
+        host_lock_owners.extend(
+            HostLockOwner(
+                kind=HostLockOwnerKind.DEMOTED_SESSION,
+                owner_id=session_id,
+                anchor_node_id=state.last_node,
+                lock_params=state.host_lock_params,
+            )
+            for session_id, state in self.session.demoted.items()
+        )
+        self.tree_core.sanity_check(
+            ongoing_write_through,
+            ongoing_load_back,
+            host_lock_owners,
+            set(self.session.demoted),
+        )
 
     def pretty_print(self) -> None:
         self.tree_core.pretty_print()

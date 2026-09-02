@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
+    HostLockOwner,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -457,6 +458,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
+        self._next_host_lock_id = 1
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -694,20 +696,83 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         node = self.node_by_id(node_id)
-        result = IncLockRefResult()
-        for component in self.components:
-            result = component.acquire_component_lock(
-                node=node, result=result, lock_host=True
-            )
-        self._update_evictable_leaf_sets(node)
+        result = IncLockRefResult(host_lock_id=self._next_host_lock_id)
+        self._next_host_lock_id += 1
+        completed = False
+        try:
+            for component in self.components:
+                result = component.acquire_component_lock(
+                    node=node, result=result, lock_host=True
+                )
+            self._update_evictable_leaf_sets(node)
+            completed = True
+        finally:
+            if not completed and len(result.host_lock_footprints) > 0:
+                self.dec_host_lock_ref(node_id, result.to_dec_params())
+        if len(result.host_lock_footprints) == 0:
+            result.host_lock_id = None
         return result
 
+    def _prepare_host_lock_release(
+        self, node_id: NodeId, params: DecLockRefParams
+    ) -> list[tuple[TreeComponent, tuple[UnifiedTreeNode, ...]]]:
+        """Validate one complete host-lock release without mutating state."""
+        node = self.node_by_id(node_id)
+        lock_id = params.host_lock_id
+        if lock_id is None:
+            if len(params.host_lock_footprints) > 0:
+                raise AssertionError("Host-lock footprint has no ownership identifier.")
+            return []
+
+        release_plan: list[tuple[TreeComponent, tuple[UnifiedTreeNode, ...]]] = []
+        expected: set[tuple[NodeId, ComponentType]] = set()
+        for component_type in params.host_lock_footprints:
+            component = self.components_by_type.get(component_type)
+            if component is None:
+                raise AssertionError(
+                    f"Host-lock receipt names absent component {component_type}."
+                )
+            nodes = component.host_lock_nodes(node, params)
+            component.validate_host_lock_nodes(nodes, params)
+            release_plan.append((component, nodes))
+            for owned_node in nodes:
+                key = (owned_node.id, component_type)
+                if key in expected:
+                    raise AssertionError(
+                        f"Host-lock owner {lock_id} resolves duplicate footprint {key}."
+                    )
+                expected.add(key)
+
+        actual = {
+            (arena_node.id, component_type)
+            for arena_node in self._node_arena.values()
+            for component_type in self.component_types
+            if lock_id
+            in (arena_node.component_data[component_type].host_lock_ids or ())
+        }
+        if actual != expected:
+            raise AssertionError(
+                f"Host-lock owner {lock_id} footprint disagrees with its receipt: "
+                f"missing={sorted(expected - actual)} "
+                f"extraneous={sorted(actual - expected)}."
+            )
+        return release_plan
+
+    def validate_host_lock_ref(
+        self,
+        node_id: NodeId,
+        params: DecLockRefParams,
+    ) -> None:
+        """Validate one complete host-lock receipt without releasing it."""
+        self._prepare_host_lock_release(node_id, params)
+
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         node = self.node_by_id(node_id)
-        for component in self.components:
-            component.release_component_lock(node=node, params=params, lock_host=True)
+        release_plan = self._prepare_host_lock_release(node_id, params)
+        for component, nodes in release_plan:
+            component.release_prepared_host_lock(nodes, params)
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 
@@ -1283,6 +1348,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._for_each_component_lru(
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
+        self._reconcile_auxiliary_host_lrus(new_node)
+        self._reconcile_auxiliary_host_lrus(child)
         child.last_access_time = get_and_increase_time_counter()
 
         self._update_evictable_leaf_sets(new_node)
@@ -1390,7 +1457,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return result
         for node in nodes:
             if any(
-                component_data.lock_ref > 0 or component_data.host_lock_ref > 0
+                component_data.lock_ref > 0
+                or component_data.host_lock_ref > 0
+                or component_data.host_lock_ids is not None
                 for component_data in node.component_data
             ):
                 raise RuntimeError(f"Session-private node {node.id} is still locked.")
@@ -1425,6 +1494,50 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             assert parent is not None
             self._update_evictable_leaf_sets(parent)
         return result
+
+    def validate_streaming_session_private_path_detach(
+        self,
+        session_id: str,
+        node_id: NodeId,
+        owner_params: DecLockRefParams,
+        *,
+        allow_device_locks: bool,
+    ) -> None:
+        """Validate private-path retirement while its session lock is held.
+
+        :param session_id: Session that owns the private suffix.
+        :param node_id: Exact private frontier.
+        :param owner_params: Demoted session's host-lock receipt.
+        :param allow_device_locks: Whether the caller will release its request lock.
+        """
+        self._prepare_host_lock_release(node_id, owner_params)
+        owner_lock_id = owner_params.host_lock_id
+        nodes = self._streaming_session_private_nodes(session_id, node_id)
+        for index, node in enumerate(nodes):
+            expected_children = {nodes[index + 1]} if index + 1 < len(nodes) else set()
+            if set(node.children.values()) != expected_children:
+                raise RuntimeError(
+                    f"Session-private node {node.id} has foreign children."
+                )
+            for component_type in self.component_types:
+                component_data = node.component_data[component_type]
+                lock_ids = set(component_data.host_lock_ids or ())
+                if component_data.host_lock_ref != len(lock_ids):
+                    raise RuntimeError(
+                        f"Session-private node {node.id} {component_type} has an "
+                        "inconsistent host-lock ledger."
+                    )
+                foreign_host_locks = lock_ids - {owner_lock_id}
+                if len(foreign_host_locks) > 0:
+                    raise RuntimeError(
+                        f"Session-private node {node.id} {component_type} is held "
+                        f"by host locks {sorted(foreign_host_locks)}."
+                    )
+                if not allow_device_locks and component_data.lock_ref > 0:
+                    raise RuntimeError(
+                        f"Session-private node {node.id} {component_type} is held "
+                        "by a device lock."
+                    )
 
     def adopt_streaming_session_private_path(
         self, session_id: str, node_id: NodeId
@@ -1493,21 +1606,53 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self,
         node: UnifiedTreeNode,
         lru_op,
-        target: EvictLayer = EvictLayer.DEVICE,
         skip_existing: bool = False,
     ):
-        """Apply lru_op to each aux component's LRU that has data on this node.
+        """Apply ``lru_op`` to each resident auxiliary device-LRU entry.
+
         If skip_existing=True, skip components already in the target LRU list."""
-        lru_dict = self.host_lru_lists if target is EvictLayer.HOST else self.lru_lists
         for ct in self.component_types:
             if ct == BASE_COMPONENT_TYPE:
                 continue  # Full uses leaf sets, not LRU
             cd = node.component_data[ct]
-            if (cd.host_value if target is EvictLayer.HOST else cd.value) is not None:
-                lru = lru_dict[ct]
+            if cd.value is not None:
+                lru = self.lru_lists[ct]
                 if skip_existing and lru.in_list(node):
                     continue
                 lru_op(lru, node)
+
+    @staticmethod
+    def _auxiliary_host_lru_eligible(component_data: ComponentData) -> bool:
+        """Whether host-only auxiliary state is currently reclaimable."""
+        return (
+            component_data.value is None
+            and component_data.host_value is not None
+            and component_data.host_lock_ref == 0
+        )
+
+    def _reconcile_auxiliary_host_lru(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+    ) -> None:
+        """Make one auxiliary host-LRU entry match its canonical eligibility."""
+        assert component_type != BASE_COMPONENT_TYPE
+        host_lru = self.host_lru_lists[component_type]
+        eligible = self._auxiliary_host_lru_eligible(
+            node.component_data[component_type]
+        )
+        if eligible and not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+            return
+        if not eligible and host_lru.in_list(node):
+            host_lru.remove_node(node)
+
+    def _reconcile_auxiliary_host_lrus(self, node: UnifiedTreeNode) -> None:
+        """Reconcile every auxiliary host-LRU entry on one node."""
+        for component_type in self.component_types:
+            if component_type == BASE_COMPONENT_TYPE:
+                continue
+            self._reconcile_auxiliary_host_lru(node, component_type)
 
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
@@ -1814,10 +1959,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         self.kv_events.record_remove(node, medium=StorageMedium.GPU)
 
-        # after device eviction, insert aux components into host LRU.
-        self._for_each_component_lru(
-            node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
-        )
+        self._reconcile_auxiliary_host_lrus(node)
         self._update_evictable_leaf_sets(node.parent)
 
     def _cascade_evict(
@@ -2460,9 +2602,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
         node.component_data[component_type].value = value
-        host_lru = self.host_lru_lists[component_type]
-        if host_lru.in_list(node):
-            host_lru.remove_node(node)
+        self._reconcile_auxiliary_host_lru(node, component_type)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
 
@@ -2479,12 +2619,120 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = self.node_by_id(node_id).component_data[component_type]
         return cd.value is None and cd.host_value is not None
 
+    def _validate_host_lock_owners(
+        self,
+        owners: list[HostLockOwner],
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        """Reconcile node host-lock counters with live lifecycle owners."""
+        expected: dict[tuple[NodeId, ComponentType], set[int]] = defaultdict(set)
+        expected_owners: dict[tuple[NodeId, ComponentType], dict[int, str]] = (
+            defaultdict(dict)
+        )
+        lifecycle_owner_by_lock_id: dict[int, str] = {}
+
+        for owner in owners:
+            anchor = self._node_arena.get(owner.anchor_node_id)
+            owner_label = f"{owner.kind.value}:{owner.owner_id}"
+            if anchor is None or anchor not in reachable_nodes:
+                report_error(
+                    f"[HostLock] owner {owner_label} has missing anchor "
+                    f"{owner.anchor_node_id}"
+                )
+                continue
+
+            lock_id = owner.lock_params.host_lock_id
+            if lock_id is None:
+                if len(owner.lock_params.host_lock_footprints) > 0:
+                    report_error(
+                        f"[HostLock] owner {owner_label} has no ownership identifier"
+                    )
+                continue
+
+            previous_owner = lifecycle_owner_by_lock_id.get(lock_id)
+            if previous_owner is not None:
+                report_error(
+                    f"[HostLock] acquisition {lock_id} is claimed by both "
+                    f"{previous_owner} and {owner_label}"
+                )
+            else:
+                lifecycle_owner_by_lock_id[lock_id] = owner_label
+
+            for component_type in owner.lock_params.host_lock_footprints:
+                component = self.components_by_type.get(component_type)
+                if component is None:
+                    report_error(
+                        f"[HostLock] owner {owner_label} names absent component "
+                        f"{component_type}"
+                    )
+                    continue
+                try:
+                    owned_nodes = component.host_lock_nodes(anchor, owner.lock_params)
+                except AssertionError as error:
+                    report_error(
+                        f"[HostLock] owner {owner_label} footprint invalid: {error}"
+                    )
+                    continue
+                if len(owned_nodes) == 0:
+                    report_error(
+                        f"[HostLock] owner {owner_label} has empty "
+                        f"{component_type} footprint"
+                    )
+                    continue
+                for node in owned_nodes:
+                    if node not in reachable_nodes:
+                        report_error(
+                            f"[HostLock] owner {owner_label} reaches detached node "
+                            f"{node.id}"
+                        )
+                        continue
+                    key = (node.id, component_type)
+                    if lock_id in expected[key]:
+                        report_error(
+                            f"[HostLock] duplicate owner {owner_label} for node "
+                            f"{node.id} {component_type} lock_id={lock_id}"
+                        )
+                    expected[key].add(lock_id)
+                    expected_owners[key][lock_id] = owner_label
+
+        nodes_to_check = set(self._node_arena.values()) | reachable_nodes
+        for node in nodes_to_check:
+            for component_type in self.component_types:
+                key = (node.id, component_type)
+                component_data = node.component_data[component_type]
+                actual_ids = set(component_data.host_lock_ids or ())
+                wanted_ids = expected.get(key, set())
+                actual_count = component_data.host_lock_ref
+                wanted_count = len(wanted_ids)
+                if actual_ids == wanted_ids and actual_count == wanted_count:
+                    continue
+                missing_ids = wanted_ids - actual_ids
+                orphan_ids = actual_ids - wanted_ids
+                if wanted_count == 0:
+                    mismatch = "orphan"
+                elif actual_count < wanted_count:
+                    mismatch = "under-count"
+                elif actual_count > wanted_count:
+                    mismatch = "over-count"
+                else:
+                    mismatch = "owner-set mismatch"
+                report_error(
+                    f"[HostLock] {mismatch} node {node.id} {component_type}: "
+                    f"actual_count={actual_count} expected_count={wanted_count} "
+                    f"actual={sorted(actual_ids)} expected={sorted(wanted_ids)} "
+                    f"missing={sorted(missing_ids)} orphan={sorted(orphan_ids)} "
+                    f"owners={expected_owners.get(key, {})}"
+                )
+
     # ==== Others ====
 
     def sanity_check(
         self,
         ongoing_write_through: list[tuple[int, NodeId]],
         ongoing_load_back: list[tuple[int, NodeId]],
+        host_lock_owners: list[HostLockOwner],
+        private_session_owners: set[str],
     ) -> None:
         """Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants; raise
         AssertionError on any violation. ongoing_* args are (id, node_id) pairs.
@@ -2494,6 +2742,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         all_nodes = self._collect_all_nodes()
         all_node_set = set(all_nodes)
         FCT = BASE_COMPONENT_TYPE
+
+        arena_nodes = set(self._node_arena.values())
+        if arena_nodes != all_node_set:
+            E(
+                "[Arena] reachability mismatch: "
+                f"detached={[node.id for node in arena_nodes - all_node_set][:5]} "
+                f"unregistered={[node.id for node in all_node_set - arena_nodes][:5]}"
+            )
+
+        for node in all_nodes:
+            private_session_id = node.private_session_id
+            if (
+                private_session_id is not None
+                and private_session_id not in private_session_owners
+            ):
+                E(
+                    f"[PrivatePath] node {node.id} belongs to unowned session "
+                    f"{private_session_id!r}"
+                )
 
         # ── PART 1: Tree Structure ──
         # Root state
@@ -2587,6 +2854,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     E(f"node {nid} {ct} lock_ref={cd.lock_ref}")
                 if cd.host_lock_ref < 0:
                     E(f"node {nid} {ct} host_lock_ref={cd.host_lock_ref}")
+                host_lock_count = len(cd.host_lock_ids or ())
+                if cd.host_lock_ref != host_lock_count:
+                    E(
+                        f"node {nid} {ct} host_lock_ref={cd.host_lock_ref} "
+                        f"!= owners={host_lock_count}"
+                    )
+                if cd.host_lock_ids is not None and host_lock_count == 0:
+                    E(f"node {nid} {ct} retains an empty host-lock owner set")
+                if (
+                    cd.host_lock_ref > 0
+                    and cd.host_value is None
+                    and not (ct == FCT and self.is_write_back)
+                ):
+                    E(f"node {nid} {ct} host-locked without a host value")
                 if ct != FCT and fl < cd.lock_ref:
                     E(f"node {nid} full_lock={fl} < {ct}_lock={cd.lock_ref}")
                 if cd.value is None and cd.lock_ref > 0:
@@ -2683,9 +2964,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
-                    and n.component_data[ct].value is None
-                    and n.component_data[ct].host_value is not None
-                    and n.component_data[ct].host_lock_ref == 0
+                    and self._auxiliary_host_lru_eligible(n.component_data[ct])
                 }
                 host_lru_ids = set(host_lru.cache.keys())
                 if evictable_host_ids != host_lru_ids:
@@ -2701,6 +2980,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # Linked-list integrity
                 self._check_lru_linked_list(lru, ct, "device", errors)
                 self._check_lru_linked_list(host_lru, ct, "host", errors)
+
+        self._validate_host_lock_owners(host_lock_owners, all_node_set, E)
 
         # ── PART 4: Size Accounting ──
         for ct in self.component_types:

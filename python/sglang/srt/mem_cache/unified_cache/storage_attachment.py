@@ -368,8 +368,12 @@ class StorageAttachment:
                     cache.revoke_pending_prefetch(req_id)
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
+                if info.anchor_lock_params is not None:
+                    cache.dec_host_lock_ref(
+                        info.anchor_node_id,
+                        info.anchor_lock_params,
+                    )
                 del cache.ongoing_prefetch[req_id]
-                cache.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
                 controller.append_host_mem_release(
                     host_indices=info.host_indices[:completed_tokens],
                     extra_pools=[
@@ -381,12 +385,12 @@ class StorageAttachment:
                 )
             except Exception:
                 logger.exception("Failed to release pending prefetch %s", req_id)
-                cache.ongoing_prefetch.pop(req_id, None)
 
         for ack_id in list(cache.ongoing_backup):
-            node_id, lock_params = cache.ongoing_backup.pop(ack_id)
+            node_id, lock_params = cache.ongoing_backup[ack_id]
             try:
                 cache.dec_host_lock_ref(node_id, lock_params)
+                del cache.ongoing_backup[ack_id]
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
 

@@ -102,4 +102,11 @@ class StreamingSessionDemotionError(ValueError):
     """Reports a session state that cannot enter the host-resident transaction."""
 
 
+class StreamingSessionBusyError(RuntimeError):
+    """Reports a lifecycle transition blocked by a live cache owner."""
+
+    status_code: int = 409
+
+
 STREAMING_SESSION_DEMOTION_ERROR_TYPE = StreamingSessionDemotionError.__name__
+STREAMING_SESSION_BUSY_ERROR_TYPE = StreamingSessionBusyError.__name__

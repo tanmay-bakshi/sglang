@@ -37,9 +37,7 @@ class _FakeAllocator:
     def get_kvcache(self) -> "_FakeAllocator":
         return self
 
-    def translate_loc_from_full_to_swa(
-        self, kv_indices: torch.Tensor
-    ) -> torch.Tensor:
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         return kv_indices + 1
 
 
@@ -79,6 +77,7 @@ class _FakeInnerCache:
         self.cleared_session_refs = []
         self.retired_private_paths = []
         self.adopted_private_paths = []
+        self.private_path_detach_validations = []
         self.inc_lock_ref_calls = []
         self.sanity_checks = 0
         self.private_parent = private_parent
@@ -117,6 +116,18 @@ class _FakeInnerCache:
 
     def retire_streaming_session_private_path(self, session_id: str, node) -> None:
         self.retired_private_paths.append((session_id, node))
+
+    def validate_streaming_session_private_path_detach(
+        self,
+        session_id: str,
+        node,
+        owner_params: DecLockRefParams,
+        *,
+        allow_device_locks: bool,
+    ) -> None:
+        self.private_path_detach_validations.append(
+            (session_id, node, owner_params, allow_device_locks)
+        )
 
     def streaming_session_private_parent(self, node):
         return self.private_parent
@@ -270,10 +281,11 @@ def test_demoted_snapshot_and_close_release_only_session_ownership() -> None:
         ),
     )
     tree_cache = StreamingSession(inner)
-    lock_params = DecLockRefParams(swa_uuid_for_host_lock=17)
+    lock_params = DecLockRefParams(host_lock_id=17)
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=41,
         cache_protected_len=96,
+        tree_protected_len=96,
         swa_evicted_seqlen=0,
         host_lock_params=lock_params,
     )
@@ -320,10 +332,11 @@ def test_restored_private_suffix_reanchors_tree_lock_and_becomes_slot_owned() ->
         swa_uuid_for_lock=17,
         skip_lock_node_ids={ComponentType.FULL: {7}},
     )
-    host_lock_params = DecLockRefParams(swa_uuid_for_host_lock=19)
+    host_lock_params = DecLockRefParams(host_lock_id=19)
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=42,
         cache_protected_len=65,
+        tree_protected_len=48,
         swa_evicted_seqlen=0,
         host_lock_params=host_lock_params,
     )
@@ -402,8 +415,9 @@ def test_demoted_swa_adoption_reconciles_restored_private_ownership(
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=42,
         cache_protected_len=65,
+        tree_protected_len=16,
         swa_evicted_seqlen=32,
-        host_lock_params=DecLockRefParams(swa_uuid_for_host_lock=19),
+        host_lock_params=DecLockRefParams(host_lock_id=19),
     )
 
     assert tree_cache._release_demoted_state("session-a")
@@ -412,9 +426,7 @@ def test_demoted_swa_adoption_reconciles_restored_private_ownership(
     assert slot.tree_protected_len == 16
     assert slot.kv.swa_evicted_seqlen == logical_watermark
     assert [
-        index
-        for freed in allocator.freed_swa
-        for index in freed.tolist()
+        index for freed in allocator.freed_swa for index in freed.tolist()
     ] == expected_freed
     assert tree_cache.session_held_swa_tokens() == 80 - logical_watermark
 
@@ -430,6 +442,7 @@ def test_demoted_reload_skips_ordinary_radix_insertion_until_adoption() -> None:
     tree_cache.demoted["session-a"] = DemotedSessionState(
         last_node=42,
         cache_protected_len=65,
+        tree_protected_len=0,
         swa_evicted_seqlen=0,
         host_lock_params=DecLockRefParams(),
     )

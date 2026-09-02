@@ -6,13 +6,14 @@ import os
 import threading
 import time
 from dataclasses import replace
+from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, cast
 
 import torch
 
 from sglang.srt.managers.cache_controller import (
-    CacheOperation,
+    AllocationReceipt,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
@@ -20,9 +21,14 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
     PrefetchAck,
+    PreparedTransfer,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
+)
+from sglang.srt.managers.cache_controller import (
+    TransferDirection,
+    _TransferBatch,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -40,6 +46,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
+
+
+class _CompositeDeviceAllocator(Protocol):
+    """Composite allocator exposing its independently owned Full-KV allocator."""
+
+    full_attn_allocator: BaseTokenToKVPoolAllocator
 
 
 class StorageOperation(BaseStorageOperation):
@@ -130,6 +142,14 @@ class HybridCacheController(BaseHiCacheController):
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
         )
+        device_cache = token_to_kv_pool_allocator.get_kvcache()
+        if mem_pool_host.anchor_entry.device_pool is device_cache:
+            self._anchor_device_allocator = token_to_kv_pool_allocator
+        else:
+            composite_allocator = cast(
+                _CompositeDeviceAllocator, token_to_kv_pool_allocator
+            )
+            self._anchor_device_allocator = composite_allocator.full_attn_allocator
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
@@ -298,7 +318,7 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue, transfer.host_indices, entry.host_pool.page_size
             )
 
-    def reset(self):
+    def reset(self) -> None:
         super().reset()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
@@ -306,52 +326,129 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-    def write(
+    def _prepare_host_pool_transfers(
+        self,
+        extra_pools: list[PoolTransfer],
+        *,
+        primary_device_indices: torch.Tensor,
+        primary_host_indices: torch.Tensor,
+        allocations: AllocationReceipt,
+    ) -> list[PoolTransfer] | None:
+        pool_transfers = self.copy_pool_transfers(extra_pools)
+        assert pool_transfers is not None
+        derived_transfers: list[PoolTransfer] = []
+
+        for transfer in pool_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                allocations.release_all()
+                raise ValueError(f"Unknown host pool {transfer.name}.")
+            if transfer.indices_from_pool is not None:
+                derived_transfers.append(transfer)
+                continue
+            if transfer.host_indices is not None or transfer.device_indices is None:
+                continue
+
+            host_indices = self.mem_pool_host.alloc(
+                len(transfer.device_indices),
+                pool=transfer.name,
+                reclaim=entry.host_evict_fn,
+            )
+            if host_indices is None:
+                allocations.release_all()
+                return None
+            transfer.host_indices = host_indices
+            allocations.add(
+                transfer.name,
+                host_indices,
+                partial(self.mem_pool_host.free, pool=transfer.name),
+            )
+
+        for transfer in derived_transfers:
+            if transfer.indices_from_pool == self.mem_pool_host.anchor_entry.name:
+                transfer.host_indices = primary_host_indices
+                transfer.device_indices = primary_device_indices
+                continue
+            source = next(
+                (
+                    candidate
+                    for candidate in pool_transfers
+                    if candidate.indices_from_pool is None
+                    and candidate.name == transfer.indices_from_pool
+                ),
+                None,
+            )
+            if source is None:
+                allocations.release_all()
+                raise ValueError(
+                    f"Side pool {transfer.name} has no source "
+                    f"{transfer.indices_from_pool}."
+                )
+            transfer.host_indices = source.host_indices
+            transfer.device_indices = source.device_indices
+        return pool_transfers
+
+    def prepare_device_to_host(
         self,
         device_indices: torch.Tensor,
-        priority: Optional[int] = None,
-        node_id: int = -1,
-        extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> Optional[torch.Tensor]:
+        priority: int | None = None,
+        domain_owner_id: int = -1,
+        extra_pools: list[PoolTransfer] | None = None,
+    ) -> PreparedTransfer | None:
+        """Allocate an invisible hybrid D2H transfer.
+
+        :param device_indices: Anchor device indices to copy.
+        :param priority: Optional scheduling priority.
+        :param domain_owner_id: Domain identity associated with the operation.
+        :param extra_pools: Caller-owned side-pool descriptors.
+        :returns: Prepared transfer, or ``None`` when any allocation fails.
+        """
+
+        allocations = AllocationReceipt()
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        pool_transfers = self.mem_pool_host.resolve_host_transfers(
-            extra_pools,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
-        if pool_transfers is None and extra_pools:
-            self.mem_pool_host.free(host_indices)
-            return None
-
-        self.write_queue.append(
-            CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
+        allocations.add(PoolName.KV, host_indices, self.mem_pool_host.free)
+        pool_transfers = None
+        if extra_pools is not None and len(extra_pools) > 0:
+            pool_transfers = self._prepare_host_pool_transfers(
+                extra_pools,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+                allocations=allocations,
             )
+            if pool_transfers is None:
+                return None
+
+        return self._new_prepared_transfer(
+            direction=TransferDirection.DEVICE_TO_HOST,
+            domain_owner_id=domain_owner_id,
+            host_indices=host_indices,
+            device_indices=device_indices,
+            priority=priority,
+            pool_transfers=pool_transfers,
+            allocations=allocations,
         )
-        self.start_writing()
-        return host_indices
 
     def _move_op_indices(
-        self, op: CacheOperation
+        self, operation: PreparedTransfer | _TransferBatch
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        return self.move_hybrid_indices(op)
+        return self.move_hybrid_indices(operation)
 
     def _move_write_operation(
-        self, op: CacheOperation
+        self, operation: PreparedTransfer | _TransferBatch
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
         if self.io_backend != "kernel" or host_group.layout != "page_first":
-            return self.move_hybrid_indices(op)
-        if not getattr(host_group, "supports_per_pool_backup_indices", False):
-            if not getattr(host_group, "can_use_write_back_jit", False):
-                return self.move_hybrid_indices(op)
-            return op.host_indices, op.device_indices, op.pool_transfers
+            return self.move_hybrid_indices(operation)
+        if not host_group.supports_per_pool_backup_indices:
+            if not host_group.can_use_write_back_jit:
+                return self.move_hybrid_indices(operation)
+            return (
+                operation.host_indices,
+                operation.device_indices,
+                operation.pool_transfers,
+            )
 
         def move_for_pool(host_pool, host_indices, device_indices):
             if getattr(host_pool, "can_use_write_back_jit", False):
@@ -362,11 +459,11 @@ class HybridCacheController(BaseHiCacheController):
 
         host_indices, device_indices = move_for_pool(
             host_group.anchor_entry.host_pool,
-            op.host_indices,
-            op.device_indices,
+            operation.host_indices,
+            operation.device_indices,
         )
         pool_transfers = []
-        for transfer in op.pool_transfers or []:
+        for transfer in operation.pool_transfers or []:
             entry = host_group.entry_map[transfer.name]
             transfer_host_indices, transfer_device_indices = move_for_pool(
                 entry.host_pool,
@@ -464,32 +561,36 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return transfers
 
-    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+    def _num_tokens_by_pool(
+        self, operation: PreparedTransfer | _TransferBatch
+    ) -> dict[str, int]:
         """Per-pool token counts for a merged transfer op (anchor + extra
         pools), shared by D->H write and H->D load acks; sidecar transfers
         reusing another pool's indices are excluded."""
-        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
-        for transfer in op.pool_transfers or []:
+        counts = {
+            self.mem_pool_host.anchor_entry.name.value: len(operation.device_indices)
+        }
+        for transfer in operation.pool_transfers or []:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
                 continue
             name = transfer.name.value
             counts[name] = counts.get(name, 0) + len(transfer.host_indices)
         return counts
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+    def _transfer_num_bytes(self, operation: PreparedTransfer | _TransferBatch) -> int:
         """Total bytes moved by a merged transfer op across all pools.
 
         Sidecar transfers riding another pool's indices are included here but
         excluded from the per-pool token counts.
         """
-        kv_tokens = len(op.device_indices)
+        kv_tokens = len(operation.device_indices)
         num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
-        for t in op.pool_transfers or []:
+        for t in operation.pool_transfers or []:
             if t.indices_from_pool is None and t.host_indices is not None:
                 source_len[t.name] = len(t.host_indices)
-        for t in op.pool_transfers or []:
+        for t in operation.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
             if entry is None:
                 continue
@@ -500,47 +601,55 @@ class HybridCacheController(BaseHiCacheController):
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 
-    def load(
+    def prepare_host_to_device(
         self,
         host_indices: torch.Tensor,
-        priority: Optional[int] = None,
-        node_id: int = -1,
-        extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> Optional[torch.Tensor]:
+        priority: int | None = None,
+        domain_owner_id: int = -1,
+        extra_pools: list[PoolTransfer] | None = None,
+    ) -> PreparedTransfer | None:
+        """Allocate an invisible hybrid H2D transfer.
+
+        :param host_indices: Anchor host indices to copy.
+        :param priority: Optional scheduling priority.
+        :param domain_owner_id: Domain identity associated with the operation.
+        :param extra_pools: Caller-owned side-pool descriptors.
+        :returns: Prepared transfer, or ``None`` when any allocation fails.
+        """
+
+        allocations = AllocationReceipt()
         need_load_kv = host_indices.numel() > 0
 
-        full_allocator = getattr(
-            self.mem_pool_device_allocator,
-            "full_attn_allocator",
-            self.mem_pool_device_allocator,
-        )
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            device_indices = self._anchor_device_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
-
-        pool_transfers = self._resolve_device_transfers(
-            extra_pools,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
-        )
-        if pool_transfers is None and extra_pools:
-            if need_load_kv:
-                full_allocator.free(device_indices)
-            return None
-
-        self.load_queue.append(
-            CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
+            allocations.add(
+                PoolName.KV, device_indices, self._anchor_device_allocator.free
             )
+
+        pool_transfers = None
+        if extra_pools is not None and len(extra_pools) > 0:
+            pool_transfers = self._prepare_device_pool_transfers(
+                extra_pools,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+                allocations=allocations,
+            )
+            if pool_transfers is None:
+                return None
+
+        return self._new_prepared_transfer(
+            direction=TransferDirection.HOST_TO_DEVICE,
+            domain_owner_id=domain_owner_id,
+            host_indices=host_indices,
+            device_indices=device_indices,
+            priority=priority,
+            pool_transfers=pool_transfers,
+            allocations=allocations,
         )
-        return device_indices
 
     def prefetch(
         self,
@@ -555,7 +664,7 @@ class HybridCacheController(BaseHiCacheController):
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
-            pool_transfers=extra_pools,
+            pool_transfers=self.copy_pool_transfers(extra_pools),
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -573,7 +682,7 @@ class HybridCacheController(BaseHiCacheController):
             token_ids,
             hash_value=hash_value,
             prefix_keys=prefix_keys,
-            pool_transfers=extra_pools,
+            pool_transfers=self.copy_pool_transfers(extra_pools),
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -606,7 +715,7 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def move_hybrid_indices(
-        self, operation: CacheOperation
+        self, operation: PreparedTransfer | _TransferBatch
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
@@ -615,20 +724,16 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
+                if transfer.host_indices is None or transfer.device_indices is None:
+                    raise ValueError(f"Unresolved L2 transfer for {transfer.name}.")
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer.host_indices, transfer.device_indices
                 )
-                # Keep the original PoolTransfer unchanged because tree-owned
-                # transfers may still reference radix-tree host state. The
-                # controller only needs a normalized execution-time copy.
                 resolved_pool_transfers.append(
-                    PoolTransfer(
-                        name=transfer.name,
+                    replace(
+                        transfer,
                         host_indices=transfer_host_indices,
                         device_indices=transfer_device_indices,
-                        keys=transfer.keys,
-                        hit_policy=transfer.hit_policy,
-                        indices_from_pool=transfer.indices_from_pool,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -830,72 +935,75 @@ class HybridCacheController(BaseHiCacheController):
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
 
-    def _resolve_device_transfers(
+    def _prepare_device_pool_transfers(
         self,
-        extra_pools: Optional[list[PoolTransfer]],
-        kv_device_indices: Optional[torch.Tensor] = None,
-        kv_host_indices: Optional[torch.Tensor] = None,
-    ) -> Optional[list[PoolTransfer]]:
-        """Allocate unresolved side-pool device indices atomically."""
-        if not extra_pools:
-            return None
-        newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
+        extra_pools: list[PoolTransfer],
+        *,
+        primary_device_indices: torch.Tensor,
+        primary_host_indices: torch.Tensor,
+        allocations: AllocationReceipt,
+    ) -> list[PoolTransfer] | None:
+        """Allocate operation-owned side-pool device indices atomically.
+
+        :param extra_pools: Caller-owned side-pool descriptors.
+        :param primary_device_indices: Prepared anchor device allocation.
+        :param primary_host_indices: Existing anchor host allocation.
+        :param allocations: Receipt that owns every allocation in the operation.
+        :returns: Resolved copies, or ``None`` after complete rollback.
+        """
+
+        pool_transfers = self.copy_pool_transfers(extra_pools)
+        assert pool_transfers is not None
         derived_transfers: list[PoolTransfer] = []
 
-        def rollback_allocated() -> None:
-            for prev_pool, prev_free_fn, prev_indices in newly_allocated:
-                prev_free_fn(prev_indices)
-                prev_pool.device_indices = None
-
-        for pool in extra_pools:
-            if pool.indices_from_pool is not None:
-                derived_transfers.append(pool)
-                continue
-            entry = self.mem_pool_host.entry_map.get(pool.name)
+        for transfer in pool_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
             if entry is None:
+                allocations.release_all()
+                raise ValueError(f"Unknown device pool {transfer.name}.")
+            if transfer.indices_from_pool is not None:
+                derived_transfers.append(transfer)
                 continue
-            if pool.device_indices is not None or pool.host_indices is None:
+            if transfer.device_indices is not None or transfer.host_indices is None:
                 continue
-            # device_alloc_fn / device_free_fn override entry.device_pool's
-            # methods for pools whose device_pool is a raw KV pool (layout)
-            # rather than an allocator (e.g. SWA).
             alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
             free_fn = entry.device_free_fn or entry.device_pool.free
             evict_fn = entry.device_evict_fn
-            size = len(pool.host_indices)
+            size = len(transfer.host_indices)
             indices = alloc_fn(size)
-            if indices is None and evict_fn:
+            if indices is None and evict_fn is not None:
                 evict_fn(size)
                 indices = alloc_fn(size)
             if indices is None:
-                # Atomic rollback: free everything we successfully allocated.
-                rollback_allocated()
+                allocations.release_all()
                 return None
-            pool.device_indices = indices
-            newly_allocated.append((pool, free_fn, indices))
+            transfer.device_indices = indices
+            allocations.add(transfer.name, indices, free_fn)
 
-        # Assign indices to deferred pools from their source.
-        for pool in derived_transfers:
-            if pool.indices_from_pool == PoolName.KV:
-                pool.host_indices = kv_host_indices
-                pool.device_indices = kv_device_indices
+        for transfer in derived_transfers:
+            if transfer.indices_from_pool == self.mem_pool_host.anchor_entry.name:
+                transfer.host_indices = primary_host_indices
+                transfer.device_indices = primary_device_indices
                 continue
 
             source = next(
                 (
-                    transfer
-                    for transfer in extra_pools
-                    if transfer.indices_from_pool is None
-                    and transfer.name == pool.indices_from_pool
+                    candidate
+                    for candidate in pool_transfers
+                    if candidate.indices_from_pool is None
+                    and candidate.name == transfer.indices_from_pool
                 ),
                 None,
             )
             if source is None:
-                rollback_allocated()
-                return None
-            pool.host_indices = source.host_indices
-            pool.device_indices = source.device_indices
-        return extra_pools
+                allocations.release_all()
+                raise ValueError(
+                    f"Side pool {transfer.name} has no source "
+                    f"{transfer.indices_from_pool}."
+                )
+            transfer.host_indices = source.host_indices
+            transfer.device_indices = source.device_indices
+        return pool_transfers
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         # Handle KV-derived pool.

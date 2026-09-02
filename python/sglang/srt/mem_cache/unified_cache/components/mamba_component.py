@@ -94,6 +94,13 @@ class MambaComponent(TreeComponent):
         if cd.session_ref == 0:
             self._refresh_session_partition(leaf)
 
+    def _session_coverage_nodes(
+        self,
+        leaf: UnifiedTreeNode,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Return the leaf-only Mamba ownership for one session frontier."""
+        return (leaf,)
+
     def _advance_session_coverage(
         self,
         session_id: str,
@@ -233,10 +240,7 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
-            # move from host LRU to device LRU
-            host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if host_lru.in_list(node):
-                host_lru.remove_node(node)
+            self.tree_core._reconcile_auxiliary_host_lru(node, self.component_type)
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -337,22 +341,12 @@ class MambaComponent(TreeComponent):
             cd.value = None
 
         # Host layer
-        host_lru = self.tree_core.host_lru_lists[self.component_type]
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
             host_frees[self.component_type].append(cd.host_value)
             cd.host_value = None
-            if host_lru.in_list(node):
-                host_lru.remove_node(node)
 
-        # After device tombstone: if only host_value remains, insert into host LRU
-        if (
-            target is EvictLayer.DEVICE
-            and cd.value is None
-            and cd.host_value is not None
-        ):
-            if not host_lru.in_list(node):
-                host_lru.insert_mru(node)
+        self.tree_core._reconcile_auxiliary_host_lru(node, self.component_type)
 
         return freed, host_freed
 
@@ -446,11 +440,8 @@ class MambaComponent(TreeComponent):
             return result
 
         if lock_host:
-            if cd.host_lock_ref == 0:
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if host_lru.in_list(node):
-                    host_lru.remove_node(node)
-            cd.host_lock_ref += 1
+            self._acquire_host_lock_ownership(node, result)
+            self.tree_core._reconcile_auxiliary_host_lru(node, ct)
         else:
             if cd.lock_ref == 0:
                 vlen = len(value)
@@ -475,11 +466,11 @@ class MambaComponent(TreeComponent):
 
         value = cd.host_value if lock_host else cd.value
         if lock_host:
-            cd.host_lock_ref -= 1
-            if cd.host_lock_ref == 0 and cd.value is None and cd.host_value is not None:
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if not host_lru.in_list(node):
-                    host_lru.insert_mru(node)
+            if params is None:
+                raise AssertionError("Mamba host-lock release requires its receipt.")
+            if ct not in params.host_lock_footprints:
+                return
+            self._release_host_lock(node, params)
             return
 
         if cd.lock_ref > 0:
@@ -488,6 +479,43 @@ class MambaComponent(TreeComponent):
                 self.tree_core.component_evictable_size_[ct] += vlen
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
+
+    def host_lock_nodes(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Resolve leaf-only Mamba ownership by its stable terminal offset."""
+        footprint = params.host_lock_footprints.get(self.component_type)
+        if footprint is None:
+            return ()
+        ranges = footprint.ranges
+        if len(ranges) != 1:
+            raise AssertionError(
+                f"Mamba host-lock receipt has {len(ranges)} acquisition ranges."
+            )
+        receipt_range = ranges[0]
+        candidates = [
+            (path_node, path_range)
+            for path_node, path_range in self._host_lock_path(node)
+            if path_range.end == receipt_range.end
+        ]
+        if len(candidates) != 1:
+            raise AssertionError(
+                f"Mamba host-lock terminal offset {receipt_range.end} resolves "
+                f"to {len(candidates)} nodes."
+            )
+        owned_node, current_range = candidates[0]
+        if current_range.start < receipt_range.start:
+            raise AssertionError(
+                f"Mamba host-lock node {owned_node.id} range {current_range} "
+                f"grew beyond acquisition range {receipt_range}."
+            )
+        if owned_node.component_data[self.component_type].host_value is None:
+            raise AssertionError(
+                f"Mamba host-lock terminal node {owned_node.id} has no host value."
+            )
+        return (owned_node,)
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
@@ -792,6 +820,7 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                self.tree_core._reconcile_auxiliary_host_lru(node, ct)
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
@@ -801,10 +830,7 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 cd.value = transfer.device_indices.clone()
                 count = len(cd.value)
-                # Move from host LRU to device LRU
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if host_lru.in_list(node):
-                    host_lru.remove_node(node)
+                self.tree_core._reconcile_auxiliary_host_lru(node, ct)
                 self.tree_core.lru_lists[ct].insert_mru(node)
                 self.tree_core.component_evictable_size_[ct] += count
 
@@ -839,10 +865,7 @@ class MambaComponent(TreeComponent):
                 return
 
             target_node.component_data[ct].host_value = host_indices.clone()
-            if target_node.component_data[ct].value is None:
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if not host_lru.in_list(target_node):
-                    host_lru.insert_mru(target_node)
+            self.tree_core._reconcile_auxiliary_host_lru(target_node, ct)
             if insert_result is not None:
                 insert_result.mamba_exist = False
 

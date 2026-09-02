@@ -1,6 +1,8 @@
 import unittest
 from array import array
+from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -27,9 +29,17 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_radix_cache import (
+    _HostStageLedger,
+    _StreamingSessionHostPathTransaction,
+    UnifiedRadixCache,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.session.errors import StreamingSessionBusyError
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
@@ -38,6 +48,43 @@ from sglang.srt.speculative.base_spec_worker import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+
+@dataclass(frozen=True)
+class _PrivatePathLifecycleState:
+    """One observable boundary in a private host path's lifecycle.
+
+    :ivar private_node_ids: Nodes created for the session-private suffix.
+    :ivar arena_node_ids: Nodes currently registered in the tree arena.
+    :ivar component_state: Device presence, host presence, device lock, host
+        lock, session reference, and exact host owners by private node and
+        component.
+    :ivar device_lru_ids: Registered device-LRU nodes by component.
+    :ivar host_lru_ids: Registered host-LRU nodes by component.
+    :ivar expected_device_leaf_ids: Private nodes satisfying device-leaf rules.
+    :ivar expected_host_leaf_ids: Private nodes satisfying host-leaf rules.
+    :ivar device_leaf_ids: Registered device-leaf nodes.
+    :ivar host_leaf_ids: Registered host-leaf nodes.
+    :ivar session_leaf_ids: Indexed session frontiers by component.
+    :ivar owner_pages: Full-KV pages owned by the detached session slot.
+    :ivar free_full_pages: Full-KV pages currently available to the allocator.
+    """
+
+    private_node_ids: frozenset[int]
+    arena_node_ids: frozenset[int]
+    component_state: dict[
+        tuple[int, ComponentType],
+        tuple[bool, bool, int, int, int, frozenset[int]],
+    ]
+    device_lru_ids: dict[ComponentType, frozenset[int]]
+    host_lru_ids: dict[ComponentType, frozenset[int]]
+    expected_device_leaf_ids: frozenset[int]
+    expected_host_leaf_ids: frozenset[int]
+    device_leaf_ids: frozenset[int]
+    host_leaf_ids: frozenset[int]
+    session_leaf_ids: dict[ComponentType, frozenset[int]]
+    owner_pages: frozenset[int]
+    free_full_pages: frozenset[int]
 
 
 class TestDecodeRetractionBackup(unittest.TestCase):
@@ -137,7 +184,14 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             ],
         )
 
-        cache._commit_streaming_session_host_path(tail_node.id, backup)
+        transaction = _StreamingSessionHostPathTransaction(
+            ledger=_HostStageLedger.from_backup(backup)
+        )
+        cache._commit_streaming_session_host_path(
+            tail_node.id,
+            backup,
+            transaction,
+        )
 
         self.assertEqual(tree_core.splits, [(prefix_node.id, 4)])
         self.assertEqual(len(prefix_node.key), 4)
@@ -359,6 +413,488 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             ),
             kv=ReqKvInfo(),
         )
+
+    def _capture_private_path_lifecycle_state(
+        self,
+        env: SimpleNamespace,
+        private_nodes: tuple[UnifiedTreeNode, ...],
+        session_id: str,
+    ) -> _PrivatePathLifecycleState:
+        """Capture every tree and allocator index for one lifecycle boundary.
+
+        :param env: Real CUDA cache fixture.
+        :param private_nodes: Stable private-node objects retained across detach.
+        :param session_id: Session whose indexes are inspected.
+        :returns: Immutable identifiers and counters for assertions.
+        """
+        cache = env.cache
+        tree_core = cache.tree_core
+        private_node_ids = frozenset(node.id for node in private_nodes)
+        arena_node_ids = frozenset(tree_core._node_arena)
+        component_state = {
+            (node.id, component_type): (
+                node.component_data[component_type].value is not None,
+                node.component_data[component_type].host_value is not None,
+                node.component_data[component_type].lock_ref,
+                node.component_data[component_type].host_lock_ref,
+                node.component_data[component_type].session_ref,
+                frozenset(node.component_data[component_type].host_lock_ids or ()),
+            )
+            for node in private_nodes
+            for component_type in tree_core.component_types
+        }
+        device_lru_ids = {
+            component_type: frozenset(tree_core.lru_lists[component_type].cache)
+            for component_type in tree_core.component_types
+        }
+        host_lru_ids = {
+            component_type: frozenset(tree_core.host_lru_lists[component_type].cache)
+            for component_type in tree_core.component_types
+        }
+        session_leaf_ids = {
+            component.component_type: frozenset(
+                node.id for node in component._session_leaves.get(session_id, ())
+            )
+            for component in tree_core.components
+        }
+
+        slot = cache.session.slots.get(session_id)
+        owner_pages: frozenset[int] = frozenset()
+        if slot is not None and slot.is_holding_kv:
+            owner_indices = env.req_to_token_pool.req_to_token[
+                slot.req_pool_idx, : slot.kv.kv_allocated_len
+            ]
+            owner_pages = frozenset(
+                int(page)
+                for page in torch.unique(owner_indices // cache.page_size).tolist()
+            )
+
+        full_allocator = env.allocator.full_attn_allocator
+        free_tensors = [full_allocator.free_pages]
+        if len(full_allocator.release_pages) > 0:
+            free_tensors.append(full_allocator.release_pages)
+        free_full_pages = frozenset(
+            int(page) for page in torch.cat(free_tensors).tolist()
+        )
+
+        def expects_device_leaf(node: UnifiedTreeNode) -> bool:
+            full_data = node.component_data[ComponentType.FULL]
+            return (
+                node.id in arena_node_ids
+                and full_data.value is not None
+                and all(data.lock_ref == 0 for data in node.component_data)
+                and all(
+                    child.component_data[ComponentType.FULL].value is None
+                    for child in node.children.values()
+                )
+            )
+
+        def expects_host_leaf(node: UnifiedTreeNode) -> bool:
+            full_data = node.component_data[ComponentType.FULL]
+            return (
+                node.id in arena_node_ids
+                and full_data.value is None
+                and full_data.host_value is not None
+                and all(data.host_lock_ref == 0 for data in node.component_data)
+                and len(node.children) == 0
+            )
+
+        return _PrivatePathLifecycleState(
+            private_node_ids=private_node_ids,
+            arena_node_ids=arena_node_ids,
+            component_state=component_state,
+            device_lru_ids=device_lru_ids,
+            host_lru_ids=host_lru_ids,
+            expected_device_leaf_ids=frozenset(
+                node.id for node in private_nodes if expects_device_leaf(node)
+            ),
+            expected_host_leaf_ids=frozenset(
+                node.id for node in private_nodes if expects_host_leaf(node)
+            ),
+            device_leaf_ids=frozenset(
+                node.id for node in tree_core.evictable_device_leaves
+            ),
+            host_leaf_ids=frozenset(
+                node.id for node in tree_core.evictable_host_leaves
+            ),
+            session_leaf_ids=session_leaf_ids,
+            owner_pages=owner_pages,
+            free_full_pages=free_full_pages,
+        )
+
+    def _exercise_private_host_path_lifecycle(
+        self,
+    ) -> dict[str, _PrivatePathLifecycleState]:
+        """Demote, restore, adopt, and close one exact SWA session path.
+
+        :returns: Bookkeeping snapshots at each externally meaningful boundary.
+        """
+        session_id = "ownership-session"
+        page_size = 64
+        exact_tokens = page_size * 2 + 1
+        token_ids = array("q", range(exact_tokens + 1))
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        self._admit_streaming_session(env, session_id, exact_tokens)
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                session_id,
+                token_ids,
+                extra_key="ownership-namespace",
+                cache_salt="ownership-tenant",
+                priority=0,
+            ),
+            exact_tokens,
+        )
+        self.assertEqual(
+            cache.commit_streaming_session_demotion(session_id),
+            exact_tokens,
+        )
+        demoted_state = cache.session.demoted[session_id]
+        private_nodes: list[UnifiedTreeNode] = []
+        node = cache.tree_core.node_by_id(demoted_state.last_node)
+        while node.is_session_private:
+            private_nodes.append(node)
+            node = node.parent
+        private_nodes.reverse()
+        stable_private_nodes = tuple(private_nodes)
+        self.assertGreater(len(stable_private_nodes), 0)
+
+        cache.sanity_check()
+        states = {
+            "demoted": self._capture_private_path_lifecycle_state(
+                env, stable_private_nodes, session_id
+            )
+        }
+
+        match_req = self._streaming_match_req(session_id)
+        owner_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    extra_key="ownership-namespace",
+                    cache_salt="ownership-tenant",
+                ),
+                req=match_req,
+            )
+        )
+        match_req.last_node = owner_match.last_device_node
+        match_req.prefix_indices = owner_match.device_indices
+        match_req.swa_host_hit_length = owner_match.swa_host_hit_length
+        match_req.mamba_host_hit_length = 0
+        match_req.mamba_pool_idx = None
+        load_result = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=owner_match.best_match_node,
+                host_hit_length=owner_match.host_hit_length,
+                req=match_req,
+            )
+        )
+        cache.ready_to_load_host_cache()
+        ack = cache.cache_controller.ack_load_queue[0]
+        ack.finish_event.synchronize()
+        cache.loading_check(finish_count=1)
+        cache.sanity_check()
+        states["restored"] = self._capture_private_path_lifecycle_state(
+            env, stable_private_nodes, session_id
+        )
+
+        restored_req = SimpleNamespace(rid="restored-owner", req_pool_idx=None)
+        self.assertIsNotNone(env.req_to_token_pool.alloc([restored_req]))
+        env.req_to_token_pool.write(
+            (restored_req.req_pool_idx, slice(0, exact_tokens)),
+            load_result.new_full_device_indices,
+        )
+        restored_lock = cache.inc_lock_ref(demoted_state.last_node)
+        cache.session.slots[session_id] = SessionSlot(
+            req_pool_idx=restored_req.req_pool_idx,
+            kv_committed_len=exact_tokens,
+            kv=ReqKvInfo(
+                kv_allocated_len=exact_tokens,
+                swa_evicted_seqlen=demoted_state.swa_evicted_seqlen,
+            ),
+            last_node=demoted_state.last_node,
+            cache_protected_len=exact_tokens,
+            tree_protected_len=exact_tokens,
+            swa_uuid_for_lock=restored_lock.swa_uuid_for_lock,
+            skip_lock_node_ids=restored_lock.skip_lock_node_ids,
+        )
+        self.assertTrue(cache.session._release_demoted_state(session_id))
+        cache.sanity_check()
+        states["adopted"] = self._capture_private_path_lifecycle_state(
+            env, stable_private_nodes, session_id
+        )
+
+        cache.release_radix_session(session_id)
+        cache.release_session(session_id)
+        cache.sanity_check()
+        states["closed"] = self._capture_private_path_lifecycle_state(
+            env, stable_private_nodes, session_id
+        )
+        return states
+
+    def test_private_host_path_device_lru_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        demoted = states["demoted"]
+        restored = states["restored"]
+        for (node_id, component_type), state in restored.component_state.items():
+            device_present = state[0]
+            if component_type is ComponentType.FULL:
+                self.assertNotIn(node_id, restored.device_lru_ids[component_type])
+            elif device_present:
+                self.assertIn(node_id, restored.device_lru_ids[component_type])
+            else:
+                self.assertNotIn(node_id, restored.device_lru_ids[component_type])
+        for boundary in (demoted, states["adopted"], states["closed"]):
+            for component_type, lru_ids in boundary.device_lru_ids.items():
+                self.assertTrue(
+                    boundary.private_node_ids.isdisjoint(lru_ids),
+                    component_type,
+                )
+
+    def test_private_host_path_host_lru_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        for boundary_name in ("demoted", "restored"):
+            boundary = states[boundary_name]
+            for (node_id, component_type), state in boundary.component_state.items():
+                device_present, host_present, _, host_lock_ref, _, _ = state
+                if component_type is ComponentType.FULL:
+                    self.assertNotIn(node_id, boundary.host_lru_ids[component_type])
+                    continue
+                host_lru_eligible = (
+                    not device_present and host_present and host_lock_ref == 0
+                )
+                self.assertEqual(
+                    node_id in boundary.host_lru_ids[component_type],
+                    host_lru_eligible,
+                )
+        for boundary_name in ("adopted", "closed"):
+            boundary = states[boundary_name]
+            for lru_ids in boundary.host_lru_ids.values():
+                self.assertTrue(boundary.private_node_ids.isdisjoint(lru_ids))
+
+    def test_private_host_path_leaf_set_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        for boundary in states.values():
+            self.assertEqual(
+                boundary.private_node_ids & boundary.device_leaf_ids,
+                boundary.expected_device_leaf_ids,
+            )
+            self.assertEqual(
+                boundary.private_node_ids & boundary.host_leaf_ids,
+                boundary.expected_host_leaf_ids,
+            )
+
+    def test_private_host_path_lock_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        demoted_host_locks = sum(
+            state[3] for state in states["demoted"].component_state.values()
+        )
+        restored_host_locks = sum(
+            state[3] for state in states["restored"].component_state.values()
+        )
+        self.assertGreater(demoted_host_locks, 0)
+        self.assertEqual(restored_host_locks, demoted_host_locks)
+        for boundary_name in ("demoted", "restored"):
+            for state in states[boundary_name].component_state.values():
+                self.assertEqual(state[3], len(state[5]))
+        for boundary_name in ("adopted", "closed"):
+            self.assertEqual(
+                sum(
+                    state[2] + state[3]
+                    for state in states[boundary_name].component_state.values()
+                ),
+                0,
+            )
+
+    def test_private_host_path_session_tracker_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        for boundary_name in ("demoted", "restored"):
+            boundary = states[boundary_name]
+            for component_type, leaf_ids in boundary.session_leaf_ids.items():
+                self.assertGreater(len(leaf_ids), 0, component_type)
+                self.assertTrue(leaf_ids <= boundary.private_node_ids)
+                for leaf_id in leaf_ids:
+                    self.assertGreater(
+                        boundary.component_state[(leaf_id, component_type)][4],
+                        0,
+                    )
+        for boundary_name in ("adopted", "closed"):
+            self.assertTrue(
+                all(
+                    len(leaf_ids) == 0
+                    for leaf_ids in states[boundary_name].session_leaf_ids.values()
+                )
+            )
+
+    def test_private_host_path_page_owner_registration(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        self.assertEqual(states["demoted"].owner_pages, frozenset())
+        self.assertEqual(states["restored"].owner_pages, frozenset())
+        adopted_owner_pages = states["adopted"].owner_pages
+        self.assertGreater(len(adopted_owner_pages), 0)
+        self.assertTrue(
+            adopted_owner_pages.isdisjoint(states["adopted"].free_full_pages)
+        )
+        self.assertEqual(states["closed"].owner_pages, frozenset())
+        self.assertTrue(adopted_owner_pages <= states["closed"].free_full_pages)
+
+    def test_private_host_path_sanity_state_lifecycle(self) -> None:
+        states = self._exercise_private_host_path_lifecycle()
+
+        for boundary_name in ("demoted", "restored"):
+            boundary = states[boundary_name]
+            self.assertTrue(boundary.private_node_ids <= boundary.arena_node_ids)
+        for boundary_name in ("adopted", "closed"):
+            boundary = states[boundary_name]
+            self.assertTrue(
+                boundary.private_node_ids.isdisjoint(boundary.arena_node_ids)
+            )
+
+    def test_close_during_load_back_is_typed_and_preserves_both_owners(self) -> None:
+        session_id = "close-during-load-back"
+        page_size = 64
+        exact_tokens = page_size * 2 + 1
+        token_ids = array("q", range(exact_tokens + 1))
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        self._admit_streaming_session(env, session_id, exact_tokens)
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                session_id,
+                token_ids,
+                extra_key="close-load-namespace",
+                cache_salt="close-load-tenant",
+                priority=0,
+            ),
+            exact_tokens,
+        )
+        cache.commit_streaming_session_demotion(session_id)
+
+        match_req = self._streaming_match_req(session_id)
+        match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    extra_key="close-load-namespace",
+                    cache_salt="close-load-tenant",
+                ),
+                req=match_req,
+            )
+        )
+        match_req.last_node = match.last_device_node
+        match_req.prefix_indices = match.device_indices
+        match_req.swa_host_hit_length = match.swa_host_hit_length
+        match_req.mamba_host_hit_length = 0
+        match_req.mamba_pool_idx = None
+        self.assertIsNotNone(
+            cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=match.best_match_node,
+                    host_hit_length=match.host_hit_length,
+                    req=match_req,
+                )
+            )
+        )
+        cache.ready_to_load_host_cache()
+
+        with self.assertRaises(StreamingSessionBusyError):
+            cache.release_session(session_id)
+
+        self.assertTrue(cache.is_streaming_session_demoted(session_id))
+        self.assertGreater(len(cache.ongoing_load_back), 0)
+        cache.sanity_check()
+
+        ack = cache.cache_controller.ack_load_queue[0]
+        ack.finish_event.synchronize()
+        cache.loading_check(finish_count=1)
+        cache.release_session(session_id)
+        cache.release_radix_session(session_id)
+        cache.sanity_check()
+        self.assertFalse(cache.is_streaming_session_demoted(session_id))
+
+    def test_demotion_publication_failures_restore_the_prepared_slot(self) -> None:
+        for failure_point in ("session_refs", "transition"):
+            with self.subTest(failure_point=failure_point):
+                session_id = f"demotion-{failure_point}-failure"
+                page_size = 64
+                exact_tokens = page_size * 2 + 1
+                token_ids = array("q", range(exact_tokens + 1))
+                env = self._build_cache(
+                    hicache_ratio=1.0,
+                    disable=False,
+                    enable_session_radix_cache=True,
+                    page_size=page_size,
+                    sliding_window_size=page_size,
+                )
+                cache = env.cache
+                self._admit_streaming_session(env, session_id, exact_tokens)
+                available_before = cache.host_pool_group.available_size()
+                self.assertEqual(
+                    cache.prepare_streaming_session_demotion(
+                        session_id,
+                        token_ids,
+                        extra_key="failure-namespace",
+                        cache_salt="failure-tenant",
+                        priority=0,
+                    ),
+                    exact_tokens,
+                )
+                if failure_point == "session_refs":
+                    target = cache.session_refs
+                    attribute = "register_streaming_session_frontier"
+                else:
+                    target = cache.session
+                    attribute = "transition_to_demoted"
+
+                with (
+                    mock.patch.object(
+                        target,
+                        attribute,
+                        side_effect=RuntimeError("injected publication failure"),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "injected publication failure",
+                    ),
+                ):
+                    cache.commit_streaming_session_demotion(session_id)
+
+                self.assertIn(session_id, cache.session.slots)
+                self.assertNotIn(session_id, cache.session.demoted)
+                self.assertNotIn(
+                    session_id,
+                    cache._pending_streaming_session_demotions,
+                )
+                self.assertFalse(
+                    any(
+                        node.private_session_id == session_id
+                        for node in cache.tree_core._node_arena.values()
+                    )
+                )
+                self.assertEqual(
+                    cache.host_pool_group.available_size(),
+                    available_before,
+                )
+                cache.sanity_check()
 
     def test_backup_declined_when_host_pool_too_small(self):
         # A backup-only host pool is deliberately smaller than the device pool,
@@ -913,6 +1449,18 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         )
         cache.sanity_check()
         state = cache.session.demoted["session"]
+        protected_swa_nodes = [
+            node
+            for node in cache.tree_core._collect_all_nodes()
+            if node.component_data[ComponentType.SWA].host_lock_ref > 0
+        ]
+        self.assertGreater(len(protected_swa_nodes), 0)
+        self.assertTrue(
+            all(
+                not cache.tree_core.host_lru_lists[ComponentType.SWA].in_list(node)
+                for node in protected_swa_nodes
+            )
+        )
         self.assertEqual(state.swa_evicted_seqlen, page_size)
         self.assertEqual(allocator.full_available_size(), full_available_baseline)
         self.assertEqual(allocator.swa_available_size(), swa_available_baseline)
@@ -1013,13 +1561,12 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         )
 
         self.assertTrue(cache.session._release_demoted_state("session"))
+        cache.sanity_check()
 
         slot = cache.session.slots["session"]
         self.assertEqual(slot.tree_protected_len, 0)
         self.assertEqual(slot.kv.swa_evicted_seqlen, page_size * 2)
-        full_consumption = (
-            full_available_baseline - allocator.full_available_size()
-        )
+        full_consumption = full_available_baseline - allocator.full_available_size()
         swa_consumption = swa_available_baseline - allocator.swa_available_size()
         self.assertEqual(cache.session.session_held_tokens(), full_consumption)
         self.assertEqual(cache.session.session_held_swa_tokens(), swa_consumption)
@@ -1033,16 +1580,14 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         self.assertTrue(
             bool(
                 (
-                    allocator.translate_loc_from_full_to_swa(released_full_slots)
-                    == 0
+                    allocator.translate_loc_from_full_to_swa(released_full_slots) == 0
                 ).all()
             )
         )
         self.assertTrue(
             bool(
                 (
-                    allocator.translate_loc_from_full_to_swa(retained_full_slots)
-                    > 0
+                    allocator.translate_loc_from_full_to_swa(retained_full_slots) > 0
                 ).all()
             )
         )
@@ -1050,6 +1595,13 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache.release_radix_session("session")
         cache.release_session("session")
         cache.sanity_check()
+        self.assertTrue(
+            all(
+                component_data.host_lock_ref == 0
+                for node in cache.tree_core._collect_all_nodes()
+                for component_data in node.component_data
+            )
+        )
         self.assertEqual(allocator.full_available_size(), full_available_baseline)
         self.assertEqual(allocator.swa_available_size(), swa_available_baseline)
         self.assertEqual(

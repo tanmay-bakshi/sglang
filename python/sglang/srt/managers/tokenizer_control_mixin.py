@@ -93,7 +93,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import LoRARef
 from sglang.srt.session.errors import (
+    STREAMING_SESSION_BUSY_ERROR_TYPE,
     STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
+    StreamingSessionBusyError,
     StreamingSessionInfoUnavailableError,
     StreamingSessionStaleEpochError,
 )
@@ -1052,6 +1054,10 @@ class TokenizerControlMixin:
                         request_epoch=result.request_epoch,
                         registered_epoch=result.registered_epoch,
                         cluster_incarnation=result.cluster_incarnation,
+                    )
+                if result.error_type == STREAMING_SESSION_BUSY_ERROR_TYPE:
+                    raise StreamingSessionBusyError(
+                        result.message or "Session cache ownership is still busy."
                     )
             finally:
                 self.close_session_futures.pop(correlation_id, None)

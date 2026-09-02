@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.errors import (
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
+    StreamingSessionBusyError,
     StreamingSessionConflictError,
     StreamingSessionInfoUnavailableError,
 )
@@ -845,6 +846,37 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(causes, ["close"])
         self.assertEqual(released, ["deferred-close"])
         self.assertNotIn("deferred-close", controller)
+
+    def test_controller_preserves_radix_ownership_when_cache_release_is_busy(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        def release_session(session_id: str) -> None:
+            events.append(f"session:{session_id}")
+            raise StreamingSessionBusyError("load-back still owns the session")
+
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False,
+            release_radix_session=lambda session_id: events.append(
+                f"radix:{session_id}"
+            ),
+            release_session=release_session,
+        )
+        controller = SessionController(tree_cache)
+        controller.open(
+            OpenSessionReqInput(
+                capacity_of_str_len=0,
+                session_id="busy-close",
+                streaming=True,
+            )
+        )
+
+        with self.assertRaises(StreamingSessionBusyError):
+            controller.close(CloseSessionReqInput(session_id="busy-close"))
+
+        self.assertEqual(events, ["session:busy-close"])
+        self.assertIn("busy-close", controller)
 
     def test_controller_records_timeout_reap(self):
         """Record timeout when lease expiry retires an idle session."""

@@ -170,6 +170,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.errors import (
+    StreamingSessionBusyError,
     StreamingSessionConflictError,
     StreamingSessionInfoUnavailableError,
     StreamingSessionJournalBehindError,
@@ -1944,7 +1945,7 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
                 status_code=HTTPStatus.CONFLICT,
             )
         )
-    except ValueError as error:
+    except (StreamingSessionBusyError, ValueError) as error:
         return _session_fencing_response(_create_error_response(error))
 
 

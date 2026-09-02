@@ -607,7 +607,7 @@ class BufferModePipeline:
         (completed_tokens can diverge across ranks under backend failure) to
         keep admission decisions TP-deterministic. No-op for operations this
         pipeline does not own (e.g. acks for already-reset state)."""
-        entry = self.ongoing_backup.pop(operation_id, None)
+        entry = self.ongoing_backup.get(operation_id)
         if entry is None:
             return
         intent = entry.intent
@@ -616,6 +616,7 @@ class BufferModePipeline:
         self.write_staged_tokens_ -= len(entry.host_indices)
         self.inflight_backup_node_ids.discard(entry.intent.node_id)
         _untrack_content_refs(self.inflight_backup_hashes, intent.hash_values)
+        del self.ongoing_backup[operation_id]
 
     def _free_staging_now(
         self, host_indices: torch.Tensor, aux_xfers: list[PoolTransfer]
@@ -1035,7 +1036,7 @@ class BufferModePipeline:
         a buffer-mode load-back. The span was published at admission; the
         ack never touches the tree (existence beliefs were fed from the
         storage-fetched pages at staging commit)."""
-        f = self.ongoing_buffer_load_back.pop(ack_id, None)
+        f = self.ongoing_buffer_load_back.get(ack_id)
         if f is None:
             return False
         cache = self._cache
@@ -1045,6 +1046,7 @@ class BufferModePipeline:
         self._free_staging_now(f.host_indices, f.aux_xfers)
 
         cc.prefetch_tokens_occupied -= f.occupied_tokens
+        del self.ongoing_buffer_load_back[ack_id]
         logger.info(
             "HiCache prefetch fill committed req=%s filled=%d occupied=%d locked=%d",
             f.req_id,
@@ -1055,6 +1057,10 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_prefetched_tokens(f.num_tokens)
         return True
+
+    def owns_load_back_ack(self, ack_id: int) -> bool:
+        """Return whether the buffer pipeline owns one queued H-to-D ACK."""
+        return ack_id in self.ongoing_buffer_load_back
 
     def release_staged_hold(self, rid: str) -> bool:
         """Free a staged hold outright — anchor pin, host bounce (KV + aux),

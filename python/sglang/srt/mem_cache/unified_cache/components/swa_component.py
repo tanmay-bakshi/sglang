@@ -92,9 +92,8 @@ class SWAComponent(TreeComponent):
         span: int,
         delta: int,
     ) -> int:
-        node = leaf
-        covered = 0
-        while node is not self.tree_core.root_node and covered < span:
+        nodes = self._session_coverage_nodes_for_span(leaf, span)
+        for node in nodes:
             cd = node.component_data[self.component_type]
             if delta < 0:
                 assert cd.session_ref > 0
@@ -102,9 +101,34 @@ class SWAComponent(TreeComponent):
             cd.session_ref += delta
             if (prev_ref == 0) != (cd.session_ref == 0):
                 self._refresh_session_partition(node)
+        return sum(len(node.key) for node in nodes)
+
+    def _session_coverage_nodes_for_span(
+        self,
+        leaf: UnifiedTreeNode,
+        span: int,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Return the leaf-to-root nodes covering one SWA ownership span."""
+        nodes: list[UnifiedTreeNode] = []
+        node = leaf
+        covered = 0
+        while node is not self.tree_core.root_node and covered < span:
+            if node.parent is None:
+                raise RuntimeError(f"SWA session leaf {leaf.id} is detached.")
+            nodes.append(node)
             covered += len(node.key)
             node = node.parent
-        return covered
+        return tuple(nodes)
+
+    def _session_coverage_nodes(
+        self,
+        leaf: UnifiedTreeNode,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Return the current SWA ownership window for one session leaf."""
+        return self._session_coverage_nodes_for_span(
+            leaf,
+            self.sliding_window_size + self.tree_core.page_size,
+        )
 
     def _inc_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
         covered_by_leaf = self._session_leaf_covered_len.setdefault(session_id, {})
@@ -161,6 +185,15 @@ class SWAComponent(TreeComponent):
                     report_error(
                         f"{ct} session {session_id!r} leaf {leaf.id} covered_len={covered_len}"
                     )
+                if leaf in reachable_nodes:
+                    expected_len = sum(
+                        len(node.key) for node in self._session_coverage_nodes(leaf)
+                    )
+                    if covered_len != expected_len:
+                        report_error(
+                            f"{ct} session {session_id!r} leaf {leaf.id} "
+                            f"covered_len={covered_len} expected={expected_len}"
+                        )
 
         for session_id, leaves in self._session_leaves.items():
             covered_by_leaf = self._session_leaf_covered_len.get(session_id, {})
@@ -432,48 +465,33 @@ class SWAComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        new_parent.component_data[self.component_type].lock_ref = child.component_data[
-            self.component_type
-        ].lock_ref
-        new_parent.component_data[self.component_type].session_ref = (
-            child.component_data[self.component_type].session_ref
+        ct = self.component_type
+        parent_data = new_parent.component_data[ct]
+        child_data = child.component_data[ct]
+        parent_data.lock_ref = child_data.lock_ref
+        parent_data.host_lock_ref = child_data.host_lock_ref
+        parent_data.host_lock_ids = (
+            None if child_data.host_lock_ids is None else set(child_data.host_lock_ids)
         )
-        assert new_parent.component_data[self.component_type].session_ids is None
+        parent_data.session_ref = child_data.session_ref
+        assert parent_data.session_ids is None
 
-        child_swa_value = child.component_data[self.component_type].value
+        child_swa_value = child_data.value
         if child_swa_value is not None:
             split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].value = child_swa_value[
-                :split_len
-            ].clone()
-            child.component_data[self.component_type].value = child_swa_value[
-                split_len:
-            ].clone()
+            parent_data.value = child_swa_value[:split_len].clone()
+            child_data.value = child_swa_value[split_len:].clone()
         else:
-            new_parent.component_data[self.component_type].value = None
+            parent_data.value = None
 
-        child_swa_host_value = child.component_data[self.component_type].host_value
+        child_swa_host_value = child_data.host_value
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].host_value = (
-                child_swa_host_value[:split_len].clone()
-            )
-            child.component_data[self.component_type].host_value = child_swa_host_value[
-                split_len:
-            ].clone()
-            host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if new_parent.component_data[self.component_type].value is None:
-                host_lru.insert_mru(new_parent)
-            if child.component_data[
-                self.component_type
-            ].value is None and not host_lru.in_list(child):
-                host_lru.insert_mru(child)
+            parent_data.host_value = child_swa_host_value[:split_len].clone()
+            child_data.host_value = child_swa_host_value[split_len:].clone()
 
-        # parent inherits the swa_uuid from child for swa lock ref
-        new_parent.component_data[self.component_type].metadata["uuid"] = (
-            child.component_data[self.component_type].metadata.get("uuid")
-        )
-        child.component_data[self.component_type].metadata.pop("uuid", None)
+        parent_data.metadata["uuid"] = child_data.metadata.get("uuid")
+        child_data.metadata.pop("uuid", None)
 
     def evict_component(
         self,
@@ -500,22 +518,12 @@ class SWAComponent(TreeComponent):
             cd.value = None
 
         # Host layer
-        host_lru = self.tree_core.host_lru_lists[ct]
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
-            if host_lru.in_list(node):
-                host_lru.remove_node(node)
 
-        # After device tombstone: if host_value remains, move into host LRU
-        if (
-            target is EvictLayer.DEVICE
-            and cd.value is None
-            and cd.host_value is not None
-        ):
-            if not host_lru.in_list(node):
-                host_lru.insert_mru(node)
+        self.tree_core._reconcile_auxiliary_host_lru(node, ct)
 
         return freed, host_freed
 
@@ -606,12 +614,6 @@ class SWAComponent(TreeComponent):
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
         swa_uuid = None
-        uuid_key = "host_uuid" if lock_host else "uuid"
-        lru = (
-            self.tree_core.host_lru_lists[ct]
-            if lock_host
-            else self.tree_core.lru_lists[ct]
-        )
 
         # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
         # skip them and keep walking up. This path is hit when HiCache
@@ -626,30 +628,27 @@ class SWAComponent(TreeComponent):
                 continue
 
             ref = comp.host_lock_ref if lock_host else comp.lock_ref
-            if ref == 0:
-                if lock_host:
-                    if lru.in_list(cur):
-                        lru.remove_node(cur)
-                else:
-                    key_len = len(cur.key)
-                    self.tree_core.component_evictable_size_[ct] -= key_len
-                    self.tree_core.component_protected_size_[ct] += key_len
-            if lock_host:
-                comp.host_lock_ref = ref + 1
-            else:
-                comp.lock_ref = ref + 1
-            swa_lock_size += self.tree_core.component_logical_length(
+            logical_length = self.tree_core.component_logical_length(
                 cur, ct, host=lock_host
             )
+            if ref == 0 and not lock_host:
+                key_len = len(cur.key)
+                self.tree_core.component_evictable_size_[ct] -= key_len
+                self.tree_core.component_protected_size_[ct] += key_len
+            if lock_host:
+                self._acquire_host_lock_ownership(cur, result)
+                self.tree_core._reconcile_auxiliary_host_lru(cur, ct)
+            else:
+                comp.lock_ref = ref + 1
+            swa_lock_size += logical_length
             if swa_lock_size >= sliding_window_size:
-                if comp.metadata.get(uuid_key) is None:
-                    comp.metadata[uuid_key] = next_component_uuid()
-                swa_uuid = comp.metadata[uuid_key]
+                if not lock_host:
+                    if comp.metadata.get("uuid") is None:
+                        comp.metadata["uuid"] = next_component_uuid()
+                    swa_uuid = comp.metadata["uuid"]
             cur = cur.parent
 
-        if lock_host:
-            result.swa_uuid_for_host_lock = swa_uuid
-        else:
+        if not lock_host:
             result.swa_uuid_for_lock = swa_uuid
         return result
 
@@ -661,14 +660,17 @@ class SWAComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         root = self.tree_core.root_node
-        swa_uuid_for_lock = (
-            (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
-            if params
-            else None
-        )
+        if lock_host:
+            if params is None:
+                raise AssertionError("SWA host-lock release requires its receipt.")
+            if ct not in params.host_lock_footprints:
+                return
+            self._release_host_lock(node, params)
+            return
+
+        swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
-        uuid_key = "host_uuid" if lock_host else "uuid"
 
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
@@ -677,25 +679,16 @@ class SWAComponent(TreeComponent):
             if cur.id in skip_lock_node_ids:
                 cur = cur.parent
                 continue
-            ref = comp.host_lock_ref if lock_host else comp.lock_ref
+            ref = comp.lock_ref
             if ref == 0:
                 cur = cur.parent
                 continue
             if ref == 1:
-                if lock_host:
-                    if comp.value is None and comp.host_value is not None:
-                        host_lru = self.tree_core.host_lru_lists[ct]
-                        if not host_lru.in_list(cur):
-                            host_lru.insert_mru(cur)
-                else:
-                    key_len = len(comp.value)
-                    self.tree_core.component_evictable_size_[ct] += key_len
-                    self.tree_core.component_protected_size_[ct] -= key_len
-            if lock_host:
-                comp.host_lock_ref = ref - 1
-            else:
-                comp.lock_ref = ref - 1
-            if swa_uuid_for_lock and comp.metadata.get(uuid_key) == swa_uuid_for_lock:
+                key_len = len(comp.value)
+                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core.component_protected_size_[ct] -= key_len
+            comp.lock_ref = ref - 1
+            if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
 
@@ -934,6 +927,7 @@ class SWAComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                self.tree_core._reconcile_auxiliary_host_lru(node, ct)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -996,9 +990,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         cd.host_value = host_indices.clone()
-        host_lru = self.tree_core.host_lru_lists[ct]
-        if cd.value is None and not host_lru.in_list(node):
-            host_lru.insert_mru(node)
+        self.tree_core._reconcile_auxiliary_host_lru(node, ct)
         self.tree_core._update_evictable_leaf_sets(node)
         if node.parent:
             self.tree_core._update_evictable_leaf_sets(node.parent)

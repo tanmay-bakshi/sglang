@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    ComponentData,
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -56,6 +57,13 @@ class _FakeTreeCore:
 
     def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
         self.cascaded.append(node)
+
+    def _reconcile_auxiliary_host_lru(self, node, component_type):
+        UnifiedTreeCore._reconcile_auxiliary_host_lru(self, node, component_type)
+
+    @staticmethod
+    def _auxiliary_host_lru_eligible(component_data: ComponentData) -> bool:
+        return UnifiedTreeCore._auxiliary_host_lru_eligible(component_data)
 
 
 class _FakeUnifiedCache:

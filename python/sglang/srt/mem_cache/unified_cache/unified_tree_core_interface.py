@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import (
         DecLockRefParams,
         DecLockRefResult,
+        HostLockOwner,
         IncLockRefResult,
         InsertParams,
         InsertResult,
@@ -275,8 +276,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def validate_host_lock_ref(
+        self,
+        node_id: NodeId,
+        params: DecLockRefParams,
+    ) -> None:
+        """Validate one host-lock receipt without releasing it."""
+        ...
+
+    @abstractmethod
     def dec_host_lock_ref(
-        self, node_id: NodeId, params: Optional[DecLockRefParams] = None
+        self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         """Decrease the reference count on a node's host-side component locks."""
         ...
@@ -429,6 +439,18 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def validate_streaming_session_private_path_detach(
+        self,
+        session_id: str,
+        node_id: NodeId,
+        owner_params: DecLockRefParams,
+        *,
+        allow_device_locks: bool,
+    ) -> None:
+        """Validate private-path detachment while its owner lock is held."""
+        ...
+
+    @abstractmethod
     def adopt_streaming_session_private_path(
         self, session_id: str, node_id: NodeId
     ) -> DemoteResult:
@@ -561,10 +583,12 @@ class UnifiedTreeCoreInterface(ABC):
         self,
         ongoing_write_through: list[tuple[int, NodeId]],
         ongoing_load_back: list[tuple[int, NodeId]],
+        host_lock_owners: list[HostLockOwner],
+        private_session_owners: set[str],
     ) -> None:
         """Verify tree invariants and raise AssertionError on any violation.
 
-        ongoing_write_through/ongoing_load_back are (id, node_id) pairs for in-flight ops.
+        ``host_lock_owners`` identifies every live host-lock acquisition.
         """
         ...
 

@@ -198,6 +198,7 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+    req.session_reload_plan = match_result.session_reload_plan
     return match_result
 
 
@@ -1349,29 +1350,39 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                load_back_result = self.tree_cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                if req.session_reload_plan is not None:
+                    prefix_len = req.session_reload_plan.reuse_len
+                    expected_prefix_len = len(req.prefix_indices) + req.host_hit_length
+                    if prefix_len != expected_prefix_len:
+                        raise AssertionError(
+                            "Session reload plan disagrees with matched Full KV: "
+                            f"{prefix_len=} {expected_prefix_len=}"
+                        )
+                    req.cache_protected_len = prefix_len
+                else:
+                    load_back_result = self.tree_cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=req.best_match_node,
+                            host_hit_length=req.host_hit_length,
+                            req=req,
+                        )
                     )
-                )
-                req.last_node = load_back_result.restored_node
-                req.prefix_indices = torch.cat(
-                    [
-                        req.prefix_indices,
-                        load_back_result.new_full_device_indices,
-                    ]
-                )
-                prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = (
-                    prefix_len
-                    if load_back_result.cache_protected_len is None
-                    else load_back_result.cache_protected_len
-                )
+                    req.last_node = load_back_result.restored_node
+                    req.prefix_indices = torch.cat(
+                        [
+                            req.prefix_indices,
+                            load_back_result.new_full_device_indices,
+                        ]
+                    )
+                    prefix_len = len(req.prefix_indices)
+                    req.cache_protected_len = (
+                        prefix_len
+                        if load_back_result.cache_protected_len is None
+                        else load_back_result.cache_protected_len
+                    )
 
             input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                len(req.full_untruncated_fill_ids) - prefix_len
             )
 
             if (
@@ -1406,9 +1417,7 @@ class PrefillAdder:
                     return tile_stop
 
                 # Non-chunked prefill — the whole sequence is committed this iter.
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-                )
+                req.set_extend_range(prefix_len, len(req.full_untruncated_fill_ids))
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -1445,9 +1454,9 @@ class PrefillAdder:
                             trunc_len // truncation_align_size
                         )
 
-                now_input_len = trunc_len + len(req.prefix_indices)
+                now_input_len = trunc_len + prefix_len
                 now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
+                trunc_len = now_input_len - prefix_len
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
@@ -1458,9 +1467,7 @@ class PrefillAdder:
                     return tile_stop
 
                 # Chunked prefill
-                req.set_extend_range(
-                    len(req.prefix_indices), len(req.prefix_indices) + trunc_len
-                )
+                req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

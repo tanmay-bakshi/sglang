@@ -64,6 +64,20 @@ class FullComponent(TreeComponent):
             cd.session_ref -= 1
             node = node.parent
 
+    def _session_coverage_nodes(
+        self,
+        leaf: UnifiedTreeNode,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Return the complete reusable Full path for one session leaf."""
+        nodes: list[UnifiedTreeNode] = []
+        node = leaf
+        while node is not self.tree_core.root_node:
+            if node.parent is None:
+                raise RuntimeError(f"Full session leaf {leaf.id} is detached.")
+            nodes.append(node)
+            node = node.parent
+        return tuple(nodes)
+
     def _advance_session_coverage(
         self,
         session_id: str,
@@ -141,18 +155,21 @@ class FullComponent(TreeComponent):
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
         ct = self.component_type
-        new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
-        new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
-        assert new_parent.component_data[ct].session_ids is None
+        parent_cd = new_parent.component_data[ct]
+        parent_cd.lock_ref = child_cd.lock_ref
+        parent_cd.host_lock_ref = child_cd.host_lock_ref
+        parent_cd.host_lock_ids = (
+            None if child_cd.host_lock_ids is None else set(child_cd.host_lock_ids)
+        )
+        parent_cd.session_ref = child_cd.session_ref
+        assert parent_cd.session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
-            new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
+            parent_cd.value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
         if child_cd.host_value is not None:
-            new_parent.component_data[ct].host_value = child_cd.host_value[
-                :split_len
-            ].clone()
+            parent_cd.host_value = child_cd.host_value[:split_len].clone()
             child_cd.host_value = child_cd.host_value[split_len:].clone()
 
     def evict_component(
@@ -268,11 +285,17 @@ class FullComponent(TreeComponent):
 
         # Only the last host node needs to be protected.
         if lock_host:
+            if node is self.tree_core.root_node:
+                return result
             cd = node.component_data[ct]
             # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
             if cd.host_value is None and not self.tree_core.is_write_back:
                 return result
-            cd.host_lock_ref += 1
+            self._acquire_host_lock_ownership(
+                node,
+                result,
+                requires_host_value=cd.host_value is not None,
+            )
             self.tree_core._update_evictable_leaf_sets(node)
             return result
 
@@ -310,14 +333,11 @@ class FullComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         if lock_host:
-            cd = node.component_data[ct]
-            if cd.host_lock_ref == 0:
+            if params is None:
+                raise AssertionError("Full host-lock release requires its receipt.")
+            if ct not in params.host_lock_footprints:
                 return
-            # Mirror of `acquire`. write_back uses a pure counter.
-            if cd.host_value is None and not self.tree_core.is_write_back:
-                return
-            cd.host_lock_ref -= 1
-            self.tree_core._update_evictable_leaf_sets(node)
+            self._release_host_lock(node, params)
             return
 
         root = self.tree_core.root_node
@@ -339,6 +359,21 @@ class FullComponent(TreeComponent):
             if cd.lock_ref == 0:
                 self.tree_core._update_evictable_leaf_sets(cur)
             cur = cur.parent
+
+    def host_lock_nodes(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Resolve a Full host lock from its acquisition range."""
+        footprint = params.host_lock_footprints.get(self.component_type)
+        if footprint is None:
+            return ()
+        return self._resolve_host_lock_ranges(
+            node,
+            footprint.ranges,
+            require_host_value=footprint.requires_host_value,
+        )
 
     # ---- HiCache Hooks ----
 

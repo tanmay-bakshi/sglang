@@ -270,7 +270,10 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
         def reject_vote(vote, **kwargs) -> None:
             vote[0] = 0
 
-        with patch("torch.distributed.all_reduce", side_effect=reject_vote):
+        with patch(
+            "sglang.srt.managers.scheduler._streaming_session_all_reduce",
+            side_effect=reject_vote,
+        ):
             output = Scheduler.demote_session(
                 scheduler,
                 DemoteSessionReqInput(
@@ -291,7 +294,10 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
         def diverge_identity(vote, **kwargs) -> None:
             vote[5] -= 1
 
-        with patch("torch.distributed.all_reduce", side_effect=diverge_identity):
+        with patch(
+            "sglang.srt.managers.scheduler._streaming_session_all_reduce",
+            side_effect=diverge_identity,
+        ):
             output = Scheduler.demote_session(
                 scheduler,
                 DemoteSessionReqInput(
@@ -305,6 +311,93 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
             "session"
         )
         scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
+
+    def test_post_commit_receipt_is_fenced_before_success(self) -> None:
+        scheduler = self._scheduler(tp_size=2)
+
+        with patch(
+            "sglang.srt.managers.scheduler._streaming_session_all_reduce"
+        ) as all_reduce:
+            output = Scheduler.demote_session(
+                scheduler,
+                DemoteSessionReqInput(
+                    session_id="session",
+                    correlation_id="correlation",
+                ),
+            )
+
+        self.assertTrue(output.success)
+        self.assertEqual(all_reduce.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["operation"] for call in all_reduce.call_args_list],
+            [
+                "streaming-session-demotion-preparation-vote",
+                "streaming-session-demotion-post-commit-fence",
+            ],
+        )
+
+    def test_post_vote_commit_failure_is_fail_stop(self) -> None:
+        scheduler = self._scheduler()
+        scheduler.tree_cache.commit_streaming_session_demotion.side_effect = (
+            RuntimeError("injected commit failure")
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler._SESSION_COLLECTIVE.terminate",
+            side_effect=RuntimeError("fail-stop requested"),
+        ) as terminate:
+            with self.assertRaisesRegex(RuntimeError, "fail-stop requested"):
+                Scheduler.demote_session(
+                    scheduler,
+                    DemoteSessionReqInput(
+                        session_id="session",
+                        correlation_id="correlation",
+                    ),
+                )
+
+        terminate.assert_called_once()
+        self.assertEqual(
+            terminate.call_args.kwargs["operation"],
+            "streaming-session-demotion-commit",
+        )
+        self.assertIn(
+            "injected commit failure",
+            terminate.call_args.kwargs["reason"],
+        )
+
+    def test_post_commit_divergence_is_fail_stop(self) -> None:
+        scheduler = self._scheduler(tp_size=2)
+        collective_count = 0
+
+        def diverge_after_commit(tensor, **kwargs) -> None:
+            nonlocal collective_count
+            collective_count += 1
+            if collective_count == 2:
+                tensor[0] -= 1
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler._streaming_session_all_reduce",
+                side_effect=diverge_after_commit,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler._SESSION_COLLECTIVE.terminate",
+                side_effect=RuntimeError("fail-stop requested"),
+            ) as terminate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fail-stop requested"):
+                Scheduler.demote_session(
+                    scheduler,
+                    DemoteSessionReqInput(
+                        session_id="session",
+                        correlation_id="correlation",
+                    ),
+                )
+
+        terminate.assert_called_once_with(
+            operation="streaming-session-demotion-post-commit-fence",
+            reason="committed host ownership diverged across ranks",
+        )
 
     def test_vote_identity_binds_lineage_and_cache_namespace(self) -> None:
         context = self._scheduler().session_controller.demotion_context.return_value

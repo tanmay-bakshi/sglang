@@ -11,6 +11,8 @@ from numpy import float64
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    HostLockFootprint,
+    HostLockRange,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -51,6 +53,7 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
+    host_lock_ids: set[int] | None = None
     session_ref: int = 0
     session_ids: Optional[set[str]] = None
 
@@ -214,6 +217,14 @@ class TreeComponent(ABC):
         ...
 
     @abstractmethod
+    def _session_coverage_nodes(
+        self,
+        leaf: UnifiedTreeNode,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Return the nodes whose counters one indexed leaf contributes to."""
+        ...
+
+    @abstractmethod
     def _advance_session_coverage(
         self,
         session_id: str,
@@ -282,6 +293,7 @@ class TreeComponent(ABC):
     ) -> None:
         reachable_nodes = set(reachable_nodes)
         ct = self.component_type
+        expected_refs: dict[UnifiedTreeNode, int] = defaultdict(int)
 
         for session_id, leaves in self._session_leaves.items():
             if not leaves:
@@ -295,11 +307,33 @@ class TreeComponent(ABC):
                     report_error(
                         f"{ct} session {session_id!r} leaf {leaf.id} is missing its marker"
                     )
+                if leaf not in reachable_nodes:
+                    continue
+                try:
+                    coverage_nodes = self._session_coverage_nodes(leaf)
+                except (AssertionError, RuntimeError) as error:
+                    report_error(
+                        f"{ct} session {session_id!r} leaf {leaf.id} has invalid "
+                        f"coverage: {error}"
+                    )
+                    continue
+                for covered_node in coverage_nodes:
+                    if covered_node not in reachable_nodes:
+                        report_error(
+                            f"{ct} session {session_id!r} coverage reaches "
+                            f"unreachable node {covered_node.id}"
+                        )
+                        continue
+                    expected_refs[covered_node] += 1
 
         for node in reachable_nodes:
             cd = node.component_data[ct]
-            if cd.session_ref < 0:
-                report_error(f"node {node.id} {ct} session_ref={cd.session_ref}")
+            expected_ref = expected_refs.get(node, 0)
+            if cd.session_ref != expected_ref:
+                report_error(
+                    f"node {node.id} {ct} session_ref={cd.session_ref} "
+                    f"expected={expected_ref}"
+                )
             if cd.session_ids is not None and not cd.session_ids:
                 report_error(f"node {node.id} {ct} has an empty session_ids marker")
             for session_id in cd.session_ids or ():
@@ -596,6 +630,231 @@ class TreeComponent(ABC):
 
         When ``lock_host`` is True, the inverse host-side semantics apply."""
         ...
+
+    def host_lock_nodes(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Resolve a receipt's split-stable footprint from tree geometry."""
+        footprint = params.host_lock_footprints.get(self.component_type)
+        if footprint is None:
+            return ()
+        return self._resolve_host_lock_ranges(
+            node,
+            footprint.ranges,
+            require_host_value=footprint.requires_host_value,
+        )
+
+    def _host_lock_path(
+        self,
+        node: UnifiedTreeNode,
+    ) -> tuple[tuple[UnifiedTreeNode, HostLockRange], ...]:
+        """Return root-relative ranges for the root-to-anchor path."""
+        path: list[UnifiedTreeNode] = []
+        current = node
+        while current is not self.tree_core.root_node:
+            if current.parent is None or current.key is None:
+                raise AssertionError(
+                    f"Host-lock anchor path is detached at node {current.id}."
+                )
+            path.append(current)
+            current = current.parent
+        path.reverse()
+
+        offset = 0
+        result: list[tuple[UnifiedTreeNode, HostLockRange]] = []
+        for path_node in path:
+            node_end = offset + len(path_node.key)
+            result.append((path_node, HostLockRange(offset, node_end)))
+            offset = node_end
+        return tuple(result)
+
+    def _host_lock_range(self, node: UnifiedTreeNode) -> HostLockRange:
+        """Return one node's stable root-relative acquisition range."""
+        for path_node, path_range in self._host_lock_path(node):
+            if path_node is node:
+                return path_range
+        raise AssertionError(f"Host-lock node {node.id} is absent from its own path.")
+
+    def _resolve_host_lock_ranges(
+        self,
+        node: UnifiedTreeNode,
+        ranges: tuple[HostLockRange, ...],
+        *,
+        require_host_value: bool = True,
+    ) -> tuple[UnifiedTreeNode, ...]:
+        """Map acquisition ranges onto the current, possibly split path."""
+        if len(ranges) == 0:
+            raise AssertionError(
+                f"{self.component_type} host-lock receipt has an empty footprint."
+            )
+        ordered_ranges = tuple(sorted(ranges, key=lambda range_: range_.start))
+        for previous, current in zip(ordered_ranges, ordered_ranges[1:]):
+            if current.start < previous.end:
+                raise AssertionError(
+                    f"{self.component_type} host-lock ranges overlap: "
+                    f"{previous} and {current}."
+                )
+
+        path = self._host_lock_path(node)
+        owned_nodes: list[UnifiedTreeNode] = []
+        for receipt_range in ordered_ranges:
+            cursor = receipt_range.start
+            for path_node, path_range in path:
+                if path_range.end <= receipt_range.start:
+                    continue
+                if path_range.start >= receipt_range.end:
+                    break
+                if path_range.start != cursor or path_range.end > receipt_range.end:
+                    raise AssertionError(
+                        f"{self.component_type} host-lock range {receipt_range} "
+                        f"cuts across current node {path_node.id} range {path_range}."
+                    )
+                component_data = path_node.component_data[self.component_type]
+                if require_host_value and component_data.host_value is None:
+                    raise AssertionError(
+                        f"{self.component_type} host-lock range {receipt_range} "
+                        f"reaches host-empty node {path_node.id}."
+                    )
+                if component_data.host_value is not None:
+                    logical_length = self.tree_core.component_logical_length(
+                        path_node,
+                        self.component_type,
+                        host=True,
+                    )
+                    if logical_length != len(path_node.key):
+                        raise AssertionError(
+                            f"{self.component_type} host value on node "
+                            f"{path_node.id} spans {logical_length} tokens, "
+                            f"tree range spans {len(path_node.key)}."
+                        )
+                owned_nodes.append(path_node)
+                cursor = path_range.end
+            if cursor != receipt_range.end:
+                raise AssertionError(
+                    f"{self.component_type} host-lock range {receipt_range} "
+                    f"is covered only through token {cursor}."
+                )
+        if len(set(owned_nodes)) != len(owned_nodes):
+            raise AssertionError(
+                f"{self.component_type} host-lock receipt resolves a node twice."
+            )
+        owned_nodes.reverse()
+        return tuple(owned_nodes)
+
+    def validate_host_lock_nodes(
+        self,
+        nodes: tuple[UnifiedTreeNode, ...],
+        params: DecLockRefParams,
+    ) -> None:
+        """Validate node counters and IDs without mutating the footprint."""
+        lock_id = params.host_lock_id
+        if lock_id is None:
+            raise AssertionError("Host-lock receipt has no ownership identifier.")
+        for owned_node in nodes:
+            component_data = owned_node.component_data[self.component_type]
+            lock_ids = component_data.host_lock_ids
+            if lock_ids is None or lock_id not in lock_ids:
+                raise AssertionError(
+                    f"Node {owned_node.id} {self.component_type} does not carry "
+                    f"host-lock owner {lock_id}."
+                )
+            if component_data.host_lock_ref != len(lock_ids):
+                raise AssertionError(
+                    f"Node {owned_node.id} {self.component_type} host-lock "
+                    f"counter disagrees with its owner ledger."
+                )
+
+    def release_prepared_host_lock(
+        self,
+        nodes: tuple[UnifiedTreeNode, ...],
+        params: DecLockRefParams,
+    ) -> None:
+        """Release a footprint after every component has passed preflight."""
+        for owned_node in nodes:
+            self._release_host_lock_ownership(owned_node, params)
+        for owned_node in nodes:
+            if self.component_type == BASE_COMPONENT_TYPE:
+                self.tree_core._update_evictable_leaf_sets(owned_node)
+            else:
+                self.tree_core._reconcile_auxiliary_host_lru(
+                    owned_node,
+                    self.component_type,
+                )
+
+    def _release_host_lock(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+    ) -> None:
+        """Validate and release one component outside a core-wide transaction."""
+        nodes = self.host_lock_nodes(node, params)
+        self.validate_host_lock_nodes(nodes, params)
+        self.release_prepared_host_lock(nodes, params)
+
+    def _acquire_host_lock_ownership(
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        *,
+        requires_host_value: bool = True,
+    ) -> None:
+        """Register one receipt as an exact owner of this component state."""
+        lock_id = result.host_lock_id
+        if lock_id is None:
+            raise AssertionError("host-lock acquisition has no ownership identifier")
+        component_data = node.component_data[self.component_type]
+        lock_ids = component_data.host_lock_ids
+        if lock_ids is not None and lock_id in lock_ids:
+            raise AssertionError(
+                f"node {node.id} already carries host-lock owner {lock_id}"
+            )
+        host_lock_range = self._host_lock_range(node)
+        footprint = result.host_lock_footprints.get(self.component_type)
+        if (
+            footprint is not None
+            and footprint.requires_host_value != requires_host_value
+        ):
+            raise AssertionError(
+                f"{self.component_type} host-lock acquisition mixed host-residency "
+                "requirements."
+            )
+        result.host_lock_footprints[self.component_type] = HostLockFootprint(
+            ranges=(
+                *(footprint.ranges if footprint is not None else ()),
+                host_lock_range,
+            ),
+            requires_host_value=requires_host_value,
+        )
+        if lock_ids is None:
+            lock_ids = set()
+            component_data.host_lock_ids = lock_ids
+        lock_ids.add(lock_id)
+        component_data.host_lock_ref += 1
+        assert component_data.host_lock_ref == len(lock_ids)
+
+    def _release_host_lock_ownership(
+        self,
+        node: UnifiedTreeNode,
+        params: DecLockRefParams,
+    ) -> None:
+        """Release this component state from its exact receipt owner."""
+        lock_id = params.host_lock_id
+        if lock_id is None:
+            raise AssertionError("host-lock release has no ownership identifier")
+        component_data = node.component_data[self.component_type]
+        lock_ids = component_data.host_lock_ids
+        if lock_ids is None or lock_id not in lock_ids:
+            raise AssertionError(
+                f"node {node.id} does not carry host-lock owner {lock_id}"
+            )
+        assert component_data.host_lock_ref == len(lock_ids)
+        lock_ids.remove(lock_id)
+        component_data.host_lock_ref -= 1
+        if len(lock_ids) == 0:
+            component_data.host_lock_ids = None
+        assert component_data.host_lock_ref == len(component_data.host_lock_ids or ())
 
     def prepare_for_caching_req(
         self,

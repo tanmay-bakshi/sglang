@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -142,13 +143,76 @@ class StreamingSessionCacheSnapshot:
     swa: KVComponentResidency = dataclasses.field(default_factory=KVComponentResidency)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class SessionReloadPlan:
+    """Allocation-free plan for restoring one host-resident session.
+
+    :ivar session_id: Session whose private host snapshot is authoritative.
+    :ivar source_node: Exact session-private host frontier.
+    :ivar tree_node: Deepest ordinary radix frontier retained by the session.
+    :ivar reuse_len: Exact logical prefix available to the request.
+    :ivar tree_protected_len: Logical prefix represented by ordinary tree nodes.
+    :ivar swa_evicted_seqlen: First token retained in the SWA window.
+    """
+
+    session_id: str
+    source_node: Any
+    tree_node: Any
+    reuse_len: int
+    tree_protected_len: int
+    swa_evicted_seqlen: int
+
+    def __post_init__(self) -> None:
+        if self.reuse_len <= 0:
+            raise ValueError("A session reload plan must expose a non-empty prefix.")
+        if not 0 <= self.tree_protected_len <= self.reuse_len:
+            raise ValueError(
+                "Session reload tree ownership must lie within the reusable prefix."
+            )
+        if not 0 <= self.swa_evicted_seqlen <= self.reuse_len:
+            raise ValueError(
+                "Session reload SWA watermark must lie within the reusable prefix."
+            )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class HostLockRange:
+    """Root-relative tree interval protected by one host lock.
+
+    :ivar start: Inclusive logical token offset.
+    :ivar end: Exclusive logical token offset.
+    """
+
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError(f"Invalid host-lock range [{self.start}, {self.end}).")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class HostLockFootprint:
+    """Split-stable component ownership recorded by one host-lock receipt.
+
+    :ivar ranges: Root-relative tree intervals occupied at acquisition.
+    :ivar requires_host_value: Whether host residency existed at acquisition.
+    """
+
+    ranges: tuple[HostLockRange, ...]
+    requires_host_value: bool
+
+
 @dataclasses.dataclass
 class IncLockRefResult:
     """Result of an inc_lock_ref operation."""
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
+    host_lock_id: int | None = None
+    host_lock_footprints: dict[ComponentType, HostLockFootprint] = dataclasses.field(
+        default_factory=dict
+    )
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or
     # request lock after that tombstone becomes a valid device value.
@@ -160,7 +224,19 @@ class IncLockRefResult:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
+            host_lock_id=self.host_lock_id,
+            host_lock_footprints={
+                component_type: HostLockFootprint(
+                    ranges=tuple(
+                        sorted(
+                            footprint.ranges,
+                            key=lambda range_: range_.start,
+                        )
+                    ),
+                    requires_host_value=footprint.requires_host_value,
+                )
+                for component_type, footprint in self.host_lock_footprints.items()
+            },
             skip_lock_node_ids={
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
@@ -173,10 +249,38 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref operation."""
 
     swa_uuid_for_lock: Optional[int] = None
-    swa_uuid_for_host_lock: Optional[int] = None
+    host_lock_id: int | None = None
+    host_lock_footprints: dict[ComponentType, HostLockFootprint] = dataclasses.field(
+        default_factory=dict
+    )
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
+
+
+class HostLockOwnerKind(StrEnum):
+    """Lifecycle state responsible for one host-lock acquisition."""
+
+    LOAD_BACK = "load_back"
+    STORAGE_BACKUP = "storage_backup"
+    PREFETCH = "prefetch"
+    DEMOTED_SESSION = "demoted_session"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class HostLockOwner:
+    """Live operation or session that owns one host-lock acquisition.
+
+    :ivar kind: Lifecycle state retaining the lock.
+    :ivar owner_id: Identity within that lifecycle state.
+    :ivar anchor_node_id: Tree anchor passed to ``inc_host_lock_ref``.
+    :ivar lock_params: Acquisition receipt used for release and validation.
+    """
+
+    kind: HostLockOwnerKind
+    owner_id: str | int
+    anchor_node_id: int
+    lock_params: DecLockRefParams
 
 
 @dataclasses.dataclass
@@ -255,6 +359,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    session_reload_plan: SessionReloadPlan | None = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -277,6 +382,7 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        session_reload_plan=None,
     )
 
 

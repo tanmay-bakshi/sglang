@@ -200,6 +200,9 @@ class _FakeFullComponent(TreeComponent):
     def _dec_session_coverage(self, session_id, leaf) -> None:
         pass
 
+    def _session_coverage_nodes(self, leaf) -> tuple[UnifiedTreeNode, ...]:
+        return ()
+
     def _advance_session_coverage(self, session_id, leaf, old_ancestor) -> None:
         pass
 
@@ -280,6 +283,7 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         core.root_node = root
         core.node_by_id.side_effect = nodes.__getitem__
         core.components_by_type = {ComponentType.FULL: mock.Mock()}
+        core._partial_page_device_chunks_by_node.return_value = {}
         core.full_host_duplicates = {}
         core._is_settled_full_host_duplicate.side_effect = (
             lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
@@ -4278,20 +4282,20 @@ class UnifiedRadixCacheSuite:
         # each evict() attempts the drop fallback on the parent.
         with mock.patch.object(cache.cache_controller, "write", return_value=None):
             # Pinned subtree root: drop declines, chain stays intact.
-            cache.inc_host_lock_ref(parent)
+            parent_lock = cache.inc_host_lock_ref(parent).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
-            cache.dec_host_lock_ref(parent)
+            cache.dec_host_lock_ref(parent, parent_lock)
 
             # Pinned host-only descendant: drop declines as well.
-            cache.inc_host_lock_ref(child)
+            child_lock = cache.inc_host_lock_ref(child).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
             m = cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
             )
             self.assertEqual(len(m.device_indices), len(parent_seq))
-            cache.dec_host_lock_ref(child)
+            cache.dec_host_lock_ref(child, child_lock)
 
             # Unpinned: the subtree drops and the child's host slots return.
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
@@ -4885,6 +4889,48 @@ class UnifiedRadixCacheSuite:
             self.assertFalse(cache.tree_core.is_node_in_device_lru(node, aux))
             if _host_value(cache, node, aux) is not None:
                 self.assertTrue(cache.tree_core.is_node_in_host_lru(node, aux))
+        cache.sanity_check()
+
+    def test_sanity_reconciles_host_locks_with_live_owner_descriptors(self):
+        if not (
+            self.cfg.has_swa
+            and self.cfg.page_size == 1
+            and self.cfg.sliding_window_size == 4
+        ):
+            self.skipTest("one SWA configuration covers typed host-lock owners")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node_id = match.last_device_node
+        self._simulate_backup(cache, node_id)
+        lock_params = cache.inc_host_lock_ref(node_id).to_dec_params()
+        operation_id = 991
+        cache.ongoing_backup[operation_id] = (node_id, lock_params)
+        cache.sanity_check()
+
+        node = cache.tree_core.node_by_id(node_id)
+        component_data = node.component_data[ComponentType.SWA]
+        self.assertGreater(component_data.host_lock_ref, 0)
+        correct_count = component_data.host_lock_ref
+
+        component_data.host_lock_ref = correct_count + 1
+        with self.assertRaisesRegex(AssertionError, "over-count"):
+            cache.sanity_check()
+
+        component_data.host_lock_ref = correct_count - 1
+        with self.assertRaisesRegex(AssertionError, "under-count"):
+            cache.sanity_check()
+
+        component_data.host_lock_ref = correct_count
+        cache.ongoing_backup.pop(operation_id)
+        with self.assertRaisesRegex(AssertionError, "orphan"):
+            cache.sanity_check()
+
+        cache.ongoing_backup[operation_id] = (node_id, lock_params)
+        cache.dec_host_lock_ref(node_id, lock_params)
+        cache.ongoing_backup.pop(operation_id)
         cache.sanity_check()
 
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
