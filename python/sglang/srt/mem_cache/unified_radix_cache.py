@@ -4209,7 +4209,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ) -> None:
             node = self.tree_core.node_by_id(node_id)
             while node is not self.tree_core.root_node:
-                if node.is_session_private():
+                if node.is_session_private:
                     node = node.parent
                     continue
                 entry = references.setdefault(node.id, {"full": set(), "swa": set()})
