@@ -3079,7 +3079,9 @@ class UnifiedRadixCache(BasePrefixCache):
                             else int(finishing_node.component_data[ComponentType.FULL].host_lock_ref)
                         ),
                         "device_lock_count": (
-                            0 if finishing_node is None else int(finishing_node.lock_ref)
+                            0
+                            if finishing_node is None
+                            else int(finishing_node.component_data[ComponentType.FULL].lock_ref)
                         ),
                         "ongoing_load_ids": [
                             str(value) for value in sorted(self.ongoing_load_back)
