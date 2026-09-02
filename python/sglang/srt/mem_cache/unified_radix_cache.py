@@ -404,6 +404,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._pending_streaming_session_demotions: dict[
             str, _PendingStreamingSessionDemotion
         ] = {}
+        self._lifecycle_lineage: dict[str, tuple[str, int]] = {}
+        self._staging_session: tuple[str, NodeId] | None = None
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -1478,14 +1480,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
             if injection_enabled():
+                staging_session, staging_anchor = self._staging_session or (None, None)
                 pause_point(
                     "demote_d2h_inflight",
                     self._pause_point_rank(),
                     {
+                        **self._lifecycle_lineage_fields(staging_session),
+                        "pending_stage_id": staging_session,
+                        "node_id": None if staging_anchor is None else str(staging_anchor),
                         "device_tokens": int(len(device_indices)),
                         "host_tokens": int(len(host_indices)),
+                        "transfer_bytes": int(len(host_indices)) * self._host_token_bytes(),
                         "extra_pools": [str(transfer.name) for transfer in resolved or []],
-                        "finish_event_done": bool(completion.finish_event.query()),
+                        "transfer_event_ready": bool(completion.finish_event.query()),
                     },
                 )
             completion.finish_event.synchronize()
@@ -3014,13 +3021,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
             if injection_enabled() and len(self.ongoing_load_back) > 0:
+                _, _, waiting_session = self._session_load_back()
                 pause_point(
                     "reload_loading_collective_peer_wait",
                     self._pause_point_rank(),
                     {
+                        **self._lifecycle_lineage_fields(waiting_session),
                         "local_ready_count": int(finish_count),
-                        "reclaim_digest": int(digest),
-                        "ongoing_load_ids": sorted(self.ongoing_load_back),
+                        "sync_tensor": [int(value) for value in sync_tensor.tolist()],
+                        "reclaim_digest": str(int(digest)),
+                        "ongoing_load_ids": [
+                            str(value) for value in sorted(self.ongoing_load_back)
+                        ],
                     },
                 )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
@@ -3033,13 +3045,45 @@ class UnifiedRadixCache(BasePrefixCache):
             ack = cc.ack_load_queue[0]
             ack.finish_event.synchronize()
             if injection_enabled():
+                finishing = [
+                    int(ack_id) for ack_id in ack.node_ids if ack_id in self.ongoing_load_back
+                ]
+                finishing_session = None
+                finishing_ack = finishing[0] if len(finishing) > 0 else None
+                for candidate in finishing:
+                    candidate_session = self._load_back_session(
+                        self.ongoing_load_back[candidate].node_id
+                    )
+                    if candidate_session is not None:
+                        finishing_ack, finishing_session = candidate, candidate_session
+                        break
+                finishing_node = (
+                    None
+                    if finishing_ack is None
+                    else self.tree_core.node_by_id(self.ongoing_load_back[finishing_ack].node_id)
+                )
                 pause_point(
                     "reload_after_transfer_before_finish",
                     self._pause_point_rank(),
                     {
+                        **self._lifecycle_lineage_fields(finishing_session),
+                        "ack_id": None if finishing_ack is None else str(finishing_ack),
                         "ack_ids": [int(ack_id) for ack_id in ack.node_ids],
-                        "ongoing_load_ids": sorted(self.ongoing_load_back),
-                        "finish_event_done": True,
+                        "node_id": None if finishing_node is None else str(finishing_node.id),
+                        "transfer_event_ready": True,
+                        "ongoing_load_present": finishing_ack in self.ongoing_load_back,
+                        "published": False,
+                        "host_lock_count": (
+                            0
+                            if finishing_node is None
+                            else int(finishing_node.component_data[ComponentType.FULL].host_lock_ref)
+                        ),
+                        "device_lock_count": (
+                            0 if finishing_node is None else int(finishing_node.lock_ref)
+                        ),
+                        "ongoing_load_ids": [
+                            str(value) for value in sorted(self.ongoing_load_back)
+                        ],
                     },
                 )
 
@@ -3258,13 +3302,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 consumer_index
             ].finish_event.query()
         ):
+            ack_id, node_id, session_id = self._session_load_back()
             pause_point(
                 "reload_h2d_inflight",
                 self._pause_point_rank(),
                 {
+                    **self._lifecycle_lineage_fields(session_id),
+                    "ack_id": None if ack_id is None else str(ack_id),
+                    "node_id": None if node_id is None else str(node_id),
                     "consumer_index": int(consumer_index),
-                    "ongoing_load_ids": sorted(self.ongoing_load_back),
-                    "finish_event_done": False,
+                    "transfer_bytes": (
+                        0
+                        if node_id is None
+                        else self._path_host_tokens(node_id) * self._host_token_bytes()
+                    ),
+                    "transfer_event_ready": False,
+                    "published": False,
+                    "ongoing_load_ids": [str(value) for value in sorted(self.ongoing_load_back)],
                 },
             )
         return consumer_index
@@ -3452,7 +3506,11 @@ class UnifiedRadixCache(BasePrefixCache):
             swa_window_start = max(0, exact_len - self.sliding_window_size)
             swa_window_start = swa_window_start // self.page_size * self.page_size
 
-        backup = self._stage_retraction_backup(device_indices, extra_transfers)
+        self._staging_session = (session_id, tree_prefix_node)
+        try:
+            backup = self._stage_retraction_backup(device_indices, extra_transfers)
+        finally:
+            self._staging_session = None
         if backup is None:
             return None
         self._pending_streaming_session_demotions[session_id] = (
@@ -3906,6 +3964,80 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return torch.distributed.get_rank(group=self.tp_group)
 
+    def record_lifecycle_lineage(
+        self, session_id: str, lineage_digest: str, lineage_generation: int
+    ) -> None:
+        """Remember a session's lineage for the lifecycle pause markers.
+
+        The scheduler knows lineage; the cache does not. This is test-only
+        instrumentation fed at demotion start and resume admission.
+
+        :param session_id: Session whose transition may pause.
+        :param lineage_digest: Canonical digest of the durable token history.
+        :param lineage_generation: Generation incremented by history rewrites.
+        """
+        self._lifecycle_lineage[session_id] = (lineage_digest, lineage_generation)
+
+    def _lifecycle_lineage_fields(self, session_id: str | None) -> dict[str, Any]:
+        """Return the lineage fields a pause marker carries for one session.
+
+        :param session_id: Session in transition, or ``None`` when unknown.
+        :returns: ``session_id``, ``lineage_digest``, ``lineage_generation``.
+        """
+        lineage = None if session_id is None else self._lifecycle_lineage.get(session_id)
+        return {
+            "session_id": session_id,
+            "lineage_digest": None if lineage is None else lineage[0],
+            "lineage_generation": None if lineage is None else lineage[1],
+        }
+
+    def _load_back_session(self, node_id: NodeId) -> str | None:
+        """Resolve the demoted session whose frontier a load-back restores.
+
+        :param node_id: Anchor node of an ongoing load-back.
+        :returns: Session id, or ``None`` for an ordinary tree load-back.
+        """
+        for session_id, state in self.session.demoted.items():
+            if state.last_node == node_id:
+                return session_id
+        return None
+
+    def _path_host_tokens(self, node_id: NodeId) -> int:
+        """Count Full-KV host tokens along one frontier's root path.
+
+        :param node_id: Frontier node.
+        :returns: Tokens with a host copy on the path.
+        """
+        tokens = 0
+        node = self.tree_core.node_by_id(node_id)
+        while node is not self.tree_core.root_node:
+            host_value = node.component_data[ComponentType.FULL].host_value
+            if host_value is not None:
+                tokens += len(host_value)
+            node = node.parent
+        return tokens
+
+    def _host_token_bytes(self) -> int:
+        """Return the Full-KV host pool's bytes per token.
+
+        :returns: Bytes moved per token by a Full-KV transfer.
+        """
+        assert self.cache_controller is not None
+        return int(self.cache_controller.mem_pool_host.get_size_per_token())
+
+    def _session_load_back(self) -> tuple[int | None, NodeId | None, str | None]:
+        """Pick the ongoing load-back that restores a demoted session.
+
+        :returns: ``(ack_id, node_id, session_id)``; ``None`` fields when none.
+        """
+        for ack_id, load_back in sorted(self.ongoing_load_back.items()):
+            session_id = self._load_back_session(load_back.node_id)
+            if session_id is not None:
+                return int(ack_id), load_back.node_id, session_id
+        for ack_id, load_back in sorted(self.ongoing_load_back.items()):
+            return int(ack_id), load_back.node_id, None
+        return None, None, None
+
     def pending_streaming_session_demotion_ids(self) -> list[str]:
         """Return the sessions with a staged but unpublished demotion.
 
@@ -4005,7 +4137,11 @@ class UnifiedRadixCache(BasePrefixCache):
         }
 
     def _unique_host_locked_pages(self) -> dict[str, int]:
-        """Count the physical host pages locked by demoted sessions, once each.
+        """Count the physical host pages demoted sessions keep, once each.
+
+        A demoted session keeps its whole root path host-resident (the private
+        tail by host lock, the shared prefix by its session references), so the
+        union walks every node on each session's path.
 
         :returns: Page counts for the Full and SWA components.
         """
@@ -4020,12 +4156,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 for component_type, pages in locked.items():
                     if component_type not in self.components:
                         continue
-                    component_data = node.component_data[component_type]
-                    if component_data.host_lock_ref > 0 and component_data.host_value is not None:
-                        pages.update(
-                            int(index) // page
-                            for index in component_data.host_value.tolist()
-                        )
+                    host_value = node.component_data[component_type].host_value
+                    if host_value is not None:
+                        pages.update(int(index) // page for index in host_value.tolist())
                 node = node.parent
         return {
             "full": len(locked[ComponentType.FULL]),

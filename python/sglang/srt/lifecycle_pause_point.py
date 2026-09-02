@@ -92,7 +92,8 @@ def pause_point(point: str, tp_rank: int, state: dict[str, Any]) -> None:
 
     :param point: Stable seam name known to the harness.
     :param tp_rank: This scheduler's tensor-parallel rank.
-    :param state: Point-specific evidence recorded in the marker.
+    :param state: Seam facts recorded flat in the marker, so the harness proves
+        the seam from the marker itself rather than from its label.
     """
     if _injection_dir is None:
         return
@@ -126,7 +127,7 @@ def pause_point(point: str, tp_rank: int, state: dict[str, Any]) -> None:
         "process_start_ticks": process_start_ticks(),
         "utc": datetime.now(timezone.utc).isoformat(),
         "monotonic_ns": time.monotonic_ns(),
-        "state": state,
+        **state,
     }
     _write_atomically(markers / f"{trial_id}-tp{tp_rank}.json", marker)
 

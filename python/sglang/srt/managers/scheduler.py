@@ -2690,6 +2690,12 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             req.qualification_entered_ns = entered_ns
+            if injection_enabled():
+                self.tree_cache.record_lifecycle_lineage(
+                    session_id,
+                    session.current_digest(),
+                    session.lineage_generation,
+                )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
@@ -5856,6 +5862,12 @@ class Scheduler(
                 observed_tip=tip,
             )
             context = self.session_controller.demotion_context(recv_req.session_id)
+            if injection_enabled():
+                self.tree_cache.record_lifecycle_lineage(
+                    context.session_id,
+                    context.lineage_digest,
+                    context.lineage_generation,
+                )
         except StreamingSessionStaleEpochError as error:
             stale_error = error
             local_error_type = STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE
@@ -5905,11 +5917,19 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
+                    "lineage_digest": context.lineage_digest,
+                    "lineage_generation": context.lineage_generation,
                     "staged": staged,
                     "mode": mode,
                     "host_backed_tokens": host_backed_tokens,
                     "local_error_type": local_error_type,
-                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "pending_stage_id": (
+                        recv_req.session_id
+                        if recv_req.session_id
+                        in self.tree_cache.pending_streaming_session_demotion_ids()
+                        else None
+                    ),
+                    "vote_started": False,
                 },
             )
         identity = _streaming_session_demotion_identity(context)
@@ -5932,10 +5952,18 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
-                    "vote": [int(value) for value in vote.tolist()],
+                    "lineage_digest": context.lineage_digest,
+                    "lineage_generation": context.lineage_generation,
+                    "local_vote": [int(value) for value in vote.tolist()],
                     "mode": mode,
                     "local_error_type": local_error_type,
-                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "pending_stage_id": (
+                        recv_req.session_id
+                        if recv_req.session_id
+                        in self.tree_cache.pending_streaming_session_demotion_ids()
+                        else None
+                    ),
+                    "vote_completed": False,
                 },
             )
         if self.ps.tp_size > 1:
@@ -5956,11 +5984,15 @@ class Scheduler(
                 self.ps.tp_rank,
                 {
                     "session_id": recv_req.session_id,
+                    "lineage_digest": context.lineage_digest,
+                    "lineage_generation": context.lineage_generation,
                     "unanimous": unanimous,
-                    "vote_values": vote_values,
+                    "reduced_vote": vote_values,
                     "mode": mode,
                     "staged": staged,
-                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "pending_stage_present": recv_req.session_id
+                    in self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "committed": False,
                     "already_demoted": self.tree_cache.is_streaming_session_demoted(
                         recv_req.session_id
                     ),
@@ -5996,10 +6028,18 @@ class Scheduler(
                     self.ps.tp_rank,
                     {
                         "session_id": recv_req.session_id,
+                        "lineage_digest": context.lineage_digest,
+                        "lineage_generation": context.lineage_generation,
                         "host_backed_tokens": host_backed_tokens,
-                        "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
-                        "demoted": self.tree_cache.is_streaming_session_demoted(
-                            recv_req.session_id
+                        "pending_stage_present": recv_req.session_id
+                        in self.tree_cache.pending_streaming_session_demotion_ids(),
+                        "committed": True,
+                        "session_state": (
+                            "host"
+                            if self.tree_cache.is_streaming_session_demoted(
+                                recv_req.session_id
+                            )
+                            else "device"
                         ),
                         "output_rank": _is_streaming_session_output_rank(self.ps),
                     },
