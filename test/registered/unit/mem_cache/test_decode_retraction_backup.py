@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -1216,6 +1217,206 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache.release_radix_session("a")
         cache.release_session("a")
         self.assertEqual(evidence()["ordinary_prefixes"], [])
+        cache.sanity_check()
+
+    def _dump_tree(self, cache) -> str:
+        """Render every node's ownership for a failing shared-prefix step."""
+        lines: list[str] = []
+        stack = [(cache.tree_core.root_node, 0)]
+        while stack:
+            node, depth = stack.pop()
+            if node is not cache.tree_core.root_node:
+                full = node.component_data[ComponentType.FULL]
+                swa = node.component_data[ComponentType.SWA]
+                lines.append(
+                    "  " * depth
+                    + f"node {node.id} len={len(node.key)} private={node.private_session_id} "
+                    f"full(dev={full.value is not None}, host={full.host_value is not None}, "
+                    f"lock={full.lock_ref}, hlock={full.host_lock_ref}) "
+                    f"swa(dev={swa.value is not None}, host={swa.host_value is not None}, "
+                    f"lock={swa.lock_ref}, hlock={swa.host_lock_ref}) children={len(node.children)}"
+                )
+            for child in node.children.values():
+                stack.append((child, depth + 1))
+        return "\n".join(lines)
+
+    def test_second_reload_of_a_shared_prefix_keeps_the_prefix(self) -> None:
+        """Two demoted sharers must both restore the whole path (E3 F16)."""
+        page_size = 64
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        tip = 2 * page_size
+        prefix_req, prefix_indices = self._admit_req(env, page_size)
+        self._seed_pool(env.target_pool, prefix_indices, base=5000)
+        prefix_key = RadixKey(
+            array("q", range(page_size + 1)),
+            extra_key="namespace",
+            cache_salt="tenant",
+            is_bigram=True,
+        )
+        planted = cache.insert(
+            InsertParams(key=prefix_key, value=prefix_indices, trigger_backup=True)
+        )
+        env.req_to_token_pool.free(prefix_req)
+        prefix_node = planted.last_device_node
+        cache.writing_check(write_back=True)
+        self.assertTrue(cache.tree_core.node_by_id(prefix_node).backuped)
+
+        for session_id in ("a", "b"):
+            req, tail_indices = self._admit_streaming_session(env, session_id, page_size)
+            row = req.req_pool_idx
+            env.req_to_token_pool.write((row, slice(0, page_size)), prefix_indices)
+            env.req_to_token_pool.write((row, slice(page_size, tip)), tail_indices)
+            lock = cache.inc_lock_ref(prefix_node)
+            slot = cache.session.slots[session_id]
+            slot.last_node = prefix_node
+            slot.cache_protected_len = page_size
+            slot.tree_protected_len = page_size
+            slot.kv_committed_len = tip
+            slot.kv = ReqKvInfo(kv_allocated_len=tip)
+            slot.swa_uuid_for_lock = lock.swa_uuid_for_lock
+            slot.skip_lock_node_ids = lock.skip_lock_node_ids
+
+        session_key = array("q", range(tip + 1))
+        for session_id in ("a", "b"):
+            self.assertEqual(
+                cache.prepare_streaming_session_demotion(
+                    session_id,
+                    session_key,
+                    extra_key="namespace",
+                    cache_salt="tenant",
+                    priority=0,
+                ),
+                tip,
+            )
+            self.assertEqual(cache.commit_streaming_session_demotion(session_id), tip)
+        cache.sanity_check()
+        after_demotions = self._dump_tree(cache)
+        prefix_full = cache.tree_core.node_by_id(prefix_node).component_data[
+            ComponentType.FULL
+        ]
+        if prefix_full.value is not None:
+            evicted = cache.evict(EvictParams(num_tokens=page_size))
+            self.assertGreaterEqual(evicted.num_tokens_evicted, page_size, after_demotions)
+        self.assertIsNone(
+            cache.tree_core.node_by_id(prefix_node).component_data[ComponentType.FULL].value,
+            self._dump_tree(cache),
+        )
+        cache.sanity_check()
+        full_available_before_reloads = env.allocator.full_available_size()
+
+        def match(session_id: str):
+            return cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        session_key,
+                        extra_key="namespace",
+                        cache_salt="tenant",
+                        is_bigram=True,
+                    ),
+                    req=self._streaming_match_req(session_id),
+                )
+            )
+
+        first = match("a")
+        self.assertEqual(first.full_kv_hit_length, tip, self._dump_tree(cache))
+        load_req = SimpleNamespace(
+            last_node=first.last_device_node,
+            prefix_indices=first.device_indices,
+            swa_host_hit_length=first.swa_host_hit_length,
+            mamba_host_hit_length=0,
+            mamba_pool_idx=None,
+        )
+        load_result = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=first.best_match_node,
+                host_hit_length=first.host_hit_length,
+                req=load_req,
+            )
+        )
+        restored = torch.cat([first.device_indices, load_result.new_full_device_indices])
+        self.assertEqual(len(restored), tip, self._dump_tree(cache))
+        cache.ready_to_load_host_cache()
+        ack = cache.cache_controller.ack_load_queue[0]
+        ack.finish_event.synchronize()
+        cache.loading_check(finish_count=1)
+        restored_lock = cache.inc_lock_ref(first.best_match_node)
+        resumed = SimpleNamespace(rid="resumed-a", req_pool_idx=None, seqlen=tip + 1)
+        self.assertIsNotNone(env.req_to_token_pool.alloc([resumed]))
+        env.req_to_token_pool.write((resumed.req_pool_idx, slice(0, tip)), restored)
+        # A resumed request inherits the demoted SWA watermark on admission.
+        restored_watermark = cache.session.demoted["a"].swa_evicted_seqlen
+        cache.session.slots["a"] = SessionSlot(
+            req_pool_idx=resumed.req_pool_idx,
+            kv_committed_len=tip,
+            kv=ReqKvInfo(kv_allocated_len=tip, swa_evicted_seqlen=restored_watermark),
+            last_node=first.best_match_node,
+            cache_protected_len=tip,
+            tree_protected_len=tip,
+            swa_uuid_for_lock=restored_lock.swa_uuid_for_lock,
+            skip_lock_node_ids=restored_lock.skip_lock_node_ids,
+        )
+        self.assertTrue(cache.session._release_demoted_state("a"))
+        cache.sanity_check()
+        after_first_reload = self._dump_tree(cache)
+        adopted = cache.session.slots["a"]
+        self.assertEqual(adopted.tree_protected_len, page_size, after_first_reload)
+        self.assertEqual(adopted.last_node, prefix_node, after_first_reload)
+        self.assertIsNotNone(
+            cache.tree_core.node_by_id(prefix_node).component_data[ComponentType.FULL].value,
+            after_first_reload,
+        )
+
+        second = match("b")
+        second_summary = (
+            f"full_kv_hit_length={second.full_kv_hit_length} "
+            f"device_indices={len(second.device_indices)} "
+            f"host_hit_length={second.host_hit_length} "
+            f"swa_host_hit_length={second.swa_host_hit_length} "
+            f"last_device_node={second.last_device_node} "
+            f"best_match_node={second.best_match_node} "
+            f"cache_protected_len={second.cache_protected_len}\n{after_first_reload}"
+        )
+        self.assertEqual(second.full_kv_hit_length, tip, second_summary)
+        self.assertEqual(len(second.device_indices), page_size, second_summary)
+        self.assertEqual(second.host_hit_length, page_size, second_summary)
+        second_load_req = SimpleNamespace(
+            last_node=second.last_device_node,
+            prefix_indices=second.device_indices,
+            swa_host_hit_length=second.swa_host_hit_length,
+            mamba_host_hit_length=0,
+            mamba_pool_idx=None,
+        )
+        second_load = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=second.best_match_node,
+                host_hit_length=second.host_hit_length,
+                req=second_load_req,
+            )
+        )
+        self.assertEqual(len(second_load.new_full_device_indices), page_size, after_first_reload)
+        self.assertEqual(second_load.cache_protected_len, tip, after_first_reload)
+        cache.ready_to_load_host_cache()
+        ack = cache.cache_controller.ack_load_queue[0]
+        ack.finish_event.synchronize()
+        cache.loading_check(finish_count=1)
+        cache.sanity_check()
+        self.assertEqual(
+            env.allocator.full_available_size(),
+            full_available_before_reloads - 3 * page_size,
+            self._dump_tree(cache),
+        )
+
+        cache.release_radix_session("b")
+        cache.release_session("b")
+        cache.release_radix_session("a")
+        cache.release_session("a")
         cache.sanity_check()
 
     def test_streaming_session_demotion_publishes_exact_private_fringe(self) -> None:
