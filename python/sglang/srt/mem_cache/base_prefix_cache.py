@@ -590,6 +590,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return False
 
+    def streaming_session_demoted_namespace(
+        self, session_id: str
+    ) -> tuple[str | None, str | None] | None:
+        """Return the cache namespace a demoted session was seeded under.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The seeded ``(extra_key, cache_salt)``, or ``None`` when the
+            session is not host-resident.
+        """
+        return None
+
     def prepare_streaming_session_demotion(
         self,
         session_id: str,

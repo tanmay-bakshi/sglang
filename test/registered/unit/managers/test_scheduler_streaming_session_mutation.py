@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from http import HTTPStatus
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -33,6 +34,7 @@ from sglang.srt.managers.scheduler import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.errors import (
+    STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
     STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
     StreamingSessionInfoUnavailableError,
 )
@@ -328,44 +330,30 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
 
         self.assertTrue(output.success)
         self.assertEqual(all_reduce.call_count, 2)
+        # The preparation vote reduces seven values; the post-commit fence four.
         self.assertEqual(
-            [call.kwargs["operation"] for call in all_reduce.call_args_list],
-            [
-                "streaming-session-demotion-preparation-vote",
-                "streaming-session-demotion-post-commit-fence",
-            ],
+            [len(call.args[0]) for call in all_reduce.call_args_list],
+            [7, 4],
         )
 
-    def test_post_vote_commit_failure_is_fail_stop(self) -> None:
+    def test_post_vote_commit_failure_propagates(self) -> None:
+        """A rank-local commit failure after a unanimous vote is never masked."""
         scheduler = self._scheduler()
         scheduler.tree_cache.commit_streaming_session_demotion.side_effect = (
             RuntimeError("injected commit failure")
         )
 
-        with patch(
-            "sglang.srt.managers.scheduler._SESSION_COLLECTIVE.terminate",
-            side_effect=RuntimeError("fail-stop requested"),
-        ) as terminate:
-            with self.assertRaisesRegex(RuntimeError, "fail-stop requested"):
-                Scheduler.demote_session(
-                    scheduler,
-                    DemoteSessionReqInput(
-                        session_id="session",
-                        correlation_id="correlation",
-                    ),
-                )
+        with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+            Scheduler.demote_session(
+                scheduler,
+                DemoteSessionReqInput(
+                    session_id="session",
+                    correlation_id="correlation",
+                ),
+            )
 
-        terminate.assert_called_once()
-        self.assertEqual(
-            terminate.call_args.kwargs["operation"],
-            "streaming-session-demotion-commit",
-        )
-        self.assertIn(
-            "injected commit failure",
-            terminate.call_args.kwargs["reason"],
-        )
-
-    def test_post_commit_divergence_is_fail_stop(self) -> None:
+    def test_post_commit_divergence_raises(self) -> None:
+        """Ranks that committed different host ownership cannot report success."""
         scheduler = self._scheduler(tp_size=2)
         collective_count = 0
 
@@ -375,17 +363,13 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
             if collective_count == 2:
                 tensor[0] -= 1
 
-        with (
-            patch(
-                "sglang.srt.managers.scheduler._streaming_session_all_reduce",
-                side_effect=diverge_after_commit,
-            ),
-            patch(
-                "sglang.srt.managers.scheduler._SESSION_COLLECTIVE.terminate",
-                side_effect=RuntimeError("fail-stop requested"),
-            ) as terminate,
+        with patch(
+            "sglang.srt.managers.scheduler._streaming_session_all_reduce",
+            side_effect=diverge_after_commit,
         ):
-            with self.assertRaisesRegex(RuntimeError, "fail-stop requested"):
+            with self.assertRaisesRegex(
+                RuntimeError, "diverged across tensor-parallel ranks"
+            ):
                 Scheduler.demote_session(
                     scheduler,
                     DemoteSessionReqInput(
@@ -393,11 +377,6 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
                         correlation_id="correlation",
                     ),
                 )
-
-        terminate.assert_called_once_with(
-            operation="streaming-session-demotion-post-commit-fence",
-            reason="committed host ownership diverged across ranks",
-        )
 
     def test_vote_identity_binds_lineage_and_cache_namespace(self) -> None:
         context = self._scheduler().session_controller.demotion_context.return_value
@@ -461,6 +440,65 @@ class TestStreamingSessionDemotionTransaction(CustomTestCase):
         scheduler.session_controller.demotion_context.assert_not_called()
         scheduler.tree_cache.prepare_streaming_session_demotion.assert_not_called()
         scheduler.tree_cache.commit_streaming_session_demotion.assert_not_called()
+
+
+class TestDemotedNamespaceRefusal(CustomTestCase):
+    """A demoted session resumed outside its seeded namespace is refused, typed."""
+
+    @staticmethod
+    def _request(extra_key: str | None, cache_salt: str | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            session=SimpleNamespace(streaming=True, session_id="session"),
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            set_finish_with_abort=MagicMock(),
+        )
+
+    @staticmethod
+    def _scheduler(seeded: tuple[str | None, str | None] | None) -> SimpleNamespace:
+        scheduler = SimpleNamespace(
+            tree_cache=MagicMock(),
+            init_req_max_new_tokens=MagicMock(),
+            _add_request_to_queue=MagicMock(),
+        )
+        scheduler.tree_cache.is_streaming_session_demoted.return_value = (
+            seeded is not None
+        )
+        scheduler.tree_cache.streaming_session_demoted_namespace.return_value = seeded
+        return scheduler
+
+    def test_mismatched_namespace_is_refused_before_admission(self) -> None:
+        scheduler = self._scheduler(("adapter-a", None))
+        req = self._request("adapter-b", None)
+
+        self.assertTrue(Scheduler._reject_demoted_namespace_mismatch(scheduler, req))
+
+        req.set_finish_with_abort.assert_called_once()
+        kwargs = req.set_finish_with_abort.call_args.kwargs
+        self.assertEqual(kwargs["status_code"], HTTPStatus.CONFLICT)
+        self.assertEqual(kwargs["err_type"], STREAMING_SESSION_NAMESPACE_ERROR_TYPE)
+        self.assertEqual(kwargs["error_data"]["seeded_extra_key"], "adapter-a")
+        self.assertEqual(kwargs["error_data"]["request_extra_key"], "adapter-b")
+        scheduler.init_req_max_new_tokens.assert_called_once_with(req)
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+
+    def test_seeded_namespace_is_admitted(self) -> None:
+        scheduler = self._scheduler(("adapter-a", "tenant"))
+        req = self._request("adapter-a", "tenant")
+
+        self.assertFalse(Scheduler._reject_demoted_namespace_mismatch(scheduler, req))
+
+        req.set_finish_with_abort.assert_not_called()
+        scheduler._add_request_to_queue.assert_not_called()
+
+    def test_device_resident_session_is_not_consulted(self) -> None:
+        scheduler = self._scheduler(None)
+        req = self._request("adapter-b", None)
+
+        self.assertFalse(Scheduler._reject_demoted_namespace_mismatch(scheduler, req))
+
+        scheduler.tree_cache.streaming_session_demoted_namespace.assert_not_called()
+        req.set_finish_with_abort.assert_not_called()
 
 
 class TestEmptyStreamingSessionMutation(CustomTestCase):

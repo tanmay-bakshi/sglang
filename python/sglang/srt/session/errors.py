@@ -108,5 +108,12 @@ class StreamingSessionBusyError(RuntimeError):
     status_code: int = 409
 
 
+class StreamingSessionNamespaceError(RuntimeError):
+    """Reports a demoted session resumed outside its seeded cache namespace."""
+
+    status_code: int = 409
+
+
 STREAMING_SESSION_DEMOTION_ERROR_TYPE = StreamingSessionDemotionError.__name__
 STREAMING_SESSION_BUSY_ERROR_TYPE = StreamingSessionBusyError.__name__
+STREAMING_SESSION_NAMESPACE_ERROR_TYPE = StreamingSessionNamespaceError.__name__

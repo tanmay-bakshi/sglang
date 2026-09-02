@@ -167,6 +167,8 @@ class DemotedSessionState:
     :ivar tree_protected_len: Prefix represented by ordinary radix nodes.
     :ivar swa_evicted_seqlen: First restored token with live SWA device state.
     :ivar host_lock_params: Component lock coordinates required for release.
+    :ivar extra_key: Radix cache classification key the session was seeded under.
+    :ivar cache_salt: Radix cache namespace salt the session was seeded under.
     """
 
     last_node: Any
@@ -174,6 +176,8 @@ class DemotedSessionState:
     tree_protected_len: int
     swa_evicted_seqlen: int
     host_lock_params: DecLockRefParams
+    extra_key: str | None
+    cache_salt: str | None
 
 
 def _is_streaming(req: Optional[Req]) -> bool:
@@ -252,6 +256,18 @@ class StreamingSession(BasePrefixCache):
         :returns: Whether the session is host-resident.
         """
         return session_id in self.demoted
+
+    def demoted_namespace(self, session_id: str) -> tuple[str | None, str | None] | None:
+        """Return the cache namespace a demoted session was seeded under.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The seeded ``(extra_key, cache_salt)``, or ``None`` when the
+            session is not host-resident.
+        """
+        state = self.demoted.get(session_id)
+        if state is None:
+            return None
+        return state.extra_key, state.cache_salt
 
     def restore_demoted_request_state(
         self, req: Req | None, matched_len: int
@@ -620,6 +636,9 @@ class StreamingSession(BasePrefixCache):
         tree_prefix_len: int,
         swa_evicted_seqlen: int,
         host_lock_params: DecLockRefParams,
+        *,
+        extra_key: str | None,
+        cache_salt: str | None,
     ) -> None:
         """Replace a detached device slot with its host-resident tree frontier.
 
@@ -631,6 +650,9 @@ class StreamingSession(BasePrefixCache):
         :param swa_evicted_seqlen: First token retained in the restored SWA
             window.
         :param host_lock_params: Component lock coordinates required for release.
+        :param extra_key: Radix cache classification key the session was seeded
+            under; a resume must present the same key to match its host path.
+        :param cache_salt: Radix cache namespace salt the session was seeded under.
         """
         slot = self.slots[session_id]
         assert session_id not in self.demoted
@@ -645,6 +667,8 @@ class StreamingSession(BasePrefixCache):
             tree_protected_len=tree_prefix_len,
             swa_evicted_seqlen=swa_evicted_seqlen,
             host_lock_params=host_lock_params,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
         )
         # Every fallible publication step has completed before this call. Retire
         # the source while the slot remains discoverable, then expose the new
@@ -1055,6 +1079,17 @@ class StreamingSession(BasePrefixCache):
         :returns: Whether the session is host-resident.
         """
         return self.is_demoted(session_id)
+
+    def streaming_session_demoted_namespace(
+        self, session_id: str
+    ) -> tuple[str | None, str | None] | None:
+        """Return the cache namespace a demoted session was seeded under.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The seeded ``(extra_key, cache_salt)``, or ``None`` when the
+            session is not host-resident.
+        """
+        return self.demoted_namespace(session_id)
 
     def prepare_streaming_session_demotion(
         self,

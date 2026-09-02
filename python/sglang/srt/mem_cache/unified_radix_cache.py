@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
-    SessionReloadPlan,
     StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
@@ -202,60 +201,6 @@ class _PendingStreamingSessionDemotion:
     tree_prefix_len: int
     swa_window_start: int
     priority: int
-
-
-@dataclass(frozen=True)
-class _SessionReloadSpan:
-    """One component span participating in a session reload.
-
-    :ivar node_id: Tree node carrying the source component state.
-    :ivar component_type: Full or SWA component represented by the span.
-    :ivar logical_length: Tokens exposed to the request or tree.
-    :ivar physical_length: Source and destination slots copied by the transfer.
-    :ivar device_indices: Existing settled device value, if already resident.
-    :ivar host_indices: Authoritative host source, if a transfer is required.
-    :ivar session_private: Whether the destination remains request-owned.
-    """
-
-    node_id: NodeId
-    component_type: ComponentType
-    logical_length: int
-    physical_length: int
-    device_indices: torch.Tensor | None
-    host_indices: torch.Tensor | None
-    session_private: bool
-
-    def __post_init__(self) -> None:
-        if self.logical_length <= 0 or self.physical_length < self.logical_length:
-            raise ValueError("A reload span must describe a non-empty physical range.")
-        if (self.device_indices is None) == (self.host_indices is None):
-            raise ValueError("A reload span must have exactly one resident source.")
-        source = (
-            self.device_indices
-            if self.device_indices is not None
-            else self.host_indices
-        )
-        assert source is not None
-        if len(source) != self.physical_length:
-            raise ValueError("Reload span source length disagrees with its footprint.")
-
-
-@dataclass(frozen=True)
-class _SessionReloadSpec:
-    """Stable component partition for one accepted session reload.
-
-    :ivar plan: Match-time session identity and ownership boundaries.
-    :ivar full_spans: Complete Full-KV lineage in root-to-frontier order.
-    :ivar swa_spans: Retained SWA window in root-to-frontier order.
-    :ivar full_transfer: Concatenated host-only Full-KV source.
-    :ivar component_transfers: Concatenated host-only auxiliary sources.
-    """
-
-    plan: SessionReloadPlan
-    full_spans: tuple[_SessionReloadSpan, ...]
-    swa_spans: tuple[_SessionReloadSpan, ...]
-    full_transfer: PoolTransfer
-    component_transfers: dict[ComponentType, list[PoolTransfer]]
 
 
 @dataclass
@@ -1753,183 +1698,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         prep = preps.get(component.component_type)
                         if prep is not None:
                             component.finalize_load_back(req, prep, success)
-
-    def _build_session_reload_spec(
-        self,
-        plan: SessionReloadPlan,
-    ) -> _SessionReloadSpec:
-        """Partition a demoted session into settled and transferable spans.
-
-        The returned descriptor is allocation-free. Private destinations never
-        become radix-tree device values; ordinary host-only destinations are
-        eligible for publication only after their transfer ACK.
-
-        :param plan: Match-time session reload identity and ownership boundary.
-        :returns: Stable Full/SWA source partition for transfer preparation.
-        """
-
-        if self.supports_mamba():
-            raise AssertionError("Streaming-session demotion does not support Mamba.")
-
-        state = self.session.demoted.get(plan.session_id)
-        if state is None:
-            raise RuntimeError(f"Session {plan.session_id} is no longer demoted.")
-        if (
-            state.last_node != plan.source_node
-            or state.cache_protected_len != plan.reuse_len
-            or state.tree_protected_len != plan.tree_protected_len
-            or state.swa_evicted_seqlen != plan.swa_evicted_seqlen
-        ):
-            raise RuntimeError(
-                f"Session {plan.session_id} reload plan is stale relative to its owner."
-            )
-
-        nodes = self._streaming_session_path(plan.source_node, plan.reuse_len)
-        full_spans: list[_SessionReloadSpan] = []
-        swa_spans: list[_SessionReloadSpan] = []
-        offset = 0
-        ordinary_end = 0
-        saw_private = False
-        for node in nodes:
-            node_start = offset
-            node_end = node_start + len(node.key)
-            offset = node_end
-            if node.is_session_private:
-                saw_private = True
-                if node.private_session_id != plan.session_id:
-                    raise AssertionError(
-                        f"Reload path contains private node {node.id} owned by "
-                        f"{node.private_session_id!r}."
-                    )
-                if node_start < plan.tree_protected_len:
-                    raise AssertionError(
-                        "Session-private reload span overlaps ordinary tree ownership."
-                    )
-            elif saw_private:
-                raise AssertionError("An ordinary node follows a private reload span.")
-            elif node_end > plan.tree_protected_len:
-                raise AssertionError(
-                    "Ordinary reload path extends beyond its declared tree frontier."
-                )
-            else:
-                ordinary_end = node_end
-
-            full_data = node.component_data[ComponentType.FULL]
-            full_device = full_data.value
-            full_host = full_data.host_value
-            if node.is_session_private and full_device is not None:
-                raise AssertionError(
-                    f"Demoted private node {node.id} unexpectedly has device Full KV."
-                )
-            if full_device is not None:
-                full_host = None
-                full_physical_length = len(full_device)
-            elif full_host is not None:
-                full_physical_length = len(full_host)
-            else:
-                raise AssertionError(
-                    f"Reload node {node.id} has neither Full device nor host state."
-                )
-            full_spans.append(
-                _SessionReloadSpan(
-                    node_id=node.id,
-                    component_type=ComponentType.FULL,
-                    logical_length=len(node.key),
-                    physical_length=full_physical_length,
-                    device_indices=full_device,
-                    host_indices=full_host,
-                    session_private=node.is_session_private,
-                )
-            )
-
-            if not self.supports_swa() or node_end <= plan.swa_evicted_seqlen:
-                continue
-            if node_start < plan.swa_evicted_seqlen:
-                raise AssertionError(
-                    "SWA reload watermark cuts through a tree node; demotion must split "
-                    "that boundary before publication."
-                )
-            swa_data = node.component_data[ComponentType.SWA]
-            swa_device = swa_data.value
-            swa_host = swa_data.host_value
-            if node.is_session_private and swa_device is not None:
-                raise AssertionError(
-                    f"Demoted private node {node.id} unexpectedly has device SWA KV."
-                )
-            if swa_device is not None:
-                swa_host = None
-                swa_physical_length = len(swa_device)
-                swa_logical_length = self.tree_core.component_logical_length(
-                    node, ComponentType.SWA, host=False
-                )
-            elif swa_host is not None:
-                swa_physical_length = len(swa_host)
-                swa_logical_length = self.tree_core.component_logical_length(
-                    node, ComponentType.SWA, host=True
-                )
-            else:
-                raise AssertionError(
-                    f"Reload node {node.id} has neither SWA device nor host state."
-                )
-            if swa_logical_length != len(node.key):
-                raise AssertionError(
-                    f"SWA reload node {node.id} spans {swa_logical_length} logical "
-                    f"tokens for a {len(node.key)}-token tree range."
-                )
-            swa_spans.append(
-                _SessionReloadSpan(
-                    node_id=node.id,
-                    component_type=ComponentType.SWA,
-                    logical_length=swa_logical_length,
-                    physical_length=swa_physical_length,
-                    device_indices=swa_device,
-                    host_indices=swa_host,
-                    session_private=node.is_session_private,
-                )
-            )
-
-        if offset != plan.reuse_len:
-            raise AssertionError(
-                f"Session reload path ends at {offset}, expected {plan.reuse_len}."
-            )
-        if ordinary_end != plan.tree_protected_len:
-            raise AssertionError(
-                "Session reload ordinary frontier disagrees with its declared length: "
-                f"{ordinary_end=} expected={plan.tree_protected_len}."
-            )
-
-        full_host_spans = [span for span in full_spans if span.host_indices is not None]
-        full_host_indices = (
-            torch.cat([span.host_indices for span in full_host_spans])
-            if len(full_host_spans) > 0
-            else torch.empty((0,), dtype=torch.int64, device="cpu")
-        )
-        full_transfer = PoolTransfer(
-            name=PoolName.KV,
-            host_indices=full_host_indices,
-            nodes_to_load=[span.node_id for span in full_host_spans],
-        )
-
-        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
-        swa_host_spans = [span for span in swa_spans if span.host_indices is not None]
-        if len(swa_host_spans) > 0:
-            component_transfers[ComponentType.SWA] = [
-                PoolTransfer(
-                    name=PoolName.SWA,
-                    host_indices=torch.cat(
-                        [span.host_indices for span in swa_host_spans]
-                    ),
-                    nodes_to_load=[span.node_id for span in swa_host_spans],
-                )
-            ]
-
-        return _SessionReloadSpec(
-            plan=plan,
-            full_spans=tuple(full_spans),
-            swa_spans=tuple(swa_spans),
-            full_transfer=full_transfer,
-            component_transfers=component_transfers,
-        )
 
     def _load_back_transfers(
         self,
@@ -3532,6 +3300,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         return self.session.is_demoted(session_id)
 
+    def streaming_session_demoted_namespace(
+        self, session_id: str
+    ) -> tuple[str | None, str | None] | None:
+        """Return the cache namespace a demoted session was seeded under.
+
+        :param session_id: Session identifier to inspect.
+        :returns: The seeded ``(extra_key, cache_salt)``, or ``None`` when the
+            session is not host-resident.
+        """
+        return self.session.demoted_namespace(session_id)
+
     def prepare_streaming_session_demotion(
         self,
         session_id: str,
@@ -3712,6 +3491,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 pending.tree_prefix_len,
                 pending.swa_window_start,
                 host_lock_params,
+                extra_key=pending.key.extra_key,
+                cache_salt=pending.key.cache_salt,
             )
             self._demote_streaming_session_tree_path(pending.tree_prefix_node)
             host_path_transaction.ledger.release_stage_owned(self.host_pool_group)

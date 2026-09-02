@@ -315,6 +315,7 @@ from sglang.srt.session.errors import (
     STREAMING_SESSION_BUSY_ERROR_TYPE,
     STREAMING_SESSION_CONFLICT_ERROR_TYPE,
     STREAMING_SESSION_DEMOTION_ERROR_TYPE,
+    STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
     STREAMING_SESSION_STALE_EPOCH_ERROR_TYPE,
     StreamingSessionBusyError,
     StreamingSessionDemotionError,
@@ -2731,7 +2732,47 @@ class Scheduler(
             self._finish_streaming_session_without_forward(req)
             return
 
+        if self._reject_demoted_namespace_mismatch(req):
+            return
+
         self._enqueue_prepared_generate_request(req)
+
+    def _reject_demoted_namespace_mismatch(self, req: Req) -> bool:
+        """Refuse, typed, a demoted session resumed under another cache namespace.
+
+        A demoted session's private host path is matched inside the cache
+        namespace it was seeded with. Resuming it under a different
+        ``extra_key`` or ``cache_salt`` would match nothing, and that request
+        must never reach the frontier assertion that guards real corruption.
+
+        :param req: Prepared streaming-session request.
+        :returns: Whether the request was refused and queued for output.
+        """
+        if req.session is None or not req.session.streaming:
+            return False
+        session_id = req.session.session_id
+        if not self.tree_cache.is_streaming_session_demoted(session_id):
+            return False
+        seeded = self.tree_cache.streaming_session_demoted_namespace(session_id)
+        if seeded is None or seeded == (req.extra_key, req.cache_salt):
+            return False
+        seeded_extra_key, seeded_cache_salt = seeded
+        req.set_finish_with_abort(
+            f"Session {session_id} is host-resident under cache namespace "
+            f"extra_key={seeded_extra_key!r} cache_salt={seeded_cache_salt!r}; "
+            "resume it under that namespace.",
+            status_code=HTTPStatus.CONFLICT,
+            err_type=STREAMING_SESSION_NAMESPACE_ERROR_TYPE,
+            error_data={
+                "seeded_extra_key": seeded_extra_key,
+                "seeded_cache_salt": seeded_cache_salt,
+                "request_extra_key": req.extra_key,
+                "request_cache_salt": req.cache_salt,
+            },
+        )
+        self.init_req_max_new_tokens(req)
+        self._add_request_to_queue(req)
+        return True
 
     def _reject_stale_session_epoch(
         self,
