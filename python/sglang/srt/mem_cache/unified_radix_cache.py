@@ -17,7 +17,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.lifecycle_pause_point import pause_point
+from sglang.srt.lifecycle_pause_point import injection_enabled, pause_point
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1477,16 +1477,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     write_host, write_device, write_pools
                 )
             )
-            pause_point(
-                "demote_d2h_inflight",
-                self._pause_point_rank(),
-                {
-                    "device_tokens": int(len(device_indices)),
-                    "host_tokens": int(len(host_indices)),
-                    "extra_pools": [str(transfer.name) for transfer in resolved or []],
-                    "finish_event_done": bool(completion.finish_event.query()),
-                },
-            )
+            if injection_enabled():
+                pause_point(
+                    "demote_d2h_inflight",
+                    self._pause_point_rank(),
+                    {
+                        "device_tokens": int(len(device_indices)),
+                        "host_tokens": int(len(host_indices)),
+                        "extra_pools": [str(transfer.name) for transfer in resolved or []],
+                        "finish_event_done": bool(completion.finish_event.query()),
+                    },
+                )
             completion.finish_event.synchronize()
         except Exception:
             self.retraction_discard(backup)
@@ -3012,7 +3013,7 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            if len(self.ongoing_load_back) > 0:
+            if injection_enabled() and len(self.ongoing_load_back) > 0:
                 pause_point(
                     "reload_loading_collective_peer_wait",
                     self._pause_point_rank(),
@@ -3031,15 +3032,16 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue[0]
             ack.finish_event.synchronize()
-            pause_point(
-                "reload_after_transfer_before_finish",
-                self._pause_point_rank(),
-                {
-                    "ack_ids": [int(ack_id) for ack_id in ack.node_ids],
-                    "ongoing_load_ids": sorted(self.ongoing_load_back),
-                    "finish_event_done": True,
-                },
-            )
+            if injection_enabled():
+                pause_point(
+                    "reload_after_transfer_before_finish",
+                    self._pause_point_rank(),
+                    {
+                        "ack_ids": [int(ack_id) for ack_id in ack.node_ids],
+                        "ongoing_load_ids": sorted(self.ongoing_load_back),
+                        "finish_event_done": True,
+                    },
+                )
 
             seen_ack_ids: set[int] = set()
             for ack_id in ack.node_ids:
@@ -3249,7 +3251,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is None:
             return 0
         consumer_index = self.cache_controller.start_loading()
-        if consumer_index >= 0 and not self.is_load_back_event_done(consumer_index):
+        if (
+            injection_enabled()
+            and consumer_index >= 0
+            and not self.cache_controller.layer_done_counter.events[
+                consumer_index
+            ].finish_event.query()
+        ):
             pause_point(
                 "reload_h2d_inflight",
                 self._pause_point_rank(),

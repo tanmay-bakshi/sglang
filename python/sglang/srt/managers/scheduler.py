@@ -104,6 +104,7 @@ from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.lifecycle_pause_point import (
     emit_idle_evidence,
     emit_scheduler_interval,
+    injection_enabled,
     pause_point,
     take_idle_evidence_request,
 )
@@ -5898,18 +5899,19 @@ class Scheduler(
                 local_error_type = STREAMING_SESSION_DEMOTION_ERROR_TYPE
                 local_error_message = "Session host staging failed on this rank."
 
-        pause_point(
-            "demote_after_stage_before_vote",
-            self.ps.tp_rank,
-            {
-                "session_id": recv_req.session_id,
-                "staged": staged,
-                "mode": mode,
-                "host_backed_tokens": host_backed_tokens,
-                "local_error_type": local_error_type,
-                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
-            },
-        )
+        if injection_enabled():
+            pause_point(
+                "demote_after_stage_before_vote",
+                self.ps.tp_rank,
+                {
+                    "session_id": recv_req.session_id,
+                    "staged": staged,
+                    "mode": mode,
+                    "host_backed_tokens": host_backed_tokens,
+                    "local_error_type": local_error_type,
+                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                },
+            )
         identity = _streaming_session_demotion_identity(context)
         vote = torch.tensor(
             [
@@ -5924,17 +5926,18 @@ class Scheduler(
             dtype=torch.int64,
             device="cpu",
         )
-        pause_point(
-            "demote_vote_collective_peer_wait",
-            self.ps.tp_rank,
-            {
-                "session_id": recv_req.session_id,
-                "vote": [int(value) for value in vote.tolist()],
-                "mode": mode,
-                "local_error_type": local_error_type,
-                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
-            },
-        )
+        if injection_enabled():
+            pause_point(
+                "demote_vote_collective_peer_wait",
+                self.ps.tp_rank,
+                {
+                    "session_id": recv_req.session_id,
+                    "vote": [int(value) for value in vote.tolist()],
+                    "mode": mode,
+                    "local_error_type": local_error_type,
+                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                },
+            )
         if self.ps.tp_size > 1:
             _streaming_session_all_reduce(
                 vote,
@@ -5947,21 +5950,22 @@ class Scheduler(
             and vote_values[3] == -vote_values[4]
             and vote_values[5] == -vote_values[6]
         )
-        pause_point(
-            "demote_after_vote_before_commit",
-            self.ps.tp_rank,
-            {
-                "session_id": recv_req.session_id,
-                "unanimous": unanimous,
-                "vote_values": vote_values,
-                "mode": mode,
-                "staged": staged,
-                "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
-                "already_demoted": self.tree_cache.is_streaming_session_demoted(
-                    recv_req.session_id
-                ),
-            },
-        )
+        if injection_enabled():
+            pause_point(
+                "demote_after_vote_before_commit",
+                self.ps.tp_rank,
+                {
+                    "session_id": recv_req.session_id,
+                    "unanimous": unanimous,
+                    "vote_values": vote_values,
+                    "mode": mode,
+                    "staged": staged,
+                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                    "already_demoted": self.tree_cache.is_streaming_session_demoted(
+                        recv_req.session_id
+                    ),
+                },
+            )
         if not unanimous:
             if staged:
                 self.tree_cache.discard_streaming_session_demotion(recv_req.session_id)
@@ -5986,19 +5990,20 @@ class Scheduler(
                 )
                 raise
 
-            pause_point(
-                "demote_after_commit_before_ack",
-                self.ps.tp_rank,
-                {
-                    "session_id": recv_req.session_id,
-                    "host_backed_tokens": host_backed_tokens,
-                    "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
-                    "demoted": self.tree_cache.is_streaming_session_demoted(
-                        recv_req.session_id
-                    ),
-                    "output_rank": _is_streaming_session_output_rank(self.ps),
-                },
-            )
+            if injection_enabled():
+                pause_point(
+                    "demote_after_commit_before_ack",
+                    self.ps.tp_rank,
+                    {
+                        "session_id": recv_req.session_id,
+                        "host_backed_tokens": host_backed_tokens,
+                        "pending_demotion_ids": self.tree_cache.pending_streaming_session_demotion_ids(),
+                        "demoted": self.tree_cache.is_streaming_session_demoted(
+                            recv_req.session_id
+                        ),
+                        "output_rank": _is_streaming_session_output_rank(self.ps),
+                    },
+                )
             committed = torch.tensor(
                 [
                     host_backed_tokens,
