@@ -4810,6 +4810,13 @@ class Scheduler(
         tag = take_idle_evidence_request(self.ps.tp_rank)
         if tag is None:
             return
+        if not self.tree_cache.supports_idle_evidence():
+            logger.error(
+                "Idle evidence request %s ignored: this cache has no hybrid SWA "
+                "allocator, so its pool equations cannot be described.",
+                tag,
+            )
+            return
         has_leak, _ = self.invariant_checker._check_all_pools(
             self.pool_stats_observer.get_pool_stats(),
         )

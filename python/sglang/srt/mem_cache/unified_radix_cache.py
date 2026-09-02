@@ -4319,6 +4319,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return records
 
+    def supports_idle_evidence(self) -> bool:
+        """Return whether this cache can describe its pools for the harness.
+
+        :returns: Whether the device allocator is the hybrid SWA allocator the
+            evidence equations are written for.
+        """
+        return isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
     def idle_ownership_evidence(
         self,
         *,
