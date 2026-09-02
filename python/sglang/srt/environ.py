@@ -474,6 +474,10 @@ class Envs:
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
+    # Test-only lifecycle pause points and idle evidence (see
+    # sglang.srt.lifecycle_pause_point); empty means inert. Registered here
+    # so a rank can attest the gate through SGLANG_EXPOSE_OWN_ENV_VARS.
+    SGLANG_PHASEC_INJECTION_DIR = EnvStr("")
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)

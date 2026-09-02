@@ -22,15 +22,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
-_GATE_ENV = "SGLANG_PHASEC_INJECTION_DIR"
 _SOURCE_IDENTITY_ENV = "PHASEC_SOURCE_IDENTITY_SHA256"
 _MAX_WAIT_SECONDS = 180.0
 _POLL_SECONDS = 0.002
 
 _injection_dir: Path | None = (
-    Path(os.environ[_GATE_ENV]) if len(os.environ.get(_GATE_ENV, "")) > 0 else None
+    Path(envs.SGLANG_PHASEC_INJECTION_DIR.get())
+    if len(envs.SGLANG_PHASEC_INJECTION_DIR.get()) > 0
+    else None
 )
 _source_identity: str = os.environ.get(_SOURCE_IDENTITY_ENV, "unset")
 _answered_evidence_tags: dict[int, str] = {}
