@@ -245,9 +245,21 @@ class SWAComponent(TreeComponent):
         swa_device_only_hicache = (
             not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
         )
+        # With a sliding-window host pool under HiCache, the device boundary is
+        # a full-attention residency boundary: window state a match needs is
+        # restored from host by the load-back, and state outside the window is
+        # never needed. Gating that boundary on window sufficiency let a
+        # full-resident node with a window-relative tombstone, sitting above a
+        # host-only tail, fall out of both the device indices and the load-back,
+        # so the request received neither copy of its pages (E3 F16).
+        swa_host_restorable = (
+            self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
+        )
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
+            if match_device_only and swa_host_restorable:
+                return cd.value is not None or cd.host_value is not None
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
