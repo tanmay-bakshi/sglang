@@ -4024,8 +4024,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         :returns: Bytes moved per token by a Full-KV transfer.
         """
-        assert self.cache_controller is not None
-        return int(self.cache_controller.mem_pool_host.get_size_per_token())
+        host_pool = self.host_pool_group.get_entry(PoolName.KV).host_pool
+        return int(host_pool.get_size_per_token())
 
     def _session_load_back(self) -> tuple[int | None, NodeId | None, str | None]:
         """Pick the ongoing load-back that restores a demoted session.
