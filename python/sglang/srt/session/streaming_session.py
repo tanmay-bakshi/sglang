@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     LoadBackResult,
     MatchPrefixParams,
     MatchResult,
-    SessionReloadPlan,
     StreamingSessionCacheSnapshot,
 )
 from sglang.srt.mem_cache.common import (
@@ -278,20 +277,17 @@ class StreamingSession(BasePrefixCache):
         """
         return session_id in self._retiring
 
-    def restore_demoted_request_state(
-        self, req: Req | None, matched_len: int
-    ) -> SessionReloadPlan | None:
+    def restore_demoted_request_state(self, req: Req | None, matched_len: int) -> None:
         """Restore physical ownership cursors for one host-resident match.
 
         :param req: Request receiving a demoted session prefix.
         :param matched_len: Exact full-KV prefix accepted by the cache.
-        :returns: Allocation-free reload plan for a demoted session match.
         """
         if req is None or not _is_streaming(req):
-            return None
+            return
         state = self.demoted.get(req.session.session_id)
         if state is None:
-            return None
+            return
         if matched_len != state.cache_protected_len:
             raise AssertionError(
                 "A demoted streaming session did not restore its exact frontier: "
@@ -308,17 +304,6 @@ class StreamingSession(BasePrefixCache):
         # the whole restored prefix stays tree-protected until adoption narrows
         # ownership back to the ordinary prefix.
         req.streaming_session_tree_protected_len = state.cache_protected_len
-        tree_node = self.inner.streaming_session_private_parent(state.last_node)
-        if tree_node is None:
-            tree_node = state.last_node
-        return SessionReloadPlan(
-            session_id=req.session.session_id,
-            source_node=state.last_node,
-            tree_node=tree_node,
-            reuse_len=state.cache_protected_len,
-            tree_protected_len=state.tree_protected_len,
-            swa_evicted_seqlen=state.swa_evicted_seqlen,
-        )
 
     # -- Try-handle entries for composition (see class docstring) --
 

@@ -108,7 +108,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchPrefixParams,
-    SessionReloadPlan,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -931,7 +930,6 @@ class Req(ReqDllmMixin):
         # Host-resident session matches remain allocation-free through admission.
         # The accepted batch materializes this plan before constructing its
         # request-row mapping.
-        self.session_reload_plan: SessionReloadPlan | None = None
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
@@ -2536,8 +2534,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "Extend range disagrees with the request prefix: "
                 f"{seq_len=} {pre_len=} extend_range={req.extend_range} "
                 f"host_hit_length={req.host_hit_length} "
-                f"cache_protected_len={req.cache_protected_len} "
-                f"session_reload_plan={req.session_reload_plan} rid={req.rid}"
+                f"cache_protected_len={req.cache_protected_len} rid={req.rid}"
             )
 
             req.extend_batch_idx += 1

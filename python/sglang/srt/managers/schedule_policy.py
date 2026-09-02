@@ -198,7 +198,6 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
-    req.session_reload_plan = match_result.session_reload_plan
     return match_result
 
 
@@ -1350,36 +1349,26 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                if req.session_reload_plan is not None:
-                    prefix_len = req.session_reload_plan.reuse_len
-                    expected_prefix_len = len(req.prefix_indices) + req.host_hit_length
-                    if prefix_len != expected_prefix_len:
-                        raise AssertionError(
-                            "Session reload plan disagrees with matched Full KV: "
-                            f"{prefix_len=} {expected_prefix_len=}"
-                        )
-                    req.cache_protected_len = prefix_len
-                else:
-                    load_back_result = self.tree_cache.init_load_back(
-                        InitLoadBackParams(
-                            best_match_node=req.best_match_node,
-                            host_hit_length=req.host_hit_length,
-                            req=req,
-                        )
+                load_back_result = self.tree_cache.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=req.best_match_node,
+                        host_hit_length=req.host_hit_length,
+                        req=req,
                     )
-                    req.last_node = load_back_result.restored_node
-                    req.prefix_indices = torch.cat(
-                        [
-                            req.prefix_indices,
-                            load_back_result.new_full_device_indices,
-                        ]
-                    )
-                    prefix_len = len(req.prefix_indices)
-                    req.cache_protected_len = (
-                        prefix_len
-                        if load_back_result.cache_protected_len is None
-                        else load_back_result.cache_protected_len
-                    )
+                )
+                req.last_node = load_back_result.restored_node
+                req.prefix_indices = torch.cat(
+                    [
+                        req.prefix_indices,
+                        load_back_result.new_full_device_indices,
+                    ]
+                )
+                prefix_len = len(req.prefix_indices)
+                req.cache_protected_len = (
+                    prefix_len
+                    if load_back_result.cache_protected_len is None
+                    else load_back_result.cache_protected_len
+                )
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - prefix_len
