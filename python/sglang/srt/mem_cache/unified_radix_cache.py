@@ -4140,11 +4140,13 @@ class UnifiedRadixCache(BasePrefixCache):
         }
 
     def _unique_host_locked_pages(self) -> dict[str, int]:
-        """Count the physical host pages demoted sessions keep, once each.
+        """Count the physical host pages demoted sessions keep locked, once each.
 
-        A demoted session keeps its whole root path host-resident (the private
-        tail by host lock, the shared prefix by its session references), so the
-        union walks every node on each session's path.
+        A demoted session's host lock walks its whole root path for full
+        attention. For the sliding window it skips nodes whose window state
+        was a tombstone when the lock was taken: those host copies lie outside
+        the session's window, stay evictable, and are not the session's to
+        keep, so they are not counted here.
 
         :returns: Page counts for the Full and SWA components.
         """
@@ -4159,14 +4161,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 for component_type, pages in locked.items():
                     if component_type not in self.components:
                         continue
-                    host_value = node.component_data[component_type].host_value
-                    if host_value is not None:
-                        pages.update(int(index) // page for index in host_value.tolist())
+                    data = node.component_data[component_type]
+                    if data.host_value is not None and data.host_lock_ref > 0:
+                        pages.update(int(index) // page for index in data.host_value.tolist())
                 node = node.parent
         return {
             "full": len(locked[ComponentType.FULL]),
             "swa": len(locked[ComponentType.SWA]),
         }
+
+    def _host_locked_path_pages(self, node_id: NodeId) -> dict[str, int]:
+        """Count the host pages one demoted session's host lock holds on its path.
+
+        :param node_id: The session's host-resident frontier.
+        :returns: Locked host pages for the Full and SWA components.
+        """
+        page = self.page_size
+        counts = {ComponentType.FULL: 0, ComponentType.SWA: 0}
+        node = self.tree_core.node_by_id(node_id)
+        while node is not self.tree_core.root_node:
+            for component_type in counts:
+                if component_type not in self.components:
+                    continue
+                data = node.component_data[component_type]
+                if data.host_value is not None and data.host_lock_ref > 0:
+                    counts[component_type] += ceil_align(len(data.host_value), page) // page
+            node = node.parent
+        return {"full": counts[ComponentType.FULL], "swa": counts[ComponentType.SWA]}
 
     def _path_tokens(self, node: "UnifiedTreeNode") -> list[int]:
         """Return the token ids from the root to one node, in order.
@@ -4299,8 +4320,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if demoted is not None:
                 state = "host"
                 slot_id = None
-                full, swa = self.streaming_session_protected_residency(demoted.last_node)
-                host_locked = {"full": full.host_backed_pages, "swa": swa.host_backed_pages}
+                host_locked = self._host_locked_path_pages(demoted.last_node)
                 ongoing = [
                     str(ack_id)
                     for ack_id, load_back in sorted(self.ongoing_load_back.items())
