@@ -3977,6 +3977,11 @@ class UnifiedRadixCache(BasePrefixCache):
         host_pool = self.host_pool_group.get_entry(pool_name).host_pool
         page = host_pool.page_size
         free = torch.cat((host_pool.free_slots, *host_pool.release_slots))
+        # Host free slots are token indices; the evidence is page-denominated,
+        # so count and digest the free pages by their first slot.
+        free_pages = free[free % page == 0] // page
+        if int(free_pages.numel()) * page != int(free.numel()):
+            raise AssertionError("Host free slots are not page-granular.")
         total = host_pool.logical_size // page
         available = host_pool.available_size() // page
         held = total - available
@@ -3995,8 +4000,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "protected_size": held - session_held_pages - evictable,
             "session_held_size": session_held_pages,
             "transient_held_size": 0,
-            "free_set_count": int(free.numel()),
-            "free_set_digest": self._free_set_digest(free),
+            "free_set_count": int(free_pages.numel()),
+            "free_set_digest": self._free_set_digest(free_pages),
         }
 
     def _unique_host_locked_pages(self) -> dict[str, int]:
