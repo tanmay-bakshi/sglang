@@ -5229,7 +5229,16 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(prep.host_indices.numel()), 1)
 
-    def test_hicache_swa_host_best_match_keeps_device_anchor(self):
+    def test_hicache_swa_host_best_match_anchors_full_residency(self):
+        """The device anchor follows full-attention residency under a host window.
+
+        A leaf whose full KV was evicted ends the device portion at its parent.
+        A leaf whose full KV is on device but whose sliding-window state lives
+        on host stays in the device portion: the load-back restores the window
+        from host (``swa_host_hit_length``) and never needs to recompute the
+        leaf. Excluding such a leaf made the match and the load-back disagree
+        about who supplies its pages (E3 F16).
+        """
         if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+SWA")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -5267,10 +5276,8 @@ class UnifiedRadixCacheSuite:
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
         self.assertEqual(result.best_match_node, leaf)
-        self.assertEqual(result.last_device_node, parent)
-        self.assertEqual(
-            len(result.device_indices), len(tokens) - _node_key_length(cache, leaf)
-        )
+        self.assertEqual(result.last_device_node, leaf)
+        self.assertEqual(len(result.device_indices), len(tokens))
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
 
