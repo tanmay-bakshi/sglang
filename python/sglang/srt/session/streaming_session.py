@@ -198,6 +198,7 @@ class StreamingSession(BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
         self.demoted: dict[str, DemotedSessionState] = {}
+        self._retiring: set[str] = set()
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -269,6 +270,14 @@ class StreamingSession(BasePrefixCache):
             return None
         return state.extra_key, state.cache_salt
 
+    def demotion_retirement_started(self, session_id: str) -> bool:
+        """Return whether a demotion began retiring its device source.
+
+        :param session_id: Session identifier to inspect.
+        :returns: Whether retirement started without publication completing.
+        """
+        return session_id in self._retiring
+
     def restore_demoted_request_state(
         self, req: Req | None, matched_len: int
     ) -> SessionReloadPlan | None:
@@ -295,7 +304,10 @@ class StreamingSession(BasePrefixCache):
                 f"watermark: {current_watermark=}"
             )
         req.kv.swa_evicted_seqlen = state.swa_evicted_seqlen
-        req.streaming_session_tree_protected_len = state.tree_protected_len
+        # While the private suffix reloads it is tree-published device state, so
+        # the whole restored prefix stays tree-protected until adoption narrows
+        # ownership back to the ordinary prefix.
+        req.streaming_session_tree_protected_len = state.cache_protected_len
         tree_node = self.inner.streaming_session_private_parent(state.last_node)
         if tree_node is None:
             tree_node = state.last_node
@@ -348,6 +360,7 @@ class StreamingSession(BasePrefixCache):
     def reset(self):
         self.slots.clear()
         self.demoted.clear()
+        self._retiring.clear()
         self.inner.reset()
 
     # -- Streaming entries: contract with embedded composers (e.g.
@@ -673,6 +686,10 @@ class StreamingSession(BasePrefixCache):
         # Every fallible publication step has completed before this call. Retire
         # the source while the slot remains discoverable, then expose the new
         # authoritative state with no resource work left after publication.
+        # Retirement is the point of no return: a failure inside it leaves
+        # ownership indeterminate, and the marker tells the commit never to roll
+        # back pages an allocator may already have released.
+        self._retiring.add(session_id)
         self._release_slot_resources(
             session_id,
             slot,
@@ -680,6 +697,7 @@ class StreamingSession(BasePrefixCache):
         )
         self.demoted[session_id] = state
         del self.slots[session_id]
+        self._retiring.discard(session_id)
 
     def _release_slot_resources(
         self,

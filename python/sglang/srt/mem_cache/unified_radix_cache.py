@@ -3436,7 +3436,6 @@ class UnifiedRadixCache(BasePrefixCache):
         host_lock_params: DecLockRefParams | None = None
         host_path_transaction: _StreamingSessionHostPathTransaction | None = None
         committed = False
-        source_retirement_started = False
         try:
             if pending.swa_window_start < pending.tree_prefix_len:
                 self._split_streaming_session_path_at(
@@ -3483,7 +3482,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 session_id,
                 last_node,
             )
-            source_retirement_started = True
             self.session.transition_to_demoted(
                 session_id,
                 last_node,
@@ -3501,11 +3499,11 @@ class UnifiedRadixCache(BasePrefixCache):
             published = committed or self.session.is_demoted(session_id)
             if published:
                 self._pending_streaming_session_demotions.pop(session_id, None)
-            elif source_retirement_started:
-                # Source retirement is deliberately the final local phase. An
-                # exception here is indeterminate and must be handled by the
-                # post-commit TP fail-stop fence; rollback could resurrect pages
-                # that one allocator has already released.
+            elif self.session.demotion_retirement_started(session_id):
+                # Source retirement is the final local phase. A failure inside it
+                # is indeterminate: rollback could resurrect pages an allocator
+                # already released, so the stage stays put and the exception
+                # ends this scheduler through the post-commit fence.
                 pass
             else:
                 self.clear_radix_session_refs(session_id)

@@ -524,6 +524,7 @@ class TestUnifiedLoadBackResult(unittest.TestCase):
 
         req = SimpleNamespace(
             last_node=cls._OLD_DEVICE_NODE,
+            prefix_indices=torch.empty(0, dtype=torch.int64),
             swa_host_hit_length=int(swa_physical_tokens > 0),
             mamba_host_hit_length=0,
         )

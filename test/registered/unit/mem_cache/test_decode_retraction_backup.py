@@ -100,54 +100,10 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         self.assertFalse(tree_core._should_backup_after_insert(state))
 
     def test_demotion_splits_node_at_swa_host_window_boundary(self) -> None:
-        class RecordingTreeCore:
-            """Record tree mutations made by SWA host publication."""
+        """The SWA window boundary is split before publication, then each
+        selected node receives exactly its staged SWA slice in path order."""
 
-            def __init__(self) -> None:
-                self.splits: list[tuple[int, int]] = []
-                self.commits: list[tuple[int, torch.Tensor]] = []
-
-            def _split_node(
-                self,
-                key: list[int],
-                node: SimpleNamespace,
-                split_len: int,
-            ) -> tuple[SimpleNamespace, None]:
-                self.splits.append((node.id, split_len))
-                node.key = key[split_len:]
-                return SimpleNamespace(), None
-
-            def commit_backup(
-                self,
-                node_id: int,
-                host_indices: torch.Tensor,
-                transfers: dict[ComponentType, list[PoolTransfer]],
-            ) -> None:
-                self.assert_empty_full(host_indices)
-                swa_transfer = transfers[ComponentType.SWA][0]
-                assert swa_transfer.host_indices is not None
-                self.commits.append((node_id, swa_transfer.host_indices.clone()))
-
-            @staticmethod
-            def assert_empty_full(host_indices: torch.Tensor) -> None:
-                assert host_indices.numel() == 0
-
-        class RecordingHostPoolGroup:
-            """Record released host slices."""
-
-            def __init__(self) -> None:
-                self.frees: list[tuple[PoolName, torch.Tensor]] = []
-
-            def free(
-                self,
-                indices: torch.Tensor,
-                *,
-                pool: PoolName,
-            ) -> int:
-                self.frees.append((pool, indices.clone()))
-                return len(indices)
-
-        def node(node_id: int, length: int) -> SimpleNamespace:
+        def make_node(node_id: int, length: int) -> SimpleNamespace:
             return SimpleNamespace(
                 id=node_id,
                 key=list(range(length)),
@@ -162,16 +118,53 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 },
             )
 
-        prefix_node = node(1, 8)
-        tail_node = node(2, 4)
+        class RecordingTreeCore:
+            """Record the split and attach SWA host slices like the real core."""
+
+            def __init__(self) -> None:
+                self.nodes: dict[int, SimpleNamespace] = {}
+                self.splits: list[tuple[int, int]] = []
+                self.commits: list[tuple[int, torch.Tensor]] = []
+
+            def _split_node(
+                self,
+                key: list[int],
+                node: SimpleNamespace,
+                split_len: int,
+            ) -> tuple[SimpleNamespace, None]:
+                self.splits.append((node.id, split_len))
+                parent = make_node(max(self.nodes) + 1, split_len)
+                node.key = key[split_len:]
+                self.nodes[parent.id] = parent
+                return parent, None
+
+            def commit_backup(
+                self,
+                node_id: int,
+                host_indices: torch.Tensor,
+                transfers: dict[ComponentType, list[PoolTransfer]],
+            ) -> None:
+                assert host_indices.numel() == 0
+                swa_transfer = transfers[ComponentType.SWA][0]
+                assert swa_transfer.host_indices is not None
+                self.commits.append((node_id, swa_transfer.host_indices.clone()))
+                swa_data = self.nodes[node_id].component_data[ComponentType.SWA]
+                swa_data.host_value = swa_transfer.host_indices.clone()
+
+        prefix_node = make_node(1, 8)
+        tail_node = make_node(2, 4)
         tree_core = RecordingTreeCore()
-        host_pool_group = RecordingHostPoolGroup()
+        tree_core.nodes = {prefix_node.id: prefix_node, tail_node.id: tail_node}
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = tree_core
-        cache.host_pool_group = host_pool_group
 
         def path(_last_node: int, _expected_len: int) -> list[SimpleNamespace]:
-            return [prefix_node, tail_node]
+            split_parents = [
+                node
+                for node in tree_core.nodes.values()
+                if node is not prefix_node and node is not tail_node
+            ]
+            return [*split_parents, prefix_node, tail_node]
 
         cache._streaming_session_path = path
         backup = RetractionBackup(
@@ -184,6 +177,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             ],
         )
 
+        cache._split_streaming_session_path_at(tail_node.id, 12, 4)
         transaction = _StreamingSessionHostPathTransaction(
             ledger=_HostStageLedger.from_backup(backup)
         )
@@ -191,6 +185,7 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             tail_node.id,
             backup,
             transaction,
+            swa_window_start=4,
         )
 
         self.assertEqual(tree_core.splits, [(prefix_node.id, 4)])
@@ -198,10 +193,24 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         self.assertEqual(
             [(node_id, indices.tolist()) for node_id, indices in tree_core.commits],
             [
-                (tail_node.id, [104, 105, 106, 107]),
                 (prefix_node.id, [100, 101, 102, 103]),
+                (tail_node.id, [104, 105, 106, 107]),
             ],
         )
+        self.assertEqual(
+            [
+                (attachment.node_id, attachment.component_type)
+                for attachment in transaction.attachments
+            ],
+            [
+                (prefix_node.id, ComponentType.SWA),
+                (tail_node.id, ComponentType.SWA),
+            ],
+        )
+        self.assertTrue(
+            all(attachment.stage_slice.tree_owned for attachment in transaction.attachments)
+        )
+        transaction.ledger.assert_fully_consumed()
 
     def _make_pool(
         self, layer_num: int, *, size: int | None = None, page_size: int = 1
@@ -895,6 +904,47 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                     available_before,
                 )
                 cache.sanity_check()
+
+    def test_demotion_retirement_failure_keeps_the_stage(self) -> None:
+        """A failure after source retirement began is indeterminate, never rolled back."""
+        session_id = "demotion-retirement-failure"
+        page_size = 64
+        exact_tokens = page_size * 2 + 1
+        token_ids = array("q", range(exact_tokens + 1))
+        env = self._build_cache(
+            hicache_ratio=1.0,
+            disable=False,
+            enable_session_radix_cache=True,
+            page_size=page_size,
+            sliding_window_size=page_size,
+        )
+        cache = env.cache
+        self._admit_streaming_session(env, session_id, exact_tokens)
+        self.assertEqual(
+            cache.prepare_streaming_session_demotion(
+                session_id,
+                token_ids,
+                extra_key="retire-namespace",
+                cache_salt="retire-tenant",
+                priority=0,
+            ),
+            exact_tokens,
+        )
+
+        with (
+            mock.patch.object(
+                cache.session,
+                "_release_slot_resources",
+                side_effect=RuntimeError("injected retirement failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected retirement failure"),
+        ):
+            cache.commit_streaming_session_demotion(session_id)
+
+        self.assertTrue(cache.session.demotion_retirement_started(session_id))
+        self.assertIn(session_id, cache._pending_streaming_session_demotions)
+        self.assertNotIn(session_id, cache.session.demoted)
+        self.assertIn(session_id, cache.session.slots)
 
     def test_backup_declined_when_host_pool_too_small(self):
         # A backup-only host pool is deliberately smaller than the device pool,

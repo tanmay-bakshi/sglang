@@ -288,6 +288,8 @@ def test_demoted_snapshot_and_close_release_only_session_ownership() -> None:
         tree_protected_len=96,
         swa_evicted_seqlen=0,
         host_lock_params=lock_params,
+        extra_key=None,
+        cache_salt=None,
     )
     tree_cache.slots["active-session"] = SessionSlot(req_pool_idx=0)
 
@@ -339,6 +341,8 @@ def test_restored_private_suffix_reanchors_tree_lock_and_becomes_slot_owned() ->
         tree_protected_len=48,
         swa_evicted_seqlen=0,
         host_lock_params=host_lock_params,
+        extra_key=None,
+        cache_salt=None,
     )
 
     tree_cache._release_demoted_state("session-a")
@@ -418,6 +422,8 @@ def test_demoted_swa_adoption_reconciles_restored_private_ownership(
         tree_protected_len=16,
         swa_evicted_seqlen=32,
         host_lock_params=DecLockRefParams(host_lock_id=19),
+        extra_key=None,
+        cache_salt=None,
     )
 
     assert tree_cache._release_demoted_state("session-a")
@@ -445,6 +451,8 @@ def test_demoted_reload_skips_ordinary_radix_insertion_until_adoption() -> None:
         tree_protected_len=0,
         swa_evicted_seqlen=0,
         host_lock_params=DecLockRefParams(),
+        extra_key=None,
+        cache_salt=None,
     )
     req = _FakeReq("session-a", req_pool_idx=0, committed=65, allocated=80)
 
