@@ -97,7 +97,6 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.fail_stop_collective import FailStopCollective
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -401,12 +400,6 @@ STEP_MAX_US = 2_000_000
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
 
-SESSION_COLLECTIVE_TIMEOUT_SECONDS = 30.0
-_SESSION_COLLECTIVE = FailStopCollective(
-    timeout_seconds=SESSION_COLLECTIVE_TIMEOUT_SECONDS
-)
-
-
 def _validate_streaming_session_topology(
     server_args: ServerArgs,
     ps: ParallelState,
@@ -480,18 +473,15 @@ def _streaming_session_demotion_identity(
 def _streaming_session_all_reduce(
     tensor: torch.Tensor,
     *,
-    operation: str,
     group: torch.distributed.ProcessGroup,
 ) -> None:
-    """Run one bounded session-control consensus operation.
+    """Run one session-control consensus reduction.
 
-    :param tensor: CPU tensor reduced in place.
-    :param operation: Stable diagnostic label for the transition boundary.
+    :param tensor: CPU tensor reduced in place with the MIN operator.
     :param group: Tensor-parallel CPU process group.
     """
-    _SESSION_COLLECTIVE.all_reduce(
+    torch.distributed.all_reduce(
         tensor,
-        operation=operation,
         op=torch.distributed.ReduceOp.MIN,
         group=group,
     )
@@ -5811,7 +5801,6 @@ class Scheduler(
         if self.ps.tp_size > 1:
             _streaming_session_all_reduce(
                 vote,
-                operation="streaming-session-demotion-preparation-vote",
                 group=self.tp_cpu_group,
             )
         vote_values = [int(value) for value in vote.tolist()]
@@ -5838,13 +5827,12 @@ class Scheduler(
                     )
                 )
             except Exception:
-                _SESSION_COLLECTIVE.terminate(
-                    operation="streaming-session-demotion-commit",
-                    reason=(
-                        "rank-local commit failed after a unanimous preparation "
-                        f"vote:\n{traceback.format_exc()}"
-                    ),
+                logger.error(
+                    "Session demotion commit failed after a unanimous "
+                    "preparation vote:\n%s",
+                    traceback.format_exc(),
                 )
+                raise
 
             committed = torch.tensor(
                 [
@@ -5859,7 +5847,6 @@ class Scheduler(
             if self.ps.tp_size > 1:
                 _streaming_session_all_reduce(
                     committed,
-                    operation="streaming-session-demotion-post-commit-fence",
                     group=self.tp_cpu_group,
                 )
             committed_values = [int(value) for value in committed.tolist()]
@@ -5867,9 +5854,8 @@ class Scheduler(
                 committed_values[0] != -committed_values[1]
                 or committed_values[2] != -committed_values[3]
             ):
-                _SESSION_COLLECTIVE.terminate(
-                    operation="streaming-session-demotion-post-commit-fence",
-                    reason="committed host ownership diverged across ranks",
+                raise RuntimeError(
+                    "Committed host ownership diverged across tensor-parallel ranks."
                 )
 
         if not _is_streaming_session_output_rank(self.ps):

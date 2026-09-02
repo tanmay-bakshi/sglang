@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.distributed.fail_stop_collective import FailStopCollective
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -108,11 +107,6 @@ if TYPE_CHECKING:
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
-
-HICACHE_COLLECTIVE_TIMEOUT_SECONDS = 30.0
-_HICACHE_COLLECTIVE = FailStopCollective(
-    timeout_seconds=HICACHE_COLLECTIVE_TIMEOUT_SECONDS
-)
 
 # Metric label per component, matching the host pool names used by
 # hicache_backup_tokens_total and the host occupancy gauges.
@@ -525,53 +519,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
-
-    def _fail_stop_all_reduce_attn_groups(
-        self,
-        tensor: torch.Tensor,
-        op: torch.distributed.ReduceOp,
-        *,
-        operation: str,
-    ) -> None:
-        """Run bounded attention-group consensus without changing its topology."""
-        reduced = False
-        for group_name, group in (
-            ("attention-context", self.attn_cp_group),
-            ("attention-tensor", self.attn_tp_group),
-        ):
-            if group is None or torch.distributed.get_world_size(group=group) <= 1:
-                continue
-            _HICACHE_COLLECTIVE.all_reduce(
-                tensor,
-                operation=f"{operation}:{group_name}",
-                op=op,
-                group=group,
-            )
-            reduced = True
-        if reduced or self.tp_world_size <= 1:
-            return
-        _HICACHE_COLLECTIVE.all_reduce(
-            tensor,
-            operation=f"{operation}:tensor-parallel",
-            op=op,
-            group=self.tp_group,
-        )
-
-    def _fail_stop_all_reduce(
-        self,
-        data: torch.Tensor,
-        tp_reduce_op: torch.distributed.ReduceOp,
-        *,
-        operation: str,
-    ) -> None:
-        """Run bounded TP consensus and preserve the established PP relay."""
-        if self.pp_rank == 0:
-            self._fail_stop_all_reduce_attn_groups(
-                data,
-                tp_reduce_op,
-                operation=operation,
-            )
-        self._pp_sync(data)
 
     def _barrier_attn_groups(self):
         waited = False
@@ -3282,11 +3229,7 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._fail_stop_all_reduce(
-                sync_tensor,
-                torch.distributed.ReduceOp.MIN,
-                operation="hicache-load-completion-consensus",
-            )
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
             assert (
                 sync_tensor[1].item() == -sync_tensor[2].item()

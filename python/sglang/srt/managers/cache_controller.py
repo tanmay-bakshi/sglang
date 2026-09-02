@@ -17,20 +17,9 @@ limitations under the License.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
-from enum import Enum
-from itertools import count
+from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    ClassVar,
-    Generic,
-    List,
-    Optional,
-    TypeVar,
-)
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -114,364 +103,94 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
-class OperationLifecycleError(RuntimeError):
-    """Raised when a cache operation violates its lifecycle contract."""
+class CacheOperation:
 
+    counter = 0
 
-class OperationRegistrationError(OperationLifecycleError):
-    """Raised when an operation registration is absent, stale, or mismatched."""
-
-
-class OperationState(str, Enum):
-    """Lifecycle states for an L2 cache transfer."""
-
-    PREPARED = "prepared"
-    REGISTERED = "registered"
-    QUEUED = "queued"
-    SUBMITTED = "submitted"
-    ACKED = "acked"
-    CANCELLED = "cancelled"
-
-
-class TransferDirection(str, Enum):
-    """Direction of an L2 cache transfer."""
-
-    DEVICE_TO_HOST = "device_to_host"
-    HOST_TO_DEVICE = "host_to_device"
-
-
-@dataclass(frozen=True, order=True)
-class OperationId:
-    """Controller-scoped identity for one physical cache operation.
-
-    :ivar controller_id: Identity of the controller that created the operation.
-    :ivar sequence: Monotonic sequence within the controller.
-    """
-
-    controller_id: int
-    sequence: int
-
-
-@dataclass(frozen=True)
-class _OwnedAllocation:
-    """One allocation owned by a prepared operation.
-
-    :ivar pool_name: Logical pool that supplied the allocation.
-    :ivar indices: Allocated indices returned by the pool.
-    :ivar release: Exact callback that returns the allocation to its pool.
-    """
-
-    pool_name: PoolName
-    indices: torch.Tensor
-    release: Callable[[torch.Tensor], object]
-
-
-class AllocationReceipt:
-    """Resumable ownership ledger for allocations made during preparation."""
-
-    _allocations: list[_OwnedAllocation]
-    _next_release_index: int
-    _relinquished: bool
-
-    def __init__(self) -> None:
-        self._allocations = []
-        self._next_release_index = 0
-        self._relinquished = False
-
-    def add(
+    def __init__(
         self,
-        pool_name: PoolName,
-        indices: torch.Tensor,
-        release: Callable[[torch.Tensor], object],
-    ) -> None:
-        """Record one allocation before the operation becomes visible.
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+        priority: Optional[int] = None,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ):
+        self.host_indices = host_indices
+        self.device_indices = device_indices
+        self.node_ids = [node_id]
+        self.data = None
+        self.pool_transfers = pool_transfers
 
-        :param pool_name: Logical pool that supplied the allocation.
-        :param indices: Allocated indices.
-        :param release: Callback that frees exactly those indices.
-        :raises OperationLifecycleError: If release or ownership transfer began.
-        """
+        self.id = CacheOperation.counter
+        CacheOperation.counter += 1
+        # default priority is the order of creation
+        self.priority = priority if priority is not None else self.id
 
-        if self._next_release_index != 0 or self._relinquished:
-            raise OperationLifecycleError(
-                "Cannot add allocations after receipt finalization begins."
+    @staticmethod
+    def _merge_pool_transfers(
+        ops: List[CacheOperation],
+    ) -> Optional[List[PoolTransfer]]:
+        grouped: dict[tuple[PoolName, Optional[PoolName]], List[PoolTransfer]] = {}
+        for op in ops:
+            for transfer in op.pool_transfers or []:
+                grouped.setdefault(
+                    (transfer.name, transfer.indices_from_pool), []
+                ).append(transfer)
+        if not grouped:
+            return None
+
+        def cat_or_none(tensors):
+            parts = [tensor for tensor in tensors if tensor is not None]
+            return torch.cat(parts) if parts else None
+
+        return [
+            PoolTransfer(
+                name=transfers[0].name,
+                host_indices=cat_or_none(t.host_indices for t in transfers),
+                device_indices=cat_or_none(t.device_indices for t in transfers),
+                keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                hit_policy=transfers[0].hit_policy,
+                indices_from_pool=transfers[0].indices_from_pool,
             )
-        self._allocations.append(_OwnedAllocation(pool_name, indices, release))
+            for transfers in grouped.values()
+        ]
 
-    def release_all(self) -> None:
-        """Release every owned allocation once, in reverse allocation order.
+    @staticmethod
+    def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
+        assert ops
+        if len(ops) == 1:
+            return ops[0]
+        host_indices = torch.cat([op.host_indices for op in ops])
+        device_indices = torch.cat([op.device_indices for op in ops])
+        node_ids = []
+        priority = min(op.priority for op in ops)
+        for op in ops:
+            node_ids.extend(op.node_ids)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            pool_transfers=CacheOperation._merge_pool_transfers(ops),
+        )
+        merged_op.node_ids = node_ids
+        return merged_op
 
-        The cursor advances before invoking a pool callback. A callback that raises
-        is an allocator failure and is never retried blindly, which prevents a
-        callback that freed and then raised from causing a double free.
-        """
-
-        if self._relinquished:
-            raise OperationLifecycleError(
-                "Cannot cancel allocations after ownership was relinquished."
-            )
-        while self._next_release_index < len(self._allocations):
-            allocation_index = len(self._allocations) - self._next_release_index - 1
-            allocation = self._allocations[allocation_index]
-            self._next_release_index += 1
-            allocation.release(allocation.indices)
-
-    def relinquish(self) -> None:
-        """Transfer all prepared allocations to the operation's domain owner."""
-
-        if self._next_release_index != 0:
-            raise OperationLifecycleError(
-                "Cannot relinquish a partially released allocation receipt."
-            )
-        self._relinquished = True
-
-    @property
-    def allocation_count(self) -> int:
-        """Return the number of independently owned allocations.
-
-        :returns: Number of allocations in the receipt.
-        """
-
-        return len(self._allocations)
-
-    @property
-    def release_complete(self) -> bool:
-        """Return whether cancellation released the complete receipt.
-
-        :returns: Whether all allocations have been released.
-        """
-
-        return self._next_release_index == len(self._allocations)
+    def __lt__(self, other: CacheOperation):
+        return self.priority < other.priority
 
 
-_OwnerT = TypeVar("_OwnerT")
-
-
-@dataclass(frozen=True)
-class OperationRegistration(Generic[_OwnerT]):
-    """Capability proving that a live domain owner backs an operation.
-
-    :ivar operation_id: Operation authorized by the capability.
-    :ivar generation: Registration generation used to reject stale tokens.
-    """
-
-    operation_id: OperationId
-    generation: int
-    _table: OperationOwnerTable[_OwnerT]
-
-
-@dataclass
-class _OwnerEntry(Generic[_OwnerT]):
-    """Live owner-table entry.
-
-    :ivar owner: Domain object responsible for completion and cleanup.
-    :ivar generation: Generation bound into the registration capability.
-    """
-
-    owner: _OwnerT
-    generation: int
-
-
-class OperationOwnerTable(Generic[_OwnerT]):
-    """Typed registry binding prepared operations to live domain owners."""
-
-    _entries: dict[OperationId, _OwnerEntry[_OwnerT]]
-    _generation_counter: count
-    _lock: threading.RLock
-
-    def __init__(self) -> None:
-        self._entries = {}
-        self._generation_counter = count()
-        self._lock = threading.RLock()
-
-    def register(
-        self, operation: PreparedTransfer, owner: _OwnerT
-    ) -> OperationRegistration[_OwnerT]:
-        """Register a domain owner for one prepared operation.
-
-        :param operation: Prepared operation to bind.
-        :param owner: Domain owner responsible for the operation.
-        :returns: Capability required for queueing, submission, and completion.
-        :raises OperationRegistrationError: If the operation is already registered.
-        """
-
-        with self._lock:
-            if operation.operation_id in self._entries:
-                raise OperationRegistrationError(
-                    f"Operation {operation.operation_id} is already registered."
-                )
-            generation = next(self._generation_counter)
-            operation._bind_registration(self, generation)
-            self._entries[operation.operation_id] = _OwnerEntry(owner, generation)
-            return OperationRegistration(operation.operation_id, generation, self)
-
-    def require(
-        self,
-        registration: OperationRegistration[_OwnerT],
-        operation_id: OperationId,
-    ) -> _OwnerT:
-        """Validate a capability and return its live owner.
-
-        :param registration: Registration capability to validate.
-        :param operation_id: Operation that is requesting authority.
-        :returns: Registered domain owner.
-        :raises OperationRegistrationError: If the capability is invalid.
-        """
-
-        if registration._table is not self:
-            raise OperationRegistrationError("Registration belongs to another table.")
-        if registration.operation_id != operation_id:
-            raise OperationRegistrationError(
-                "Registration does not belong to the submitted operation."
-            )
-        with self._lock:
-            entry = self._entries.get(operation_id)
-            if entry is None or entry.generation != registration.generation:
-                raise OperationRegistrationError(
-                    f"Registration for {operation_id} is stale."
-                )
-            return entry.owner
-
-    def unregister(self, registration: OperationRegistration[_OwnerT]) -> _OwnerT:
-        """Retire a live registration and return its owner.
-
-        :param registration: Live registration capability.
-        :returns: Owner removed from the table.
-        :raises OperationRegistrationError: If the capability is invalid.
-        """
-
-        owner = self.require(registration, registration.operation_id)
-        with self._lock:
-            del self._entries[registration.operation_id]
-        return owner
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-
-@dataclass
-class PreparedTransfer:
-    """Allocated but initially invisible L2 transfer.
-
-    :ivar operation_id: Controller-generated transfer identity.
-    :ivar direction: Physical transfer direction.
-    :ivar domain_owner_id: Domain-local identity, such as a tree node ID.
-    :ivar host_indices: Anchor host-pool indices.
-    :ivar device_indices: Anchor device-pool indices.
-    :ivar priority: Scheduling priority for a queued H2D transfer.
-    :ivar pool_transfers: Operation-owned side-pool descriptors.
-    :ivar allocations: Exact ledger of allocations made during preparation.
-    :ivar state: Current lifecycle state.
-    """
-
-    operation_id: OperationId
-    direction: TransferDirection
-    domain_owner_id: int
-    host_indices: torch.Tensor
-    device_indices: torch.Tensor
-    priority: int
-    pool_transfers: list[PoolTransfer] | None
-    allocations: AllocationReceipt
-    state: OperationState = OperationState.PREPARED
-    _registration_table: object | None = None
-    _registration_generation: int | None = None
-
-    def _bind_registration(self, table: object, generation: int) -> None:
-        if self.state != OperationState.PREPARED:
-            raise OperationLifecycleError(
-                f"Cannot register {self.operation_id} from state {self.state.value}."
-            )
-        self._registration_table = table
-        self._registration_generation = generation
-        self.state = OperationState.REGISTERED
-
-    def _require_registration(self, registration: OperationRegistration[Any]) -> None:
-        if (
-            self._registration_table is not registration._table
-            or self._registration_generation != registration.generation
-        ):
-            raise OperationRegistrationError(
-                f"Registration does not authorize {self.operation_id}."
-            )
-
-    def _transition(
-        self,
-        expected: OperationState | tuple[OperationState, ...],
-        target: OperationState,
-    ) -> None:
-        expected_states = expected if isinstance(expected, tuple) else (expected,)
-        if self.state not in expected_states:
-            raise OperationLifecycleError(
-                f"Cannot transition {self.operation_id} from {self.state.value} "
-                f"to {target.value}."
-            )
-        self.state = target
-
-
-@dataclass(frozen=True)
-class _TransferBatch:
-    """Physical batch assembled from registered prepared transfers.
-
-    :ivar operations: Logical operations represented by the batch.
-    :ivar host_indices: Merged anchor host indices.
-    :ivar device_indices: Merged anchor device indices.
-    :ivar priority: Minimum member priority.
-    :ivar pool_transfers: Merged operation-owned side-pool descriptors.
-    """
-
-    operations: tuple[PreparedTransfer, ...]
-    host_indices: torch.Tensor
-    device_indices: torch.Tensor
-    priority: int
-    pool_transfers: list[PoolTransfer] | None
-
-
-@dataclass(frozen=True)
-class _QueuedTransfer:
-    """Registered H2D transfer made visible to the controller queue.
-
-    :ivar operation: Queued prepared operation.
-    :ivar registration: Capability active when the operation was queued.
-    """
-
-    operation: PreparedTransfer
-    registration: OperationRegistration[Any]
-
-
-@dataclass
-class AckCommitProgress:
-    """Persistent progress for resumable physical-ACK commitment.
-
-    :ivar next_operation_index: First physical-ACK member not yet committed.
-    :ivar metrics_emitted: Whether aggregate transfer metrics were emitted.
-    """
-
-    next_operation_index: int = 0
-    metrics_emitted: bool = False
-
-
-@dataclass
-class HiCacheAck:
-    """Physical transfer ACK carrying logical operation identities.
-
-    :ivar start_event: Transfer start event.
-    :ivar finish_event: Transfer completion event.
-    :ivar operation_ids: Ordered logical operations in the physical transfer.
-    :ivar num_tokens: Number of transferred anchor tokens.
-    :ivar timing_enabled: Whether events support elapsed-time measurement.
-    :ivar num_tokens_by_pool: Token counts for independently indexed pools.
-    :ivar num_bytes: Total bytes moved across anchor and side pools.
-    :ivar commit_progress: Persistent member and metrics commit cursor.
-    """
-
+class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
-    operation_ids: tuple[OperationId, ...]
+    node_ids: List[int]
     num_tokens: int = 0
     timing_enabled: bool = False
-    num_tokens_by_pool: dict[str, int] | None = None
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
-    commit_progress: AckCommitProgress = field(default_factory=AckCommitProgress)
 
 
 @dataclass
@@ -568,9 +287,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-    """Coordinates prepared L2 transfers and optional storage operations."""
-
-    _controller_id_counter: ClassVar[count] = count()
 
     def __init__(
         self,
@@ -645,10 +361,12 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self._initialize_operation_lifecycle()
+        # self.write_queue = PriorityQueue[CacheOperation]()
+        self.load_queue: List[CacheOperation] = []
+        self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
         # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards during batch submission.
+        # behind in-flight forwards (see start_loading).
         self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
@@ -1028,189 +746,13 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
         )
 
-    def _initialize_operation_lifecycle(self) -> None:
-        """Initialize controller-scoped operation identity and ownership state."""
-
-        self._controller_id = next(self._controller_id_counter)
-        self._operation_sequence = count()
-        self._operations: dict[OperationId, PreparedTransfer] = {}
-        self.load_queue: list[_QueuedTransfer] = []
-
-    @staticmethod
-    def copy_pool_transfers(
-        pool_transfers: list[PoolTransfer] | None,
-    ) -> list[PoolTransfer] | None:
-        """Create operation-owned copies of pool-transfer descriptors.
-
-        :param pool_transfers: Caller-owned descriptors.
-        :returns: Independent descriptors that may be resolved by an operation.
-        """
-
-        if pool_transfers is None or len(pool_transfers) == 0:
-            return None
-        return [
-            PoolTransfer(
-                name=transfer.name,
-                host_indices=transfer.host_indices,
-                device_indices=transfer.device_indices,
-                keys=list(transfer.keys) if transfer.keys is not None else None,
-                hit_policy=transfer.hit_policy,
-                nodes_to_load=(
-                    list(transfer.nodes_to_load)
-                    if transfer.nodes_to_load is not None
-                    else None
-                ),
-                indices_from_pool=transfer.indices_from_pool,
-            )
-            for transfer in pool_transfers
-        ]
-
-    @staticmethod
-    def _merge_pool_transfers(
-        operations: tuple[PreparedTransfer, ...],
-    ) -> list[PoolTransfer] | None:
-        grouped: dict[tuple[PoolName, PoolName | None], list[PoolTransfer]] = {}
-        for operation in operations:
-            for transfer in operation.pool_transfers or []:
-                grouped.setdefault(
-                    (transfer.name, transfer.indices_from_pool), []
-                ).append(transfer)
-        if len(grouped) == 0:
-            return None
-
-        def cat_optional(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
-            parts = [tensor for tensor in tensors if tensor is not None]
-            return torch.cat(parts) if len(parts) > 0 else None
-
-        merged: list[PoolTransfer] = []
-        for transfers in grouped.values():
-            merged.append(
-                PoolTransfer(
-                    name=transfers[0].name,
-                    host_indices=cat_optional(
-                        [transfer.host_indices for transfer in transfers]
-                    ),
-                    device_indices=cat_optional(
-                        [transfer.device_indices for transfer in transfers]
-                    ),
-                    keys=[
-                        key for transfer in transfers for key in (transfer.keys or [])
-                    ]
-                    or None,
-                    hit_policy=transfers[0].hit_policy,
-                    nodes_to_load=[
-                        node
-                        for transfer in transfers
-                        for node in (transfer.nodes_to_load or [])
-                    ]
-                    or None,
-                    indices_from_pool=transfers[0].indices_from_pool,
-                )
-            )
-        return merged
-
-    def _new_prepared_transfer(
-        self,
-        *,
-        direction: TransferDirection,
-        domain_owner_id: int,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        priority: int | None,
-        pool_transfers: list[PoolTransfer] | None,
-        allocations: AllocationReceipt,
-    ) -> PreparedTransfer:
-        operation_id = OperationId(
-            controller_id=self._controller_id,
-            sequence=next(self._operation_sequence),
-        )
-        operation = PreparedTransfer(
-            operation_id=operation_id,
-            direction=direction,
-            domain_owner_id=domain_owner_id,
-            host_indices=host_indices,
-            device_indices=device_indices,
-            priority=operation_id.sequence if priority is None else priority,
-            pool_transfers=pool_transfers,
-            allocations=allocations,
-        )
-        self._operations[operation_id] = operation
-        return operation
-
-    def _require_known_operation(self, operation: PreparedTransfer) -> None:
-        known = self._operations.get(operation.operation_id)
-        if known is not operation:
-            raise OperationLifecycleError(
-                f"Operation {operation.operation_id} is not live on this controller."
-            )
-
-    def _require_registration(
-        self,
-        operation: PreparedTransfer,
-        registration: OperationRegistration[Any] | None,
-    ) -> None:
-        self._require_known_operation(operation)
-        if not isinstance(registration, OperationRegistration):
-            raise OperationRegistrationError(
-                f"Operation {operation.operation_id} requires a registration."
-            )
-        registration._table.require(registration, operation.operation_id)
-        operation._require_registration(registration)
-
-    def _build_transfer_batch(
-        self, operations: tuple[PreparedTransfer, ...]
-    ) -> _TransferBatch:
-        if len(operations) == 0:
-            raise OperationLifecycleError("Cannot build an empty transfer batch.")
-        operation_ids = {operation.operation_id for operation in operations}
-        if len(operation_ids) != len(operations):
-            raise OperationLifecycleError(
-                "A physical transfer batch cannot contain duplicate operations."
-            )
-        return _TransferBatch(
-            operations=operations,
-            host_indices=torch.cat(
-                [operation.host_indices for operation in operations]
-            ),
-            device_indices=torch.cat(
-                [operation.device_indices for operation in operations]
-            ),
-            priority=min(operation.priority for operation in operations),
-            pool_transfers=self._merge_pool_transfers(operations),
-        )
-
-    def _assert_resettable(self) -> None:
-        live_operations = [
-            operation.operation_id
-            for operation in self._operations.values()
-            if operation.state not in (OperationState.ACKED, OperationState.CANCELLED)
-        ]
-        incomplete_acks = [
-            ack.operation_ids
-            for ack in (*self.ack_write_queue, *self.ack_load_queue)
-            if ack.commit_progress.next_operation_index < len(ack.operation_ids)
-            or not ack.commit_progress.metrics_emitted
-        ]
-        if len(live_operations) == 0 and len(incomplete_acks) == 0:
-            return
-        raise OperationLifecycleError(
-            "Cannot reset HiCache with live operations or incomplete ACKs: "
-            f"operations={live_operations}, acks={incomplete_acks}."
-        )
-
-    def reset(self) -> None:
-        """Reset an idle controller without discarding live ownership state.
-
-        :raises OperationLifecycleError: If an operation or ACK is nonterminal.
-        """
-
-        self._assert_resettable()
+    def reset(self):
         self.storage_stop_event.set()
 
+        self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
-        self._operations.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
             self.prefetch_io_aux_thread.join()
@@ -1246,252 +788,70 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
-    def prepare_device_to_host(
+    def write(
         self,
         device_indices: torch.Tensor,
-        priority: int | None = None,
-        domain_owner_id: int = -1,
-        extra_pools: list[PoolTransfer] | None = None,
-    ) -> PreparedTransfer | None:
-        """Allocate an invisible D2H transfer.
-
-        :param device_indices: Anchor device indices to copy.
-        :param priority: Optional scheduling priority.
-        :param domain_owner_id: Domain identity associated with the operation.
-        :param extra_pools: Side-pool descriptors, unsupported by this controller.
-        :returns: Prepared transfer, or ``None`` when host allocation fails.
-        :raises ValueError: If side pools are supplied to a non-hybrid controller.
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
         """
-
-        if extra_pools is not None and len(extra_pools) > 0:
-            raise ValueError("Side-pool transfers require HybridCacheController.")
-        allocations = AllocationReceipt()
+        Back up KV caches from device memory to host memory.
+        """
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        allocations.add(PoolName.KV, host_indices, self.mem_pool_host.free)
-        return self._new_prepared_transfer(
-            direction=TransferDirection.DEVICE_TO_HOST,
-            domain_owner_id=domain_owner_id,
-            host_indices=host_indices,
-            device_indices=device_indices,
-            priority=priority,
-            pool_transfers=None,
-            allocations=allocations,
+        self.write_queue.append(
+            CacheOperation(host_indices, device_indices, node_id, priority)
         )
+        self.start_writing()
+        return host_indices
 
-    def submit_device_to_host(
-        self,
-        operation: PreparedTransfer,
-        registration: OperationRegistration[Any] | None,
-    ) -> HiCacheAck:
-        """Submit a registered D2H operation to the transfer engine.
+    def start_writing(self) -> None:
+        if len(self.write_queue) == 0:
+            return
 
-        :param operation: Registered D2H operation.
-        :param registration: Live owner capability for the operation.
-        :returns: Physical ACK appended to ``ack_write_queue``.
-        :raises OperationLifecycleError: If direction or state is invalid.
-        :raises OperationRegistrationError: If the capability is invalid.
-        """
-
-        self._require_registration(operation, registration)
-        if operation.direction != TransferDirection.DEVICE_TO_HOST:
-            raise OperationLifecycleError("Cannot submit an H2D operation as D2H.")
-        if operation.state != OperationState.REGISTERED:
-            raise OperationLifecycleError(
-                f"D2H submission requires REGISTERED, got {operation.state.value}."
-            )
-
-        host_indices, device_indices, pool_transfers = self._move_write_operation(
-            operation
-        )
-        operation._transition(OperationState.REGISTERED, OperationState.SUBMITTED)
+        op = CacheOperation.merge_ops(self.write_queue)
+        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
+        self.write_queue.clear()
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
 
-        ack = HiCacheAck(
-            start_event=completion.start_event,
-            finish_event=completion.finish_event,
-            operation_ids=(operation.operation_id,),
-            num_tokens=len(operation.device_indices),
-            timing_enabled=completion.timing_enabled,
-            num_tokens_by_pool=self._num_tokens_by_pool(operation),
-            num_bytes=self._transfer_num_bytes(operation),
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
+            )
         )
-        self.ack_write_queue.append(ack)
-        return ack
 
-    def _transfer_num_bytes(self, operation: PreparedTransfer | _TransferBatch) -> int:
-        return len(operation.device_indices) * self.mem_pool_host.size_per_token
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        return len(op.device_indices) * self.mem_pool_host.size_per_token
 
-    def _num_tokens_by_pool(
-        self, operation: PreparedTransfer | _TransferBatch
-    ) -> dict[str, int]:
-        return {PoolName.KV.value: len(operation.device_indices)}
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        return {PoolName.KV.value: len(op.device_indices)}
 
-    def prepare_host_to_device(
+    def load(
         self,
         host_indices: torch.Tensor,
-        priority: int | None = None,
-        domain_owner_id: int = -1,
-        extra_pools: list[PoolTransfer] | None = None,
-    ) -> PreparedTransfer | None:
-        """Allocate an invisible H2D transfer.
-
-        :param host_indices: Anchor host indices to copy.
-        :param priority: Optional scheduling priority.
-        :param domain_owner_id: Domain identity associated with the operation.
-        :param extra_pools: Side-pool descriptors, unsupported by this controller.
-        :returns: Prepared transfer, or ``None`` when device allocation fails.
-        :raises ValueError: If side pools are supplied to a non-hybrid controller.
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[torch.Tensor]:
         """
-
-        if extra_pools is not None and len(extra_pools) > 0:
-            raise ValueError("Side-pool transfers require HybridCacheController.")
-        allocations = AllocationReceipt()
-        if host_indices.numel() == 0:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
-        else:
-            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
-            if device_indices is None:
-                return None
-            allocations.add(
-                PoolName.KV, device_indices, self.mem_pool_device_allocator.free
-            )
-        return self._new_prepared_transfer(
-            direction=TransferDirection.HOST_TO_DEVICE,
-            domain_owner_id=domain_owner_id,
-            host_indices=host_indices,
-            device_indices=device_indices,
-            priority=priority,
-            pool_transfers=None,
-            allocations=allocations,
+        Load KV caches from host memory to device memory.
+        """
+        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if device_indices is None:
+            return None
+        self.load_queue.append(
+            CacheOperation(host_indices, device_indices, node_id, priority)
         )
-
-    def enqueue_host_to_device(
-        self,
-        operation: PreparedTransfer,
-        registration: OperationRegistration[Any] | None,
-    ) -> None:
-        """Publish a registered H2D operation to the controller queue.
-
-        :param operation: Registered H2D operation.
-        :param registration: Live owner capability for the operation.
-        :raises OperationLifecycleError: If direction or state is invalid.
-        :raises OperationRegistrationError: If the capability is invalid.
-        """
-
-        self._require_registration(operation, registration)
-        if operation.direction != TransferDirection.HOST_TO_DEVICE:
-            raise OperationLifecycleError("Cannot enqueue a D2H operation as H2D.")
-        operation._transition(OperationState.REGISTERED, OperationState.QUEUED)
-        self.load_queue.append(_QueuedTransfer(operation, registration))
-
-    def cancel_transfer(
-        self,
-        operation: PreparedTransfer,
-        registration: OperationRegistration[Any] | None = None,
-    ) -> None:
-        """Cancel an operation before stream submission.
-
-        :param operation: Prepared, registered, or queued operation.
-        :param registration: Required capability after owner registration.
-        :raises OperationLifecycleError: If the operation was submitted or ACKed.
-        :raises OperationRegistrationError: If a required capability is invalid.
-        """
-
-        if operation.state == OperationState.CANCELLED:
-            return
-        self._require_known_operation(operation)
-        if operation.state in (OperationState.SUBMITTED, OperationState.ACKED):
-            raise OperationLifecycleError(
-                f"Cannot cancel {operation.operation_id} after submission."
-            )
-        if operation.state != OperationState.PREPARED:
-            self._require_registration(operation, registration)
-        elif registration is not None:
-            raise OperationRegistrationError(
-                "A PREPARED operation has no registration capability."
-            )
-
-        if operation.state == OperationState.QUEUED:
-            self.load_queue[:] = [
-                queued
-                for queued in self.load_queue
-                if queued.operation is not operation
-            ]
-        operation.allocations.release_all()
-        previous_state = operation.state
-        operation._transition(
-            (
-                OperationState.PREPARED,
-                OperationState.REGISTERED,
-                OperationState.QUEUED,
-            ),
-            OperationState.CANCELLED,
-        )
-        if previous_state != OperationState.PREPARED:
-            assert registration is not None
-            registration._table.unregister(registration)
-        del self._operations[operation.operation_id]
-
-    def acknowledge_transfer(
-        self,
-        ack: HiCacheAck,
-        registration: OperationRegistration[Any] | None,
-    ) -> PreparedTransfer:
-        """Commit the next physical-ACK member and advance its persistent cursor.
-
-        Domain completion must finish before calling this method. If domain
-        completion raises, the cursor remains on the same member for retry.
-
-        :param ack: Physical ACK being committed.
-        :param registration: Owner capability for the current ACK member.
-        :returns: Operation transitioned to ``ACKED``.
-        :raises OperationLifecycleError: If the ACK is complete or out of order.
-        :raises OperationRegistrationError: If the capability is invalid.
-        """
-
-        member_index = ack.commit_progress.next_operation_index
-        if member_index >= len(ack.operation_ids):
-            raise OperationLifecycleError("Every member of this ACK is committed.")
-        operation_id = ack.operation_ids[member_index]
-        operation = self._operations.get(operation_id)
-        if operation is None:
-            raise OperationLifecycleError(
-                f"ACK references unknown operation {operation_id}."
-            )
-        self._require_registration(operation, registration)
-        if operation.state != OperationState.SUBMITTED:
-            raise OperationLifecycleError(
-                f"ACK requires SUBMITTED, got {operation.state.value}."
-            )
-
-        operation.allocations.relinquish()
-        operation._transition(OperationState.SUBMITTED, OperationState.ACKED)
-        assert registration is not None
-        registration._table.unregister(registration)
-        del self._operations[operation_id]
-        ack.commit_progress.next_operation_index += 1
-        return operation
-
-    @staticmethod
-    def mark_ack_metrics_emitted(ack: HiCacheAck) -> bool:
-        """Claim the ACK's aggregate metrics marker exactly once.
-
-        Callers set the marker before updating non-authoritative counters. A retry
-        observes ``False`` and does not emit duplicate metrics.
-
-        :param ack: Physical ACK whose metrics are being committed.
-        :returns: ``True`` only for the first caller.
-        """
-
-        if ack.commit_progress.metrics_emitted:
-            return False
-        ack.commit_progress.metrics_emitted = True
-        return True
+        return device_indices
 
     def move_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
@@ -1518,7 +878,7 @@ class HiCacheController:
             raise ValueError(f"Unsupported io backend")
 
     def _move_write_operation(
-        self, operation: PreparedTransfer | _TransferBatch
+        self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
         """Keep CPU host indices only for page-first staged write-back."""
         if (
@@ -1526,20 +886,13 @@ class HiCacheController:
             and self.mem_pool_host.layout == "page_first"
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
         ):
-            return (
-                operation.host_indices,
-                operation.device_indices,
-                operation.pool_transfers,
-            )
-        return self._move_op_indices(operation)
+            return op.host_indices, op.device_indices, op.pool_transfers
+        return self._move_op_indices(op)
 
     def _move_op_indices(
-        self, operation: PreparedTransfer | _TransferBatch
+        self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
-        return (
-            *self.move_indices(operation.host_indices, operation.device_indices),
-            None,
-        )
+        return (*self.move_indices(op.host_indices, op.device_indices), None)
 
     def _l2_transfers(
         self,
@@ -1566,33 +919,14 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
-    def submit_host_to_device_batch(self) -> int:
-        """Submit every currently queued H2D operation as one physical batch.
-
-        :returns: Layer-event producer ID, or ``-1`` when the queue is empty.
-        :raises OperationLifecycleError: If a queued operation is invalid.
-        :raises OperationRegistrationError: If a queued capability became stale.
-        """
-
+    def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
 
-        queued_batch = tuple(self.load_queue)
-        for queued in queued_batch:
-            self._require_registration(queued.operation, queued.registration)
-            if queued.operation.state != OperationState.QUEUED:
-                raise OperationLifecycleError(
-                    f"Queued operation {queued.operation.operation_id} is "
-                    f"{queued.operation.state.value}."
-                )
-
         producer_id = self.layer_done_counter.update_producer()
-        operation_batch = self._build_transfer_batch(
-            tuple(queued.operation for queued in queued_batch)
-        )
-        host_indices, device_indices, pool_transfers = self._move_op_indices(
-            operation_batch
-        )
+        op = CacheOperation.merge_ops(self.load_queue)
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -1604,8 +938,6 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
-        for operation in operation_batch.operations:
-            operation._transition(OperationState.QUEUED, OperationState.SUBMITTED)
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
@@ -1613,27 +945,15 @@ class HiCacheController:
             layer_num=self.layer_num,
         )
 
-        if len(self.load_queue) < len(queued_batch) or any(
-            current is not expected
-            for current, expected in zip(
-                self.load_queue[: len(queued_batch)], queued_batch
-            )
-        ):
-            raise OperationLifecycleError(
-                "H2D queue changed while its physical batch was submitted."
-            )
-        del self.load_queue[: len(queued_batch)]
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
                 finish_event=completion.finish_event,
-                operation_ids=tuple(
-                    operation.operation_id for operation in operation_batch.operations
-                ),
-                num_tokens=len(operation_batch.device_indices),
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(operation_batch),
-                num_bytes=self._transfer_num_bytes(operation_batch),
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id
